@@ -97,6 +97,54 @@ impl DeliveryMode {
     pub fn is_foreground(self) -> bool { matches!(self, Self::Foreground) }
 }
 
+/// Fail closed when a background pixel event would be hit-tested onto a
+/// different visible window. Cursor-overlay windows are filtered inside the
+/// WindowServer hit-test because they share this process's pid.
+pub(crate) fn pixel_obstruction_error(
+    target_pid: i32,
+    target_window_id: u32,
+    screen_x: f64,
+    screen_y: f64,
+    point_name: Option<&str>,
+) -> Option<cua_driver_core::protocol::ToolResult> {
+    let occluder = crate::windows::pixel_obstruction(
+        target_pid,
+        target_window_id,
+        screen_x,
+        screen_y,
+    )?;
+    let app = if occluder.app_name.trim().is_empty() {
+        format!("pid {}", occluder.pid)
+    } else {
+        occluder.app_name.clone()
+    };
+    let title_suffix = if occluder.title.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" (\"{}\")", occluder.title)
+    };
+    let point_suffix = point_name.map(|name| format!(" at the drag {name}")).unwrap_or_default();
+    Some(
+        cua_driver_core::protocol::ToolResult::error(format!(
+            "Pixel dispatch blocked{point_suffix}: {app}{title_suffix} window {} is in front at \
+             screen point ({screen_x:.0}, {screen_y:.0}). Retry with \
+             delivery_mode:\"foreground\" or clear the obstruction.",
+            occluder.window_id,
+        ))
+        .with_structured(serde_json::json!({
+            "error": "obstructed",
+            "code": "background_occluded",
+            "occluding_app": app,
+            "occluding_pid": occluder.pid,
+            "occluding_window_id": occluder.window_id,
+            "occluding_window_title": occluder.title,
+            "screen_point": { "x": screen_x, "y": screen_y },
+            "point": point_name,
+            "hint": "retry with delivery_mode:\"foreground\" or clear the obstruction"
+        })),
+    )
+}
+
 /// px-focus for the keyboard family (type_text / press_key / hotkey): pixel-click
 /// at (x,y) to establish real renderer focus before a keystroke — the *element px
 /// action* form of a keyboard tool. Reuses ClickTool's exact coordinate
@@ -126,9 +174,9 @@ pub(crate) async fn focus_by_pixel(
     if from_zoom { click_args["from_zoom"] = serde_json::json!(true); }
     let focus = click::ClickTool::new(state.clone()).invoke(click_args).await;
     if focus.is_error == Some(true) {
-        return Err(cua_driver_core::protocol::ToolResult::error(format!(
-            "focus pixel-click at ({x:.0},{y:.0}) failed."
-        )));
+        // Preserve structured obstruction/background-unavailable details from
+        // ClickTool so pixel-focused keyboard calls remain actionable.
+        return Err(focus);
     }
     // Brief settle so the renderer registers focus before the keystrokes.
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -369,6 +417,9 @@ impl Default for ToolState {
 /// variant — same name, stricter args, window-scoped JPEG @ 85% + a text
 /// note telling the caller to use pixel-addressed tools.
 pub fn register_all(registry: &mut ToolRegistry, compat: bool) {
+    registry.set_target_app_resolver(|pid| {
+        i32::try_from(pid).ok().and_then(crate::apps::get_app_name_for_pid)
+    });
     let state = Arc::new(ToolState::default());
     // Share the element cache with the recording-hook layer so it can
     // resolve element_index → window-local screenshot coords for click.png.

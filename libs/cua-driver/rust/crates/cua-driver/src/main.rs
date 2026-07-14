@@ -630,13 +630,15 @@ fn main() {
                     // Wire up replay tool's back-reference to the registry.
                     registry.init_self_weak();
                     let result = if codex_compat {
-                        cua_driver_core::server::run_codex_computer_use_compat(registry).await
+                        cua_driver_core::server::run_codex_computer_use_compat(registry.clone())
+                            .await
                     } else {
-                        cua_driver_core::server::run(registry).await
+                        cua_driver_core::server::run(registry.clone()).await
                     };
                     if let Err(e) = result {
                         tracing::error!("MCP server error: {e}");
                     }
+                    registry.remove_state_file();
                 });
             });
             platform_macos::pip::request_appkit_main_loop_stop();
@@ -886,10 +888,11 @@ async fn async_main() -> anyhow::Result<()> {
     let registry = Arc::new(build_registry(cursor_cfg));
     registry.init_self_weak();
     maybe_init_pip();
-    let result = cua_driver_core::server::run(registry).await;
+    let result = cua_driver_core::server::run(registry.clone()).await;
     if let Err(e) = &result {
         tracing::error!("MCP server error: {e}");
     }
+    registry.remove_state_file();
 
     // The stdio MCP server loop has ended — the client disconnected (stdin
     // EOF) or a fatal I/O error occurred. The cursor overlay runs on its own
