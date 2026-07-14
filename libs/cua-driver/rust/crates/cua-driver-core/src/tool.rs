@@ -311,6 +311,13 @@ pub struct ToolRegistry {
     state_file: Option<crate::session_state::StateFile>,
     /// Platform hook for resolving a human-readable target application name.
     target_app_resolver: Option<fn(i64) -> Option<String>>,
+    /// Platform hook that brings a driven target app to the foreground so the
+    /// watching user sees the window being driven. Only invoked in embedded
+    /// mode, from the shared action choke point, for targeted action tools.
+    /// The hook is best-effort and must never fail a tool call; it owns its own
+    /// front-once/dedupe state. Called with `(target_pid, session)`. Left `None`
+    /// on platforms/modes that keep the background-drive default (serve/daemon).
+    target_front_hook: Option<fn(i64, Option<&str>)>,
 }
 
 impl ToolRegistry {
@@ -321,11 +328,18 @@ impl ToolRegistry {
             recording: Arc::new(RecordingSession::new()),
             state_file: crate::session_state::StateFile::from_env(),
             target_app_resolver: Some(crate::session_state::resolve_process_name),
+            target_front_hook: None,
         }
     }
 
     pub fn set_target_app_resolver(&mut self, resolver: fn(i64) -> Option<String>) {
         self.target_app_resolver = Some(resolver);
+    }
+
+    /// Install the platform hook that fronts a driven target in embedded mode.
+    /// See [`ToolRegistry::target_front_hook`].
+    pub fn set_target_front_hook(&mut self, hook: fn(i64, Option<&str>)) {
+        self.target_front_hook = Some(hook);
     }
 
     #[cfg(test)]
@@ -461,6 +475,27 @@ impl ToolRegistry {
             .then(|| self.recording.begin_turn(resolved_name, &args, start_ms))
             .flatten();
 
+        // Embedded "watchable" fronting: BEFORE driving a targeted action, bring
+        // the target app to the foreground so the user (who watches the driver
+        // via the on-screen agent-cursor overlay) sees the window being driven —
+        // and so the pixel obstruction check sees an un-occluded, frontmost
+        // target. Serve/daemon/one-shot modes keep the background-drive default
+        // (no hook installed / not embedded). Best-effort: the hook owns its own
+        // front-once dedupe and never fails a tool call.
+        if crate::embedded_mode() {
+            if let Some(hook) = self.target_front_hook {
+                if action_targets_window(resolved_name, &args) {
+                    if let Some(target_pid) = args.get("pid").and_then(Value::as_i64) {
+                        let session = args
+                            .get("session")
+                            .and_then(Value::as_str)
+                            .or_else(|| args.get("_session_id").and_then(Value::as_str));
+                        hook(target_pid, session);
+                    }
+                }
+            }
+        }
+
         let result = match self.tools.get(resolved_name) {
             Some(tool) => tool.invoke(args.clone()).await,
             None => return ToolResult::error(format!("Unknown tool: {name}")),
@@ -555,6 +590,38 @@ impl Default for ToolRegistry {
     }
 }
 
+/// The action tools that DRIVE a specific target window (as opposed to merely
+/// inspecting it). In embedded mode the driver fronts the target before these
+/// so the watching user sees the driven window. `get_window_state` is a
+/// perception tool and is fronted only when it carries an explicit `action`
+/// (it does not today — so it stays a pure read, never stealing focus on
+/// inspection). Serve/daemon modes never front (the embedded gate in `invoke`
+/// short-circuits first).
+const FRONT_ACTION_TOOLS: &[&str] = &[
+    "click",
+    "double_click",
+    "right_click",
+    "type_text",
+    "press_key",
+    "hotkey",
+    "scroll",
+    "drag",
+    "set_value",
+];
+
+/// Whether a call is a targeted drive action that should front its target in
+/// embedded mode. `get_window_state` fronts only with an explicit non-null
+/// `action` arg so ordinary perception never steals focus.
+fn action_targets_window(name: &str, args: &Value) -> bool {
+    if FRONT_ACTION_TOOLS.contains(&name) {
+        return true;
+    }
+    if name == "get_window_state" {
+        return args.get("action").map(|v| !v.is_null()).unwrap_or(false);
+    }
+    false
+}
+
 /// Build a short, human-friendly label for the PiP overlay from the
 /// tool name + raw args. Kept under ~60 chars so the macOS NSTextField
 /// has room without truncation at default geometry.
@@ -599,6 +666,35 @@ fn synthesize_action_label(tool_name: &str, args: &Value) -> String {
         tool_name.to_owned()
     } else {
         format!("{tool_name}: {summary}")
+    }
+}
+
+#[cfg(test)]
+mod front_gate_tests {
+    //! Which calls trigger embedded "watchable" fronting at the choke point.
+    use super::action_targets_window;
+    use serde_json::json;
+
+    #[test]
+    fn drive_action_tools_front() {
+        for name in [
+            "click", "double_click", "right_click", "type_text", "press_key", "hotkey", "scroll",
+            "drag", "set_value",
+        ] {
+            assert!(action_targets_window(name, &json!({"pid": 42})), "{name} should front");
+        }
+    }
+
+    #[test]
+    fn perception_and_unknown_tools_do_not_front() {
+        // get_window_state is perception: no fronting unless it carries an
+        // explicit action (it does not today).
+        assert!(!action_targets_window("get_window_state", &json!({"pid": 42})));
+        assert!(!action_targets_window("get_window_state", &json!({"pid": 42, "action": null})));
+        assert!(action_targets_window("get_window_state", &json!({"pid": 42, "action": "press"})));
+        // Read-only / non-drive tools never front.
+        assert!(!action_targets_window("list_windows", &json!({})));
+        assert!(!action_targets_window("launch_app", &json!({"bundle_id": "x"})));
     }
 }
 

@@ -520,6 +520,25 @@ pub fn activate_pid(pid: i32) -> bool {
     }
 }
 
+/// Bring the app owning `pid` fully to the foreground via
+/// `NSRunningApplication.activateWithOptions(NSApplicationActivateAllWindows)`
+/// — the same call `bring_to_front` uses, so a multi-window target lands
+/// entirely frontmost (not just its key window). Returns `true` when Cocoa
+/// accepted the swap. Used by the embedded "watchable" fronting path so the
+/// user watching the agent cursor sees the driven app. Best-effort: callers
+/// treat a `false`/missing app as a warning, never a hard failure.
+pub fn activate_pid_all_windows(pid: i32) -> bool {
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+    unsafe {
+        match NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
+            Some(app) => app.activateWithOptions(
+                NSApplicationActivationOptions::NSApplicationActivateAllWindows,
+            ),
+            None => false,
+        }
+    }
+}
+
 /// Return the bundle identifier of the running process for `pid`, via
 /// `NSRunningApplication.runningApplicationWithProcessIdentifier(pid)?.bundleIdentifier`.
 ///

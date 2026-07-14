@@ -97,6 +97,95 @@ impl DeliveryMode {
     pub fn is_foreground(self) -> bool { matches!(self, Self::Foreground) }
 }
 
+// ── Embedded "watchable" target fronting ─────────────────────────────────────
+//
+// In embedded mode the user WATCHES computer use (there is an on-screen agent
+// cursor overlay), so the app being driven must be visible/frontmost — unlike
+// serve/daemon mode, which deliberately drives apps in the background. The
+// shared action choke point (`ToolRegistry::invoke` in cua-driver-core) calls
+// [`front_target_if_embedded`] before each targeted drive action; this module
+// owns the activation + the front-once/dedupe state so we never flicker focus
+// by re-activating an already-frontmost target on every single action.
+
+/// The (session, target_pid) most recently fronted by [`front_target_if_embedded`].
+/// One driver process ⇒ one dedupe cell. `None` until the first front.
+static LAST_FRONTED: std::sync::Mutex<Option<(Option<String>, i32)>> =
+    std::sync::Mutex::new(None);
+
+/// Outcome of the front-once/dedupe decision. Pure and unit-testable: given the
+/// target, the current frontmost pid, and what we fronted last, decide whether
+/// to issue an activation now and what to remember as last-fronted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrontDecision {
+    /// Issue an `activate` for the target now.
+    pub front: bool,
+    /// Value to store as the new last-fronted `(session, pid)`.
+    pub new_last: Option<(Option<String>, i32)>,
+}
+
+/// Decide whether to bring `target_pid` to the front.
+///
+/// Rules (pure — no OS calls):
+/// - If the target is ALREADY frontmost → skip (never flicker a frontmost app),
+///   but still record it as last-fronted so later unchanged actions dedupe.
+/// - Else if we already fronted this exact `(session, target_pid)` on the
+///   previous action AND no *different* app has since grabbed the foreground
+///   (frontmost is the target or simply unknown) → skip: the earlier activation
+///   is still settling, re-issuing it just churns focus.
+/// - Else → front it so the watching user sees the driven window.
+pub(crate) fn decide_front(
+    target_pid: i32,
+    session: Option<&str>,
+    frontmost_pid: Option<i32>,
+    last_fronted: Option<&(Option<String>, i32)>,
+) -> FrontDecision {
+    let key = (session.map(str::to_owned), target_pid);
+    let already_frontmost = frontmost_pid == Some(target_pid);
+    let unchanged = last_fronted == Some(&key);
+    // A *different* app currently holds the foreground (real focus steal), as
+    // opposed to `None`/target (activation still settling).
+    let stolen_by_other = matches!(frontmost_pid, Some(p) if p != target_pid);
+
+    let front = if already_frontmost {
+        false
+    } else if unchanged && !stolen_by_other {
+        false
+    } else {
+        true
+    };
+    FrontDecision { front, new_last: Some(key) }
+}
+
+/// Bring a driven target app to the foreground in embedded mode so the watching
+/// user sees the window being driven. Best-effort and deduped via
+/// [`decide_front`]: a rejected/failed activation is only warned about, never an
+/// error — this is called from the shared action choke point and must never
+/// fail a tool call. No-op outside embedded mode (the core caller already gates
+/// on `embedded_mode()`, and this rechecks so a stray direct call stays safe).
+pub fn front_target_if_embedded(target_pid: i64, session: Option<&str>) {
+    if !cua_driver_core::embedded_mode() {
+        return;
+    }
+    let Ok(pid) = i32::try_from(target_pid) else {
+        return;
+    };
+    let frontmost = crate::apps::frontmost_pid();
+    let mut last = LAST_FRONTED.lock().unwrap();
+    let decision = decide_front(pid, session, frontmost, last.as_ref());
+    if decision.front {
+        let activated = crate::apps::activate_pid_all_windows(pid);
+        if !activated {
+            tracing::warn!(
+                target: "platform_macos::tools::watchable_front",
+                target_pid = pid,
+                "embedded watchable front: activation returned NO (app hidden, \
+                 terminating, or denied) — proceeding with background drive"
+            );
+        }
+    }
+    *last = decision.new_last;
+}
+
 /// Fail closed when a background pixel event would be hit-tested onto a
 /// different visible window. Cursor-overlay windows are filtered inside the
 /// WindowServer hit-test because they share this process's pid.
@@ -420,6 +509,11 @@ pub fn register_all(registry: &mut ToolRegistry, compat: bool) {
     registry.set_target_app_resolver(|pid| {
         i32::try_from(pid).ok().and_then(crate::apps::get_app_name_for_pid)
     });
+    // Embedded "watchable" fronting: the core action choke point calls this
+    // before each targeted drive action (embedded mode only) so the app being
+    // driven is visible/frontmost for the watching user. No-op in serve/daemon
+    // mode (the caller gates on embedded_mode()).
+    registry.set_target_front_hook(front_target_if_embedded);
     let state = Arc::new(ToolState::default());
     // Share the element cache with the recording-hook layer so it can
     // resolve element_index → window-local screenshot coords for click.png.
@@ -518,6 +612,83 @@ pub fn register_all(registry: &mut ToolRegistry, compat: bool) {
 /// pid/window primitives and retain a fail-closed snapshot per MCP session.
 pub fn register_codex_compat(registry: &mut ToolRegistry) {
     codex_compat::register_all(registry);
+}
+
+#[cfg(test)]
+mod watchable_front_tests {
+    //! Pure front-once/dedupe decision for embedded "watchable" fronting.
+    //! Injects the frontmost pid + last-fronted state so no live WindowServer
+    //! is needed.
+    use super::{decide_front, FrontDecision};
+
+    fn last(session: Option<&str>, pid: i32) -> (Option<String>, i32) {
+        (session.map(str::to_owned), pid)
+    }
+
+    #[test]
+    fn fronts_when_target_not_frontmost_and_no_history() {
+        // First action on a target that is behind the host: bring it forward.
+        let d = decide_front(42, Some("s"), Some(99), None);
+        assert_eq!(
+            d,
+            FrontDecision { front: true, new_last: Some(last(Some("s"), 42)) }
+        );
+    }
+
+    #[test]
+    fn skips_when_target_already_frontmost() {
+        // Never flicker a frontmost app — but still record it as last-fronted.
+        let d = decide_front(42, Some("s"), Some(42), None);
+        assert_eq!(
+            d,
+            FrontDecision { front: false, new_last: Some(last(Some("s"), 42)) }
+        );
+    }
+
+    #[test]
+    fn dedupes_unchanged_target_while_activation_settles() {
+        // We fronted (s,42) last action; frontmost hasn't updated yet (unknown).
+        // No *other* app stole focus, so don't re-issue the activation.
+        let prev = last(Some("s"), 42);
+        let d = decide_front(42, Some("s"), None, Some(&prev));
+        assert_eq!(d, FrontDecision { front: false, new_last: Some(prev) });
+    }
+
+    #[test]
+    fn refronts_unchanged_target_when_another_app_stole_focus() {
+        // Same target as last action, but a DIFFERENT app is now frontmost —
+        // a real focus steal — so bring the target back for the watcher.
+        let prev = last(Some("s"), 42);
+        let d = decide_front(42, Some("s"), Some(77), Some(&prev));
+        assert_eq!(
+            d,
+            FrontDecision { front: true, new_last: Some(last(Some("s"), 42)) }
+        );
+    }
+
+    #[test]
+    fn fronts_when_target_changed_even_if_not_frontmost() {
+        // Last action fronted a different target; the new target is not
+        // frontmost → front it.
+        let prev = last(Some("s"), 7);
+        let d = decide_front(42, Some("s"), Some(7), Some(&prev));
+        assert_eq!(
+            d,
+            FrontDecision { front: true, new_last: Some(last(Some("s"), 42)) }
+        );
+    }
+
+    #[test]
+    fn distinct_sessions_do_not_dedupe_each_other() {
+        // Same pid, different session key ⇒ treated as changed; front when the
+        // target is not already frontmost.
+        let prev = last(Some("a"), 42);
+        let d = decide_front(42, Some("b"), None, Some(&prev));
+        assert_eq!(
+            d,
+            FrontDecision { front: true, new_last: Some(last(Some("b"), 42)) }
+        );
+    }
 }
 
 #[cfg(test)]
