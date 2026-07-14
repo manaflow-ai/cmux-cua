@@ -22,6 +22,12 @@ pub const RESPONSIBILITY_DISCLAIMED_ENV: &str = "CUA_DRIVER_RS_RESPONSIBILITY_DI
 /// attribution decision (`permission_source` in platform-macos).
 pub const EMBEDDED_ENV: &str = "CUA_DRIVER_EMBEDDED";
 
+/// Stable cursor/session identity for an embedded stdio driver process.
+/// Embedding hosts may set this before launching the driver so their own run
+/// identity appears in cursor ownership and diagnostics. When it is absent (or
+/// empty), the driver mints a process-local `embedded-<pid>` id.
+pub const DEFAULT_SESSION_ENV: &str = "CUA_DRIVER_DEFAULT_SESSION";
+
 /// Advisory label for the embedding host's bundle id, echoed in
 /// `check_permissions` output. NOT a trust signal — trust comes from the
 /// OS responsibility chain.
@@ -30,6 +36,33 @@ pub const HOST_BUNDLE_ID_ENV: &str = "CUA_DRIVER_HOST_BUNDLE_ID";
 /// Only the exact value `1` counts — fail-safe for anything else.
 pub fn embedded_mode() -> bool {
     std::env::var_os(EMBEDDED_ENV).is_some_and(|v| v == "1")
+}
+
+/// Return the default session owned by this embedded driver process.
+///
+/// The id is resolved once so every argument-less tool call in the stdio MCP
+/// session shares one cursor. Non-embedded processes deliberately return
+/// `None`: daemon/serve and one-shot CLI calls retain their explicit-session
+/// cursor semantics.
+pub fn embedded_default_session_id() -> Option<&'static str> {
+    if !embedded_mode() {
+        return None;
+    }
+
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    Some(ID.get_or_init(|| {
+        default_session_id_from_env(
+            std::env::var(DEFAULT_SESSION_ENV).ok().as_deref(),
+            std::process::id(),
+        )
+    }).as_str())
+}
+
+fn default_session_id_from_env(value: Option<&str>, pid: u32) -> String {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("embedded-{pid}"))
 }
 
 pub mod capture_mode;
@@ -61,3 +94,23 @@ pub mod video;
 pub mod video_ffmpeg;
 
 pub use recording::RecordingSession;
+
+#[cfg(test)]
+mod embedded_session_tests {
+    use super::default_session_id_from_env;
+
+    #[test]
+    fn default_session_uses_host_value_when_provided() {
+        assert_eq!(
+            default_session_id_from_env(Some("cmux-codex-42"), 123),
+            "cmux-codex-42"
+        );
+    }
+
+    #[test]
+    fn default_session_falls_back_to_stable_process_id() {
+        assert_eq!(default_session_id_from_env(None, 123), "embedded-123");
+        assert_eq!(default_session_id_from_env(Some(""), 123), "embedded-123");
+        assert_eq!(default_session_id_from_env(Some("   "), 123), "embedded-123");
+    }
+}

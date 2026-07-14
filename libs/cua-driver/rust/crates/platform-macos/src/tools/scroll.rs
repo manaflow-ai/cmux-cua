@@ -276,7 +276,7 @@ fn def() -> &'static ToolDef {
             // schema — keeps the contract consistent across platforms.
             "required": ["direction"],
             "properties": {
-                "session": { "type": "string", "description": "Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less." },
+                "session": { "type": "string", "description": "Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-<pid>); anonymous non-embedded calls remain cursor-less." },
                 "pid": { "type": "integer" },
                 "direction": {
                     "type": "string",
@@ -388,6 +388,17 @@ impl Tool for ScrollTool {
                 return ToolResult::error(format!(
                     "Element index {idx} not found. Call get_window_state first."
                 ));
+            }
+        }
+
+        // An element-addressed scroll may complete through the native AX
+        // scrollbar path below, before the targeted-wheel code gets a chance
+        // to place the cursor. Glide now so every element scroll is visible at
+        // its action point; the wheel path may refine the point after
+        // AXScrollToVisible changes the element frame.
+        if let Some(element_ptr) = pre_focus_ptr {
+            if let Some(point) = super::cursor_tools::retained_element_center(element_ptr).await {
+                super::cursor_tools::animate_to_action_point(&self.state, &args, point, window_id).await;
             }
         }
 
@@ -724,6 +735,14 @@ impl Tool for ScrollTool {
             _ => "down",
         };
         let key = key.to_owned();
+
+        // The untargeted keystroke path acts on the currently focused region.
+        // When AX exposes its bounds, make that implicit action point visible.
+        if pre_focus_ptr.is_none() {
+            if let Some(point) = super::cursor_tools::focused_element_center(pid).await {
+                super::cursor_tools::animate_to_action_point(&self.state, &args, point, window_id).await;
+            }
+        }
 
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // Scroll keystrokes (PageDown / arrow) into search-box autocomplete

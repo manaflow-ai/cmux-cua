@@ -44,7 +44,10 @@ embedded mode does not address.
 
 ```sh
 # env var form — set by the host on the child process
-CUA_DRIVER_EMBEDDED=1 CUA_DRIVER_HOST_BUNDLE_ID=com.yourco.yourapp cua-driver mcp
+CUA_DRIVER_EMBEDDED=1 \
+CUA_DRIVER_HOST_BUNDLE_ID=com.yourco.yourapp \
+CUA_DRIVER_DEFAULT_SESSION=my-agent-run \
+cua-driver mcp
 
 # flag form — equivalent (the flags just set the env vars)
 cua-driver mcp --embedded --host-bundle-id com.yourco.yourapp
@@ -67,7 +70,9 @@ Only the exact value `CUA_DRIVER_EMBEDDED=1` enables embedded mode; anything
 else is ignored (fail-safe). `--host-bundle-id` is an advisory label echoed
 in `check_permissions` output and logs — it is **not** a trust signal; trust
 comes from the OS responsibility chain, so there is nothing to spoof by
-setting it.
+setting it. `CUA_DRIVER_DEFAULT_SESSION` names the stable cursor owned by this
+stdio MCP process when tools omit `session` / `cursor_id`; if absent or empty,
+the driver uses `embedded-<pid>`. Explicit tool cursor identity still wins.
 
 ## What embedded mode changes (and what it doesn't)
 
@@ -79,6 +84,7 @@ setting it.
 | Permission prompts / startup gate | May prompt once                  | **Never prompts**                        |
 | Settings → Privacy & Security entries | CuaDriver                    | your app only                            |
 | `check_permissions` `source.attribution` | `driver-daemon` (or `caller`) | `host`                            |
+| Argument-less action cursor       | none                                | `CUA_DRIVER_DEFAULT_SESSION`, else `embedded-<pid>` |
 | Overlay, background input, capture, all tools | full               | full — identical                          |
 
 Everything else — the agent-cursor overlay, background (no-focus-steal)

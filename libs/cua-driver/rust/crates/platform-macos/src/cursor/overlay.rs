@@ -1891,6 +1891,31 @@ mod tests {
     }
 
     #[test]
+    fn first_action_lazily_creates_a_cursor_with_host_branding() {
+        let (defaults, warnings) = cursor_overlay::AgentCursorDefaults::parse_values(
+            Some("#12c7f5,#2d8cff,#6c5cff"),
+            Some("#3456ef"),
+            Some("Codex"),
+        );
+        assert!(warnings.is_empty());
+
+        let mut template = CursorConfig::default();
+        template.gradient_colors = defaults.gradient_colors.clone();
+        template.bloom_color = defaults.bloom_color;
+        template.cursor_label = defaults.cursor_label.clone();
+        let mut map = empty_map();
+        map.template = template;
+
+        // A location-bearing action's first MoveTo is the lazy-creation edge.
+        apply_msg(&mut map, move_msg("embedded-codex", 42.0, 24.0));
+
+        let cursor = &map.cursors["embedded-codex"].core;
+        assert_eq!(cursor.gradient_colors, defaults.gradient_colors);
+        assert_eq!(cursor.bloom_override, defaults.bloom_color);
+        assert_eq!(cursor.cfg.cursor_label, defaults.cursor_label);
+    }
+
+    #[test]
     fn session_end_removes_only_that_session() {
         let mut map = empty_map();
         apply_msg(&mut map, move_msg("sessA", 10.0, 10.0));

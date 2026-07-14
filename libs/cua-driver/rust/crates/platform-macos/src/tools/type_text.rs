@@ -80,7 +80,7 @@ fn def() -> &'static ToolDef {
             "type": "object",
             "required": ["pid", "text"],
             "properties": {
-                "session": { "type": "string", "description": "Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less." },
+                "session": { "type": "string", "description": "Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-<pid>); anonymous non-embedded calls remain cursor-less." },
                 "pid":  { "type": "integer", "description": "Target process ID." },
                 "text": { "type": "string",  "description": "Text to insert at the target's cursor." },
                 "window_id": {
@@ -203,6 +203,19 @@ impl Tool for TypeTextTool {
             None
         };
         let element_ptr = element_guard.as_ref().map(|(g, idx)| (g.as_ptr(), Some(*idx)));
+
+        // A keyboard action still has a visible action point: the explicit AX
+        // target, or the app's currently focused element. Glide before typing
+        // so an embedded default cursor is present where the text lands (the px
+        // form has already focused/clicked the same point above).
+        let cursor_point = if let Some((ptr, _)) = element_ptr {
+            super::cursor_tools::retained_element_center(ptr).await
+        } else {
+            super::cursor_tools::focused_element_center(pid).await
+        };
+        if let Some(point) = cursor_point {
+            super::cursor_tools::animate_to_action_point(&self.state, &args, point, window_id).await;
+        }
 
         let text_clone  = text.clone();
         let char_count  = text.chars().count();

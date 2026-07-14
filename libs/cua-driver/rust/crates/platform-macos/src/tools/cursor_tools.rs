@@ -11,38 +11,71 @@ use std::sync::Arc;
 
 use super::ToolState;
 
-/// Resolve the cursor key for a tool invocation. Always returns a non-empty
-/// key, so the agent cursor is shown by default.
+/// The empty cursor key is the established no-cursor sentinel. Overlay and
+/// registry writes both ignore it.
+pub(crate) const NO_CURSOR: &str = "";
+
+/// Resolve the cursor key for a tool invocation.
 ///
-/// Precedence: an explicit `session` arg, then its legacy alias `cursor_id`,
-/// then the connection-injected `_session_id` the daemon mirrors onto every
-/// call, then a stable per-daemon fallback ([`default_cursor_session`]). So a
-/// caller that never declares a session still gets a consistent cursor for the
-/// run (e.g. raw CLI `call`s). The same id works identically over MCP, the CLI
-/// (`--session`), or the raw socket, and follows the run across any number of
-/// apps/windows. Opt out per session with `set_agent_cursor_enabled`.
+/// Explicit `session` / `cursor_id` always wins. An anonymous call receives the
+/// stable embedded stdio session only in embedded mode; daemon/serve and CLI
+/// calls remain cursor-less unless their caller declares an identity. The
+/// daemon-injected `_session_id` intentionally remains lifecycle metadata, not
+/// an explicit cursor choice.
 pub(crate) fn resolve_cursor_key(args: &Value) -> String {
+    resolve_cursor_key_with_default(args, cua_driver_core::embedded_default_session_id())
+}
+
+fn resolve_cursor_key_with_default(args: &Value, embedded_default: Option<&str>) -> String {
     use cua_driver_core::tool_args::ArgsExt;
-    // Explicit cursor identity first (`session`, or its legacy `cursor_id` alias),
-    // then the per-run `_session_id` the daemon mirrors onto every call, then a
-    // stable per-daemon fallback. So the agent cursor is shown by DEFAULT with an
-    // id that stays consistent across a run, even when the caller never declared a
-    // session (e.g. raw CLI `call`s). Opt out per session with set_agent_cursor_enabled.
-    for key in ["session", "cursor_id", "_session_id"] {
+    for key in ["session", "cursor_id"] {
         if let Some(v) = args.opt_str(key) {
             if !v.is_empty() {
                 return v;
             }
         }
     }
-    default_cursor_session()
+    embedded_default.unwrap_or(NO_CURSOR).to_owned()
 }
 
-/// Stable per-daemon cursor session, minted once per `serve` process. Used when a
-/// call carries no session identity at all, so every such call shares one cursor.
-fn default_cursor_session() -> String {
-    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    ID.get_or_init(|| format!("auto-{:x}", std::process::id())).clone()
+/// Glide the resolved cursor to an action point and keep its inspectable state
+/// in sync. The first position update lazily materializes the session cursor;
+/// the overlay seeds that cursor off-target so its first arrival is animated.
+pub(crate) async fn animate_to_action_point(
+    state: &ToolState,
+    args: &Value,
+    point: (f64, f64),
+    window_id: Option<u32>,
+) {
+    let cursor_key = resolve_cursor_key(args);
+    if let Some(wid) = window_id {
+        crate::cursor::overlay::send_command(
+            cursor_key.clone(),
+            cursor_overlay::OverlayCommand::PinAbove(wid as u64),
+        );
+    }
+    crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), point.0, point.1).await;
+    state.cursor_registry.update_position(&cursor_key, point.0, point.1);
+}
+
+/// Resolve an already-retained AX element's screen center off the async worker.
+pub(crate) async fn retained_element_center(element_ptr: usize) -> Option<(f64, f64)> {
+    tokio::task::spawn_blocking(move || unsafe {
+        crate::ax::bindings::element_screen_center(
+            element_ptr as crate::ax::bindings::AXUIElementRef,
+        )
+    }).await.ok().flatten()
+}
+
+/// Resolve the current focused element's screen center. The AX object returned
+/// by `focused_element_of_pid` is owned here and released before returning.
+pub(crate) async fn focused_element_center(pid: i32) -> Option<(f64, f64)> {
+    tokio::task::spawn_blocking(move || unsafe {
+        let element = crate::ax::bindings::focused_element_of_pid(pid)?;
+        let center = crate::ax::bindings::element_screen_center(element);
+        core_foundation::base::CFRelease(element as _);
+        center
+    }).await.ok().flatten()
 }
 
 // ── SetAgentCursorEnabled ─────────────────────────────────────────────────────
@@ -60,18 +93,19 @@ static ENABLED_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn enabled_def() -> &'static ToolDef {
     ENABLED_DEF.get_or_init(|| ToolDef {
         name: "set_agent_cursor_enabled".into(),
-        description: "Show or hide the agent cursor for a session. A cursor exists only for a \
-                      DECLARED session: pass `session` (the same id you start_session / drive \
-                      actions with) and the cursor appears on that session's first action — its \
-                      color is derived from the id. Without a `session`, actions run cursor-less. \
-                      Use enabled=false to hide a session's cursor, enabled=true to re-show it. \
-                      (`cursor_id` is a legacy alias for `session`.)".into(),
+        description: "Show or hide the agent cursor for a session. In embedded mode, omitting \
+                      `session` controls the process's automatic default cursor \
+                      (`CUA_DRIVER_DEFAULT_SESSION`, or `embedded-<pid>`). Outside embedded mode, \
+                      pass `session`; anonymous actions remain cursor-less. Use enabled=false to \
+                      hide that cursor and enabled=true to re-show it. An explicit `session` or \
+                      legacy `cursor_id` always takes precedence.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["enabled"],
             "properties": {
                 "enabled": { "type": "boolean", "description": "true = show, false = hide." },
-                "cursor_id": { "type": "string", "description": "Cursor instance. Default: 'default'." }
+                "session": { "type": "string", "description": "Explicit session cursor. Takes precedence over cursor_id and the embedded default." },
+                "cursor_id": { "type": "string", "description": "Legacy explicit cursor alias." }
             },
             "additionalProperties": false
         }),
@@ -136,6 +170,7 @@ fn motion_def() -> &'static ToolDef {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
+                "session":      { "type": "string", "description": "Explicit session cursor. Takes precedence over cursor_id and the embedded default." },
                 "cursor_id":    { "type": "string", "description": "Cursor instance name. Default: 'default'." },
                 "cursor_icon":  { "type": "string", "description": format!("Built-in shape ({}) or a path to a PNG/SVG/ICO file. '' reverts to the default cursor.", cursor_overlay::BuiltinShape::names_help()) },
                 "cursor_color": { "type": "string", "description": "Hex color (e.g. '#00FFFF') or CSS color name." },
@@ -330,6 +365,10 @@ fn style_def() -> &'static ToolDef {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
+                "session": {
+                    "type": "string",
+                    "description": "Explicit session cursor. Takes precedence over cursor_id and the embedded default."
+                },
                 "cursor_id": {
                     "type": "string",
                     "description": "Cursor instance. Default: 'default'."
@@ -505,6 +544,7 @@ fn state_def() -> &'static ToolDef {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
+                "session": { "type": "string", "description": "Explicit session cursor. Takes precedence over cursor_id and the embedded default." },
                 "cursor_id": { "type": "string", "description": "Cursor instance. Default: this session's cursor." }
             },
             "additionalProperties": false
@@ -521,8 +561,8 @@ impl Tool for GetAgentCursorStateTool {
     fn def(&self) -> &ToolDef { state_def() }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        // Scope to the CALLER's cursor (explicit cursor_id > injected
-        // _session_id > "default"). Returning every session's cursors here was a
+        // Scope to the CALLER's cursor (explicit session/cursor_id, then the
+        // embedded process default). Returning every session's cursors here was a
         // cross-session leak, and deriving the top-level `enabled` via
         // `.first()` over a HashMap-backed Vec was nondeterministic with N
         // cursors. A non-creating `get` keeps a never-touched session from
@@ -545,7 +585,7 @@ impl Tool for GetAgentCursorStateTool {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_cursor_key;
+    use super::{resolve_cursor_key, resolve_cursor_key_with_default, NO_CURSOR};
     use serde_json::json;
 
     #[tokio::test]
@@ -571,17 +611,29 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_defaults_to_a_stable_cursor_session() {
-        // No session/cursor_id declared → a stable per-daemon "auto-…" cursor
-        // session (never the empty key), so the agent cursor shows by default.
-        // The id is consistent across calls within the process.
-        let a = resolve_cursor_key(&json!({}));
-        let b = resolve_cursor_key(&json!({ "x": 1 }));
-        assert!(a.starts_with("auto-"), "got {a}");
-        assert_ne!(a, "");
-        assert_eq!(a, b, "the anonymous default must stay the same across calls");
-        // The minted per-run `_session_id` now DOES drive the cursor (consistent run id).
-        assert_eq!(resolve_cursor_key(&json!({ "_session_id": "mcp-1-2" })), "mcp-1-2");
+    fn embedded_anonymous_call_uses_the_process_default() {
+        let args = json!({ "x": 1, "_session_id": "daemon-lifecycle-only" });
+        assert_eq!(
+            resolve_cursor_key_with_default(&args, Some("cmux-codex-42")),
+            "cmux-codex-42"
+        );
+    }
+
+    #[test]
+    fn non_embedded_anonymous_call_stays_cursorless() {
+        let args = json!({ "x": 1, "_session_id": "mcp-1-2" });
+        assert_eq!(resolve_cursor_key_with_default(&args, None), NO_CURSOR);
+    }
+
+    #[test]
+    fn embedded_default_cursor_can_be_disabled_before_its_first_action() {
+        let key = resolve_cursor_key_with_default(&json!({}), Some("cmux-default"));
+        let registry = crate::cursor::CursorRegistry::new();
+        registry.set_enabled(&key, false);
+        registry.update_position(&key, 42.0, 24.0);
+        let cursor = registry.get(&key).expect("default cursor is materialized");
+        assert!(!cursor.config.enabled, "the first action must not re-enable an opt-out");
+        assert_eq!(cursor.position.map(|point| (point.x, point.y)), Some((42.0, 24.0)));
     }
 
     #[test]
@@ -596,6 +648,14 @@ mod tests {
         assert_eq!(
             resolve_cursor_key(&json!({ "session": "s1", "cursor_id": "c1" })),
             "s1"
+        );
+        assert_eq!(
+            resolve_cursor_key_with_default(
+                &json!({ "session": "s1", "cursor_id": "c1" }),
+                Some("embedded-default")
+            ),
+            "s1",
+            "an explicit session must override the embedded default"
         );
     }
 
@@ -662,15 +722,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_strings_fall_through_to_the_default_cursor() {
-        // An empty `session` falls through to `cursor_id`; both empty → the stable
-        // per-daemon default (never the empty key, so a cursor is still shown).
+    fn empty_strings_fall_through_to_the_embedded_default_only() {
         assert_eq!(
             resolve_cursor_key(&json!({ "session": "", "cursor_id": "c1" })),
             "c1"
         );
-        let both_empty = resolve_cursor_key(&json!({ "session": "", "cursor_id": "" }));
-        assert!(both_empty.starts_with("auto-"), "got {both_empty}");
-        assert_ne!(both_empty, "");
+        let both_empty = json!({ "session": "", "cursor_id": "" });
+        assert_eq!(
+            resolve_cursor_key_with_default(&both_empty, Some("embedded-default")),
+            "embedded-default"
+        );
+        assert_eq!(resolve_cursor_key_with_default(&both_empty, None), NO_CURSOR);
     }
 }
