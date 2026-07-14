@@ -11,6 +11,10 @@ use crate::tool::ToolRegistry;
 /// responses to stdout. Exits when stdin reaches EOF or a fatal I/O
 /// error occurs.
 pub async fn run(registry: Arc<ToolRegistry>) -> anyhow::Result<()> {
+    // One stdio process is one embedded MCP session. Keep its implicit cursor
+    // under the same session_end lifecycle as declared sessions, including I/O
+    // errors: the guard fires cleanup when this function returns or unwinds.
+    let _embedded_session = EmbeddedSessionGuard::new();
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
@@ -55,6 +59,36 @@ pub async fn run(registry: Arc<ToolRegistry>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+struct EmbeddedSessionGuard(Option<&'static str>);
+
+impl EmbeddedSessionGuard {
+    fn new() -> Self {
+        Self(crate::embedded_default_session_id())
+    }
+}
+
+impl Drop for EmbeddedSessionGuard {
+    fn drop(&mut self) {
+        if let Some(session_id) = self.0 {
+            crate::session::fire_session_end(session_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EmbeddedSessionGuard;
+
+    #[test]
+    fn embedded_stdio_guard_ends_its_default_session_on_drop() {
+        let session_id = "embedded-stdio-guard-test-7f9c";
+        crate::session::revive_session(session_id);
+        assert!(!crate::session::is_session_ended(session_id));
+        drop(EmbeddedSessionGuard(Some(session_id)));
+        assert!(crate::session::is_session_ended(session_id));
+    }
 }
 
 /// Dispatch one MCP JSON-RPC request against the registry (initialize /

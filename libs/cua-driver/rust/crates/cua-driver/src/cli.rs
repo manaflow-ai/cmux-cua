@@ -217,9 +217,11 @@ pub fn parse_command() -> Command {
         println!("                          for any future compat-gated tool.");
         println!();
         println!("agent cursor overlay (serve / mcp only — needs the daemon UI runloop):");
-        println!("  The overlay is ON by default: every MCP session automatically gets its own");
-        println!("  cursor (keyed by session id) that shows where the agent acts without moving the");
-        println!("  real pointer. It is removed when the session ends. A pure accessibility (AX)");
+        println!("  Embedded stdio processes (CUA_DRIVER_EMBEDDED=1) get an automatic default");
+        println!("  cursor keyed by CUA_DRIVER_DEFAULT_SESSION (else embedded-<pid>), so anonymous");
+        println!("  calls show a cursor with no session arg. Non-embedded callers must pass an");
+        println!("  explicit `session` to get a cursor. The cursor shows where the agent acts");
+        println!("  without moving the real pointer and is removed when the session ends. A pure accessibility (AX)");
         println!("  action snaps the cursor with a brief pulse on its first action instead of a long");
         println!("  glide, so it can be easy to miss — do a pixel click or move_cursor first");
         println!("  for a visibly gliding demo. These flags tune the overlay on `serve`/`mcp`:");
