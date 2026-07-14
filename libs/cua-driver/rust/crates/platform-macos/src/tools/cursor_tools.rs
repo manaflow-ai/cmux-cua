@@ -130,6 +130,11 @@ impl Tool for SetAgentCursorEnabledTool {
             key.clone(),
             cursor_overlay::OverlayCommand::SetEnabled(enabled),
         );
+        // Hide the cmux host feed promptly on disable (don't wait for the next
+        // action to gate it), so the host-rendered cursor disappears at once.
+        if !enabled {
+            cua_driver_core::cursor_feed::emit_hidden();
+        }
         ToolResult::text(format!("Agent cursor '{}' {}.", key, if enabled { "enabled" } else { "disabled" }))
     }
 }
