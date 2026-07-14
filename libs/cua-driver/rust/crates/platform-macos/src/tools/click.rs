@@ -636,7 +636,12 @@ impl Tool for ClickTool {
                 if let (Some(b), scale) = result {
                     let wx = cx / scale;
                     let wy = cy / scale;
-                    (b.x + wx, b.y + wy, wx, wy)
+                    // Window-local screenshot pixel → GLOBAL top-left-origin
+                    // screen point; this is the coordinate space the cursor
+                    // feed emits in (see cua_driver_core::cursor_feed).
+                    let (gx, gy) =
+                        cua_driver_core::cursor_feed::window_local_to_global((b.x, b.y), scale, (cx, cy));
+                    (gx, gy, wx, wy)
                 } else {
                     // window_id not found — fall back to treating x,y as screen coords.
                     (cx, cy, cx, cy)

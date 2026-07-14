@@ -441,6 +441,10 @@ pub fn register_all(registry: &mut ToolRegistry, compat: bool) {
             // cursor are a harmless no-op.
             cursor_registry.remove(session_id);
             crate::cursor::overlay::remove_cursor(session_id.to_owned());
+            // Embedded-mode cursor feed: mark the host-rendered cursor hidden at
+            // its last position so it doesn't linger after the session ends.
+            // No-op unless embedded + CUA_DRIVER_STATE_DIR is set.
+            cua_driver_core::cursor_feed::emit_hidden();
         });
     }
 

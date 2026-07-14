@@ -341,6 +341,9 @@ impl ToolRegistry {
                 eprintln!("[cua-driver] warning: failed to remove state file: {error}");
             }
         }
+        // Clean up the embedded-mode agent-cursor feed on the same shutdown
+        // paths (stdio EOF / clean exit). No-op unless the feed is enabled.
+        crate::cursor_feed::remove();
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {

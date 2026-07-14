@@ -427,6 +427,28 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
     if key.is_empty() {
         return;
     }
+    // Embedded-mode cursor feed: the in-process overlay renders nothing for a
+    // CLI-grandchild driver, so emit the destination (already GLOBAL screen
+    // coords, top-left origin) to `<state_dir>/<pid>.cursor.json` for the cmux
+    // host to render. Best-effort, no-op unless embedded + STATE_DIR is set.
+    //
+    // Gate the feed on the cursor's enabled + not-ended state: after
+    // set_agent_cursor_enabled(false) or once a session has ended, the driver
+    // considers the cursor hidden, so the host must not keep drawing it. Default
+    // to enabled when the cursor has not been materialized yet (first action).
+    let cursor_enabled = {
+        let guard = RENDER.lock().unwrap();
+        guard
+            .as_ref()
+            .and_then(|m| m.cursors.get(&key))
+            .map(|rs| rs.core.cfg.enabled)
+            .unwrap_or(true)
+    };
+    if cursor_enabled && !cua_driver_core::session::is_session_ended(&key) {
+        cua_driver_core::cursor_feed::emit_move(Some(&key), x, y);
+    } else {
+        cua_driver_core::cursor_feed::emit_hidden();
+    }
     // Seed a sentinel cursor on-screen so the MoveTo below glides instead of
     // being short-circuited. After this the cursor's pos.0 > -50.0, so the
     // should-animate check passes on the first action just like later ones.
