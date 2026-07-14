@@ -25,10 +25,15 @@ fn def() -> &'static ToolDef {
             those indices to click, type_text, press_key, etc.\n\n\
             INVARIANT: call get_window_state once per turn per (pid, window_id) before any \
             element-indexed action. The index map is replaced by the next snapshot.\n\n\
-            PREFERRED CONSUMERS read `structuredContent.elements` (one entry per \
-            indexed row with `element_index`, `role`, `label`, `value` (the \
-            element's text/AXValue when present — use it to verify what a field \
-            holds), `frame: {x,y,w,h}`, `parent_index`, `depth`). The markdown \
+            PREFERRED CONSUMERS read `structuredContent.elements` (actionable rows \
+            carry `element_index` + `element_token`; value-bearing read-only \
+            AXStaticText/AXTextField/AXTextArea rows are also included without \
+            addressability fields). Each entry carries `role`, title-first `label`, \
+            optional `description` when distinct from the label, `value` \
+            (stringified AXValue, capped at 512 characters), `frame: {x,y,w,h}`, \
+            `parent_index`, and `depth`. Mirrored actionable AX copies \
+            with the same role + label + frame are deduplicated so label lookup \
+            is unambiguous. The markdown \
             `tree_markdown` stays available \
             and unchanged in shape for existing text-parsing callers — but new \
             fields will only be added to the structured side.\n\n\
@@ -278,8 +283,9 @@ impl Tool for GetWindowStateTool {
         let snapshot_id = cua_driver_core::element_token::global()
             .register_snapshot(pid, window_id, elem_count_for_snapshot);
 
-        // Build the structured `elements` array — one entry per actionable
-        // node, matching the order (and indices) of the markdown rendering.
+        // Build the structured `elements` array — every actionable node plus
+        // value-bearing read-only text nodes, in markdown/DFS order. Only the
+        // actionable rows carry indices and tokens.
         // This is the preferred consumption path; `tree_markdown` is kept
         // alongside for back-compat with existing text-parsing callers
         // (Hermes' regex parser, Codex, Claude Code) and is signalled as
@@ -353,16 +359,12 @@ impl Tool for GetWindowStateTool {
     }
 }
 
-/// Render the actionable nodes from the AX walk into the
-/// `structuredContent.elements` array shape described on the tool: one entry
-/// per node with an `element_index`, carrying role, label (built from
-/// title/description/value/identifier), frame, parent_index, depth, and —
-/// Surface 6 — an opaque `element_token` for the same row.
+/// Render actionable nodes and value-bearing read-only text nodes from the AX
+/// walk into the `structuredContent.elements` array shape described on the
+/// tool. Addressable entries carry `element_index` plus the matching opaque
+/// `element_token`; read-only text entries omit both fields.
 ///
-/// Order matches the markdown rendering exactly (DFS, same indices). Only
-/// nodes that received an `element_index` (i.e. are addressable via
-/// click(element_index=N)) appear — non-actionable display-only rows are
-/// omitted to match the contract on the tool description.
+/// Order matches the markdown rendering exactly (DFS, same actionable indices).
 pub(crate) fn build_elements_array_with_token(
     nodes: &[crate::ax::tree::AXNode],
     snapshot_id: u32,
@@ -370,32 +372,46 @@ pub(crate) fn build_elements_array_with_token(
     nodes
         .iter()
         .filter_map(|node| {
-            let idx = node.element_index?;
-            // `label` is a best-effort human-readable string: title first,
-            // then description, then value, then identifier. Mirrors what
-            // a human reading the markdown row would call this element.
-            let label = node
-                .title
-                .clone()
-                .or_else(|| node.description.clone())
-                .or_else(|| node.value.clone())
-                .or_else(|| node.identifier.clone());
+            let include_read_only_value = node.element_index.is_none()
+                && node.value.as_ref().is_some_and(|value| !value.is_empty())
+                && matches!(node.role.as_str(), "AXStaticText" | "AXTextField" | "AXTextArea");
+            if node.element_index.is_none() && !include_read_only_value {
+                return None;
+            }
+
+            let label = crate::ax::tree::preferred_label(
+                node.title.as_deref(),
+                node.description.as_deref(),
+                node.value.as_deref(),
+                node.identifier.as_deref(),
+            ).map(str::to_owned);
             let frame = node.frame.map(|[x, y, w, h]| {
                 serde_json::json!({ "x": x, "y": y, "w": w, "h": h })
             });
             let mut entry = serde_json::json!({
-                "element_index": idx,
+                "role": node.role,
+                "depth": node.depth,
+            });
+            if let Some(idx) = node.element_index {
+                entry["element_index"] = serde_json::json!(idx);
                 // Surface 6: opaque token paired to the integer index.
                 // Tools accept either; the token has explicit validity
                 // (invalidated when the next snapshot supersedes this
                 // one in the per-pid LRU). See cua-driver-core's
                 // `element_token` module.
-                "element_token": cua_driver_core::element_token::token_for(snapshot_id, idx),
-                "role": node.role,
-                "depth": node.depth,
-            });
-            if let Some(label) = label {
-                entry["label"] = serde_json::Value::String(label);
+                entry["element_token"] = serde_json::Value::String(
+                    cua_driver_core::element_token::token_for(snapshot_id, idx),
+                );
+            }
+            if let Some(ref label) = label {
+                entry["label"] = serde_json::Value::String(label.clone());
+            }
+            if let Some(description) = node
+                .description
+                .clone()
+                .filter(|description| label.as_deref() != Some(description.as_str()))
+            {
+                entry["description"] = serde_json::Value::String(description);
             }
             // Surface the element's AXValue separately from `label`. `label`
             // collapses title→description→value→identifier into one display
@@ -509,6 +525,53 @@ mod tests {
         let entry = &build_elements_array(&nodes)[0];
         assert_eq!(entry["label"], "Compose message", "label stays the title");
         assert_eq!(entry["value"], "i love u", "value must be surfaced separately");
+    }
+
+    #[test]
+    fn elements_keep_title_first_label_and_surface_distinct_description() {
+        let mut nodes = vec![node(
+            Some(0),
+            "AXButton",
+            Some("Internal title"),
+            1,
+            None,
+            None,
+        )];
+        nodes[0].description = Some("Visible label".into());
+        let entry = &build_elements_array(&nodes)[0];
+        assert_eq!(entry["label"], "Internal title");
+        assert_eq!(entry["description"], "Visible label");
+        assert!(entry.get("title").is_none());
+    }
+
+    #[test]
+    fn elements_include_value_bearing_read_only_text_without_addressability() {
+        for role in ["AXStaticText", "AXTextField", "AXTextArea"] {
+            let mut nodes = vec![node(None, role, None, 2, Some(4), Some([1.0, 2.0, 3.0, 4.0]))];
+            nodes[0].value = Some("80".into());
+            let entries = build_elements_array_with_token(&nodes, 9);
+            assert_eq!(entries.len(), 1, "{role} should be surfaced");
+            let entry = &entries[0];
+            assert_eq!(entry["role"], role);
+            assert_eq!(entry["label"], "80");
+            assert_eq!(entry["value"], "80");
+            assert!(entry.get("element_index").is_none());
+            assert!(entry.get("element_token").is_none());
+            assert_eq!(entry["parent_index"], 4);
+        }
+    }
+
+    #[test]
+    fn long_values_are_unicode_safely_truncated_for_structured_and_markdown_use() {
+        let value = "🧮".repeat(crate::ax::tree::MAX_AX_VALUE_CHARS + 10);
+        let truncated = crate::ax::tree::truncate_ax_value(value);
+        assert_eq!(truncated.chars().count(), crate::ax::tree::MAX_AX_VALUE_CHARS + 1);
+        assert!(truncated.ends_with('…'));
+
+        let mut nodes = vec![node(Some(0), "AXTextArea", Some("Input"), 0, None, None)];
+        nodes[0].value = Some(truncated.clone());
+        let entry = &build_elements_array(&nodes)[0];
+        assert_eq!(entry["value"], truncated);
     }
 
     #[test]

@@ -843,6 +843,7 @@ pub async fn run_serve(
     if let Some(pid_path) = pid_file_path {
         let _ = std::fs::remove_file(pid_path);
     }
+    registry.remove_state_file();
 
     Ok(())
 }
@@ -1410,10 +1411,11 @@ pub fn run_serve_cmd(
         .expect("tokio runtime");
 
     if let Err(e) = rt.block_on(run_serve(
-        registry,
+        registry.clone(),
         &socket_path,
         pid_file_path.as_deref(),
     )) {
+        registry.remove_state_file();
         eprintln!("cua-driver serve error: {e}");
         std::process::exit(1);
     }

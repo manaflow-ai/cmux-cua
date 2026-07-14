@@ -290,6 +290,10 @@ pub struct ToolRegistry {
     order: Vec<String>,
     /// Shared recording session — auto-records each non-read-only tool call.
     pub recording: Arc<RecordingSession>,
+    /// Optional embedded-host state file, enabled by CUA_DRIVER_STATE_DIR.
+    state_file: Option<crate::session_state::StateFile>,
+    /// Platform hook for resolving a human-readable target application name.
+    target_app_resolver: Option<fn(i64) -> Option<String>>,
 }
 
 impl ToolRegistry {
@@ -298,6 +302,27 @@ impl ToolRegistry {
             tools: HashMap::new(),
             order: Vec::new(),
             recording: Arc::new(RecordingSession::new()),
+            state_file: crate::session_state::StateFile::from_env(),
+            target_app_resolver: Some(crate::session_state::resolve_process_name),
+        }
+    }
+
+    pub fn set_target_app_resolver(&mut self, resolver: fn(i64) -> Option<String>) {
+        self.target_app_resolver = Some(resolver);
+    }
+
+    #[cfg(test)]
+    fn set_state_file_for_test(&mut self, state_file: crate::session_state::StateFile) {
+        self.state_file = Some(state_file);
+    }
+
+    /// Best-effort explicit cleanup for long-running servers whose entry point
+    /// exits the process before ordinary Rust destructors can run.
+    pub fn remove_state_file(&self) {
+        if let Some(state_file) = &self.state_file {
+            if let Err(error) = state_file.remove() {
+                eprintln!("[cua-driver] warning: failed to remove state file: {error}");
+            }
         }
     }
 
@@ -409,6 +434,48 @@ impl ToolRegistry {
             Some(tool) => tool.invoke(args.clone()).await,
             None => return ToolResult::error(format!("Unknown tool: {name}")),
         };
+
+        // Embedded-host process state is action-scoped: update it only after a
+        // successful call to one of the target-driving tools, and only when the
+        // call names a target pid/window. State I/O is observability-only and
+        // must never turn a successful tool action into an error.
+        const STATE_ACTION_TOOLS: &[&str] = &[
+            "click",
+            "type_text",
+            "press_key",
+            "hotkey",
+            "scroll",
+            "drag",
+            "set_value",
+            "get_window_state",
+        ];
+        if result.is_error != Some(true)
+            && STATE_ACTION_TOOLS.contains(&resolved_name)
+            && (args.get("pid").and_then(Value::as_i64).is_some()
+                || args.get("window_id").and_then(Value::as_u64).is_some())
+        {
+            if let Some(state_file) = &self.state_file {
+                let target_pid = args
+                    .get("pid")
+                    .and_then(Value::as_i64);
+                let target_app = target_pid
+                    .and_then(|pid| self.target_app_resolver.and_then(|resolver| resolver(pid)));
+                let mut state_args = args.clone();
+                if state_args.get("window_id").and_then(Value::as_u64).is_none() {
+                    if let (Some(pid), Some(token)) = (
+                        target_pid.and_then(|pid| i32::try_from(pid).ok()),
+                        state_args.get("element_token").and_then(Value::as_str),
+                    ) {
+                        if let Ok((window_id, _)) = crate::element_token::global().resolve(pid, token) {
+                            state_args["window_id"] = serde_json::json!(window_id);
+                        }
+                    }
+                }
+                if let Err(error) = state_file.update(&state_args, target_app) {
+                    eprintln!("[cua-driver] warning: failed to update state file: {error}");
+                }
+            }
+        }
         // Use the original name for downstream code paths below so the
         // exit-code matching and recording paths keep treating the alias
         // as a distinct call site.
@@ -511,6 +578,61 @@ mod capability_tests {
     //! These belong in cua-driver-core because they cover the shape
     //! of the registry response — no platform code involved.
     use super::*;
+
+    struct SuccessfulTargetTool {
+        def: ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SuccessfulTargetTool {
+        fn def(&self) -> &ToolDef { &self.def }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            ToolResult::text("ok")
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_target_action_updates_embedded_process_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("5151.json");
+        let mut registry = ToolRegistry::new();
+        registry.set_state_file_for_test(crate::session_state::StateFile::new(
+            dir.path().to_owned(),
+            5151,
+        ));
+        registry.set_target_app_resolver(|pid| (pid == 42).then(|| "TextEdit".to_owned()));
+        registry.register(Box::new(SuccessfulTargetTool { def: dummy_def("click") }));
+
+        let result = registry.invoke(
+            "click",
+            serde_json::json!({
+                "session": "embedded-1",
+                "pid": 42,
+                "window_id": 99,
+            }),
+        ).await;
+        assert_ne!(result.is_error, Some(true));
+        let state: crate::session_state::DriverProcessState =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(state.session.as_deref(), Some("embedded-1"));
+        assert_eq!(state.target_app.as_deref(), Some("TextEdit"));
+        assert_eq!(state.target_pid, Some(42));
+        assert_eq!(state.target_window_id, Some(99));
+    }
+
+    #[tokio::test]
+    async fn malformed_state_dir_never_fails_a_successful_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("plain-file");
+        std::fs::write(&not_a_dir, b"occupied").unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.set_state_file_for_test(crate::session_state::StateFile::new(not_a_dir, 5252));
+        registry.register(Box::new(SuccessfulTargetTool { def: dummy_def("click") }));
+
+        let result = registry.invoke("click", serde_json::json!({"pid": 42})).await;
+        assert_ne!(result.is_error, Some(true));
+    }
 
     /// Tools whose `default_capabilities_for` mapping must NOT be
     /// empty. Mirrors the documented vocabulary above. Lives here

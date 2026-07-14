@@ -61,8 +61,12 @@ fn def() -> &'static ToolDef {
                next snapshot of the same window — re-snapshot every turn before clicking.\n\n\
              - x, y (window-local screenshot pixels, top-left origin of the PNG returned \
                by get_window_state): CGEvent path. Synthesizes mouse events and posts to \
-               pid. Use modifier for cmd/shift/option/ctrl. Needs a visible on-screen \
-               window to anchor the conversion.\n\n\
+               pid. Before a background post with pid+window_id, the driver checks the \
+               front-to-back WindowServer stack and returns error=`obstructed`, \
+               code=`background_occluded` without posting if another app/window owns \
+               that point. Use modifier for \
+               cmd/shift/option/ctrl. Needs a visible on-screen window to anchor the \
+               conversion.\n\n\
              button: \"left\" (default), \"right\", or \"middle\". Defaults to left so the \
              field is fully back-compat — omit it and you get the legacy left-click behaviour. \
              Pixel path: routes through the CGEvent left/right/middle mouse-button primitives. \
@@ -112,7 +116,7 @@ fn def() -> &'static ToolDef {
                 "delivery_mode": {
                     "type": "string",
                     "enum": ["background", "foreground"],
-                    "description": "Best-effort-background ladder rung (default \"background\"). \"background\": perform the AX action or post the CGEvent without fronting. \"foreground\": briefly front the window, act, let transient UI settle, then restore the prior frontmost app. Requires window_id. A click is never driver-verifiable (no read-back), so both report verified:false — confirm the effect via screenshot. Use the agent loop: background AX (element_index) → screenshot → background pixel (x/y) → screenshot → delivery_mode:\"foreground\"."
+                    "description": "Best-effort-background ladder rung (default \"background\"). \"background\": perform the AX action or post the CGEvent without fronting; pixel dispatch with pid+window_id fails with structured error=\"obstructed\", code=\"background_occluded\" when a different visible window owns the screen point. \"foreground\": briefly front the window, act, let transient UI settle, then restore the prior frontmost app; foreground skips the obstruction check because fronting resolves Z order. Requires window_id. A click that is dispatched remains verified:false — confirm its effect via get_window_state."
                 },
                 "scope": {
                     "type": "string",
@@ -682,6 +686,20 @@ impl Tool for ClickTool {
                             }));
                     }
                     _ => {}
+                }
+            }
+
+            // PID-posted CGEvents are still hit-tested by WindowServer at the
+            // screen point. If another window owns that pixel, fail before
+            // posting instead of claiming an unverifiable success. Foreground
+            // mode intentionally skips this check because it fronts the target.
+            if !delivery_mode.is_foreground() {
+                if let Some(wid) = window_id {
+                    if let Some(error) =
+                        super::pixel_obstruction_error(pid, wid, screen_x, screen_y, None)
+                    {
+                        return error;
+                    }
                 }
             }
 

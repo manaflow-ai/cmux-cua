@@ -544,7 +544,12 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
     let _: () = msg_send![win, setBackgroundColor: clear];
     let _: () = msg_send![win, setHasShadow: false];
+    // The overlay is visual-only. Keep both click/scroll hit-testing and
+    // mouse-move tracking disabled; obstruction detection separately excludes
+    // every window owned by this driver pid because WindowServer still lists
+    // this full-screen layer-0 window in its front-to-back stack.
     let _: () = msg_send![win, setIgnoresMouseEvents: true];
+    let _: () = msg_send![win, setAcceptsMouseMovedEvents: false];
     // NSNormalWindowLevel = 0.  The overlay lives at the normal window level so
     // it appears in CGWindowList layer=0 results (which agents inspect via
     // list_windows).  Z-ordering above the target is managed dynamically via

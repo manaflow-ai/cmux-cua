@@ -96,13 +96,15 @@ impl RenderStateCore {
         let palette = cfg.palette();
         let motion = cfg.motion.clone();
         let shape = cfg.shape.clone();
+        let gradient_colors = cfg.gradient_colors.clone();
+        let bloom_override = cfg.bloom_color;
         Self {
             cfg,
             palette,
             motion,
             shape,
-            gradient_colors: vec![],
-            bloom_override: None,
+            gradient_colors,
+            bloom_override,
             pos: (-200.0, -200.0),
             heading: std::f64::consts::FRAC_PI_4,
             path: None,

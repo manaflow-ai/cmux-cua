@@ -548,6 +548,28 @@ mod tests {
     use super::resolve_cursor_key;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn motion_tool_cursor_label_overrides_the_env_default() {
+        let mut default_config = crate::cursor::state::CursorConfig::default();
+        default_config.cursor_label = Some("cmux".to_owned());
+        let mut state = super::ToolState::default();
+        state.cursor_registry = std::sync::Arc::new(
+            crate::cursor::CursorRegistry::with_default_config(default_config),
+        );
+        let state = std::sync::Arc::new(state);
+        let tool = super::SetAgentCursorMotionTool::new(state.clone());
+
+        let result = cua_driver_core::tool::Tool::invoke(
+            &tool,
+            json!({"session":"override-test","cursor_label":"agent"}),
+        ).await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(
+            state.cursor_registry.get("override-test").unwrap().config.cursor_label.as_deref(),
+            Some("agent"),
+        );
+    }
+
     #[test]
     fn anonymous_defaults_to_a_stable_cursor_session() {
         // No session/cursor_id declared → a stable per-daemon "auto-…" cursor
