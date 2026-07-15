@@ -452,6 +452,18 @@ fn main() {
         }
     }
 
+    // Standalone-helper identity: when cmux spawns the bundled helper in
+    // non-embedded `mcp --no-daemon-relaunch` mode it sets
+    // CUA_DRIVER_DISCLAIM_MCP, asking this in-process MCP server to disclaim
+    // responsibility so it becomes its own responsible process. Because the
+    // executable lives inside the helper's own .app bundle, TCC then attributes
+    // its Accessibility / Screen Recording grants to that bundle's identity
+    // instead of cmux's. No-op for embedded mode, an already-disclaimed re-exec,
+    // or a binary inside CuaDriver.app (see reexec_disclaimed_if_needed's gates).
+    if crate::bundle::is_env_truthy("CUA_DRIVER_DISCLAIM_MCP") {
+        responsibility::reexec_disclaimed_if_needed();
+    }
+
     let cursor_cfg = cursor_overlay::CursorConfig::from_args();
 
     tracing::info!(
