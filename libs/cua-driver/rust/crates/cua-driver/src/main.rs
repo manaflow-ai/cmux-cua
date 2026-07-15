@@ -216,6 +216,20 @@ mod appkit_worker_tests {
 fn main() {
     init_logging();
 
+    // Standalone-helper identity: when cmux spawns the bundled helper (both the
+    // long-running `mcp` server and one-shot `call check_permissions` status
+    // probes) it sets CUA_DRIVER_DISCLAIM, asking this process to disclaim
+    // responsibility so it becomes its own responsible process. Because the
+    // executable lives inside the helper's own .app bundle, macOS then
+    // attributes — and reports — its Accessibility / Screen Recording grants
+    // under that bundle's identity ("cmux Computer Use") instead of cmux's.
+    // Runs before command dispatch so it applies uniformly to every subcommand;
+    // reexec_disclaimed_if_needed is still a no-op for embedded mode, an
+    // already-disclaimed re-exec, or a binary inside CuaDriver.app.
+    if crate::bundle::is_env_truthy("CUA_DRIVER_DISCLAIM") {
+        responsibility::reexec_disclaimed_if_needed();
+    }
+
     // ── CLI subcommand dispatch ──────────────────────────────────────────────
     // Handled before AppKit init so `list-tools` / `describe` / `call` exit
     // cleanly without starting the overlay or NSApplication.
@@ -558,18 +572,6 @@ fn main() {
             // in the in-process path, so we drop it on the floor.
             let _ = socket;
         }
-    }
-
-    // Standalone-helper identity: when cmux spawns the bundled helper in
-    // non-embedded `mcp --no-daemon-relaunch` mode it sets
-    // CUA_DRIVER_DISCLAIM_MCP, asking this in-process MCP server to disclaim
-    // responsibility so it becomes its own responsible process. Because the
-    // executable lives inside the helper's own .app bundle, TCC then attributes
-    // its Accessibility / Screen Recording grants to that bundle's identity
-    // instead of cmux's. No-op for embedded mode, an already-disclaimed re-exec,
-    // or a binary inside CuaDriver.app (see reexec_disclaimed_if_needed's gates).
-    if crate::bundle::is_env_truthy("CUA_DRIVER_DISCLAIM_MCP") {
-        responsibility::reexec_disclaimed_if_needed();
     }
 
     let codex_compat = CODEX_COMPUTER_USE_COMPAT.load(Ordering::SeqCst);
