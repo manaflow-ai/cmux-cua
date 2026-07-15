@@ -133,9 +133,10 @@ pub struct CursorFeed {
 }
 
 impl CursorFeed {
-    /// Build the feed only when `CUA_DRIVER_STATE_DIR` is set AND embedded mode
-    /// is on. Non-embedded (serve/daemon/one-shot CLI) callers get `None`: the
-    /// in-process serve-mode overlay renders for them, so no feed is needed.
+    /// Build the feed whenever `CUA_DRIVER_STATE_DIR` is set, regardless of
+    /// embedded mode. cmux renders the agent cursor from this feed for both the
+    /// embedded driver (which has no in-process overlay) and the standalone helper
+    /// (non-embedded, so it can carry its own permission identity).
     pub fn from_env() -> Option<Self> {
         Self::from_parts(
             crate::embedded_mode(),
@@ -145,15 +146,13 @@ impl CursorFeed {
     }
 
     /// Env-free constructor used by `from_env` and by unit tests. Returns `None`
-    /// unless `embedded` is true and a state dir is present.
+    /// unless a state dir is present; the feed is emitted in every driver mode so
+    /// the cmux host can render the cursor from it.
     pub fn from_parts(
-        embedded: bool,
+        _embedded: bool,
         dir: Option<PathBuf>,
         branding: CursorBranding,
     ) -> Option<Self> {
-        if !embedded {
-            return None;
-        }
         let dir = dir?;
         Some(Self::new(dir, std::process::id(), branding))
     }
@@ -444,18 +443,18 @@ mod tests {
     }
 
     #[test]
-    fn from_parts_is_noop_when_state_dir_unset_or_not_embedded() {
+    fn from_parts_gates_on_state_dir_only() {
         let dir = tempfile::tempdir().unwrap();
-        // Not embedded → no feed even with a state dir.
-        assert!(
-            CursorFeed::from_parts(false, Some(dir.path().to_owned()), CursorBranding::default())
-                .is_none()
-        );
-        // Embedded but no state dir → no feed.
+        // No state dir → no feed, in either mode.
         assert!(CursorFeed::from_parts(true, None, CursorBranding::default()).is_none());
-        // Embedded + state dir → feed enabled.
+        assert!(CursorFeed::from_parts(false, None, CursorBranding::default()).is_none());
+        // State dir present → feed enabled, regardless of embedded mode.
         assert!(
             CursorFeed::from_parts(true, Some(dir.path().to_owned()), CursorBranding::default())
+                .is_some()
+        );
+        assert!(
+            CursorFeed::from_parts(false, Some(dir.path().to_owned()), CursorBranding::default())
                 .is_some()
         );
     }
