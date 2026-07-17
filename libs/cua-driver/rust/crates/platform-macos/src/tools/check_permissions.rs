@@ -166,7 +166,21 @@ impl Tool for CheckPermissionsTool {
         let accessibility = accessibility_granted();
         let screen_recording = screen_recording_granted();
         // (A) Authoritative live probe — see `screen_recording_capturable`.
-        let screen_recording_capturable = screen_recording_capturable();
+        //
+        // CRITICAL: `SCShareableContent::get()` REGISTERS this process with TCC
+        // and RAISES the Screen Recording system prompt when the grant is
+        // missing. That is a real side effect, so it must only happen when the
+        // caller opted into prompting (`prompt:true`). A read-only status query
+        // (`prompt:false`) — e.g. a host app refreshing the helper's status when
+        // an agent session merely starts — MUST stay silent; running the live
+        // probe there pops a permission dialog before the user has done anything
+        // with computer use. When we're not allowed to prompt, fall back to the
+        // non-triggering preflight value instead of the live capture probe.
+        let screen_recording_capturable = if should_prompt {
+            screen_recording_capturable()
+        } else {
+            screen_recording
+        };
         // (B) Which identity the booleans above belong to.
         let source = permission_source();
         let is_caller = source.get("attribution").and_then(|v| v.as_str()) == Some("caller");
