@@ -790,30 +790,20 @@ pub fn run_mcp_via_daemon_proxy(
                  and retry."
             );
         }
-        #[cfg(target_os = "macos")]
-        {
-            let socket_suffix = if socket_path != crate::serve::default_socket_path() {
-                format!(" --socket {socket_path}")
-            } else {
-                String::new()
-            };
-            eprintln!(
-                "cua-driver-rs: mcp launched without CuaDriver.app's TCC grants; \
-                 auto-launching the daemon via `open -n -g -a CuaDriver --args serve{socket_suffix}` \
-                 and proxying MCP requests through it. Pass --no-daemon-relaunch to stay in-process."
-            );
-            launch_daemon_and_wait(&socket_path, 10, claude_code_compat)?;
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = claude_code_compat;
-        // On Linux / Windows there's no equivalent `open -a CuaDriver`
-        // mechanism to spawn a daemon attributed to the user's
-        // interactive session. The caller is expected to have one
-        // running already (e.g. via `cua-driver autostart enable && kick`
-        // on Windows). Bail with an actionable error rather than
-        // silently falling back to an in-process server that would
-        // be attributed to whatever session spawned us (typically
-        // Session 0 over SSH).
+        // macOS: do NOT launch the daemon here. The proxy launches it lazily on
+        // the FIRST `tools/call` (see proxy::run_proxy), serving `initialize`
+        // and `tools/list` from the in-process registry until then. This keeps
+        // the permission-requesting daemon dormant so nothing prompts merely
+        // because an agent registered this MCP server at session start — the
+        // Accessibility / Screen Recording prompts appear only when the agent
+        // actually invokes a computer-use tool.
+        //
+        // On Linux / Windows there's no equivalent `open -a` mechanism to spawn
+        // a daemon attributed to the user's interactive session. The caller is
+        // expected to have one running already; bail with an actionable error
+        // rather than silently falling back to an in-process server that would
+        // be attributed to whatever session spawned us (typically Session 0
+        // over SSH).
         #[cfg(not(target_os = "macos"))]
         {
             anyhow::bail!(
@@ -832,7 +822,7 @@ pub fn run_mcp_via_daemon_proxy(
         .enable_all()
         .build()
         .expect("tokio runtime");
-    rt.block_on(crate::proxy::run_proxy(socket_path))
+    rt.block_on(crate::proxy::run_proxy(socket_path, claude_code_compat))
 }
 
 /// Emit a stable, machine-readable JSON description of the cua-driver CLI
