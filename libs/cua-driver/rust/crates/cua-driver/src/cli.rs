@@ -672,6 +672,13 @@ pub fn should_use_daemon_proxy(no_daemon_relaunch: bool) -> bool {
     if is_env_truthy("CUA_DRIVER_RS_MCP_FORCE_PROXY") {
         return true;
     }
+    // cmux names a specific helper app to launch as the daemon (see
+    // launch_daemon_and_wait). Take the proxy path so that app — launched via
+    // LaunchServices under its own TCC identity — performs the TCC-gated work,
+    // instead of this in-process server running under the host app's identity.
+    if std::env::var_os("CUA_DRIVER_DAEMON_APP").is_some() {
+        return true;
+    }
     if !is_executable_inside_cuadriver_app() {
         // Raw `cargo run` / dev binary — no installed bundle to land
         // in, so relaunching would fail. Stay in-process.
@@ -822,7 +829,15 @@ pub fn launch_daemon_and_wait(
     // actually differs from the default, so the common case keeps the
     // shorter `open` argv (and matches Swift's invocation byte-for-byte).
     let pass_socket = socket_path != crate::serve::default_socket_path();
-    let mut open_args: Vec<&str> = vec!["-n", "-g", "-a", "CuaDriver", "--args", "serve"];
+    // cmux sets CUA_DRIVER_DAEMON_APP to its bundled "cmux Computer Use.app" so
+    // LaunchServices launches THAT app as the serve daemon. A LaunchServices-
+    // launched app is its own responsible process (launchd-parented), so macOS
+    // attributes Accessibility / Screen Recording to the helper bundle's identity
+    // — the permission prompt names "cmux Computer Use", not the host app.
+    let daemon_app =
+        std::env::var("CUA_DRIVER_DAEMON_APP").unwrap_or_else(|_| "CuaDriver".to_string());
+    let mut open_args: Vec<&str> =
+        vec!["-n", "-g", "-a", daemon_app.as_str(), "--args", "serve"];
     if pass_socket {
         open_args.push("--socket");
         open_args.push(socket_path);
