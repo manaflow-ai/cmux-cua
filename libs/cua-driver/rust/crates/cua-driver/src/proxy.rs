@@ -61,15 +61,9 @@ enum ControlConnectionState {
 /// Swift `makeProxy`'s `fetchProxyToolList` pre-check.
 pub async fn run_proxy(
     socket_path: String,
+    claude_code_compat: bool,
     expected_profile: DaemonProfile,
 ) -> anyhow::Result<()> {
-    if !is_daemon_listening(&socket_path) {
-        anyhow::bail!(
-            "cua-driver-rs daemon not reachable on {socket_path}. Start it \
-             with `open -n -g -a CuaDriver --args serve` and retry."
-        );
-    }
-
     // Mint this MCP session's identity once at proxy startup. One proxy process
     // == one MCP session; the daemon outlives it. We stamp this id on every
     // forwarded request so the daemon can OWN and CLEAN UP this session's
@@ -80,50 +74,67 @@ pub async fn run_proxy(
     let session_id = mint_session_id();
     debug!(session_id = %session_id, "proxy session minted");
 
-    // Open ONE long-lived "control" connection to the daemon and hold it open
-    // for this proxy's entire lifetime (separate from the per-call connections
-    // that `send_request` opens and closes per tool call). It sends a single
-    // `session_begin` line and then parks reading — it never writes again and
-    // never closes until this process dies.
+    // Serve `initialize` and `tools/list` WITHOUT the daemon so the
+    // permission-requesting daemon stays DORMANT until the agent actually
+    // invokes a tool.
     //
-    // This is the reaper: when the proxy exits (graceful stdin EOF) OR is
-    // SIGKILLed/crashes, the kernel closes this socket; the daemon's
-    // per-connection reader hits EOF and fires `session_end` for `session_id`,
+    // The "control" connection referenced below is the reaper: it holds one
+    // long-lived socket to the daemon and sends a single `session_begin`; when
+    // the proxy exits (graceful stdin EOF) OR is SIGKILLed/crashes, the kernel
+    // closes it and the daemon fires `session_end` for this `session_id`,
     // tearing down every piece of state this session owns (overlay cursor,
-    // config overrides, recording). Liveness is connection-based, so an
-    // alive-but-idle session — one issuing zero tool calls — is never reaped:
-    // its control connection stays parked open.
+    // config overrides, recording).
     //
-    // Detached + fire-and-forget. If the connect races daemon startup and
-    // fails, we log and continue — the per-call `send_request` has its own
-    // retry/timeout, and a restarted daemon loses session state anyway, so a
-    // missing control connection only degrades to no-reaper (the recording
-    // idle-TTL still backstops a leaked recording). It must NOT bail the proxy.
     let (control_ready_tx, control_ready_rx) =
         tokio::sync::watch::channel(ControlConnectionState::Connecting);
+    #[cfg(target_os = "macos")]
+    let mut daemon_started = false;
+    #[cfg(not(target_os = "macos"))]
     {
+        if !is_daemon_listening(&socket_path) {
+            anyhow::bail!(
+                "cua-driver-rs daemon not reachable on {socket_path}. Start it \
+                 with `cua-driver serve` and retry."
+            );
+        }
         let socket = socket_path.clone();
         let sid = session_id.clone();
+        let ready = control_ready_tx.clone();
         tokio::spawn(async move {
-            run_control_connection(
-                socket,
-                sid,
-                expected_profile,
-                control_ready_tx,
-            )
-            .await;
+            run_control_connection(socket, sid, expected_profile, ready).await;
         });
     }
 
-    let _ = wait_for_control_connection(control_ready_rx.clone()).await?;
-
-    // Cache the tool list once at startup. The daemon's registry is
-    // static for the lifetime of the daemon, so polling on every
-    // `tools/list` would waste a round-trip per call. Swift does the
-    // same caching in `fetchProxyToolList`.
-    let cached_tools_list =
-        fetch_tools_list_from_daemon(&socket_path, &session_id, expected_profile)?;
-    let cached_tools_list = Arc::new(cached_tools_list);
+    // macOS: build the tool list from the in-process registry — a pure,
+    // permission-free operation — and launch the daemon (plus the reaper) lazily
+    // on the FIRST `tools/call` (see `ensure_daemon_started`). Nothing prompts
+    // merely because an agent registered this MCP server at session start.
+    //
+    // Other platforms: there is no lazy `open -a` launch path, so the caller
+    // guarantees a daemon is already up. Fetch the list from it and start the
+    // reaper immediately (unchanged behaviour).
+    #[cfg(target_os = "macos")]
+    let cached_tools_list = {
+        let registry = crate::build_macos_registry_with_compat(
+            claude_code_compat,
+            expected_profile == DaemonProfile::CodexComputerUseCompat,
+        );
+        Arc::new(if expected_profile == DaemonProfile::CodexComputerUseCompat {
+            registry.codex_computer_use_tools_list()
+        } else {
+            registry.tools_list()
+        })
+    };
+    #[cfg(not(target_os = "macos"))]
+    let cached_tools_list = {
+        let _ = claude_code_compat;
+        let _ = wait_for_control_connection(control_ready_rx.clone()).await?;
+        Arc::new(fetch_tools_list_from_daemon(
+            &socket_path,
+            &session_id,
+            expected_profile,
+        )?)
+    };
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -158,7 +169,30 @@ pub async fn run_proxy(
                 if req.method == "initialize" {
                     client_supports_elicitation = supports_elicitation(&req);
                 }
-                if req.method == "tools/call"
+                #[cfg(target_os = "macos")]
+                let daemon_start = if req.method == "tools/call" {
+                    ensure_daemon_started(
+                        &socket_path,
+                        &mut daemon_started,
+                        &session_id,
+                        claude_code_compat,
+                        expected_profile,
+                        &control_ready_tx,
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
+                #[cfg(not(target_os = "macos"))]
+                let daemon_start: anyhow::Result<()> = Ok(());
+
+                if let Err(error) = daemon_start {
+                    Response::error(
+                        id,
+                        -32603,
+                        format!("computer-use daemon failed to start: {error}"),
+                    )
+                } else if req.method == "tools/call"
                     && expected_profile == DaemonProfile::CodexComputerUseCompat
                 {
                     match req.tool_call() {
@@ -592,6 +626,11 @@ fn validate_daemon_profile_and_roster(
 /// `tools/list` result. The daemon now returns the full ToolDef
 /// (`name`, `description`, `input_schema`, annotation hints) per
 /// commit 3's `serve.rs` change.
+///
+/// macOS serves `tools/list` from the in-process registry instead (so the
+/// daemon can stay dormant until the first tool call), leaving this used only
+/// on other platforms — hence the platform-scoped dead-code allowance.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn fetch_tools_list_from_daemon(
     socket_path: &str,
     session_id: &str,
@@ -1115,6 +1154,135 @@ where
             "app_approval_unavailable",
             "Computer Use daemon returned an invalid app approval resolution.",
         ),
+    }
+}
+
+/// Bring the daemon (and the reaper control connection) up exactly once, on the
+/// first `tools/call`. Serving `initialize` / `tools/list` from the in-process
+/// registry keeps the permission-requesting daemon dormant until the agent
+/// actually invokes a tool, so its Accessibility / Screen Recording prompts
+/// appear on real use rather than at agent-session start.
+///
+/// `launch_daemon_and_wait` runs `open -n -g -a <helper> --args serve` and
+/// blocks until the daemon's socket is up (the daemon binds before running its
+/// permission gate, so this returns promptly even while the gate prompts). It's
+/// a blocking call, so it runs on the blocking pool.
+#[cfg(target_os = "macos")]
+async fn ensure_daemon_started(
+    socket_path: &str,
+    started: &mut bool,
+    session_id: &str,
+    claude_code_compat: bool,
+    expected_profile: DaemonProfile,
+    control_ready: &tokio::sync::watch::Sender<ControlConnectionState>,
+) -> anyhow::Result<()> {
+    if *started {
+        return Ok(());
+    }
+    if !is_daemon_listening(socket_path) {
+        // FORCE_PROXY callers supply their own daemon and have no bundle to
+        // relaunch into — never auto-launch on their behalf.
+        if crate::bundle::is_env_truthy("CUA_DRIVER_RS_MCP_FORCE_PROXY") {
+            anyhow::bail!(
+                "CUA_DRIVER_RS_MCP_FORCE_PROXY=1 but no daemon listening on {socket_path}"
+            );
+        }
+        let sp = socket_path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            crate::cli::launch_daemon_and_wait(
+                &sp,
+                10,
+                claude_code_compat,
+                expected_profile == DaemonProfile::CodexComputerUseCompat,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("daemon launch task failed: {e}"))??;
+    }
+    // Daemon is up: start the reaper now (deferred from proxy startup).
+    {
+        let socket = socket_path.to_owned();
+        let sid = session_id.to_owned();
+        let ready = control_ready.clone();
+        tokio::spawn(async move {
+            run_control_connection(socket, sid, expected_profile, ready).await;
+        });
+    }
+    let _ = wait_for_control_connection(control_ready.subscribe()).await?;
+    // Onboarding: wait until BOTH TCC grants are in before the first tool
+    // executes. The daemon's startup gate raises the Accessibility + Screen
+    // Recording prompts and re-execs the daemon (~every 25s) to pick up each
+    // grant. If the agent's first tool call runs during that window it races
+    // the re-exec — dropped connections mid-click and a cursor that blinks out
+    // (its overlay state is lost on re-exec until the next move). Holding the
+    // first call until the grants settle makes onboarding go through all steps
+    // first, then run on a stable daemon with a stable cursor. Bounded +
+    // fail-safe: on timeout we proceed and let the tool call surface any real
+    // TCC error, so a user who ignores the prompts is never hung forever.
+    wait_for_daemon_grants(socket_path, session_id).await;
+    *started = true;
+    Ok(())
+}
+
+/// Poll the daemon's `check_permissions` (read-only, `prompt:false`) until both
+/// Accessibility and Screen Recording read granted, or a bounded deadline
+/// elapses. Kept under a typical MCP client tool-call timeout so a slow grant
+/// degrades to "first call fails, agent retries on the now-granted daemon"
+/// rather than a hung call. Every failure path (transport error during a gate
+/// re-exec, unexpected shape) just retries until the deadline.
+#[cfg(target_os = "macos")]
+async fn wait_for_daemon_grants(socket_path: &str, session_id: &str) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(55);
+    loop {
+        if Instant::now() >= deadline {
+            debug!("wait_for_daemon_grants: deadline elapsed; proceeding");
+            return;
+        }
+        let sp = socket_path.to_owned();
+        let sid = session_id.to_owned();
+        let probe = tokio::task::spawn_blocking(move || {
+            let req = DaemonRequest {
+                method: "call".into(),
+                name: Some("check_permissions".into()),
+                args: Some(serde_json::json!({ "prompt": false })),
+                session_id: Some(sid),
+            };
+            send_request(&sp, &req)
+        })
+        .await;
+        if let Ok(Ok(resp)) = probe {
+            if let Some(result) = resp.result.as_ref() {
+                if let Some((ax, sr)) = extract_grants(result) {
+                    if ax && sr {
+                        debug!("wait_for_daemon_grants: both grants active");
+                        return;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+}
+
+/// Recursively locate the `check_permissions` structured payload — an object
+/// carrying both `accessibility` and `screen_recording` booleans — wherever the
+/// daemon nests it, and return `(accessibility, screen_recording)`. Shape-
+/// tolerant so the poll doesn't depend on the exact result envelope.
+#[cfg(target_os = "macos")]
+fn extract_grants(v: &serde_json::Value) -> Option<(bool, bool)> {
+    match v {
+        serde_json::Value::Object(obj) => {
+            if let (Some(a), Some(s)) = (
+                obj.get("accessibility").and_then(serde_json::Value::as_bool),
+                obj.get("screen_recording").and_then(serde_json::Value::as_bool),
+            ) {
+                return Some((a, s));
+            }
+            obj.values().find_map(extract_grants)
+        }
+        serde_json::Value::Array(arr) => arr.iter().find_map(extract_grants),
+        _ => None,
     }
 }
 
