@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn embedded_anonymous_call_uses_the_process_default() {
-        let args = json!({ "x": 1, "_session_id": "daemon-lifecycle-only" });
+        let args = json!({ "x": 1 });
         assert_eq!(
             resolve_cursor_key_with_default(&args, Some("cmux-codex-42")),
             "cmux-codex-42"
@@ -625,8 +625,19 @@ mod tests {
     }
 
     #[test]
-    fn non_embedded_anonymous_call_stays_cursorless() {
+    fn daemon_proxy_call_uses_its_lifecycle_session() {
         let args = json!({ "x": 1, "_session_id": "mcp-1-2" });
+        assert_eq!(resolve_cursor_key_with_default(&args, None), "mcp-1-2");
+        assert_eq!(
+            resolve_cursor_key_with_default(&args, Some("embedded-default")),
+            "mcp-1-2",
+            "the proxy lifecycle must own its cursor even if an embedded default exists"
+        );
+    }
+
+    #[test]
+    fn truly_anonymous_non_embedded_call_stays_cursorless() {
+        let args = json!({ "x": 1 });
         assert_eq!(resolve_cursor_key_with_default(&args, None), NO_CURSOR);
     }
 
@@ -727,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_strings_fall_through_to_the_embedded_default_only() {
+    fn empty_explicit_ids_fall_through_to_lifecycle_then_embedded_default() {
         assert_eq!(
             resolve_cursor_key(&json!({ "session": "", "cursor_id": "c1" })),
             "c1"
@@ -738,5 +749,10 @@ mod tests {
             "embedded-default"
         );
         assert_eq!(resolve_cursor_key_with_default(&both_empty, None), NO_CURSOR);
+        let lifecycle = json!({ "session": "", "cursor_id": "", "_session_id": "mcp-7" });
+        assert_eq!(
+            resolve_cursor_key_with_default(&lifecycle, Some("embedded-default")),
+            "mcp-7"
+        );
     }
 }
