@@ -1477,6 +1477,22 @@ pub fn run_status_cmd(socket_path: &str, pid_file_path: &str) {
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+mod external_permission_flow_tests {
+    use super::clamp_external_permission_prompt;
+
+    #[test]
+    fn external_permission_flow_clamps_agent_prompt_requests() {
+        let mut args = serde_json::json!({ "prompt": true });
+        clamp_external_permission_prompt(true, "check_permissions", &mut args);
+        assert_eq!(args["prompt"], serde_json::json!(false));
+
+        let mut ordinary_tool_args = serde_json::json!({ "prompt": true });
+        clamp_external_permission_prompt(true, "click", &mut ordinary_tool_args);
+        assert_eq!(ordinary_tool_args["prompt"], serde_json::json!(true));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod gate_tests {
     //! Ended-session resurrection guard wired into the `call` dispatch.
