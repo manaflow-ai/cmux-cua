@@ -17,18 +17,17 @@ pub(crate) const NO_CURSOR: &str = "";
 
 /// Resolve the cursor key for a tool invocation.
 ///
-/// Explicit `session` / `cursor_id` always wins. An anonymous call receives the
-/// stable embedded stdio session only in embedded mode; daemon/serve and CLI
-/// calls remain cursor-less unless their caller declares an identity. The
-/// daemon-injected `_session_id` intentionally remains lifecycle metadata, not
-/// an explicit cursor choice.
+/// Explicit `session` / `cursor_id` always wins. A daemon-proxy call then uses
+/// its connection-injected `_session_id`, which keeps the cursor scoped to the
+/// proxy lifecycle. A direct embedded stdio call instead receives the stable
+/// embedded session. Truly anonymous serve/CLI calls remain cursor-less.
 pub(crate) fn resolve_cursor_key(args: &Value) -> String {
     resolve_cursor_key_with_default(args, cua_driver_core::embedded_default_session_id())
 }
 
 fn resolve_cursor_key_with_default(args: &Value, embedded_default: Option<&str>) -> String {
     use cua_driver_core::tool_args::ArgsExt;
-    for key in ["session", "cursor_id"] {
+    for key in ["session", "cursor_id", "_session_id"] {
         if let Some(v) = args.opt_str(key) {
             if !v.is_empty() {
                 return v;
@@ -93,12 +92,12 @@ static ENABLED_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn enabled_def() -> &'static ToolDef {
     ENABLED_DEF.get_or_init(|| ToolDef {
         name: "set_agent_cursor_enabled".into(),
-        description: "Show or hide the agent cursor for a session. In embedded mode, omitting \
-                      `session` controls the process's automatic default cursor \
-                      (`CUA_DRIVER_DEFAULT_SESSION`, or `embedded-<pid>`). Outside embedded mode, \
-                      pass `session`; anonymous actions remain cursor-less. Use enabled=false to \
-                      hide that cursor and enabled=true to re-show it. An explicit `session` or \
-                      legacy `cursor_id` always takes precedence.".into(),
+        description: "Show or hide the agent cursor for a session. Omitting `session` uses the \
+                      daemon proxy's automatic lifecycle session when present, or the embedded \
+                      process default (`CUA_DRIVER_DEFAULT_SESSION`, or `embedded-<pid>`). Truly \
+                      anonymous serve/CLI actions remain cursor-less. Use enabled=false to hide \
+                      that cursor and enabled=true to re-show it. An explicit `session` or legacy \
+                      `cursor_id` always takes precedence.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["enabled"],
@@ -566,18 +565,17 @@ impl Tool for GetAgentCursorStateTool {
     fn def(&self) -> &ToolDef { state_def() }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        // Scope to the CALLER's cursor (explicit session/cursor_id, then the
-        // embedded process default). Returning every session's cursors here was a
-        // cross-session leak, and deriving the top-level `enabled` via
+        // Scope to the CALLER's cursor (explicit session/cursor_id, then its
+        // daemon-proxy lifecycle session, then the embedded process default).
+        // Returning every session's cursors here was a cross-session leak, and
+        // deriving the top-level `enabled` via
         // `.first()` over a HashMap-backed Vec was nondeterministic with N
         // cursors. A non-creating `get` keeps a never-touched session from
         // materialising a phantom entry.
         let key = resolve_cursor_key(&args);
         let state = self.state.cursor_registry.get(&key);
-        // `enabled` defaults to true when the session has no cursor yet — the
-        // anonymous / one-shot path resolves to "default", which is always
-        // present, so this default only applies to a brand-new session that has
-        // not enabled/moved its cursor, where "visible by default" is correct.
+        // `enabled` defaults to true when the resolved session has not moved or
+        // configured its cursor yet, where "visible by default" is correct.
         let enabled = state.as_ref().map(|s| s.config.enabled).unwrap_or(true);
         let cursors: Vec<&crate::cursor::CursorState> = state.iter().collect();
         let json = serde_json::to_value(&cursors).unwrap_or_default();
