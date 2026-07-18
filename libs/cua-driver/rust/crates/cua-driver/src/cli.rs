@@ -946,6 +946,13 @@ pub fn run_mcp_via_daemon_proxy(
         // CuaDriver.app to relaunch into. Fail fast if no daemon is
         // up at this point.
         if crate::bundle::is_env_truthy("CUA_DRIVER_RS_MCP_FORCE_PROXY") {
+            if crate::bundle::is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW") {
+                anyhow::bail!(
+                    "the cmux Computer Use runtime is not listening on {socket_path}. \
+                     Open cmux Settings → Computer Use and keep permission setup inside \
+                     cmux; do not launch cua-driver directly"
+                );
+            }
             anyhow::bail!(
                 "CUA_DRIVER_RS_MCP_FORCE_PROXY=1 but no daemon listening on \
                  {socket_path}. Start one with `cua-driver serve --socket {socket_path}` \

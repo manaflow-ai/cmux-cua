@@ -1183,6 +1183,13 @@ async fn ensure_daemon_started(
         // FORCE_PROXY callers supply their own daemon and have no bundle to
         // relaunch into — never auto-launch on their behalf.
         if crate::bundle::is_env_truthy("CUA_DRIVER_RS_MCP_FORCE_PROXY") {
+            if crate::bundle::is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW") {
+                anyhow::bail!(
+                    "the cmux Computer Use runtime is not listening on {socket_path}. \
+                     Open cmux Settings → Computer Use and keep permission setup inside \
+                     cmux; do not launch cua-driver directly"
+                );
+            }
             anyhow::bail!(
                 "CUA_DRIVER_RS_MCP_FORCE_PROXY=1 but no daemon listening on {socket_path}"
             );
@@ -1219,7 +1226,9 @@ async fn ensure_daemon_started(
     // first, then run on a stable daemon with a stable cursor. Bounded +
     // fail-safe: on timeout we proceed and let the tool call surface any real
     // TCC error, so a user who ignores the prompts is never hung forever.
-    wait_for_daemon_grants(socket_path, session_id).await;
+    if !crate::bundle::is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW") {
+        wait_for_daemon_grants(socket_path, session_id).await;
+    }
     *started = true;
     Ok(())
 }
