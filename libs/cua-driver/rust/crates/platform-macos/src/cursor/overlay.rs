@@ -1222,6 +1222,32 @@ mod tests {
     }
 
     #[test]
+    fn first_action_on_upper_display_seeds_inside_that_display() {
+        // The reporter's layout places a 1920x1080 display above a 1512x982
+        // primary display. Quartz action coordinates on that upper display
+        // therefore have negative Y values. The first-action seed must remain
+        // in that display's coordinate space so the cursor visibly glides to
+        // the target instead of being clamped into the primary display.
+        let mut map = empty_map();
+        map.win_w = 2087.0;
+        map.win_h = 2062.0;
+
+        let seeded = seed_start_in_map(
+            &mut map,
+            &"upper-display-session".to_owned(),
+            779.0,
+            -253.0,
+        );
+
+        assert!(seeded, "the first action must seed a visible glide");
+        let pos = map.cursors["upper-display-session"].core.pos;
+        assert!(
+            (-1080.0..0.0).contains(&pos.1),
+            "seed must stay on the upper display, got {pos:?}"
+        );
+    }
+
+    #[test]
     fn seed_does_not_resurrect_ended_session() {
         // The seed shares the resurrection guard: it must not re-create a cursor
         // whose session already ended.
