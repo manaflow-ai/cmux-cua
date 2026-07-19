@@ -354,7 +354,7 @@ pub fn current_motion(key: &str) -> MotionConfig {
 /// the sentinel and only `ClickPulse` snapped a static arrow, which is easy to
 /// miss. See the AX-no-glide report.
 ///
-/// No-op when the cursor is already on-screen (pos.0 > -50.0) or absent. The
+/// No-op when the cursor is already placed or absent. The
 /// seed is clamped to the main screen frame so it never starts off-display.
 /// Returns true if a seed was applied (i.e. the cursor was at the sentinel and
 /// is now primed to glide).
@@ -389,7 +389,7 @@ fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target
         .cursors
         .entry(key.clone())
         .or_insert_with(|| render_state_for_key(&template, &k));
-    if !(rs.core.cfg.enabled && rs.core.pos.0 < -50.0) {
+    if !(rs.core.cfg.enabled && rs.core.is_unplaced()) {
         return false;
     }
     let mut sx = target_x - SEED_OFFSET;
@@ -407,9 +407,7 @@ fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target
             sy = (target_y + SEED_OFFSET).min(win_h - 2.0);
         }
     }
-    rs.core.pos = (sx, sy);
-    rs.core.idle_secs = 0.0;
-    rs.core.idle_alpha = 1.0;
+    rs.core.place_at(sx, sy);
     true
 }
 
@@ -450,8 +448,8 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
         cua_driver_core::cursor_feed::emit_hidden();
     }
     // Seed a sentinel cursor on-screen so the MoveTo below glides instead of
-    // being short-circuited. After this the cursor's pos.0 > -50.0, so the
-    // should-animate check passes on the first action just like later ones.
+    // being short-circuited. After this the cursor is explicitly placed, so
+    // the should-animate check passes on the first action just like later ones.
     seed_start_if_sentinel(&key, x, y);
 
     // Check whether animation should run for THIS cursor. A disabled cursor
@@ -459,7 +457,7 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
     let should_animate = {
         let guard = RENDER.lock().unwrap();
         match guard.as_ref().and_then(|m| m.cursors.get(&key)) {
-            Some(rs) if rs.core.cfg.enabled && rs.core.pos.0 > -50.0 => true,
+            Some(rs) if rs.core.cfg.enabled && !rs.core.is_unplaced() => true,
             _ => false,
         }
     };
@@ -618,7 +616,7 @@ impl RenderState {
     }
 
     fn visible_on_screen(&self) -> bool {
-        self.core.visible && self.core.pos.0 >= -100.0
+        self.core.visible && !self.core.is_unplaced()
     }
 
     fn idle_fade_in_progress(&self) -> bool {
@@ -1028,7 +1026,7 @@ fn appearance_signature(rs: &RenderState) -> AppearanceSignature {
 }
 
 fn cursor_window_rect(rs: &RenderState) -> Option<LogicalRect> {
-    if !rs.core.visible || rs.core.pos.0 < -100.0 || rs.core.idle_alpha < 0.004 {
+    if !rs.core.visible || rs.core.is_unplaced() || rs.core.idle_alpha < 0.004 {
         return None;
     }
 
