@@ -228,7 +228,7 @@ fn seed_start_if_sentinel(key: &CursorKey, target_x: f64, target_y: f64) -> bool
         .cursors
         .entry(key.clone())
         .or_insert_with(|| render_state_for_key(&template, &k));
-    if !(rs.core.cfg.enabled && rs.core.pos.0 < -50.0) {
+    if !(rs.core.cfg.enabled && rs.core.is_unplaced()) {
         return false;
     }
     let max_x = map.scr_w.max(2) as f64 - 2.0;
@@ -239,7 +239,7 @@ fn seed_start_if_sentinel(key: &CursorKey, target_x: f64, target_y: f64) -> bool
         sx = (target_x + SEED_OFFSET).clamp(2.0, max_x);
         sy = (target_y + SEED_OFFSET).clamp(2.0, max_y);
     }
-    rs.core.pos = (sx, sy);
+    rs.core.place_at(sx, sy);
     true
 }
 
@@ -255,7 +255,7 @@ pub async fn animate_cursor_to_for(key: CursorKey, x: f64, y: f64) {
     let should_animate = {
         let guard = RENDER.lock().unwrap();
         match guard.as_ref().and_then(|m| m.cursors.get(&key)) {
-            Some(rs) if rs.core.cfg.enabled && rs.core.visible && rs.core.pos.0 > -50.0 => true,
+            Some(rs) if rs.core.cfg.enabled && rs.core.visible && !rs.core.is_unplaced() => true,
             _ => false,
         }
     };

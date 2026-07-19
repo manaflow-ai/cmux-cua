@@ -446,36 +446,83 @@ fn fetch_tools_list_from_daemon(
 /// permission gate, so this returns promptly even while the gate prompts). It's
 /// a blocking call, so it runs on the blocking pool.
 #[cfg(target_os = "macos")]
+async fn ensure_daemon_available_with<Probe, Launch>(
+    previously_started: bool,
+    externally_owned: bool,
+    timeout: std::time::Duration,
+    retry_interval: std::time::Duration,
+    mut probe: Probe,
+    launch: Launch,
+) -> anyhow::Result<()>
+where
+    Probe: FnMut() -> bool,
+    Launch: FnOnce() -> anyhow::Result<()>,
+{
+    if probe() {
+        return Ok(());
+    }
+
+    if externally_owned {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                let state = if previously_started {
+                    "after the previously-connected daemon exited"
+                } else {
+                    "during initial connection"
+                };
+                anyhow::bail!("cmux-owned Computer Use daemon stayed unavailable {state}");
+            }
+            tokio::time::sleep(retry_interval).await;
+            if probe() {
+                return Ok(());
+            }
+        }
+    }
+
+    launch()?;
+    if probe() {
+        Ok(())
+    } else {
+        anyhow::bail!("launched Computer Use daemon did not become reachable")
+    }
+}
+
+#[cfg(target_os = "macos")]
 async fn ensure_daemon_started(
     socket_path: &str,
     started: &mut bool,
     session_id: &str,
     claude_code_compat: bool,
 ) -> anyhow::Result<()> {
-    if *started {
+    let listening = is_daemon_listening(socket_path);
+    if *started && listening {
         return Ok(());
     }
-    if !is_daemon_listening(socket_path) {
+    if !listening {
         // FORCE_PROXY callers supply their own daemon and have no bundle to
         // relaunch into — never auto-launch on their behalf.
         if crate::bundle::is_env_truthy("CUA_DRIVER_RS_MCP_FORCE_PROXY") {
-            if crate::bundle::is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW") {
-                anyhow::bail!(
-                    "the cmux Computer Use runtime is not listening on {socket_path}. \
-                     Open cmux Settings → Computer Use and keep permission setup inside \
-                     cmux; do not launch cua-driver directly"
-                );
-            }
-            anyhow::bail!(
-                "CUA_DRIVER_RS_MCP_FORCE_PROXY=1 but no daemon listening on {socket_path}"
-            );
+            ensure_daemon_available_with(
+                *started,
+                true,
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_millis(100),
+                || is_daemon_listening(socket_path),
+                || anyhow::bail!("forced proxy cannot launch a standalone daemon"),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(
+                "the tag-scoped cmux Computer Use runtime is not listening on {socket_path}: {e}"
+            ))?;
+        } else {
+            let sp = socket_path.to_owned();
+            tokio::task::spawn_blocking(move || {
+                crate::cli::launch_daemon_and_wait(&sp, 10, claude_code_compat)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("daemon launch task failed: {e}"))??;
         }
-        let sp = socket_path.to_owned();
-        tokio::task::spawn_blocking(move || {
-            crate::cli::launch_daemon_and_wait(&sp, 10, claude_code_compat)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("daemon launch task failed: {e}"))??;
     }
     // Daemon is up: start the reaper now (deferred from proxy startup).
     {
@@ -767,6 +814,7 @@ mod tests {
 
         let result = ensure_daemon_available_with(
             true,
+            true,
             Duration::from_millis(100),
             Duration::from_millis(1),
             || probes.fetch_add(1, Ordering::SeqCst) >= 2,
@@ -791,6 +839,7 @@ mod tests {
         let probes = AtomicUsize::new(0);
 
         let result = ensure_daemon_available_with(
+            true,
             true,
             Duration::from_millis(100),
             Duration::from_millis(1),

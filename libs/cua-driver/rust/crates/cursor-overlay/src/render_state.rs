@@ -22,8 +22,8 @@
 //!   Returns `false` for variants the core doesn't handle so platforms can
 //!   layer their own behaviour on top (e.g. macOS ShowFocusRect).
 //! - [`render_frame`] — the tiny-skia paint of bloom + click-pulse + arrow.
-//!   Parametrised by pixmap dimensions and an origin offset so Windows can
-//!   pass `(virt_x, virt_y)` while macOS / Linux pass `(0, 0)`.
+//!   Parametrised by pixmap dimensions and an origin offset so Windows and
+//!   macOS can pass their virtual-desktop origins while Linux passes `(0, 0)`.
 //! - [`draw_default_arrow`] — gradient-arrow rasteriser.
 //!
 //! ## What stays per-platform
@@ -56,6 +56,10 @@ pub struct RenderStateCore {
     pub motion: MotionConfig,
     /// Current rendered position in screen / overlay-window coordinates.
     pub pos: (f64, f64),
+    /// Whether the cursor has ever been assigned a real screen position.
+    /// Kept separately from `pos` because negative coordinates are valid on
+    /// displays arranged above or to the left of the primary display.
+    placed: bool,
     /// Visual heading in radians (tip direction = motion_dir + π).
     pub heading: f64,
     /// In-flight planned path; `None` = at rest.
@@ -106,6 +110,7 @@ impl RenderStateCore {
             gradient_colors,
             bloom_override,
             pos: (-200.0, -200.0),
+            placed: false,
             heading: std::f64::consts::FRAC_PI_4,
             path: None,
             dist: 0.0,
@@ -118,6 +123,17 @@ impl RenderStateCore {
             idle_alpha: 1.0,
             pinned_wid: None,
         }
+    }
+
+    /// True until the cursor receives its first real screen position.
+    pub fn is_unplaced(&self) -> bool {
+        !self.placed
+    }
+
+    /// Assign a real global screen position to the cursor.
+    pub fn place_at(&mut self, x: f64, y: f64) {
+        self.pos = (x, y);
+        self.placed = true;
     }
 
     /// Advance the animation by `dt` seconds using runtime [`MotionConfig`]
@@ -367,7 +383,7 @@ impl RenderStateCore {
     ///
     /// `move_to_snap_sentinel` controls macOS-only behaviour: when `true`,
     /// `MoveTo` snaps `self.pos` to the offset target if the cursor is
-    /// still at the off-screen sentinel (`pos.0 < -50.0`).  Windows/Linux
+    /// still has no real screen placement. Windows/Linux
     /// pass `false` here.
     ///
     /// `click_pulse_sentinel_only` likewise controls macOS-only behaviour:
@@ -398,8 +414,8 @@ impl RenderStateCore {
 
                 // macOS-only: if the cursor is still at the initial off-screen
                 // sentinel, snap it to the offset target so the path starts on-screen.
-                if move_to_snap_sentinel && self.pos.0 < -50.0 {
-                    self.pos = (tx, ty);
+                if move_to_snap_sentinel && self.is_unplaced() {
+                    self.place_at(tx, ty);
                 }
                 let (x0, y0) = self.pos;
                 let th0 = self.heading + std::f64::consts::PI;
@@ -427,7 +443,7 @@ impl RenderStateCore {
                 y,
                 heading_radians,
             } => {
-                self.pos = (x, y);
+                self.place_at(x, y);
                 if let Some(heading) = heading_radians {
                     self.heading = heading;
                 }
@@ -443,17 +459,17 @@ impl RenderStateCore {
                 if click_pulse_sentinel_only {
                     // macOS: only snap position on first placement (sentinel state).
                     // After that the cursor stays where the animation landed.
-                    if self.pos.0 < -50.0 {
+                    if self.is_unplaced() {
                         // Apply same click offset so tip lands at click point.
                         const CLICK_OFFSET: f64 = 16.0;
                         let angle = std::f64::consts::FRAC_PI_4;
-                        self.pos = (
+                        self.place_at(
                             x + angle.cos() * CLICK_OFFSET,
                             y + angle.sin() * CLICK_OFFSET,
                         );
                     }
                 } else {
-                    self.pos = (x, y);
+                    self.place_at(x, y);
                 }
                 self.click_t = Some(0.0);
                 self.idle_secs = 0.0;
@@ -524,8 +540,8 @@ pub struct FocusRect {
 ///
 /// `origin_x`, `origin_y` are subtracted from the cursor `core.pos` before
 /// drawing — Windows passes the virtual-screen `(virt_x, virt_y)` so the
-/// pixmap is laid out in window-local coordinates.  macOS / Linux pass
-/// `(0.0, 0.0)`.
+/// pixmap is laid out in window-local coordinates. macOS does the same for its
+/// multi-display union; Linux passes `(0.0, 0.0)`.
 ///
 /// `backing_scale` is the destination-pixmap-pixels per logical-point ratio
 /// (e.g. 2.0 on a retina display where the pixmap is sized at physical
@@ -554,7 +570,7 @@ pub fn render_frame(
 /// render N owned cursors into one buffer / one NSWindow.
 ///
 /// `origin_x` / `origin_y` are subtracted from `core.pos` before drawing
-/// (Windows passes the virtual-screen origin; macOS / Linux pass `(0.0, 0.0)`).
+/// (Windows and macOS pass virtual-screen origins; Linux passes `(0.0, 0.0)`).
 /// Both are in **logical** screen points, just like `core.pos`.
 ///
 /// `backing_scale` is the destination-pixmap-pixels per logical-point ratio.
@@ -578,7 +594,7 @@ pub fn paint_cursor(
     focus_rect: Option<FocusRect>,
     backing_scale: f32,
 ) {
-    if !core.visible || core.pos.0 < -100.0 || core.idle_alpha < 0.004 {
+    if !core.visible || core.is_unplaced() || core.idle_alpha < 0.004 {
         return;
     }
 
@@ -690,8 +706,8 @@ pub fn paint_cursor(
         let (cr, cg, cb) = (0x5Eu8, 0xC0u8, 0xE8u8);
 
         if let Some(rect) = tiny_skia::Rect::from_xywh(
-            (fx * s) as f32,
-            (fy * s) as f32,
+            ((fx - origin_x) * s) as f32,
+            ((fy - origin_y) * s) as f32,
             (fw * s) as f32,
             (fh * s) as f32,
         ) {
@@ -956,7 +972,7 @@ mod glide_duration_tests {
         let mut core = RenderStateCore::new(CursorConfig::default());
         core.motion.glide_duration_ms = glide_ms;
         core.motion.idle_hide_ms = 0.0;
-        core.pos = (0.0, 0.0);
+        core.place_at(0.0, 0.0);
         // Aligned headings → an effectively straight path of length ~dist_pts.
         core.path = Some(PathPlanner::plan(0.0, 0.0, 0.0, dist_pts, 0.0, 0.0, 0.0, 80.0));
         core.dist = 0.0;
@@ -1012,7 +1028,7 @@ mod backing_scale_tests {
         // Place the cursor at the centre of the logical area and disable
         // idle-fade so the arrow paints at full alpha regardless of timing.
         let centre = logical_size as f64 / 2.0;
-        core.pos = (centre, centre);
+        core.place_at(centre, centre);
         core.idle_alpha = 1.0;
         core.visible = true;
 
