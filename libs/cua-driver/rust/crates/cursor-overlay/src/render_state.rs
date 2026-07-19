@@ -360,6 +360,13 @@ impl RenderStateCore {
         }
     }
 
+    fn click_offset_points(&self) -> f64 {
+        match (self.shape.as_ref(), self.cfg.builtin_shape) {
+            (None, BuiltinShape::Cmux) => 0.0,
+            _ => 16.0,
+        }
+    }
+
     /// Handle the OverlayCommand variants that are identical across all
     /// three platforms.  Returns `true` if the command was consumed; `false`
     /// for variants the platform must handle itself (e.g. macOS's
@@ -387,14 +394,12 @@ impl RenderStateCore {
                 y,
                 end_heading_radians,
             } => {
-                // Apply click offset (16 pt along end_heading) before planning,
-                // matching Swift `moveTo(point:endAngleRadians:)`:
-                //   tx = clickPoint.x + cos(endAngle) * clickOffset
-                //   ty = clickPoint.y + sin(endAngle) * clickOffset
-                const CLICK_OFFSET: f64 = 16.0;
+                // Centre-anchored shapes keep the legacy 16 pt click offset;
+                // the cmux Sky kite is tip-anchored at the event coordinate.
                 let turn_radius = self.motion.turn_radius;
-                let tx = x + end_heading_radians.cos() * CLICK_OFFSET;
-                let ty = y + end_heading_radians.sin() * CLICK_OFFSET;
+                let click_offset = self.click_offset_points();
+                let tx = x + end_heading_radians.cos() * click_offset;
+                let ty = y + end_heading_radians.sin() * click_offset;
 
                 // macOS-only: if the cursor is still at the initial off-screen
                 // sentinel, snap it to the offset target so the path starts on-screen.
@@ -444,12 +449,12 @@ impl RenderStateCore {
                     // macOS: only snap position on first placement (sentinel state).
                     // After that the cursor stays where the animation landed.
                     if self.pos.0 < -50.0 {
-                        // Apply same click offset so tip lands at click point.
-                        const CLICK_OFFSET: f64 = 16.0;
+                        // Apply the same anchor offset as MoveTo.
                         let angle = std::f64::consts::FRAC_PI_4;
+                        let click_offset = self.click_offset_points();
                         self.pos = (
-                            x + angle.cos() * CLICK_OFFSET,
-                            y + angle.sin() * CLICK_OFFSET,
+                            x + angle.cos() * click_offset,
+                            y + angle.sin() * click_offset,
                         );
                     }
                 } else {
@@ -766,13 +771,31 @@ pub fn paint_cursor(
     //        rasterises.
     //      - `teardrop`: blit the cached `CursorShape::teardrop()` pixmap
     //        — rasterised once at 2× the display target.
-    //   3. (No other built-ins today.)
+    //      - `cmux`: blit the branded Sky kite, anchored at its pointing tip.
     //
     // Teardrop is the default silhouette; `--cursor-shape arrow` (or
     // `cursor_icon: "arrow"`) selects the procedural arrow instead.
-    let shape: Option<&CursorShape> = match (core.shape.as_ref(), core.cfg.builtin_shape) {
-        (Some(custom), _) => Some(custom),
-        (None, BuiltinShape::Teardrop) => Some(CursorShape::teardrop()),
+    let shape: Option<(&CursorShape, f32, f32, f32)> = match (core.shape.as_ref(), core.cfg.builtin_shape) {
+        (Some(custom), _) => Some((
+            custom,
+            custom.width as f32 / 2.0,
+            custom.height as f32 / 2.0,
+            90.0,
+        )),
+        (None, BuiltinShape::Teardrop) => {
+            let teardrop = CursorShape::teardrop();
+            Some((
+                teardrop,
+                teardrop.width as f32 / 2.0,
+                teardrop.height as f32 / 2.0,
+                90.0,
+            ))
+        }
+        (None, BuiltinShape::Cmux) => {
+            let cmux = CursorShape::cmux();
+            let hotspot = 3.0 * cmux.width as f32 / 18.59;
+            Some((cmux, hotspot, hotspot, 135.0))
+        }
         (None, BuiltinShape::Arrow) => {
             let grad_override = if core.gradient_colors.is_empty() {
                 None
@@ -791,8 +814,8 @@ pub fn paint_cursor(
             None
         }
     };
-    let shape = match shape {
-        Some(s) => s,
+    let (shape, hotspot_x, hotspot_y, intrinsic_rotation_degrees) = match shape {
+        Some(value) => value,
         None => return,
     };
     // Display size in pixels. 26 logical points is a touch larger than a
@@ -808,19 +831,19 @@ pub fn paint_cursor(
     if let Some(pix) =
         tiny_skia::PixmapRef::from_bytes(&shape.pixels, shape.width, shape.height)
     {
-        // T = Translate(px, py) * Rotate(angle) * Scale(s) * Translate(-w/2, -h/2)
-        // Centres the source on its own origin, scales to display_size, rotates
-        // around the scaled centre, lands the centre at (px, py).
+        // T = Translate(px, py) * Rotate(angle) * Scale(s) * Translate(-hotspot)
+        // moves the source hotspot to its origin, scales and rotates around it,
+        // then lands that hotspot at the event coordinate.
         //
         // +90° offset compensates for the SVG's intrinsic orientation: the
         // cursor-up silhouette points UP at rest (CSS y-down angle -π/2),
         // whereas the procedural arrow's rotation convention assumes the
         // shape points RIGHT at rest (angle 0). Without the +90°, motion-
         // right rotation would leave the tip still pointing up.
-        let rotation_deg = heading.to_degrees() as f32 + 180.0 + 90.0;
+        let rotation_deg = heading.to_degrees() as f32 + 180.0 + intrinsic_rotation_degrees;
         let transform = tiny_skia::Transform::from_translate(
-            -(shape.width as f32) / 2.0,
-            -(shape.height as f32) / 2.0,
+            -hotspot_x,
+            -hotspot_y,
         )
         .post_scale(scale, scale)
         .post_rotate(rotation_deg)
@@ -991,6 +1014,50 @@ mod glide_duration_tests {
             let long = arrival_secs(0.0, 1400.0, swift);
             assert!(long > short + 0.2, "swift={swift} short={short} long={long}");
         }
+    }
+}
+
+#[cfg(test)]
+mod cmux_hotspot_tests {
+    use super::*;
+    use crate::{BuiltinShape, CursorConfig};
+
+    fn config(shape: BuiltinShape) -> CursorConfig {
+        let mut config = CursorConfig::default();
+        config.builtin_shape = shape;
+        config
+    }
+
+    #[test]
+    fn cmux_cursor_uses_tip_hotspot_while_generic_shapes_keep_offset() {
+        let event = (100.0, 200.0);
+        let heading = std::f64::consts::FRAC_PI_4;
+
+        let mut cmux = RenderStateCore::new(config(BuiltinShape::Cmux));
+        cmux.apply_command_base(
+            OverlayCommand::MoveTo {
+                x: event.0,
+                y: event.1,
+                end_heading_radians: heading,
+            },
+            true,
+            true,
+        );
+        assert!((cmux.pos.0 - event.0).abs() < 0.001);
+        assert!((cmux.pos.1 - event.1).abs() < 0.001);
+
+        let mut teardrop = RenderStateCore::new(config(BuiltinShape::Teardrop));
+        teardrop.apply_command_base(
+            OverlayCommand::MoveTo {
+                x: event.0,
+                y: event.1,
+                end_heading_radians: heading,
+            },
+            true,
+            true,
+        );
+        assert!((teardrop.pos.0 - event.0).abs() > 10.0);
+        assert!((teardrop.pos.1 - event.1).abs() > 10.0);
     }
 }
 

@@ -40,9 +40,8 @@ pub struct CursorConfig {
     pub shape: Option<CursorShape>,
 
     /// Which built-in silhouette to render when no custom `shape` is set.
-    /// Defaults to [`BuiltinShape::Arrow`] (the procedural gradient
-    /// diamond) until the embedded teardrop's retina rasterisation is
-    /// fully sorted; opt into the teardrop via `--cursor-shape teardrop`.
+    /// Defaults to [`BuiltinShape::Teardrop`]; embedding hosts can select a
+    /// branded built-in with `--cursor-shape <name>`.
     pub builtin_shape: BuiltinShape,
 
     /// Initial motion config (can be updated at runtime via MCP tool).
@@ -182,8 +181,8 @@ impl CursorConfig {
     /// ```text
     /// --cursor-icon  <path.svg|path.ico|path.png>
     /// --cursor-id    <id>
-    /// --cursor-shape <arrow|teardrop>  (selects a built-in silhouette;
-    ///                                   default: arrow)
+    /// --cursor-shape <arrow|teardrop|cmux>  (selects a built-in silhouette;
+    ///                                        default: teardrop)
     /// --cursor-palette <name>     (selects a named Palette)
     /// --no-overlay                (start with overlay disabled)
     /// --glide-ms     <f64>        (glideDurationMs override)
@@ -232,7 +231,8 @@ impl CursorConfig {
                         match BuiltinShape::parse(name) {
                             Some(s) => cfg.builtin_shape = s,
                             None => tracing::warn!(
-                                "--cursor-shape {name}: unknown shape (expected arrow|teardrop); falling back to default"
+                                "--cursor-shape {name}: unknown shape (expected {}); falling back to default",
+                                BuiltinShape::names_help()
                             ),
                         }
                         i += 1;
