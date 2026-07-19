@@ -1016,6 +1016,37 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn virtual_desktop_geometry_covers_an_upper_left_display() {
+        let geometry = virtual_desktop_geometry(
+            [0.0, 0.0, 1_512.0, 982.0],
+            &[
+                [0.0, 0.0, 1_512.0, 982.0],
+                [-575.0, 982.0, 1_920.0, 1_080.0],
+            ],
+        );
+
+        assert_eq!(geometry.appkit_frame, [-575.0, 0.0, 2_087.0, 2_062.0]);
+        assert_eq!(geometry.global_origin, (-575.0, -1_080.0));
+        assert_eq!(
+            geometry.window_local_point(1_068.0, -258.0),
+            (1_643.0, 822.0),
+            "Calculator's upper-display point must land inside the overlay canvas"
+        );
+    }
+
+    #[test]
+    fn negative_x_cursor_is_not_the_unplaced_sentinel() {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        assert!(core.is_unplaced());
+
+        core.pos = (-420.0, 220.0);
+        assert!(
+            !core.is_unplaced(),
+            "a cursor on a left-hand display must remain renderable"
+        );
+    }
+
     fn empty_map() -> RenderMap {
         let mut cursors = IndexMap::new();
         cursors.insert(
