@@ -1679,6 +1679,8 @@ mod tests {
         );
         server.await.unwrap();
     }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     /// Reconstruct the `!resp.ok` branch in isolation so we can assert
     /// on the serialized shape without spinning up a real daemon /
@@ -1936,5 +1938,51 @@ mod tests {
         task.abort();
         let _ = task.await;
         drop(second_stream);
+    }
+
+    #[tokio::test]
+    async fn external_proxy_waits_for_cmux_daemon_without_launching_standalone() {
+        let probes = AtomicUsize::new(0);
+        let launches = AtomicUsize::new(0);
+
+        let result = ensure_daemon_available_with(
+            true,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            || probes.fetch_add(1, Ordering::SeqCst) >= 2,
+            || {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result.is_ok(), "cmux recovered within the bounded wait");
+        assert!(probes.load(Ordering::SeqCst) >= 3);
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            0,
+            "an externally-owned proxy must never launch CuaDriver.app"
+        );
+    }
+
+    #[tokio::test]
+    async fn previously_started_proxy_rechecks_daemon_health() {
+        let probes = AtomicUsize::new(0);
+
+        let result = ensure_daemon_available_with(
+            true,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            || probes.fetch_add(1, Ordering::SeqCst) >= 1,
+            || Ok(()),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(
+            probes.load(Ordering::SeqCst) >= 2,
+            "started state must not bypass a fresh socket health check"
+        );
     }
 }
