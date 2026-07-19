@@ -652,12 +652,14 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
         // The overlay is visual-only. Keep both click/scroll hit-testing and
         // mouse-move tracking disabled; obstruction detection separately excludes
         // every window owned by this driver pid because WindowServer still lists
-        // these full-screen layer-0 windows in its front-to-back stack.
+        // these full-screen overlay windows in its front-to-back stack.
         let _: () = msg_send![win, setIgnoresMouseEvents: true];
         let _: () = msg_send![win, setAcceptsMouseMovedEvents: false];
-        // NSNormalWindowLevel = 0. Z-ordering above the target is managed
-        // dynamically via orderWindow:relativeTo:.
-        let _: () = msg_send![win, setLevel: 0i64];
+        // NSFloatingWindowLevel = 3. `orderWindow:relativeTo:` does not reliably
+        // lift a normal-level window above another application's window, so the
+        // cursor overlay must live in a higher level to remain visible over the
+        // driven app. It is fully transparent and ignores mouse events.
+        let _: () = msg_send![win, setLevel: 3i64];
         // NSWindowCollectionBehaviorCanJoinAllSpaces(1<<0) |
         // FullScreenAuxiliary(1<<8) | Stationary(1<<4)
         let _: () = msg_send![win, setCollectionBehavior: (1u64 | (1<<8) | (1<<4))];
@@ -930,8 +932,9 @@ fn dispatch_set_layer_contents(layer_ptr: usize, pixmap: tiny_skia::Pixmap) {
 /// server list.  Called from the render thread; dispatches to the main queue
 /// (AppKit must be used on the main thread).
 ///
-/// `NSWindowAbove = 1`; `orderWindow:relativeTo:` accepts any CGWindowID as
-/// the `relativeTo` argument — it works cross-application via CGS.
+/// `NSWindowAbove = 1`; `orderWindow:relativeTo:` provides best-effort ordering
+/// near the target. The overlay's floating window level is what guarantees it
+/// remains above normal application windows across process boundaries.
 fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
     use std::ffi::c_void;
 
@@ -971,12 +974,9 @@ fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
 /// `orderWindow:relativeTo:` call to the main queue (AppKit must run on
 /// the main thread).
 ///
-/// `target = None` is treated as a no-op here rather than raising to the
-/// front: macOS creates the overlay at `NSNormalWindowLevel` and never
-/// promotes it into an "always-on-top" level the way Windows does with
-/// `HWND_TOPMOST`, so there is no topmost band to escape. Letting the
-/// overlay stay where the user's activations have left it keeps it out
-/// of the way when no agent action is in flight.
+/// `target = None` is treated as a no-op. The floating overlay is transparent
+/// and click-through, and its pixel content is cleared when no cursor is
+/// visible, so leaving the window ordered does not obstruct user interaction.
 struct MacZOrderEnforcer {
     win_ptr: usize,
 }
