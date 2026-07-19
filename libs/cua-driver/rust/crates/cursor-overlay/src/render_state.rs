@@ -523,9 +523,9 @@ pub struct FocusRect {
 /// fresh tiny-skia [`tiny_skia::Pixmap`] of `(width, height)`.
 ///
 /// `origin_x`, `origin_y` are subtracted from the cursor `core.pos` before
-/// drawing — Windows passes the virtual-screen `(virt_x, virt_y)` so the
-/// pixmap is laid out in window-local coordinates.  macOS / Linux pass
-/// `(0.0, 0.0)`.
+/// drawing — Windows passes the virtual-screen `(virt_x, virt_y)` and macOS
+/// passes the current display's Quartz origin so each pixmap is laid out in
+/// window-local coordinates. Linux passes `(0.0, 0.0)`.
 ///
 /// `backing_scale` is the destination-pixmap-pixels per logical-point ratio
 /// (e.g. 2.0 on a retina display where the pixmap is sized at physical
@@ -554,8 +554,9 @@ pub fn render_frame(
 /// render N owned cursors into one buffer / one NSWindow.
 ///
 /// `origin_x` / `origin_y` are subtracted from `core.pos` before drawing
-/// (Windows passes the virtual-screen origin; macOS / Linux pass `(0.0, 0.0)`).
-/// Both are in **logical** screen points, just like `core.pos`.
+/// (Windows passes the virtual-screen origin, macOS passes the current
+/// display's Quartz origin, and Linux passes `(0.0, 0.0)`). Both are in
+/// **logical** screen points, just like `core.pos`.
 ///
 /// `backing_scale` is the destination-pixmap-pixels per logical-point ratio.
 /// On a 2× retina macOS display the caller sizes the pixmap at the screen's
