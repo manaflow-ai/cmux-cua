@@ -76,10 +76,21 @@ pub fn visible_windows() -> Vec<WindowInfo> {
 /// overlay should sit above. The caller supplies WindowServer's native
 /// front-to-back ordering and the overlay owner's pid.
 pub(crate) fn cursor_overlay_anchor_window(
-    _windows: &[WindowInfo],
-    _driver_pid: i32,
+    windows: &[WindowInfo],
+    driver_pid: i32,
 ) -> Option<u32> {
-    None
+    windows
+        .iter()
+        .find(|window| {
+            window.pid != driver_pid
+                && window.layer == 0
+                && window.is_on_screen
+                && window.alpha > 0.01
+                && window.bounds.width > 1.0
+                && window.bounds.height > 1.0
+                && !is_window_server_owner_name(&window.app_name)
+        })
+        .map(|window| window.window_id)
 }
 
 fn enumerate_windows(options: u32) -> Vec<WindowInfo> {

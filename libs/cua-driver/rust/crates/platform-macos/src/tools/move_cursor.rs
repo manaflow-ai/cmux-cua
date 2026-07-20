@@ -53,6 +53,20 @@ impl Tool for MoveCursorTool {
         let y = match args.require_f64("y") { Ok(v) => v, Err(e) => return e };
         let cursor_id = super::cursor_tools::resolve_cursor_key(&args);
 
+        // Unlike click/scroll/drag, move_cursor has no target window id to pin
+        // above. Re-anchor the overlay above WindowServer's real frontmost
+        // layer-0 window before animating so an explicit visual cursor move can
+        // never remain hidden behind the app the user is looking at.
+        if let Some(window_id) = crate::windows::cursor_overlay_anchor_window(
+            &crate::windows::visible_windows(),
+            std::process::id() as i32,
+        ) {
+            crate::cursor::overlay::send_command(
+                cursor_id.clone(),
+                cursor_overlay::OverlayCommand::PinAbove(window_id as u64),
+            );
+        }
+
         self.state.cursor_registry.update_position(&cursor_id, x, y);
         // Drive the DRAWN cursor via the same path as click's animation. A raw
         // `MoveTo` doesn't reliably bring a brand-new session cursor on-screen —
