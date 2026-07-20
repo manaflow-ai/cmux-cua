@@ -104,7 +104,7 @@ pub async fn run_proxy(
         let sid = session_id.clone();
         let ready = control_ready_tx.clone();
         tokio::spawn(async move {
-            run_control_connection(socket, sid, expected_profile, ready).await;
+            run_control_connection(socket, sid, expected_profile, ready, None).await;
         });
     }
 
@@ -117,7 +117,7 @@ pub async fn run_proxy(
     // guarantees a daemon is already up. Fetch the list from it and start the
     // reaper immediately (unchanged behaviour).
     #[cfg(target_os = "macos")]
-    let cached_tools_list = {
+    let bootstrap_tools_list = {
         let registry = crate::build_macos_registry_with_compat(
             claude_code_compat,
             expected_profile == DaemonProfile::CodexComputerUseCompat,
@@ -139,19 +139,40 @@ pub async fn run_proxy(
         )?)
     };
 
+    #[cfg(target_os = "macos")]
+    let (daemon_lifecycle_tx, mut daemon_lifecycle_rx) =
+        tokio::sync::mpsc::unbounded_channel::<DaemonLifecycleEvent>();
+
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin);
+    let mut lines = BufReader::new(stdin).lines();
     let mut writer = tokio::io::BufWriter::new(stdout);
-    let mut line = String::new();
     let mut client_supports_elicitation = false;
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
+        // The persistent control connection is also the authoritative daemon
+        // lifetime signal. A helper can exit and finish relaunching between
+        // two MCP calls, leaving the same socket path reachable; a transient
+        // `is_daemon_listening` probe cannot identify that replacement. Its
+        // EOF event invalidates the generation/cache before the next request.
+        // `next_line` is cancellation-safe, so selecting it against lifecycle
+        // events cannot discard a partially received JSON-RPC line.
+        #[cfg(target_os = "macos")]
+        let line = tokio::select! {
+            biased;
+            event = daemon_lifecycle_rx.recv() => {
+                if let Some(event) = event {
+                    daemon_state.observe_control_connection_end(event.generation);
+                }
+                continue;
+            }
+            line = lines.next_line() => line?,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let line = lines.next_line().await?;
+        let Some(line) = line else {
             break; // EOF — MCP client disconnected (stdin closed).
-        }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -183,6 +204,7 @@ pub async fn run_proxy(
                         expected_profile,
                         &control_ready_tx,
                         wait_for_grants,
+                        &daemon_lifecycle_tx,
                     )
                     .await
                 } else {
@@ -215,18 +237,23 @@ pub async fn run_proxy(
                                 &session_id,
                                 &control_ready_rx,
                                 client_supports_elicitation,
-                                &mut reader,
+                                &mut lines,
                                 &mut writer,
                             )
                             .await
                         }
                     }
                 } else {
+                    #[cfg(target_os = "macos")]
+                    let current_tools_list =
+                        daemon_state.tools_list_or(&bootstrap_tools_list);
+                    #[cfg(not(target_os = "macos"))]
+                    let current_tools_list = &cached_tools_list;
                     handle_proxy_request(
                         req,
                         id,
                         &socket_path,
-                        &cached_tools_list,
+                        current_tools_list,
                         &session_id,
                         &control_ready_rx,
                         expected_profile,
@@ -278,6 +305,10 @@ async fn run_control_connection(
     session_id: String,
     expected_profile: DaemonProfile,
     readiness: tokio::sync::watch::Sender<ControlConnectionState>,
+    mut lifecycle: Option<(
+        tokio::sync::mpsc::UnboundedSender<DaemonLifecycleEvent>,
+        u64,
+    )>,
 ) {
     let begin = DaemonRequest {
         method: "session_begin".into(),
@@ -312,6 +343,14 @@ async fn run_control_connection(
                     return;
                 }
             };
+            if connected {
+                if let Some((sender, generation)) = lifecycle.as_mut() {
+                    let _ = sender.send(DaemonLifecycleEvent {
+                        generation: *generation,
+                    });
+                    *generation = generation.wrapping_add(1).max(1);
+                }
+            }
             debug!(
                 session_id = %session_id,
                 connected,
@@ -342,6 +381,14 @@ async fn run_control_connection(
                     return;
                 }
             };
+            if connected {
+                if let Some((sender, generation)) = lifecycle.as_mut() {
+                    let _ = sender.send(DaemonLifecycleEvent {
+                        generation: *generation,
+                    });
+                    *generation = generation.wrapping_add(1).max(1);
+                }
+            }
             debug!(
                 session_id = %session_id,
                 connected,
@@ -356,7 +403,14 @@ async fn run_control_connection(
 
     #[cfg(all(not(unix), not(target_os = "windows")))]
     {
-        let _ = (line, session_id, socket_path, expected_profile, readiness);
+        let _ = (
+            line,
+            session_id,
+            socket_path,
+            expected_profile,
+            readiness,
+            lifecycle,
+        );
     }
 }
 
@@ -632,10 +686,9 @@ fn validate_daemon_profile_and_roster(
 /// (`name`, `description`, `input_schema`, annotation hints) per
 /// commit 3's `serve.rs` change.
 ///
-/// macOS serves `tools/list` from the in-process registry instead (so the
-/// daemon can stay dormant until the first tool call), leaving this used only
-/// on other platforms — hence the platform-scoped dead-code allowance.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+/// macOS serves the in-process list only while its lazy proxy is dormant. Once
+/// connected, it fetches this daemon-authored list once per observed daemon
+/// generation and caches it for later `tools/list` requests.
 fn fetch_tools_list_from_daemon(
     socket_path: &str,
     session_id: &str,
@@ -913,7 +966,7 @@ async fn write_json_value<W: AsyncWrite + Unpin>(
 }
 
 async fn await_elicitation_decision<R, W>(
-    reader: &mut R,
+    lines: &mut tokio::io::Lines<R>,
     writer: &mut W,
     request_id: &str,
 ) -> Result<ElicitationDecision, String>
@@ -921,16 +974,14 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut line = String::new();
     loop {
-        line.clear();
-        let bytes = reader
-            .read_line(&mut line)
+        let line = lines
+            .next_line()
             .await
-            .map_err(|error| format!("read elicitation response: {error}"))?;
-        if bytes == 0 {
-            return Err("MCP client disconnected during app approval elicitation".to_owned());
-        }
+            .map_err(|error| format!("read elicitation response: {error}"))?
+            .ok_or_else(|| {
+                "MCP client disconnected during app approval elicitation".to_owned()
+            })?;
         let value: serde_json::Value = serde_json::from_str(line.trim())
             .map_err(|error| format!("decode elicitation response: {error}"))?;
         if value.get("id").and_then(serde_json::Value::as_str) == Some(request_id) {
@@ -1013,7 +1064,7 @@ async fn forward_tool_call_with_approval<R, W>(
     session_id: &str,
     control_ready: &tokio::sync::watch::Receiver<ControlConnectionState>,
     client_supports_elicitation: bool,
-    reader: &mut R,
+    lines: &mut tokio::io::Lines<R>,
     writer: &mut W,
 ) -> Response
 where
@@ -1076,7 +1127,7 @@ where
             format!("write app approval elicitation: {error}"),
         );
     }
-    let decision = match await_elicitation_decision(reader, writer, &elicitation_id).await {
+    let decision = match await_elicitation_decision(lines, writer, &elicitation_id).await {
         Ok(decision) => decision,
         Err(error) => {
             return app_approval_error_response(id, "app_approval_unavailable", error)
@@ -1224,6 +1275,14 @@ where
 struct DaemonStartState {
     reaper_started: bool,
     grant_wait_completed: bool,
+    daemon_generation: u64,
+    tools_list_generation: Option<u64>,
+    authoritative_tools_list: Option<Arc<serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonLifecycleEvent {
+    generation: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -1234,6 +1293,78 @@ impl DaemonStartState {
 
     fn complete_grant_wait(&mut self) {
         self.grant_wait_completed = true;
+    }
+
+    /// Record an observed socket outage. Until a replacement daemon is
+    /// connected and queried, `tools/list` must fall back to the local,
+    /// permission-free bootstrap registry rather than advertise the vanished
+    /// daemon's contract.
+    fn observe_daemon_loss(&mut self) {
+        self.grant_wait_completed = false;
+        self.tools_list_generation = None;
+        self.authoritative_tools_list = None;
+    }
+
+    /// Apply the EOF signal from the generation-tagged control connection.
+    /// Returns whether the event invalidated the current daemon. A delayed EOF
+    /// from an older control task must not tear down a replacement generation.
+    fn observe_control_connection_end(&mut self, generation: u64) -> bool {
+        if !self.reaper_started || generation != self.daemon_generation {
+            return false;
+        }
+        self.observe_daemon_loss();
+        self.daemon_generation = self.daemon_generation.wrapping_add(1).max(1);
+        true
+    }
+
+    /// Start a new observed daemon generation and return its stable token.
+    /// The token lets the cache policy distinguish a replacement daemon from
+    /// the one whose list it previously stored without a list round-trip on
+    /// every tool call.
+    fn begin_daemon_generation(&mut self) -> u64 {
+        self.daemon_generation = self.daemon_generation.wrapping_add(1).max(1);
+        self.reaper_started = true;
+        self.daemon_generation
+    }
+
+    fn tools_list_refresh_generation(&self) -> Option<u64> {
+        if self.reaper_started
+            && self.tools_list_generation != Some(self.daemon_generation)
+        {
+            Some(self.daemon_generation)
+        } else {
+            None
+        }
+    }
+
+    fn cache_authoritative_tools_list(
+        &mut self,
+        generation: u64,
+        tools_list: Arc<serde_json::Value>,
+    ) -> bool {
+        if !self.reaper_started || generation != self.daemon_generation {
+            return false;
+        }
+        self.authoritative_tools_list = Some(tools_list);
+        self.tools_list_generation = Some(generation);
+        true
+    }
+
+    fn tools_list_or<'a>(
+        &'a self,
+        bootstrap: &'a Arc<serde_json::Value>,
+    ) -> &'a Arc<serde_json::Value> {
+        match (
+            self.tools_list_generation,
+            self.authoritative_tools_list.as_ref(),
+        ) {
+            (Some(generation), Some(tools_list))
+                if self.reaper_started && generation == self.daemon_generation =>
+            {
+                tools_list
+            }
+            _ => bootstrap,
+        }
     }
 }
 
@@ -1258,14 +1389,14 @@ async fn ensure_daemon_started(
     expected_profile: DaemonProfile,
     control_ready: &tokio::sync::watch::Sender<ControlConnectionState>,
     wait_for_grants: bool,
+    lifecycle_tx: &tokio::sync::mpsc::UnboundedSender<DaemonLifecycleEvent>,
 ) -> anyhow::Result<()> {
     let listening = is_daemon_listening(socket_path);
     if !listening {
         // A replacement daemon needs a fresh control connection and, for the
         // next driving action, a fresh onboarding stability wait.
         let previously_started = state.reaper_started;
-        state.reaper_started = false;
-        state.grant_wait_completed = false;
+        state.observe_daemon_loss();
         // FORCE_PROXY callers supply their own daemon and have no bundle to
         // relaunch into — never auto-launch on their behalf.
         if crate::bundle::requires_external_daemon() {
@@ -1297,15 +1428,41 @@ async fn ensure_daemon_started(
     }
     // Daemon is up: start the reaper now (deferred from proxy startup).
     if !state.reaper_started {
+        let generation = state.begin_daemon_generation();
         let socket = socket_path.to_owned();
         let sid = session_id.to_owned();
         let ready = control_ready.clone();
+        let lifecycle_tx = lifecycle_tx.clone();
         tokio::spawn(async move {
-            run_control_connection(socket, sid, expected_profile, ready).await;
+            run_control_connection(
+                socket,
+                sid,
+                expected_profile,
+                ready,
+                Some((lifecycle_tx, generation)),
+            )
+            .await;
         });
-        state.reaper_started = true;
     }
     let _ = wait_for_control_connection(control_ready.subscribe()).await?;
+    // The bootstrap list intentionally keeps initialize/tools/list local and
+    // permission-free while the lazy daemon is dormant. Once a daemon is
+    // connected, however, that daemon is the execution authority and its
+    // schema must win. Fetch once for this observed generation, then reuse the
+    // cache until a socket outage invalidates it. `send_request` is blocking
+    // UDS I/O, so keep it off Tokio's worker threads.
+    if let Some(generation) = state.tools_list_refresh_generation() {
+        let socket = socket_path.to_owned();
+        let sid = session_id.to_owned();
+        let tools_list = tokio::task::spawn_blocking(move || {
+            fetch_tools_list_from_daemon(&socket, &sid, expected_profile)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("daemon tool-list task failed: {e}"))??;
+        if !state.cache_authoritative_tools_list(generation, Arc::new(tools_list)) {
+            anyhow::bail!("daemon changed while its authoritative tool list was loading");
+        }
+    }
     // Onboarding: wait until BOTH TCC grants are in before the first tool
     // executes. The daemon's startup gate raises the Accessibility + Screen
     // Recording prompts and re-execs the daemon (~every 25s) to pick up each
@@ -1396,7 +1553,7 @@ fn extract_grants(v: &serde_json::Value) -> Option<(bool, bool)> {
 ///   - `initialize`     → static `initialize_result()` (same envelope
 ///                        the in-process path returns; the daemon's
 ///                        identity is hidden from the MCP client).
-///   - `tools/list`     → return the cached daemon tool list.
+///   - `tools/list`     → return the current bootstrap/daemon cache.
 ///   - `tools/call`     → forward to the daemon and reshape the
 ///                        response into MCP's `CallTool.Result`.
 ///   - other            → method-not-found, same as in-process.
@@ -1404,7 +1561,7 @@ async fn handle_proxy_request(
     req: Request,
     id: serde_json::Value,
     socket_path: &str,
-    cached_tools_list: &Arc<serde_json::Value>,
+    cached_tools_list: &serde_json::Value,
     session_id: &str,
     control_ready: &tokio::sync::watch::Receiver<ControlConnectionState>,
     expected_profile: DaemonProfile,
@@ -1419,7 +1576,7 @@ async fn handle_proxy_request(
             },
         ),
 
-        "tools/list" => Response::ok(id, (**cached_tools_list).clone()),
+        "tools/list" => Response::ok(id, cached_tools_list.clone()),
 
         "tools/call" => match req.tool_call() {
             Err(e) => Response::error(id, -32602, format!("Invalid params: {e}")),
@@ -1670,7 +1827,7 @@ mod tests {
     async fn nested_elicitation_response_is_read_as_a_response_not_a_request() {
         let (proxy_stream, mut client_stream) = tokio::io::duplex(2048);
         let (proxy_read, mut proxy_write) = tokio::io::split(proxy_stream);
-        let mut proxy_read = BufReader::new(proxy_read);
+        let mut proxy_lines = BufReader::new(proxy_read).lines();
         tokio::spawn(async move {
             client_stream
                 .write_all(
@@ -1680,7 +1837,7 @@ mod tests {
                 .unwrap();
         });
         let decision = await_elicitation_decision(
-            &mut proxy_read,
+            &mut proxy_lines,
             &mut proxy_write,
             "approval-7",
         )
@@ -1755,7 +1912,7 @@ mod tests {
         );
         let (proxy_stream, _client_stream) = tokio::io::duplex(1024);
         let (proxy_read, mut proxy_write) = tokio::io::split(proxy_stream);
-        let mut proxy_read = BufReader::new(proxy_read);
+        let mut proxy_lines = BufReader::new(proxy_read).lines();
         let response = forward_tool_call_with_approval(
             serde_json::json!(4),
             "get_app_state".to_owned(),
@@ -1764,7 +1921,7 @@ mod tests {
             "session-a",
             &control_rx,
             false,
-            &mut proxy_read,
+            &mut proxy_lines,
             &mut proxy_write,
         )
         .await;
@@ -2007,6 +2164,7 @@ mod tests {
             session_id.clone(),
             DaemonProfile::Native,
             ready_tx,
+            None,
         ));
 
         let first_stream = accept_session_begin(&first_listener, &session_id).await;
@@ -2124,6 +2282,7 @@ mod tests {
         let mut state = DaemonStartState {
             reaper_started: true,
             grant_wait_completed: false,
+            ..DaemonStartState::default()
         };
 
         assert!(
@@ -2145,5 +2304,114 @@ mod tests {
             !state.needs_grant_wait(true, false),
             "a completed wait should not repeat while the daemon remains healthy"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tool_list_cache_tracks_observed_daemon_generations() {
+        let bootstrap = Arc::new(serde_json::json!({ "source": "bootstrap" }));
+        let daemon_v1 = Arc::new(serde_json::json!({ "source": "daemon-v1" }));
+        let daemon_v2 = Arc::new(serde_json::json!({ "source": "daemon-v2" }));
+        let mut state = DaemonStartState::default();
+
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "bootstrap");
+        assert_eq!(state.tools_list_refresh_generation(), None);
+
+        let first_generation = state.begin_daemon_generation();
+        assert_eq!(
+            state.tools_list_refresh_generation(),
+            Some(first_generation),
+            "a newly connected daemon needs exactly one authoritative list fetch"
+        );
+        assert!(state.cache_authoritative_tools_list(first_generation, daemon_v1));
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "daemon-v1");
+        assert_eq!(
+            state.tools_list_refresh_generation(),
+            None,
+            "healthy calls must reuse the generation cache instead of round-tripping"
+        );
+
+        assert!(state.observe_control_connection_end(first_generation));
+        assert_eq!(
+            state.tools_list_or(&bootstrap)["source"],
+            "bootstrap",
+            "an observed outage must stop advertising the vanished daemon's schema"
+        );
+        assert_eq!(
+            state.tools_list_refresh_generation(),
+            Some(state.daemon_generation)
+        );
+
+        let second_generation = state.daemon_generation;
+        assert_ne!(second_generation, first_generation);
+        assert_eq!(
+            state.tools_list_refresh_generation(),
+            Some(second_generation),
+            "a replacement daemon must refresh the authoritative contract"
+        );
+        assert!(state.cache_authoritative_tools_list(second_generation, daemon_v2));
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "daemon-v2");
+        assert_eq!(state.tools_list_refresh_generation(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_daemon_generation_cannot_overwrite_replacement_tool_list() {
+        let bootstrap = Arc::new(serde_json::json!({ "source": "bootstrap" }));
+        let stale = Arc::new(serde_json::json!({ "source": "stale-daemon" }));
+        let current = Arc::new(serde_json::json!({ "source": "current-daemon" }));
+        let mut state = DaemonStartState::default();
+
+        let stale_generation = state.begin_daemon_generation();
+        assert!(state.observe_control_connection_end(stale_generation));
+        let current_generation = state.daemon_generation;
+
+        assert!(!state.cache_authoritative_tools_list(stale_generation, stale));
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "bootstrap");
+        assert!(state.cache_authoritative_tools_list(current_generation, current));
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "current-daemon");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn control_eof_detects_replacement_completed_between_requests() {
+        let bootstrap = Arc::new(serde_json::json!({ "source": "bootstrap" }));
+        let daemon_v1 = Arc::new(serde_json::json!({ "source": "daemon-v1" }));
+        let daemon_v2 = Arc::new(serde_json::json!({ "source": "daemon-v2" }));
+        let mut state = DaemonStartState::default();
+
+        let first_generation = state.begin_daemon_generation();
+        assert!(state.cache_authoritative_tools_list(first_generation, daemon_v1));
+        state.complete_grant_wait();
+        assert!(state.reaper_started);
+        assert!(state.grant_wait_completed);
+
+        // The helper exits and its replacement binds the same path before the
+        // next MCP request. Socket reachability alone is true both before and
+        // after, but EOF from the old control connection identifies the loss.
+        assert!(state.observe_control_connection_end(first_generation));
+        assert!(
+            state.reaper_started,
+            "the reconnecting control supervisor remains the session owner"
+        );
+        assert!(!state.grant_wait_completed);
+        assert_eq!(state.tools_list_generation, None);
+        assert!(state.authoritative_tools_list.is_none());
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "bootstrap");
+
+        let replacement_generation = state.daemon_generation;
+        assert_ne!(replacement_generation, first_generation);
+        assert_eq!(
+            state.tools_list_refresh_generation(),
+            Some(replacement_generation)
+        );
+        assert!(state.cache_authoritative_tools_list(replacement_generation, daemon_v2));
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "daemon-v2");
+
+        assert!(
+            !state.observe_control_connection_end(first_generation),
+            "a delayed EOF from the old control task must not invalidate the replacement"
+        );
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "daemon-v2");
     }
 }
