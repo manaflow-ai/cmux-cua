@@ -16,9 +16,7 @@ use cua_driver_core::health_report::{
     NAME_SESSION_ACTIVE, NAME_TCC_ACCESSIBILITY, NAME_TCC_SCREEN_RECORDING,
 };
 
-use crate::permissions::status::{
-    accessibility_granted, current_status, screen_recording_granted,
-};
+use crate::permissions::status::{accessibility_granted, current_status, screen_recording_granted};
 
 /// macOS run order, in the order consumers see them reflected back in
 /// `report.checks[]`. Matches the Swift PR #1905 contract.
@@ -112,6 +110,25 @@ pub(crate) fn check_bundle_identity() -> CheckEntry {
         .and_then(|p| p.to_str().map(str::to_owned))
         .unwrap_or_default();
 
+    check_bundle_identity_for_context(bid, exe, external_permission_flow_enabled())
+}
+
+fn external_permission_flow_enabled() -> bool {
+    std::env::var("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn check_bundle_identity_for_context(
+    bid: Option<String>,
+    exe: String,
+    _external_permission_flow: bool,
+) -> CheckEntry {
     let is_correct = bid.as_deref() == Some(CANONICAL_BUNDLE_ID);
     let data = CheckData {
         bundle_identifier: bid.clone(),
@@ -253,7 +270,7 @@ fn probe_shareable_displays() -> Result<u32, String> {
 /// Read the running process's `CFBundleIdentifier` via CoreFoundation.
 /// Returns `None` when the process has no associated bundle (e.g.
 /// running the bare binary outside `CuaDriver.app`).
-fn current_bundle_identifier() -> Option<String> {
+pub(crate) fn current_bundle_identifier() -> Option<String> {
     use core_foundation::base::TCFType;
     use core_foundation::bundle::{CFBundle, CFBundleGetMainBundle};
     use core_foundation::string::CFString;
@@ -368,6 +385,24 @@ mod tests {
         assert!(
             data.executable_path.is_some(),
             "executable_path must be set so consumers can identify the wrong binary"
+        );
+    }
+
+    #[test]
+    fn external_cmux_helper_bundle_identity_passes_without_standalone_hint() {
+        let entry = check_bundle_identity_for_context(
+            Some("com.cmuxterm.app.debug.tag.computer-use".to_owned()),
+            "/Library/Application Support/cmux/computer-use/helper/tag/cmux Computer Use.app/Contents/MacOS/cmux-cua-driver".to_owned(),
+            true,
+        );
+
+        assert_eq!(entry.status, CheckStatus::Pass);
+        assert!(
+            entry
+                .hint
+                .as_deref()
+                .is_none_or(|hint| !hint.contains("CuaDriver")),
+            "a healthy host-owned helper must not recommend CuaDriver.app",
         );
     }
 
