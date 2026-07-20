@@ -132,7 +132,7 @@ impl Tool for SetAgentCursorEnabledTool {
         // Hide the cmux host feed promptly on disable (don't wait for the next
         // action to gate it), so the host-rendered cursor disappears at once.
         if !enabled {
-            cua_driver_core::cursor_feed::emit_hidden();
+            cua_driver_core::cursor_feed::emit_hidden_if_owned(&key);
         }
         ToolResult::text(format!("Agent cursor '{}' {}.", key, if enabled { "enabled" } else { "disabled" }))
     }

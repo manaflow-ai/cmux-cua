@@ -96,11 +96,13 @@ pub async fn run_proxy(socket_path: String, claude_code_compat: bool) -> anyhow:
         Arc::new(fetch_tools_list_from_daemon(&socket_path, &session_id)?)
     };
 
-    // macOS: `false` until the first tool call brings the daemon (and reaper)
-    // up. The stdin loop is a single sequential task, so a plain flag threaded
-    // by `&mut` is race-free — no lock needed.
+    // macOS: the daemon/reaper lifecycle and the onboarding grant wait are
+    // tracked separately. A first `check_permissions` call must be forwarded
+    // promptly, but that status call must not let a later driving action skip
+    // the grant wait. The stdin loop is a single sequential task, so plain
+    // state threaded by `&mut` is race-free — no lock needed.
     #[cfg(target_os = "macos")]
-    let mut daemon_started = false;
+    let mut daemon_state = DaemonStartState::default();
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -140,11 +142,13 @@ pub async fn run_proxy(socket_path: String, claude_code_compat: bool) -> anyhow:
                 #[cfg(target_os = "macos")]
                 {
                     if req.method.as_str() == "tools/call" {
+                        let wait_for_grants = tool_call_requires_grant_wait(&req);
                         if let Err(e) = ensure_daemon_started(
                             &socket_path,
-                            &mut daemon_started,
+                            &mut daemon_state,
                             &session_id,
                             claude_code_compat,
+                            wait_for_grants,
                         )
                         .await
                         {
@@ -488,23 +492,60 @@ where
     }
 }
 
+/// Lazy proxy startup has two independent milestones: the daemon/reaper is
+/// connected, and the onboarding grant wait has completed. Keeping them
+/// separate ensures a prompt status call cannot accidentally waive onboarding
+/// for the next driving action.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct DaemonStartState {
+    reaper_started: bool,
+    grant_wait_completed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl DaemonStartState {
+    fn needs_grant_wait(&self, request_requires_wait: bool, external_permission_flow: bool) -> bool {
+        request_requires_wait && !external_permission_flow && !self.grant_wait_completed
+    }
+
+    fn complete_grant_wait(&mut self) {
+        self.grant_wait_completed = true;
+    }
+}
+
+/// `check_permissions` is itself the supported permission/status surface. It
+/// must reach the daemon immediately, whether it is a read-only
+/// `{ "prompt": false }` probe or the explicit prompting form, instead of
+/// waiting up to 55 seconds for the condition it reports/requests. Every other
+/// tool call retains the onboarding wait, including all driving actions.
+#[cfg(target_os = "macos")]
+fn tool_call_requires_grant_wait(req: &Request) -> bool {
+    req.tool_call()
+        .map(|call| call.name != "check_permissions")
+        .unwrap_or(true)
+}
+
 #[cfg(target_os = "macos")]
 async fn ensure_daemon_started(
     socket_path: &str,
-    started: &mut bool,
+    state: &mut DaemonStartState,
     session_id: &str,
     claude_code_compat: bool,
+    wait_for_grants: bool,
 ) -> anyhow::Result<()> {
     let listening = is_daemon_listening(socket_path);
-    if *started && listening {
-        return Ok(());
-    }
     if !listening {
+        // A replacement daemon needs a fresh control connection and, for the
+        // next driving action, a fresh onboarding stability wait.
+        let previously_started = state.reaper_started;
+        state.reaper_started = false;
+        state.grant_wait_completed = false;
         // FORCE_PROXY callers supply their own daemon and have no bundle to
         // relaunch into — never auto-launch on their behalf.
         if crate::bundle::requires_external_daemon() {
             ensure_daemon_available_with(
-                *started,
+                previously_started,
                 true,
                 std::time::Duration::from_secs(10),
                 std::time::Duration::from_millis(100),
@@ -525,12 +566,13 @@ async fn ensure_daemon_started(
         }
     }
     // Daemon is up: start the reaper now (deferred from proxy startup).
-    {
+    if !state.reaper_started {
         let socket = socket_path.to_owned();
         let sid = session_id.to_owned();
         tokio::spawn(async move {
             run_control_connection(socket, sid).await;
         });
+        state.reaper_started = true;
     }
     // Onboarding: wait until BOTH TCC grants are in before the first tool
     // executes. The daemon's startup gate raises the Accessibility + Screen
@@ -542,10 +584,16 @@ async fn ensure_daemon_started(
     // first, then run on a stable daemon with a stable cursor. Bounded +
     // fail-safe: on timeout we proceed and let the tool call surface any real
     // TCC error, so a user who ignores the prompts is never hung forever.
-    if !crate::bundle::is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW") {
+    let external_permission_flow =
+        crate::bundle::is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW");
+    if state.needs_grant_wait(wait_for_grants, external_permission_flow) {
         wait_for_daemon_grants(socket_path, session_id).await;
+        state.complete_grant_wait();
+    } else if wait_for_grants && external_permission_flow {
+        // The embedding host owns permission onboarding, so driving calls are
+        // intentionally considered past this proxy-local milestone.
+        state.complete_grant_wait();
     }
-    *started = true;
     Ok(())
 }
 
@@ -856,6 +904,65 @@ mod tests {
         assert!(
             probes.load(Ordering::SeqCst) >= 2,
             "started state must not bypass a fresh socket health check"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn grant_wait_policy_bypasses_only_permission_status_calls() {
+        fn request(name: &str, arguments: serde_json::Value) -> Request {
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
+            .expect("valid request")
+        }
+
+        assert!(!tool_call_requires_grant_wait(&request(
+            "check_permissions",
+            serde_json::json!({ "prompt": false }),
+        )));
+        assert!(!tool_call_requires_grant_wait(&request(
+            "check_permissions",
+            serde_json::json!({ "prompt": true }),
+        )));
+
+        for driving_tool in ["click", "move_cursor", "type_text", "scroll"] {
+            assert!(
+                tool_call_requires_grant_wait(&request(driving_tool, serde_json::json!({}))),
+                "{driving_tool} must retain the onboarding grant wait"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn permission_status_skip_does_not_waive_later_driving_wait() {
+        let mut state = DaemonStartState {
+            reaper_started: true,
+            grant_wait_completed: false,
+        };
+
+        assert!(
+            !state.needs_grant_wait(false, false),
+            "the first permission status call must be forwarded promptly"
+        );
+        assert!(
+            !state.grant_wait_completed,
+            "skipping the status call must leave the grant milestone pending"
+        );
+
+        assert!(
+            state.needs_grant_wait(true, false),
+            "the next driving call must still perform the grant wait"
+        );
+        state.complete_grant_wait();
+        assert!(state.grant_wait_completed);
+        assert!(
+            !state.needs_grant_wait(true, false),
+            "a completed wait should not repeat while the daemon remains healthy"
         );
     }
 }

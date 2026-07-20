@@ -328,7 +328,7 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
     if cursor_enabled && !cua_driver_core::session::is_session_ended(&key) {
         cua_driver_core::cursor_feed::emit_move(Some(&key), x, y);
     } else {
-        cua_driver_core::cursor_feed::emit_hidden();
+        cua_driver_core::cursor_feed::emit_hidden_if_owned(&key);
     }
     // Seed a sentinel cursor on-screen so the MoveTo below glides instead of
     // being short-circuited. After this the cursor is explicitly placed, so

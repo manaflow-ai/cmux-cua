@@ -174,21 +174,39 @@ impl CursorFeed {
     /// Emit a cursor move at GLOBAL screen coordinates (top-left origin). The
     /// visible flag is `true` — the cursor is on-screen and active.
     pub fn update(&self, session: Option<&str>, x: f64, y: f64) -> std::io::Result<()> {
-        *self.last.lock().unwrap() = Some((session.map(str::to_owned), x, y));
+        // Hold the ownership lock through the atomic file replacement. This
+        // serializes a move with `hide_if_owned`, so a session cannot pass an
+        // ownership check and then hide a newer session's update.
+        let mut last = self.last.lock().unwrap();
+        *last = Some((session.map(str::to_owned), x, y));
         self.write_state(session, true, x, y)
     }
 
-    /// Mark the cursor hidden at its last known position (session end). If no
-    /// position was ever emitted, writes `visible=false` at the origin with a
-    /// null session so the host still learns the cursor is gone.
+    /// Unconditionally mark the cursor hidden at its last known position for a
+    /// process-global shutdown/reset. Per-session teardown must use
+    /// [`CursorFeed::hide_if_owned`]. If no position was ever emitted, writes
+    /// `visible=false` at the origin with a null session.
     pub fn hide(&self) -> std::io::Result<()> {
-        let (session, x, y) = self
-            .last
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or((None, 0.0, 0.0));
+        let last = self.last.lock().unwrap();
+        let (session, x, y) = last.clone().unwrap_or((None, 0.0, 0.0));
         self.write_state(session.as_deref(), false, x, y)
+    }
+
+    /// Hide only when `session` still owns the process-global feed. Returns
+    /// `true` when a hidden state was written and `false` when a newer/different
+    /// session owns the feed. The ownership check and file replacement share
+    /// the same lock as [`CursorFeed::update`], making the decision atomic with
+    /// respect to concurrent cursor moves.
+    pub fn hide_if_owned(&self, session: &str) -> std::io::Result<bool> {
+        let last = self.last.lock().unwrap();
+        let Some((owner, x, y)) = last.as_ref() else {
+            return Ok(false);
+        };
+        if owner.as_deref() != Some(session) {
+            return Ok(false);
+        }
+        self.write_state(owner.as_deref(), false, *x, *y)?;
+        Ok(true)
     }
 
     fn write_state(
@@ -286,12 +304,24 @@ pub fn emit_move(session: Option<&str>, x: f64, y: f64) {
     }
 }
 
-/// Best-effort `visible=false` at the last position (session end). No-op when
-/// the feed is disabled.
+/// Best-effort unconditional `visible=false` for process-global shutdown/reset.
+/// Per-session teardown must use [`emit_hidden_if_owned`]. No-op when the feed
+/// is disabled.
 pub fn emit_hidden() {
     if let Some(feed) = global() {
         if let Err(error) = feed.hide() {
             eprintln!("[cua-driver] warning: failed to hide cursor feed: {error}");
+        }
+    }
+}
+
+/// Best-effort `visible=false` only when `session` still owns the last emitted
+/// cursor. Used by per-session end/disable paths so one session cannot hide a
+/// different session's active feed.
+pub fn emit_hidden_if_owned(session: &str) {
+    if let Some(feed) = global() {
+        if let Err(error) = feed.hide_if_owned(session) {
+            eprintln!("[cua-driver] warning: failed to hide owned cursor feed: {error}");
         }
     }
 }
@@ -429,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn hide_marks_invisible_at_last_position_on_session_end() {
+    fn unconditional_hide_marks_invisible_at_last_position_for_global_shutdown() {
         let dir = tempfile::tempdir().unwrap();
         let feed = CursorFeed::new(dir.path().to_owned(), 5151, branding());
         feed.update(Some("embedded-1"), 640.0, 400.0).unwrap();
@@ -440,6 +470,34 @@ mod tests {
         assert!(!state.visible, "session end must clear visibility");
         assert_eq!((state.x, state.y), (640.0, 400.0), "hide keeps last position");
         assert_eq!(state.session.as_deref(), Some("embedded-1"));
+    }
+
+    #[test]
+    fn non_owner_session_end_or_disable_does_not_hide_active_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = CursorFeed::new(dir.path().to_owned(), 5152, branding());
+        feed.update(Some("active-session"), 320.0, 240.0).unwrap();
+
+        assert!(!feed.hide_if_owned("other-session").unwrap());
+        let state: CursorFeedState =
+            serde_json::from_slice(&std::fs::read(feed.path()).unwrap()).unwrap();
+        assert!(state.visible, "a non-owner must not hide the active cursor");
+        assert_eq!(state.session.as_deref(), Some("active-session"));
+        assert_eq!((state.x, state.y), (320.0, 240.0));
+    }
+
+    #[test]
+    fn owner_session_end_or_disable_hides_active_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = CursorFeed::new(dir.path().to_owned(), 5153, branding());
+        feed.update(Some("active-session"), 320.0, 240.0).unwrap();
+
+        assert!(feed.hide_if_owned("active-session").unwrap());
+        let state: CursorFeedState =
+            serde_json::from_slice(&std::fs::read(feed.path()).unwrap()).unwrap();
+        assert!(!state.visible, "the owner must hide its active cursor");
+        assert_eq!(state.session.as_deref(), Some("active-session"));
+        assert_eq!((state.x, state.y), (320.0, 240.0));
     }
 
     #[test]
