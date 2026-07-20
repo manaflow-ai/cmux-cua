@@ -69,7 +69,7 @@ fn permission_source_for_context(
     disclaimed: bool,
     embedded: bool,
     host_bundle_id: &str,
-    _bundle_identifier: Option<&str>,
+    bundle_identifier: Option<&str>,
 ) -> serde_json::Value {
     // Embedded mode: the driver is a child in a host app's responsibility
     // chain, so the probes already answer for the host's TCC identity.
@@ -101,15 +101,24 @@ fn permission_source_for_context(
     // — outside the bundle — the env var must NOT grant daemon attribution, or
     // a caller could pre-set it and spoof the TCC source. Fail closed to
     // "caller" whenever the bundle signal is absent.
-    let inside_bundle = exe.contains("/CuaDriver.app/Contents/MacOS/");
-    let is_driver_daemon = inside_bundle && (ppid == 1 || disclaimed);
+    let inside_app_bundle = exe.contains(".app/Contents/MacOS/");
+    let is_responsible_app = inside_app_bundle
+        && bundle_identifier.is_some_and(|identifier| !identifier.is_empty())
+        && (ppid == 1 || disclaimed);
 
-    let (attribution, note) = if is_driver_daemon {
+    let (attribution, note) = if is_responsible_app
+        && bundle_identifier == Some(super::health_report::CANONICAL_BUNDLE_ID)
+    {
         (
             "driver-daemon",
             "These booleans reflect the CuaDriver daemon's own TCC identity \
              (com.trycua.driver) because this process is its own responsible \
              process.",
+        )
+    } else if is_responsible_app {
+        (
+            "helper-daemon",
+            "These booleans reflect this helper application's own TCC identity. Permission setup belongs to the embedding host; do not run the standalone cua-driver permission flow.",
         )
     } else {
         (
@@ -127,6 +136,7 @@ fn permission_source_for_context(
         "pid": pid,
         "responsible_ppid": ppid,
         "executable": exe,
+        "bundle_identifier": bundle_identifier,
         "disclaim_env": disclaimed,
         "note": note,
     })
@@ -147,7 +157,7 @@ fn def() -> &'static ToolDef {
             preflight APIs), `screen_recording_capturable` (a live ScreenCaptureKit \
             probe — if it disagrees with `screen_recording`, the preflight grant \
             belongs to a different process), and `source` (which TCC identity the \
-            booleans reflect: the CuaDriver daemon vs the launching terminal/IDE). \
+            booleans reflect: the responsible daemon app vs the launching terminal/IDE). \
             macOS attributes grants to the responsible process, so a standalone call \
             from a terminal reports the terminal's grants, not the driver's.".into(),
         input_schema: serde_json::json!({
@@ -182,7 +192,9 @@ impl Tool for CheckPermissionsTool {
         // host owns the grant flow). This and the startup gate are the only
         // `request_*` call sites, so both being gated makes prompts
         // unreachable when embedded.
-        let should_prompt = args.bool_or("prompt", true) && !cua_driver_core::embedded_mode();
+        let should_prompt = args.bool_or("prompt", true)
+            && !cua_driver_core::embedded_mode()
+            && !super::health_report::external_permission_flow_enabled();
         if should_prompt {
             let _ = request_accessibility();
             let _ = request_screen_recording();

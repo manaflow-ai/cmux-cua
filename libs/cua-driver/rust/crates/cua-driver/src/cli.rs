@@ -650,7 +650,16 @@ pub fn run_describe(registry: &ToolRegistry, name: &str) {
 /// there's no `open -a` equivalent on Linux / Windows.
 #[cfg(target_os = "macos")]
 pub fn should_use_daemon_proxy(no_daemon_relaunch: bool) -> bool {
-    use crate::bundle::{is_env_truthy, is_executable_inside_cuadriver_app, parent_is_not_launchd};
+    use crate::bundle::{
+        is_env_truthy, is_executable_inside_cuadriver_app, parent_is_not_launchd,
+        requires_external_daemon,
+    };
+    // A host-owned runtime is proxy-only. Evaluate this before every opt-out
+    // so ambient EMBEDDED / NO_RELAUNCH values cannot move a cmux session back
+    // into the main app's TCC responsibility chain.
+    if requires_external_daemon() {
+        return true;
+    }
     // Embedded mode stays in-process: relaunching via `open -a CuaDriver`
     // would leave the host's TCC responsibility chain and could prompt
     // for com.trycua.driver.
@@ -669,9 +678,6 @@ pub fn should_use_daemon_proxy(no_daemon_relaunch: bool) -> bool {
     // who've wrapped the binary in a custom bundle. Skips the
     // launch_daemon_and_wait `open -a` step too — caller is expected
     // to have a daemon already running on the chosen socket.
-    if is_env_truthy("CUA_DRIVER_RS_MCP_FORCE_PROXY") {
-        return true;
-    }
     // cmux names a specific helper app to launch as the daemon (see
     // launch_daemon_and_wait). Take the proxy path so that app — launched via
     // LaunchServices under its own TCC identity — performs the TCC-gated work,
@@ -945,7 +951,7 @@ pub fn run_mcp_via_daemon_proxy(
         // launch step, since they don't have an installed
         // CuaDriver.app to relaunch into. Fail fast if no daemon is
         // up at this point.
-        if crate::bundle::is_env_truthy("CUA_DRIVER_RS_MCP_FORCE_PROXY") {
+        if crate::bundle::requires_external_daemon() {
             if crate::bundle::is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW") {
                 anyhow::bail!(
                     "the cmux Computer Use runtime is not listening on {socket_path}. \
@@ -1979,6 +1985,12 @@ pub fn run_permissions_cmd(
     subcommand: &str,
     json: bool,
 ) {
+    if crate::bundle::requires_external_daemon() {
+        eprintln!(
+            "cmux Computer Use owns this binary's permission flow. Use the tag-scoped cmux Computer Use helper and cmux Settings; standalone `cua-driver permissions` is disabled."
+        );
+        process::exit(1);
+    }
     match subcommand {
         "status" => run_permissions_status(json),
         "grant" => run_permissions_grant(),

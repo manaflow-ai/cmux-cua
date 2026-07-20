@@ -98,6 +98,31 @@ pub fn is_env_truthy(name: &str) -> bool {
     }
 }
 
+/// Returns `true` for the executable name cmux uses for every bundled proxy
+/// and helper binary. Unlike an environment variable, the current executable
+/// name cannot be changed by an ambient agent-session environment.
+pub fn is_cmux_branded_executable() -> bool {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .is_some_and(is_cmux_branded_executable_path)
+}
+
+fn is_cmux_branded_executable_path(path: &std::path::Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("cmux-cua-driver")
+}
+
+/// Whether an embedding host owns daemon lifecycle and permission UX.
+///
+/// cmux sets both environment flags on its MCP proxy. The executable-name
+/// fallback keeps a directly invoked bundled binary fail-closed even when an
+/// agent supplies a hostile or incomplete environment.
+pub fn requires_external_daemon() -> bool {
+    is_cmux_branded_executable()
+        || is_env_truthy("CUA_DRIVER_RS_MCP_FORCE_PROXY")
+        || is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW")
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -142,5 +167,18 @@ mod tests {
         // launched it (cargo / IDE / shell), not directly under
         // launchd. The helper should report true.
         assert!(parent_is_not_launchd());
+    }
+
+    #[test]
+    fn cmux_branded_binary_requires_external_daemon() {
+        assert!(is_cmux_branded_executable_path(std::path::Path::new(
+            "/Applications/cmux.app/Contents/Resources/bin/cmux-cua-driver"
+        )));
+        assert!(is_cmux_branded_executable_path(std::path::Path::new(
+            "/Library/Application Support/cmux/computer-use/helper/tag/cmux Computer Use.app/Contents/MacOS/cmux-cua-driver"
+        )));
+        assert!(!is_cmux_branded_executable_path(std::path::Path::new(
+            "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
+        )));
     }
 }
