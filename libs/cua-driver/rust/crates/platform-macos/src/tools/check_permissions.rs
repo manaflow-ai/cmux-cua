@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use cua_driver_core::{protocol::ToolResult, tool::{Tool, ToolDef}};
+use cua_driver_core::{
+    protocol::ToolResult,
+    tool::{Tool, ToolDef},
+};
 use serde_json::Value;
 
 use crate::permissions::status::{
@@ -44,16 +47,36 @@ fn permission_source() -> serde_json::Value {
         .and_then(|p| std::fs::canonicalize(p).ok())
         .and_then(|p| p.to_str().map(str::to_owned))
         .unwrap_or_default();
-    let disclaimed =
-        std::env::var_os(cua_driver_core::RESPONSIBILITY_DISCLAIMED_ENV).is_some();
+    let disclaimed = std::env::var_os(cua_driver_core::RESPONSIBILITY_DISCLAIMED_ENV).is_some();
+    let embedded = cua_driver_core::embedded_mode();
+    let host_bundle_id = std::env::var(cua_driver_core::HOST_BUNDLE_ID_ENV).unwrap_or_default();
+    let bundle_identifier = super::health_report::current_bundle_identifier();
+    permission_source_for_context(
+        pid,
+        ppid,
+        &exe,
+        disclaimed,
+        embedded,
+        &host_bundle_id,
+        bundle_identifier.as_deref(),
+    )
+}
+
+fn permission_source_for_context(
+    pid: libc::pid_t,
+    ppid: libc::pid_t,
+    exe: &str,
+    disclaimed: bool,
+    embedded: bool,
+    host_bundle_id: &str,
+    _bundle_identifier: Option<&str>,
+) -> serde_json::Value {
     // Embedded mode: the driver is a child in a host app's responsibility
     // chain, so the probes already answer for the host's TCC identity.
     // This branch only ever downgrades attribution (host, never
     // driver-daemon), so the caller-controlled env var can't spoof an
     // elevated identity. `host_bundle_id` is advisory, not a trust signal.
-    if cua_driver_core::embedded_mode() {
-        let host_bundle_id = std::env::var(cua_driver_core::HOST_BUNDLE_ID_ENV)
-            .unwrap_or_default();
+    if embedded {
         return serde_json::json!({
             "attribution": "host",
             "host_bundle_id": host_bundle_id,
@@ -148,7 +171,9 @@ fn def() -> &'static ToolDef {
 
 #[async_trait]
 impl Tool for CheckPermissionsTool {
-    fn def(&self) -> &ToolDef { def() }
+    fn def(&self) -> &ToolDef {
+        def()
+    }
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
@@ -157,8 +182,7 @@ impl Tool for CheckPermissionsTool {
         // host owns the grant flow). This and the startup gate are the only
         // `request_*` call sites, so both being gated makes prompts
         // unreachable when embedded.
-        let should_prompt =
-            args.bool_or("prompt", true) && !cua_driver_core::embedded_mode();
+        let should_prompt = args.bool_or("prompt", true) && !cua_driver_core::embedded_mode();
         if should_prompt {
             let _ = request_accessibility();
             let _ = request_screen_recording();
@@ -187,10 +211,18 @@ impl Tool for CheckPermissionsTool {
 
         // Text format mirrors Swift 1:1:
         //   "✅ Accessibility: granted.\n✅ Screen Recording: granted."
-        let ax_prefix  = if accessibility   { "✅" } else { "❌" };
-        let sr_prefix  = if screen_recording { "✅" } else { "❌" };
-        let ax_state   = if accessibility   { "granted" } else { "NOT granted" };
-        let sr_state   = if screen_recording { "granted" } else { "NOT granted" };
+        let ax_prefix = if accessibility { "✅" } else { "❌" };
+        let sr_prefix = if screen_recording { "✅" } else { "❌" };
+        let ax_state = if accessibility {
+            "granted"
+        } else {
+            "NOT granted"
+        };
+        let sr_state = if screen_recording {
+            "granted"
+        } else {
+            "NOT granted"
+        };
         let mut summary = format!(
             "{ax_prefix} Accessibility: {ax_state}.\n{sr_prefix} Screen Recording: {sr_state}."
         );
@@ -217,13 +249,12 @@ impl Tool for CheckPermissionsTool {
             );
         }
 
-        ToolResult::text(summary)
-            .with_structured(serde_json::json!({
-                "accessibility":               accessibility,
-                "screen_recording":            screen_recording,
-                "screen_recording_capturable": screen_recording_capturable,
-                "source":                      source,
-            }))
+        ToolResult::text(summary).with_structured(serde_json::json!({
+            "accessibility":               accessibility,
+            "screen_recording":            screen_recording,
+            "screen_recording_capturable": screen_recording_capturable,
+            "source":                      source,
+        }))
     }
 }
 
@@ -280,7 +311,10 @@ mod tests {
     fn embedded_mode_reports_host_attribution() {
         let _guard = env_lock();
         let embedded = swap_env(cua_driver_core::EMBEDDED_ENV, Some("1"));
-        let host = swap_env(cua_driver_core::HOST_BUNDLE_ID_ENV, Some("com.example.host"));
+        let host = swap_env(
+            cua_driver_core::HOST_BUNDLE_ID_ENV,
+            Some("com.example.host"),
+        );
 
         let source = permission_source();
         assert_eq!(
@@ -326,5 +360,36 @@ mod tests {
             "only CUA_DRIVER_EMBEDDED=1 may enable embedded mode"
         );
         restore_env(cua_driver_core::EMBEDDED_ENV, embedded);
+    }
+
+    #[test]
+    fn cmux_helper_reports_its_own_daemon_identity() {
+        let source = permission_source_for_context(
+            42,
+            1,
+            "/Library/Application Support/cmux/computer-use/helper/tag/cmux Computer Use.app/Contents/MacOS/cmux-cua-driver",
+            true,
+            false,
+            "",
+            Some("com.cmuxterm.app.debug.tag.computer-use"),
+        );
+
+        assert_eq!(
+            source.get("attribution").and_then(|value| value.as_str()),
+            Some("helper-daemon"),
+        );
+        assert_eq!(
+            source
+                .get("bundle_identifier")
+                .and_then(|value| value.as_str()),
+            Some("com.cmuxterm.app.debug.tag.computer-use"),
+        );
+        assert!(
+            !source["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("permissions grant"),
+            "a host-owned helper must never recommend the standalone permission flow",
+        );
     }
 }
