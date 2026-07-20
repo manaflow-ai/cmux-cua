@@ -502,7 +502,7 @@ async fn ensure_daemon_started(
     if !listening {
         // FORCE_PROXY callers supply their own daemon and have no bundle to
         // relaunch into — never auto-launch on their behalf.
-        if crate::bundle::is_env_truthy("CUA_DRIVER_RS_MCP_FORCE_PROXY") {
+        if crate::bundle::requires_external_daemon() {
             ensure_daemon_available_with(
                 *started,
                 true,

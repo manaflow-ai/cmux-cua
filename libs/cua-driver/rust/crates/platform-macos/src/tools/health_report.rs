@@ -113,15 +113,22 @@ pub(crate) fn check_bundle_identity() -> CheckEntry {
     check_bundle_identity_for_context(bid, exe, external_permission_flow_enabled())
 }
 
-fn external_permission_flow_enabled() -> bool {
-    std::env::var("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW")
+pub(crate) fn external_permission_flow_enabled() -> bool {
+    let from_environment = std::env::var("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW")
         .map(|value| {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
             )
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let cmux_branded_executable = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_owned()))
+        .and_then(|name| name.to_str().map(str::to_owned))
+        .as_deref()
+        == Some("cmux-cua-driver");
+    from_environment || cmux_branded_executable
 }
 
 fn check_bundle_identity_for_context(
@@ -129,36 +136,64 @@ fn check_bundle_identity_for_context(
     exe: String,
     _external_permission_flow: bool,
 ) -> CheckEntry {
-    let is_correct = bid.as_deref() == Some(CANONICAL_BUNDLE_ID);
+    let is_canonical = bid.as_deref() == Some(CANONICAL_BUNDLE_ID);
+    let is_external_helper = _external_permission_flow
+        && exe.contains(".app/Contents/MacOS/")
+        && bid
+            .as_deref()
+            .is_some_and(|identifier| !identifier.is_empty());
     let data = CheckData {
         bundle_identifier: bid.clone(),
         executable_path: if exe.is_empty() { None } else { Some(exe) },
         ..Default::default()
     };
-    if is_correct {
+    if is_canonical {
         return CheckEntry::pass(
             NAME_BUNDLE_IDENTITY,
             format!("Bundle is {CANONICAL_BUNDLE_ID}."),
         )
         .with_data(data);
     }
-    let (message, hint) = match bid.as_deref() {
-        None | Some("") => (
-            "Process has no CFBundleIdentifier.".to_owned(),
-            format!(
-                "Run the binary inside CuaDriver.app so TCC grants attribute correctly. \
+    if is_external_helper {
+        let identifier = bid.as_deref().unwrap_or_default();
+        return CheckEntry::pass(
+            NAME_BUNDLE_IDENTITY,
+            format!("Bundle is {identifier}; the embedding host owns permission setup."),
+        )
+        .with_data(data);
+    }
+    let (message, hint) = if _external_permission_flow {
+        match bid.as_deref() {
+            None | Some("") => (
+                "Process has no CFBundleIdentifier.".to_owned(),
+                "Restart the embedding host so it can launch its bundled Computer Use helper. Do not run the standalone cua-driver permission flow."
+                    .to_owned(),
+            ),
+            Some(other) => (
+                format!("Bundle is {other}, but the executable is not inside its helper app."),
+                "Restart the embedding host's Computer Use runtime so permission status comes from its own LaunchServices helper. Do not run `cua-driver permissions grant`."
+                    .to_owned(),
+            ),
+        }
+    } else {
+        match bid.as_deref() {
+            None | Some("") => (
+                "Process has no CFBundleIdentifier.".to_owned(),
+                format!(
+                    "Run the binary inside CuaDriver.app so TCC grants attribute correctly. \
                  Start the daemon with `open -n -g -a CuaDriver --args serve` and \
                  connect via `cua-driver mcp`."
+                ),
             ),
-        ),
-        Some(other) => (
-            format!("Bundle is {other}, not {CANONICAL_BUNDLE_ID}."),
-            format!(
-                "TCC grants will be attributed to {other}, not the cua-driver daemon. \
+            Some(other) => (
+                format!("Bundle is {other}, not {CANONICAL_BUNDLE_ID}."),
+                format!(
+                    "TCC grants will be attributed to {other}, not the cua-driver daemon. \
                  Run via `cua-driver mcp` (auto-relaunches inside CuaDriver.app) or \
-                 start the daemon manually: `open -n -g -a CuaDriver --args serve`."
+                start the daemon manually: `open -n -g -a CuaDriver --args serve`."
+                ),
             ),
-        ),
+        }
     };
     CheckEntry::fail(NAME_BUNDLE_IDENTITY, message, hint).with_data(data)
 }
@@ -174,13 +209,15 @@ fn check_tcc_accessibility() -> CheckEntry {
         return CheckEntry::pass(NAME_TCC_ACCESSIBILITY, "Accessibility is granted.")
             .with_data(data);
     }
+    let hint = if external_permission_flow_enabled() {
+        "Grant Accessibility to the Computer Use helper reported by bundle_identity using the embedding host's onboarding. Do not run the standalone cua-driver permission flow."
+    } else {
+        "Grant Accessibility to CuaDriver.app in System Settings → Privacy & Security → Accessibility. If the process bundle is not com.trycua.driver (see bundle_identity), the grant must target the responsible app — restart via `cua-driver mcp` to relaunch inside CuaDriver.app."
+    };
     CheckEntry::fail(
         NAME_TCC_ACCESSIBILITY,
         "Accessibility is NOT granted for this process.",
-        "Grant Accessibility to CuaDriver.app in System Settings → Privacy & Security → \
-         Accessibility. If the process bundle is not com.trycua.driver (see bundle_identity), \
-         the grant must target the responsible app — restart via `cua-driver mcp` to relaunch \
-         inside CuaDriver.app.",
+        hint,
     )
     .with_data(data)
 }
@@ -195,12 +232,15 @@ fn check_tcc_screen_recording() -> CheckEntry {
         return CheckEntry::pass(NAME_TCC_SCREEN_RECORDING, "Screen Recording is granted.")
             .with_data(data);
     }
+    let hint = if external_permission_flow_enabled() {
+        "Grant Screen Recording to the Computer Use helper reported by bundle_identity using the embedding host's onboarding. Do not run the standalone cua-driver permission flow."
+    } else {
+        "Grant Screen Recording to CuaDriver.app in System Settings → Privacy & Security → Screen Recording. The grant is attributed to the responsible process — see bundle_identity to confirm the right binary is being prompted."
+    };
     CheckEntry::fail(
         NAME_TCC_SCREEN_RECORDING,
         "Screen Recording is NOT granted for this process.",
-        "Grant Screen Recording to CuaDriver.app in System Settings → Privacy & Security → \
-         Screen Recording. The grant is attributed to the responsible process — see \
-         bundle_identity to confirm the right binary is being prompted.",
+        hint,
     )
     .with_data(data)
 }
