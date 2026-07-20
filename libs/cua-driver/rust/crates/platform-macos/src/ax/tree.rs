@@ -79,6 +79,46 @@ impl DuplicateTracker {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeEmissionPlan {
+    should_emit: bool,
+    element_index: Option<usize>,
+    descendants_parent_index: Option<usize>,
+}
+
+/// Plan this node's emission separately from descendant traversal. A mirrored
+/// actionable node consumes no index and does not become the descendants'
+/// parent, but its children must still be walked.
+fn plan_node_emission(
+    duplicates: &mut DuplicateTracker,
+    is_actionable: bool,
+    is_indexed: bool,
+    role: &str,
+    label: Option<&str>,
+    frame: Option<[f64; 4]>,
+    parent_index: Option<usize>,
+    counter: &mut usize,
+) -> NodeEmissionPlan {
+    if !duplicates.should_emit(is_actionable, role, label, frame) {
+        return NodeEmissionPlan {
+            should_emit: false,
+            element_index: None,
+            descendants_parent_index: parent_index,
+        };
+    }
+
+    let element_index = is_indexed.then(|| {
+        let index = *counter;
+        *counter += 1;
+        index
+    });
+    NodeEmissionPlan {
+        should_emit: true,
+        element_index,
+        descendants_parent_index: element_index.or(parent_index),
+    }
+}
+
 pub(crate) fn truncate_ax_value(value: String) -> String {
     if value.chars().count() <= MAX_AX_VALUE_CHARS {
         return value;
@@ -520,17 +560,25 @@ unsafe fn walk_element(
         (!visible_value.is_empty()).then_some(visible_value.as_str()),
         identifier.as_deref(),
     );
-    if !duplicates.should_emit(is_actionable, &role, label, frame) {
-        return;
-    }
-    let node = if is_indexed {
-        let idx = *counter;
-        *counter += 1;
-        // Retain so the element stays alive in the cache after `copy_children`
-        // releases the per-child ref at the end of the caller's loop.
-        CFRetain(element as CFTypeRef);
-        AXNode {
-            element_index: Some(idx),
+    let emission = plan_node_emission(
+        duplicates,
+        is_actionable,
+        is_indexed,
+        &role,
+        label,
+        frame,
+        parent_index,
+        counter,
+    );
+    if emission.should_emit {
+        if emission.element_index.is_some() {
+            // Retain so the element stays alive in the cache after
+            // `copy_children` releases the per-child ref at the end of the
+            // caller's loop.
+            CFRetain(element as CFTypeRef);
+        }
+        let node = AXNode {
+            element_index: emission.element_index,
             role: role.clone(),
             title: if visible_title.is_empty() {
                 None
@@ -554,51 +602,19 @@ unsafe fn walk_element(
             depth,
             parent_element_index: parent_index,
             frame,
-        }
-    } else {
-        AXNode {
-            element_index: None,
-            role: role.clone(),
-            title: if visible_title.is_empty() {
-                None
-            } else {
-                Some(visible_title.clone())
-            },
-            value: if visible_value.is_empty() {
-                None
-            } else {
-                Some(visible_value.clone())
-            },
-            description: if visible_description.is_empty() {
-                None
-            } else {
-                Some(visible_description.clone())
-            },
-            identifier: identifier.clone(),
-            help: help.clone(),
-            actions: vec![],
-            element_ptr,
-            depth,
-            parent_element_index: parent_index,
-            frame,
-        }
-    };
+        };
 
-    // Track this node as the parent for its descendants only when it was
-    // assigned an element_index (mirrors what the markdown shows: only
-    // indexed rows are addressable in click(element_index=N)).
-    let next_parent = node.element_index.or(parent_index);
-
-    let line = format_node_line(&node);
-    lines.push((depth, line));
-    nodes.push(node);
+        let line = format_node_line(&node);
+        lines.push((depth, line));
+        nodes.push(node);
+    }
 
     let children = copy_children(element);
     for child in children {
         walk_element(
             child,
             depth + 1,
-            next_parent,
+            emission.descendants_parent_index,
             nodes,
             lines,
             counter,
@@ -851,6 +867,59 @@ mod tests {
         assert!(!truncated);
         assert!(depth_limit_reached(21, 20, &mut truncated));
         assert!(truncated);
+    }
+
+    #[test]
+    fn duplicate_actionable_parent_is_suppressed_but_unique_child_is_addressable() {
+        let mut tracker = DuplicateTracker::default();
+        let mut counter = 0;
+        let outer_parent = Some(41);
+        let duplicate_frame = Some([10.0, 20.0, 30.0, 40.0]);
+
+        let original = plan_node_emission(
+            &mut tracker,
+            true,
+            true,
+            "AXButton",
+            Some("Mirrored parent"),
+            duplicate_frame,
+            outer_parent,
+            &mut counter,
+        );
+        assert_eq!(original.element_index, Some(0));
+
+        let duplicate = plan_node_emission(
+            &mut tracker,
+            true,
+            true,
+            "AXButton",
+            Some("Mirrored parent"),
+            duplicate_frame,
+            outer_parent,
+            &mut counter,
+        );
+        assert!(!duplicate.should_emit);
+        assert_eq!(duplicate.element_index, None);
+        assert_eq!(duplicate.descendants_parent_index, outer_parent);
+
+        let child = plan_node_emission(
+            &mut tracker,
+            true,
+            true,
+            "AXButton",
+            Some("Unique child"),
+            Some([15.0, 25.0, 10.0, 10.0]),
+            duplicate.descendants_parent_index,
+            &mut counter,
+        );
+        let returned_indices: Vec<_> = [duplicate, child]
+            .into_iter()
+            .filter(|plan| plan.should_emit)
+            .filter_map(|plan| plan.element_index)
+            .collect();
+
+        assert_eq!(returned_indices, vec![1]);
+        assert_eq!(counter, 2, "the duplicate parent must not consume an index");
     }
 
     #[test]

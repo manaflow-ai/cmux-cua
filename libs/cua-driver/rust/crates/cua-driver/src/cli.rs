@@ -912,10 +912,36 @@ pub fn launch_daemon_and_wait(
     );
 }
 
-/// Run the MCP proxy path: ensure a daemon is up (spawning via
-/// `open` if needed), then `crate::proxy::run_proxy` against its
-/// socket. Builds its own tokio runtime — same shape as the other
-/// `run_*` helpers in this file that own their event loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingDaemonAction {
+    EnterLazyProxy,
+    FailExternalDaemon,
+    FailPlatformDaemon,
+}
+
+/// Decide what startup should do when the proxy socket is initially absent.
+///
+/// macOS intentionally enters `run_proxy` while dormant: that loop serves the
+/// permission-free handshake locally and performs the bounded daemon wait on
+/// the first tool call. Other platforms have no lazy LaunchServices path, so
+/// they retain their existing fail-fast behavior.
+fn missing_daemon_action(
+    is_macos: bool,
+    requires_external_daemon: bool,
+) -> MissingDaemonAction {
+    if is_macos {
+        MissingDaemonAction::EnterLazyProxy
+    } else if requires_external_daemon {
+        MissingDaemonAction::FailExternalDaemon
+    } else {
+        MissingDaemonAction::FailPlatformDaemon
+    }
+}
+
+/// Run the MCP proxy path: enter `crate::proxy::run_proxy` against the daemon
+/// socket, allowing its macOS implementation to start or wait for the daemon
+/// lazily. Builds its own tokio runtime — same shape as the other `run_*`
+/// helpers in this file that own their event loop.
 pub fn run_mcp_via_daemon_proxy(
     socket: Option<String>,
     claude_code_compat: bool,
@@ -946,50 +972,43 @@ pub fn run_mcp_via_daemon_proxy(
     };
 
     if !crate::serve::is_daemon_listening(&socket_path) {
-        // CUA_DRIVER_RS_MCP_FORCE_PROXY callers (test harness, custom
-        // bundle setups) supply their own daemon — skip the auto-
-        // launch step, since they don't have an installed
-        // CuaDriver.app to relaunch into. Fail fast if no daemon is
-        // up at this point.
-        if crate::bundle::requires_external_daemon() {
-            if crate::bundle::is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW") {
+        match missing_daemon_action(
+            cfg!(target_os = "macos"),
+            crate::bundle::requires_external_daemon(),
+        ) {
+            // Do not launch here. On macOS `run_proxy` serves `initialize` and
+            // `tools/list` locally, then waits for an externally-owned daemon
+            // (or lazily launches an ordinary CuaDriver daemon) on the first
+            // `tools/call`. In particular, the external branch never launches
+            // a standalone daemon.
+            MissingDaemonAction::EnterLazyProxy => {}
+            MissingDaemonAction::FailExternalDaemon => {
+                if crate::bundle::is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW") {
+                    anyhow::bail!(
+                        "the cmux Computer Use runtime is not listening on {socket_path}. \
+                         Open cmux Settings → Computer Use and keep permission setup inside \
+                         cmux; do not launch cua-driver directly"
+                    );
+                }
                 anyhow::bail!(
-                    "the cmux Computer Use runtime is not listening on {socket_path}. \
-                     Open cmux Settings → Computer Use and keep permission setup inside \
-                     cmux; do not launch cua-driver directly"
+                    "CUA_DRIVER_RS_MCP_FORCE_PROXY=1 but no daemon listening on \
+                     {socket_path}. Start one with `cua-driver serve --socket {socket_path}` \
+                     and retry."
                 );
             }
-            anyhow::bail!(
-                "CUA_DRIVER_RS_MCP_FORCE_PROXY=1 but no daemon listening on \
-                 {socket_path}. Start one with `cua-driver serve --socket {socket_path}` \
-                 and retry."
-            );
-        }
-        // macOS: do NOT launch the daemon here. The proxy launches it lazily on
-        // the FIRST `tools/call` (see proxy::run_proxy), serving `initialize`
-        // and `tools/list` from the in-process registry until then. This keeps
-        // the permission-requesting daemon dormant so nothing prompts merely
-        // because an agent registered this MCP server at session start — the
-        // Accessibility / Screen Recording prompts appear only when the agent
-        // actually invokes a computer-use tool.
-        //
-        // On Linux / Windows there's no equivalent `open -a` mechanism to spawn
-        // a daemon attributed to the user's interactive session. The caller is
-        // expected to have one running already; bail with an actionable error
-        // rather than silently falling back to an in-process server that would
-        // be attributed to whatever session spawned us (typically Session 0
-        // over SSH).
-        #[cfg(not(target_os = "macos"))]
-        {
-            anyhow::bail!(
-                "no Cua Driver daemon listening on {socket_path}. Start one in \
-                 your interactive session — on Windows run \
-                 `cua-driver autostart enable && cua-driver autostart kick`; \
-                 on Linux run `cua-driver serve &` in the user's session. \
-                 Then re-run `cua-driver mcp`. To skip the proxy and run \
-                 in-process anyway (Session 0 attribution, GUI tools will \
-                 return empty), pass --no-daemon-relaunch."
-            );
+            MissingDaemonAction::FailPlatformDaemon => {
+                // Linux / Windows have no equivalent lazy LaunchServices path.
+                // The caller must provide a daemon in the interactive session.
+                anyhow::bail!(
+                    "no Cua Driver daemon listening on {socket_path}. Start one in \
+                     your interactive session — on Windows run \
+                     `cua-driver autostart enable && cua-driver autostart kick`; \
+                     on Linux run `cua-driver serve &` in the user's session. \
+                     Then re-run `cua-driver mcp`. To skip the proxy and run \
+                     in-process anyway (Session 0 attribution, GUI tools will \
+                     return empty), pass --no-daemon-relaunch."
+                );
+            }
         }
     }
 
@@ -1004,6 +1023,27 @@ pub fn run_mcp_via_daemon_proxy(
             codex_computer_use_compat,
         ),
     ))
+}
+
+#[cfg(test)]
+mod daemon_proxy_startup_policy_tests {
+    use super::{missing_daemon_action, MissingDaemonAction};
+
+    #[test]
+    fn external_macos_proxy_enters_lazy_proxy_when_socket_is_absent() {
+        assert_eq!(
+            missing_daemon_action(true, true),
+            MissingDaemonAction::EnterLazyProxy
+        );
+    }
+
+    #[test]
+    fn external_non_macos_proxy_remains_fail_fast_when_socket_is_absent() {
+        assert_eq!(
+            missing_daemon_action(false, true),
+            MissingDaemonAction::FailExternalDaemon
+        );
+    }
 }
 
 /// Emit a stable, machine-readable JSON description of the cua-driver CLI
