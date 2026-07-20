@@ -745,7 +745,9 @@ async fn forward_tool_call(
 mod tests {
     use super::*;
     use crate::serve::DaemonResponse;
+    #[cfg(target_os = "macos")]
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(target_os = "macos")]
     use std::time::Duration;
 
     /// Reconstruct the `!resp.ok` branch in isolation so we can assert
@@ -807,6 +809,7 @@ mod tests {
         assert_eq!(value["result"]["structuredContent"]["exit_code"], 1);
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn external_proxy_waits_for_cmux_daemon_without_launching_standalone() {
         let probes = AtomicUsize::new(0);
@@ -834,6 +837,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn previously_started_proxy_rechecks_daemon_health() {
         let probes = AtomicUsize::new(0);
