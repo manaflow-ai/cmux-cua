@@ -479,6 +479,8 @@ impl ToolRegistry {
         // must never turn a successful tool action into an error.
         const STATE_ACTION_TOOLS: &[&str] = &[
             "click",
+            "double_click",
+            "right_click",
             "type_text",
             "press_key",
             "hotkey",
@@ -692,7 +694,7 @@ mod capability_tests {
     }
 
     #[tokio::test]
-    async fn successful_target_action_updates_embedded_process_state() {
+    async fn successful_click_actions_update_embedded_process_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("5151.json");
         let mut registry = ToolRegistry::new();
@@ -700,24 +702,39 @@ mod capability_tests {
             dir.path().to_owned(),
             5151,
         ));
-        registry.set_target_app_resolver(|pid| (pid == 42).then(|| "TextEdit".to_owned()));
-        registry.register(Box::new(SuccessfulTargetTool { def: dummy_def("click") }));
+        registry.set_target_app_resolver(|pid| Some(format!("Target-{pid}")));
+        for name in ["click", "double_click", "right_click"] {
+            registry.register(Box::new(SuccessfulTargetTool {
+                def: dummy_def(name),
+            }));
+        }
 
-        let result = registry.invoke(
-            "click",
-            serde_json::json!({
-                "session": "embedded-1",
-                "pid": 42,
-                "window_id": 99,
-            }),
-        ).await;
-        assert_ne!(result.is_error, Some(true));
-        let state: crate::session_state::DriverProcessState =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        assert_eq!(state.session.as_deref(), Some("embedded-1"));
-        assert_eq!(state.target_app.as_deref(), Some("TextEdit"));
-        assert_eq!(state.target_pid, Some(42));
-        assert_eq!(state.target_window_id, Some(99));
+        for (index, name) in ["click", "double_click", "right_click"]
+            .into_iter()
+            .enumerate()
+        {
+            let pid = 42 + index as i64;
+            let window_id = 99 + index as u64;
+            let session = format!("embedded-{name}");
+            let target_app = format!("Target-{pid}");
+            let result = registry
+                .invoke(
+                    name,
+                    serde_json::json!({
+                        "session": session,
+                        "pid": pid,
+                        "window_id": window_id,
+                    }),
+                )
+                .await;
+            assert_ne!(result.is_error, Some(true));
+            let state: crate::session_state::DriverProcessState =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(state.session.as_deref(), Some(session.as_str()));
+            assert_eq!(state.target_app.as_deref(), Some(target_app.as_str()));
+            assert_eq!(state.target_pid, Some(pid));
+            assert_eq!(state.target_window_id, Some(window_id));
+        }
     }
 
     #[tokio::test]
