@@ -19,7 +19,7 @@
 //! (stderr warning only), and file removal on clean shutdown.
 
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -216,7 +216,7 @@ impl CursorFeed {
         x: f64,
         y: f64,
     ) -> std::io::Result<()> {
-        ensure_private_dir(&self.dir)?;
+        crate::session_state::ensure_private_dir(&self.dir)?;
         let state = CursorFeedState {
             driver_pid: self.driver_pid,
             session: session.map(str::to_owned),
@@ -240,10 +240,7 @@ impl CursorFeed {
 
         let result = (|| {
             use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
+            let mut file = crate::session_state::create_private_temp_file(&temp_path)?;
             file.write_all(&body)?;
             file.sync_all()?;
             std::fs::rename(&temp_path, self.path())
@@ -268,18 +265,6 @@ impl Drop for CursorFeed {
             eprintln!("[cua-driver] warning: failed to remove cursor feed file: {error}");
         }
     }
-}
-
-fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
-    if !dir.exists() {
-        std::fs::create_dir_all(dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-    }
-    Ok(())
 }
 
 // ── Process-global feed handle ───────────────────────────────────────────────
@@ -536,6 +521,29 @@ mod tests {
         std::fs::write(&not_a_dir, b"occupied").unwrap();
         let feed = CursorFeed::new(not_a_dir, 5252, CursorBranding::default());
         assert!(feed.update(Some("s"), 1.0, 2.0).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_repairs_existing_directory_and_writes_private_cursor_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let state_dir = parent.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let feed = CursorFeed::new(state_dir.clone(), 5353, CursorBranding::default());
+        feed.update(Some("private"), 10.0, 20.0).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(feed.path()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }
 

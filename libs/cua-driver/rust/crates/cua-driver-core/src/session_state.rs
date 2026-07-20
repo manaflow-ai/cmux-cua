@@ -126,10 +126,7 @@ impl StateFile {
 
         let result = (|| {
             use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp_path)?;
+            let mut file = create_private_temp_file(&temp_path)?;
             file.write_all(&body)?;
             file.sync_all()?;
             std::fs::rename(&temp_path, self.path())
@@ -156,16 +153,27 @@ impl Drop for StateFile {
     }
 }
 
-fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
-    if !dir.exists() {
-        std::fs::create_dir_all(dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        }
+pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // The host may supply an existing state directory. Re-apply the privacy
+        // invariant on every write rather than trusting its prior mode.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+pub(crate) fn create_private_temp_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 #[cfg(test)]
@@ -222,6 +230,35 @@ mod tests {
         assert!(writer
             .update(&serde_json::json!({"pid": 10}), None)
             .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_repairs_existing_directory_and_writes_private_state_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let state_dir = parent.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let writer = StateFile::new(state_dir.clone(), 4545);
+        writer
+            .update(&serde_json::json!({"session": "private"}), None)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(writer.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]
