@@ -72,6 +72,16 @@ pub fn visible_windows() -> Vec<WindowInfo> {
     enumerate_windows(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements)
 }
 
+/// Select the real frontmost layer-0 window that an otherwise-unpinned cursor
+/// overlay should sit above. The caller supplies WindowServer's native
+/// front-to-back ordering and the overlay owner's pid.
+pub(crate) fn cursor_overlay_anchor_window(
+    _windows: &[WindowInfo],
+    _driver_pid: i32,
+) -> Option<u32> {
+    None
+}
+
 fn enumerate_windows(options: u32) -> Vec<WindowInfo> {
     enumerate_windows_inner(options, true)
 }
@@ -420,6 +430,23 @@ mod tests {
         ];
         let owner = frontmost_input_window_at_point(&windows, 50.0, 50.0, driver_pid).unwrap();
         assert_eq!(owner.window_id, 9, "driver-owned overlay must be skipped");
+    }
+
+    #[test]
+    fn unpinned_cursor_anchors_above_frontmost_real_window() {
+        let driver_pid = 100;
+        let windows = vec![
+            // The overlay itself is first in WindowServer's front-to-back list.
+            window(7, driver_pid, "cmux Computer Use", 0, 1.0),
+            window(8, 200, "Messages", 0, 1.0),
+            window(9, 300, "Calculator", 0, 1.0),
+        ];
+
+        assert_eq!(
+            cursor_overlay_anchor_window(&windows, driver_pid),
+            Some(8),
+            "move_cursor must raise the overlay above the real frontmost app, not leave it hidden behind that app",
+        );
     }
 
     #[test]
