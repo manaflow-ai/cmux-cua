@@ -283,7 +283,7 @@ Use for: marquee/lasso selection, drag-and-drop, resizing via a handle, scrubbin
 
 `modifier` keys (cmd/shift/option/ctrl) are held across the entire gesture.
 
-Background drag is unavailable on macOS because pid-posted drag streams drop background CGEvents. Pass delivery_mode=`foreground`.
+Background drag is unavailable on macOS because pid-posted drag streams drop background CGEvents. Pass delivery_mode=`foreground` and the `window_id` whose screenshot supplied the coordinates.
 
 When `from_zoom` is true, coordinates are in the last zoom image for this pid; the driver maps them back to window coordinates before dispatching.
 
@@ -301,10 +301,10 @@ When `from_zoom` is true, coordinates are in the last zoom image for this pid; t
 - `steps` (integer, optional): Number of intermediate mouseDragged events linearly interpolated along the path. Default: 20.
 - `to_x` (number, required): Drag-end X in window-local screenshot pixels.
 - `to_y` (number, required): Drag-end Y in window-local screenshot pixels.
-- `window_id` (integer, optional): CGWindowID for the window the pixel coordinates were measured against. Optional — when omitted the driver picks the frontmost window of pid.
+- `window_id` (integer, required): Required CGWindowID for the window whose screenshot supplied the pixel coordinates. Foreground drag uses it to front the exact target window before dispatch.
 
 ```json
-{"from_x":100,"from_y":200,"pid":844,"to_x":100,"to_y":200}
+{"from_x":100,"from_y":200,"pid":844,"to_x":100,"to_y":200,"window_id":10725}
 ```
 
 ### `type_text`
