@@ -48,19 +48,20 @@ fn def() -> &'static ToolDef {
              slower, more human drags; decrease for snap gestures.\n\n\
              `modifier` keys (cmd/shift/option/ctrl) are held across the entire gesture.\n\n\
              Background drag is unavailable on macOS because pid-posted drag streams \
-             drop background CGEvents. Pass delivery_mode=`foreground`.\n\n\
+             drop background CGEvents. Pass delivery_mode=`foreground` and the \
+             `window_id` whose screenshot supplied the coordinates.\n\n\
              When `from_zoom` is true, coordinates are in the last zoom image for this \
              pid; the driver maps them back to window coordinates before dispatching."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
-            "required": ["pid", "from_x", "from_y", "to_x", "to_y"],
+            "required": ["pid", "window_id", "from_x", "from_y", "to_x", "to_y"],
             "properties": {
                 "session": { "type": "string", "description": "Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-<pid>); anonymous non-embedded calls remain cursor-less." },
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "window_id": {
                     "type": "integer",
-                    "description": "CGWindowID for the window the pixel coordinates were measured against. Optional — when omitted the driver picks the frontmost window of pid."
+                    "description": "Required CGWindowID for the window whose screenshot supplied the pixel coordinates. Foreground drag uses it to front the exact target window before dispatch."
                 },
                 "from_x": { "type": "number", "description": "Drag-start X in window-local screenshot pixels. Top-left origin." },
                 "from_y": { "type": "number", "description": "Drag-start Y in window-local screenshot pixels. Top-left origin." },
@@ -129,6 +130,14 @@ impl Tool for DragTool {
             )
             .with_structured(serde_json::json!({ "code": "background_unavailable" }));
         }
+        // This is the only gate into the foreground drag path. Keep it before
+        // cursor resolution, coordinate translation, focus changes, and event
+        // synthesis so an underspecified destructive action has no side effect.
+        let window_id = match require_foreground_window_id(&args) {
+            Ok(window_id) => window_id,
+            Err(error) => return error,
+        };
+        let window_id = Some(window_id);
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
 
         // Coerce integer or float from JSON for coordinate fields.
@@ -154,7 +163,6 @@ impl Tool for DragTool {
             None => return ToolResult::error("Missing required parameter: to_y"),
         };
 
-        let window_id = args.opt_u64("window_id").map(|v| v as u32);
         let duration_ms = args.u64_or("duration_ms", 500);
         let steps = args.u64_or("steps", 20) as usize;
         let from_zoom = args.bool_or("from_zoom", false);
@@ -380,5 +388,75 @@ impl Tool for DragTool {
             Ok(Err(e)) => ToolResult::error(format!("drag failed: {e}")),
             Err(e)     => ToolResult::error(format!("Task error: {e}")),
         }
+    }
+}
+
+fn require_foreground_window_id(args: &Value) -> Result<u32, ToolResult> {
+    args.get("window_id")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            ToolResult::error(
+                "Foreground drag requires a valid window_id from the target window screenshot.",
+            )
+            .with_structured(serde_json::json!({
+                "code": "window_id_required",
+                "field": "window_id"
+            }))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_requires_window_id_for_drag() {
+        let required = def().input_schema["required"]
+            .as_array()
+            .expect("drag required fields");
+        assert!(
+            required.iter().any(|field| field == "window_id"),
+            "foreground drag must require an exact target window"
+        );
+        assert!(
+            def().input_schema["properties"]["window_id"]["description"]
+                .as_str()
+                .expect("window_id description")
+                .contains("Required"),
+            "schema prose must not advertise window_id as optional"
+        );
+    }
+
+    #[test]
+    fn foreground_drag_without_window_id_fails_at_the_dispatch_gate() {
+        let error = require_foreground_window_id(&serde_json::json!({
+            "pid": 42,
+            "delivery_mode": "foreground",
+            "from_x": 1,
+            "from_y": 2,
+            "to_x": 3,
+            "to_y": 4
+        }))
+        .expect_err("missing window_id must prevent a dispatch plan");
+
+        assert_eq!(error.is_error, Some(true));
+        assert_eq!(
+            error.structured_content.as_ref().expect("structured error")["code"],
+            "window_id_required"
+        );
+        assert_eq!(
+            error.structured_content.as_ref().expect("structured error")["field"],
+            "window_id"
+        );
+    }
+
+    #[test]
+    fn foreground_drag_with_window_id_produces_a_concrete_dispatch_target() {
+        assert_eq!(
+            require_foreground_window_id(&serde_json::json!({ "window_id": 1234 }))
+                .expect("valid target"),
+            1234
+        );
     }
 }
