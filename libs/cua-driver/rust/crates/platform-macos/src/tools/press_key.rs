@@ -69,6 +69,17 @@ fn def() -> &'static ToolDef {
 impl Tool for PressKeyTool {
     fn def(&self) -> &ToolDef { def() }
 
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        cua_driver_core::tool::validate_dispatch_args(self.def(), args)?;
+        let address = super::preflight_action_address(args, "press_key")?;
+        if address.element && address.has_xy {
+            return Err(ToolResult::error(
+                "Pass either element_index (ax) or x,y (px) to press_key, not both.",
+            ));
+        }
+        Ok(())
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         let dispatch_gate = crate::dispatch_gate::NativeDispatchGate::for_args(&args);

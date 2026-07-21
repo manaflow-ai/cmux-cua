@@ -139,6 +139,10 @@ impl Tool for ClickTool {
         def()
     }
 
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        click_dispatch_preflight(args)
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         let dispatch_gate = crate::dispatch_gate::NativeDispatchGate::for_args(&args);
@@ -868,6 +872,58 @@ impl Tool for ClickTool {
             )
         }
     }
+}
+
+/// Side-effect-free validation performed before embedded watchable mode may
+/// front the target. Runtime cache/AX failures remain ordinary dispatch
+/// failures, but malformed addressing and delivery requests cannot steal focus.
+fn click_dispatch_preflight(args: &Value) -> Result<(), ToolResult> {
+    use cua_driver_core::tool_args::ArgsExt;
+
+    cua_driver_core::tool::validate_dispatch_args(def(), args)?;
+    let has_pid = args.get("pid").is_some_and(|value| !value.is_null());
+    let has_window_id = args.get("window_id").is_some_and(|value| !value.is_null());
+    let has_x = args.get("x").is_some_and(Value::is_number);
+    let has_y = args.get("y").is_some_and(Value::is_number);
+
+    if has_x && has_y && !has_pid && !has_window_id {
+        return if args.str_or("scope", "window") == "desktop" {
+            Ok(())
+        } else {
+            Err(ToolResult::error(
+                "click: x,y given with no pid/window_id, but scope is \"window\". \
+                 Screen-absolute clicks require desktop scope. Pass scope=\"desktop\" \
+                 (and use get_desktop_state with scope=\"desktop\" to read true \
+                 screen pixels) first."
+                    .to_owned(),
+            )
+            .with_structured(serde_json::json!({
+                "code": "desktop_scope_disabled",
+                "scope": "window",
+                "suggestion": "pass scope=\"desktop\"",
+            })))
+        };
+    }
+
+    let address = super::preflight_action_address(args, "click")?;
+    let has_element_target = address.element && address.window_id.is_some();
+    if !has_element_target && !address.has_xy {
+        return Err(ToolResult::error(
+            "Provide either (element_index + window_id) or (x + y). pid is always required.",
+        ));
+    }
+    if !has_element_target && args.opt_str("debug_image_out").is_some() {
+        if args.bool_or("from_zoom", false) {
+            return Err(ToolResult::error(
+                "debug_image_out is incompatible with from_zoom — received (x, y) \
+                 would be in zoom-crop space, not window-local.",
+            ));
+        }
+        if address.window_id.is_none() {
+            return Err(ToolResult::error("debug_image_out requires window_id."));
+        }
+    }
+    Ok(())
 }
 
 // ── AX click implementation (blocking) ───────────────────────────────────────

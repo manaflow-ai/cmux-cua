@@ -87,6 +87,17 @@ fn is_modifier(k: &str) -> bool {
 impl Tool for HotkeyTool {
     fn def(&self) -> &ToolDef { def() }
 
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        cua_driver_core::tool::validate_dispatch_args(self.def(), args)?;
+        let raw_keys = args.get("keys").and_then(Value::as_array).expect("schema validated keys");
+        if !raw_keys.iter().filter_map(Value::as_str).any(|key| !is_modifier(key)) {
+            return Err(ToolResult::error(
+                "keys must include at least one non-modifier key (e.g. \"c\" in [\"cmd\", \"c\"]).",
+            ));
+        }
+        Ok(())
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         let _ = &self.state;

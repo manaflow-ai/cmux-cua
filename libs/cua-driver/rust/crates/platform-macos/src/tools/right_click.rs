@@ -81,6 +81,26 @@ fn def() -> &'static ToolDef {
 impl Tool for RightClickTool {
     fn def(&self) -> &ToolDef { def() }
 
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        cua_driver_core::tool::validate_dispatch_args(self.def(), args)?;
+        let address = super::preflight_action_address(args, "right_click")?;
+        if address.partial_xy {
+            return Err(ToolResult::error("Provide both x and y together, not just one."));
+        }
+        if address.element && address.has_xy {
+            return Err(ToolResult::error("Provide either element_index or (x, y), not both."));
+        }
+        if !address.element && !address.has_xy {
+            return Err(ToolResult::error(
+                "Provide element_index or (x, y) to address the right-click target.",
+            ));
+        }
+        if address.element && address.window_id.is_none() {
+            return Err(ToolResult::error("window_id is required when element_index is used."));
+        }
+        Ok(())
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         let pid = match args.require_i32("pid") { Ok(v) => v, Err(e) => return e };

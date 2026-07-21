@@ -297,7 +297,165 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn def(&self) -> &ToolDef;
+
+    /// Validate everything that must be known before a targeted action may
+    /// have observable dispatch side effects (for example, fronting its app).
+    ///
+    /// The registry calls this at the embedded action choke point immediately
+    /// before the front hook and `invoke`. The default validates the advertised
+    /// input-schema subset used by driver tools; tools with semantic delivery
+    /// constraints (such as macOS foreground-only drag) extend it and return a
+    /// structured rejection here. Implementations must be side-effect free.
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        validate_dispatch_args(self.def(), args)
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult;
+}
+
+/// Validate the JSON-Schema vocabulary used by driver tool definitions at the
+/// embedded dispatch boundary. This intentionally covers only the vocabulary
+/// emitted by our hand-written schemas: object properties, required fields,
+/// primitive types, array item types/cardinality, enums, and numeric bounds.
+///
+/// MCP clients normally validate this schema themselves, but the driver cannot
+/// rely on that for focus safety: direct CLI/daemon callers can reach the
+/// registry with malformed JSON. Internal daemon metadata keys (`_...`) are
+/// ignored because they are injected after client-side schema validation.
+pub fn validate_dispatch_args(def: &ToolDef, args: &Value) -> Result<(), ToolResult> {
+    let Some(object) = args.as_object() else {
+        return Err(dispatch_validation_error(&def.name, "arguments must be an object"));
+    };
+    let schema = &def.input_schema;
+    let properties = schema.get("properties").and_then(Value::as_object);
+
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for field in required.iter().filter_map(Value::as_str) {
+            if !object.get(field).is_some_and(|value| !value.is_null()) {
+                return Err(dispatch_validation_error(
+                    &def.name,
+                    &format!("missing required field `{field}`"),
+                ));
+            }
+        }
+    }
+
+    if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
+        if let Some(properties) = properties {
+            if let Some(field) = object
+                .keys()
+                .find(|field| !field.starts_with('_') && !properties.contains_key(*field))
+            {
+                return Err(dispatch_validation_error(
+                    &def.name,
+                    &format!("unknown field `{field}`"),
+                ));
+            }
+        }
+    }
+
+    let Some(properties) = properties else {
+        return Ok(());
+    };
+    for (field, value) in object {
+        if field.starts_with('_') || value.is_null() {
+            continue;
+        }
+        let Some(field_schema) = properties.get(field) else {
+            continue;
+        };
+        validate_dispatch_value(&def.name, field, value, field_schema)?;
+    }
+    Ok(())
+}
+
+fn validate_dispatch_value(
+    tool_name: &str,
+    field: &str,
+    value: &Value,
+    schema: &Value,
+) -> Result<(), ToolResult> {
+    if let Some(expected) = schema.get("type").and_then(Value::as_str) {
+        let valid = match expected {
+            "string" => value.is_string(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            _ => true,
+        };
+        if !valid {
+            return Err(dispatch_validation_error(
+                tool_name,
+                &format!("field `{field}` must be {expected}"),
+            ));
+        }
+    }
+
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        if !allowed.contains(value) {
+            return Err(dispatch_validation_error(
+                tool_name,
+                &format!("field `{field}` has an unsupported value"),
+            ));
+        }
+    }
+
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64) {
+            if number < minimum {
+                return Err(dispatch_validation_error(
+                    tool_name,
+                    &format!("field `{field}` must be at least {minimum}"),
+                ));
+            }
+        }
+        if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
+            if number > maximum {
+                return Err(dispatch_validation_error(
+                    tool_name,
+                    &format!("field `{field}` must be at most {maximum}"),
+                ));
+            }
+        }
+    }
+
+    if let (Some(values), Some(item_schema)) =
+        (value.as_array(), schema.get("items"))
+    {
+        for item in values {
+            validate_dispatch_value(tool_name, field, item, item_schema)?;
+        }
+    }
+    if let Some(values) = value.as_array() {
+        if let Some(min_items) = schema.get("minItems").and_then(Value::as_u64) {
+            if values.len() < min_items as usize {
+                return Err(dispatch_validation_error(
+                    tool_name,
+                    &format!("field `{field}` must contain at least {min_items} items"),
+                ));
+            }
+        }
+        if let Some(max_items) = schema.get("maxItems").and_then(Value::as_u64) {
+            if values.len() > max_items as usize {
+                return Err(dispatch_validation_error(
+                    tool_name,
+                    &format!("field `{field}` must contain at most {max_items} items"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_validation_error(tool_name: &str, detail: &str) -> ToolResult {
+    ToolResult::error(format!("Invalid {tool_name} arguments: {detail}."))
+        .with_structured(serde_json::json!({
+            "code": "invalid_arguments",
+            "tool": tool_name,
+            "detail": detail,
+        }))
 }
 
 /// Thread-safe collection of all registered tools.
@@ -462,11 +620,13 @@ impl ToolRegistry {
             other => other,
         };
 
+        let Some(tool) = self.tools.get(resolved_name) else {
+            return ToolResult::error(format!("Unknown tool: {name}"));
+        };
+
         // Reserve and capture the turn before dispatch so recorded evidence
         // shows the application immediately before the action changed it.
-        let should_record = self.tools.get(resolved_name)
-            .map(|tool| !tool.def().read_only)
-            .unwrap_or(false)
+        let should_record = !tool.def().read_only
             && !matches!(
                 resolved_name,
                 "start_recording" | "stop_recording" | "get_recording_state" | "replay_trajectory"
@@ -475,31 +635,28 @@ impl ToolRegistry {
             .then(|| self.recording.begin_turn(resolved_name, &args, start_ms))
             .flatten();
 
-        // Embedded "watchable" fronting: BEFORE driving a targeted action, bring
-        // the target app to the foreground so the user (who watches the driver
-        // via the on-screen agent-cursor overlay) sees the window being driven —
-        // and so the pixel obstruction check sees an un-occluded, frontmost
-        // target. Serve/daemon/one-shot modes keep the background-drive default
-        // (no hook installed / not embedded). Best-effort: the hook owns its own
-        // front-once dedupe and never fails a tool call.
-        if crate::embedded_mode() {
-            if let Some(hook) = self.target_front_hook {
-                if action_targets_window(resolved_name, &args) {
-                    if let Some(target_pid) = args.get("pid").and_then(Value::as_i64) {
-                        let session = args
-                            .get("session")
-                            .and_then(Value::as_str)
-                            .or_else(|| args.get("_session_id").and_then(Value::as_str));
-                        hook(target_pid, session);
-                    }
-                }
+        // A rejected action must be side-effect free. In particular, embedded
+        // watchable mode must not front a target until schema + tool-specific
+        // delivery preflight has accepted the call. This is intentionally the
+        // final boundary before invoke so accepted actions remain visible.
+        if let Err(error) = preflight_and_front_target(
+            tool.as_ref(),
+            resolved_name,
+            &args,
+            crate::embedded_mode(),
+            self.target_front_hook,
+        ) {
+            if let Some(pending_turn) = pending_turn {
+                let result_text = error.content.iter().find_map(|content| match content {
+                    Content::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                }).unwrap_or("");
+                self.recording.finish_turn(pending_turn, result_text);
             }
+            return error;
         }
 
-        let result = match self.tools.get(resolved_name) {
-            Some(tool) => tool.invoke(args.clone()).await,
-            None => return ToolResult::error(format!("Unknown tool: {name}")),
-        };
+        let result = tool.invoke(args.clone()).await;
 
         // Embedded-host process state is action-scoped: update it only after a
         // successful call to one of the target-driving tools, and only when the
@@ -584,6 +741,31 @@ impl ToolRegistry {
 
         result
     }
+}
+
+/// Shared embedded-action boundary: validate first, then front exactly once.
+/// Kept separate from [`ToolRegistry::invoke`] so focus ordering can be tested
+/// without mutating the process-wide embedded-mode environment.
+fn preflight_and_front_target(
+    tool: &dyn Tool,
+    name: &str,
+    args: &Value,
+    embedded: bool,
+    hook: Option<fn(i64, Option<&str>)>,
+) -> Result<(), ToolResult> {
+    if !embedded || !action_targets_window(name, args) {
+        return Ok(());
+    }
+
+    tool.dispatch_preflight(args)?;
+    if let (Some(hook), Some(target_pid)) = (hook, args.get("pid").and_then(Value::as_i64)) {
+        let session = args
+            .get("session")
+            .and_then(Value::as_str)
+            .or_else(|| args.get("_session_id").and_then(Value::as_str));
+        hook(target_pid, session);
+    }
+    Ok(())
 }
 
 impl Default for ToolRegistry {
@@ -674,8 +856,79 @@ fn synthesize_action_label(tool_name: &str, args: &Value) -> String {
 #[cfg(test)]
 mod front_gate_tests {
     //! Which calls trigger embedded "watchable" fronting at the choke point.
-    use super::action_targets_window;
+    use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static FRONT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_front(_pid: i64, _session: Option<&str>) {
+        FRONT_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    struct PreflightTool {
+        def: ToolDef,
+        foreground_drag_only: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for PreflightTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+            validate_dispatch_args(self.def(), args)?;
+            if self.foreground_drag_only
+                && args.get("delivery_mode").and_then(Value::as_str) != Some("foreground")
+            {
+                return Err(ToolResult::error("background drag rejected"));
+            }
+            Ok(())
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            ToolResult::text("dispatched")
+        }
+    }
+
+    fn action_tool(name: &str, required: &[&str], foreground_drag_only: bool) -> PreflightTool {
+        PreflightTool {
+            def: ToolDef {
+                name: name.to_owned(),
+                description: "test action".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": required,
+                    "properties": {
+                        "pid": { "type": "integer" },
+                        "window_id": { "type": "integer" },
+                        "from_x": { "type": "number" },
+                        "from_y": { "type": "number" },
+                        "to_x": { "type": "number" },
+                        "to_y": { "type": "number" },
+                        "x": { "type": "number" },
+                        "y": { "type": "number" },
+                        "delivery_mode": {
+                            "type": "string",
+                            "enum": ["background", "foreground"]
+                        },
+                        "keys": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "minItems": 2
+                        },
+                    },
+                    "additionalProperties": false
+                }),
+                read_only: false,
+                destructive: true,
+                idempotent: false,
+                open_world: true,
+            },
+            foreground_drag_only,
+        }
+    }
 
     #[test]
     fn drive_action_tools_front() {
@@ -697,6 +950,82 @@ mod front_gate_tests {
         // Read-only / non-drive tools never front.
         assert!(!action_targets_window("list_windows", &json!({})));
         assert!(!action_targets_window("launch_app", &json!({"bundle_id": "x"})));
+    }
+
+    #[test]
+    fn rejected_actions_never_front_and_valid_action_fronts_once() {
+        FRONT_CALLS.store(0, Ordering::SeqCst);
+        let drag = action_tool(
+            "drag",
+            &["pid", "window_id", "from_x", "from_y", "to_x", "to_y"],
+            true,
+        );
+        let click = action_tool("click", &["pid", "x", "y"], false);
+
+        for rejected in [
+            json!({
+                "pid": 42, "window_id": 9,
+                "from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4,
+                "delivery_mode": "background"
+            }),
+            json!({
+                "pid": 42,
+                "from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4,
+                "delivery_mode": "foreground"
+            }),
+            json!({
+                "pid": 42, "window_id": "not-a-window",
+                "from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4,
+                "delivery_mode": "foreground"
+            }),
+        ] {
+            assert!(
+                preflight_and_front_target(&drag, "drag", &rejected, true, Some(count_front))
+                    .is_err()
+            );
+        }
+        assert!(
+            preflight_and_front_target(
+                &click,
+                "click",
+                &json!({"pid": "not-a-pid", "x": 1, "y": 2}),
+                true,
+                Some(count_front),
+            )
+            .is_err()
+        );
+        assert_eq!(FRONT_CALLS.load(Ordering::SeqCst), 0);
+
+        preflight_and_front_target(
+            &click,
+            "click",
+            &json!({"pid": 42, "x": 1, "y": 2}),
+            true,
+            Some(count_front),
+        )
+        .expect("valid click should pass dispatch preflight");
+        assert_eq!(FRONT_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn malformed_hotkey_below_min_items_never_fronts() {
+        static HOTKEY_FRONT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn count_hotkey_front(_pid: i64, _session: Option<&str>) {
+            HOTKEY_FRONT_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        HOTKEY_FRONT_CALLS.store(0, Ordering::SeqCst);
+        let hotkey = action_tool("hotkey", &["pid", "keys"], false);
+        let result = preflight_and_front_target(
+            &hotkey,
+            "hotkey",
+            &json!({"pid": 42, "keys": ["cmd"]}),
+            true,
+            Some(count_hotkey_front),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(HOTKEY_FRONT_CALLS.load(Ordering::SeqCst), 0);
     }
 }
 

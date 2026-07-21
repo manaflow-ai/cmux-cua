@@ -97,6 +97,47 @@ impl DeliveryMode {
     pub fn is_foreground(self) -> bool { matches!(self, Self::Foreground) }
 }
 
+/// Side-effect-free addressing result used by targeted-action preflights.
+/// Resolving an element token reads only the snapshot registry; it does not
+/// touch Accessibility, cursor, focus, or input state.
+pub(crate) struct ActionAddress {
+    pub element: bool,
+    pub window_id: Option<u32>,
+    pub has_xy: bool,
+    pub partial_xy: bool,
+}
+
+pub(crate) fn preflight_action_address(
+    args: &serde_json::Value,
+    tool_name: &str,
+) -> Result<ActionAddress, cua_driver_core::protocol::ToolResult> {
+    use cua_driver_core::tool_args::ArgsExt;
+
+    let pid = args.require_i32("pid")?;
+    let window_id_arg = args.opt_u64("window_id").and_then(|value| u32::try_from(value).ok());
+    let resolved = cua_driver_core::element_token::resolve_element_args(
+        pid,
+        args.opt_u64("element_index").map(|value| value as usize),
+        args.opt_str("element_token").as_deref(),
+        window_id_arg,
+        tool_name,
+    )?;
+    let (element, window_id) = match resolved {
+        cua_driver_core::element_token::ResolvedElement::None => (false, window_id_arg),
+        cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => {
+            (true, window_id)
+        }
+    };
+    let has_x = args.get("x").is_some_and(serde_json::Value::is_number);
+    let has_y = args.get("y").is_some_and(serde_json::Value::is_number);
+    Ok(ActionAddress {
+        element,
+        window_id,
+        has_xy: has_x && has_y,
+        partial_xy: has_x != has_y,
+    })
+}
+
 // ── Embedded "watchable" target fronting ─────────────────────────────────────
 //
 // In embedded mode the user WATCHES computer use (there is an on-screen agent

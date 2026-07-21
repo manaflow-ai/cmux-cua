@@ -56,6 +56,18 @@ fn def() -> &'static ToolDef {
 impl Tool for DoubleClickTool {
     fn def(&self) -> &ToolDef { def() }
 
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        cua_driver_core::tool::validate_dispatch_args(self.def(), args)?;
+        let address = super::preflight_action_address(args, "double_click")?;
+        let has_element_target = address.element && address.window_id.is_some();
+        if !has_element_target && !address.has_xy {
+            return Err(ToolResult::error(
+                "Either element_index + window_id or x + y must be provided.",
+            ));
+        }
+        Ok(())
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         let pid = match args.require_i32("pid") { Ok(v) => v, Err(e) => return e };

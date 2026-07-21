@@ -2345,27 +2345,44 @@ fn run_permissions_status(json: bool) {
             println!();
         }
         println!("{} ({})", state.endpoint.label, state.endpoint.profile);
-        println!(
-            "  Accessibility:    {}",
-            if permission_bool(state, "accessibility") {
-                "✅ granted"
-            } else {
-                "❌ not granted"
-            }
-        );
-        println!(
-            "  Screen Recording: {}",
-            if permission_bool(state, "screen_recording") {
-                "✅ granted"
-            } else {
-                "❌ not granted"
-            }
-        );
-        println!("  Source: driver-daemon");
+        for line in permission_status_lines(&state.payload) {
+            println!("  {line}");
+        }
     }
     if states.iter().any(|state| !permission_all_granted(state)) {
         println!("\n  Run `cua-driver permissions grant` to continue onboarding.");
     }
+}
+
+fn permission_status_lines(structured: &serde_json::Value) -> Vec<String> {
+    let b = |k: &str| structured.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    let ax = b("accessibility");
+    let sr = b("screen_recording");
+    let cap = structured
+        .get("screen_recording_capturable")
+        .and_then(|value| value.as_bool());
+    let attribution = structured
+        .get("source")
+        .and_then(|s| s.get("attribution"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("driver-daemon");
+
+    let mut lines = vec![
+        format!("Accessibility:    {}", if ax { "✅ granted" } else { "❌ not granted" }),
+        format!("Screen Recording: {}", if sr { "✅ granted" } else { "❌ not granted" }),
+    ];
+    match cap {
+        Some(false) if sr => lines.push(
+            "  ⚠️  preflight reports granted, but a live capture probe failed — the grant likely belongs to another process, not this one."
+                .to_owned(),
+        ),
+        None => lines.push(
+            "Live capture probe: ❓ not performed (silent status check)".to_owned(),
+        ),
+        _ => {}
+    }
+    lines.push(format!("Source: {attribution}"));
+    lines
 }
 
 #[cfg(target_os = "macos")]
@@ -3884,6 +3901,37 @@ mod tests {
         let sanitized = sanitize_tool_name(&long_name);
         assert_eq!(sanitized.len(), 64);
         assert!(sanitized.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn silent_permission_status_does_not_treat_unknown_probe_as_failure() {
+        let lines = permission_status_lines(&serde_json::json!({
+            "accessibility": true,
+            "screen_recording": true,
+            "screen_recording_capturable": null,
+            "screen_recording_probe_performed": false,
+            "source": { "attribution": "driver-daemon" }
+        }));
+        let output = lines.join("\n");
+        assert!(output.contains("not performed"));
+        assert!(!output.contains("live capture probe failed"));
+    }
+
+    #[test]
+    fn live_permission_probe_false_warns_but_true_does_not() {
+        for (capturable, should_warn) in [(false, true), (true, false)] {
+            let lines = permission_status_lines(&serde_json::json!({
+                "accessibility": true,
+                "screen_recording": true,
+                "screen_recording_capturable": capturable,
+                "screen_recording_probe_performed": true,
+                "source": { "attribution": "driver-daemon" }
+            }));
+            assert_eq!(
+                lines.join("\n").contains("live capture probe failed"),
+                should_warn,
+            );
+        }
     }
 
     // ── Surface 8: manifest shape ───────────────────────────────────────────
