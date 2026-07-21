@@ -74,7 +74,7 @@ pub struct RenderStateCore {
     pub click_t: Option<f64>,
     /// Whether a button is currently being held for this cursor.
     pub pressed: bool,
-    /// Custom cursor shape; `None` = built-in gradient arrow.
+    /// Custom cursor shape; `None` = the configured built-in silhouette.
     pub shape: Option<CursorShape>,
     /// User-controlled visibility.
     pub visible: bool,
@@ -535,6 +535,16 @@ pub struct FocusRect {
     pub t: f64,
 }
 
+#[derive(Clone, Copy)]
+enum RasterPlacement {
+    RotatingCentered { display_size: f32 },
+    UprightActionHotspot {
+        display_size: f32,
+        normalized_x: f32,
+        normalized_y: f32,
+    },
+}
+
 /// Render the cursor + bloom + click-pulse + (optional) focus-rect into a
 /// fresh tiny-skia [`tiny_skia::Pixmap`] of `(width, height)`.
 ///
@@ -776,36 +786,56 @@ pub fn paint_cursor(
     //   1. Per-instance custom asset loaded from `--cursor-icon <path>`
     //      (or runtime `set_agent_cursor_style.image_path`) wins.
     //   2. Else the built-in selected by `--cursor-shape`:
-    //      - `arrow` (default): call `draw_default_arrow` — procedural
+    //      - `arrow`: call `draw_default_arrow` — procedural
     //        gradient diamond, sharp at any backing scale because nothing
     //        rasterises.
     //      - `teardrop`: blit the cached `CursorShape::teardrop()` pixmap
     //        — rasterised once at 2× the display target.
-    //   3. (No other built-ins today.)
+    //      - `cmux`: blit the official gradient chevron upright, with its
+    //        right-hand point anchored to the same action hotspot as the
+    //        procedural arrow tip.
     //
     // Teardrop is the default silhouette; `--cursor-shape arrow` (or
     // `cursor_icon: "arrow"`) selects the procedural arrow instead.
-    let shape: Option<&CursorShape> = match (core.shape.as_ref(), core.cfg.builtin_shape) {
-        (Some(custom), _) => Some(custom),
-        (None, BuiltinShape::Teardrop) => Some(CursorShape::teardrop()),
-        (None, BuiltinShape::Arrow) => {
-            let grad_override = if core.gradient_colors.is_empty() {
-                None
-            } else {
-                Some(&core.gradient_colors)
-            };
-            draw_default_arrow(
-                pm,
-                &core.palette,
-                grad_override,
-                px as f32,
-                py as f32,
-                heading as f32,
-                alpha_scale,
-            );
-            None
-        }
-    };
+    let (shape, placement): (Option<&CursorShape>, RasterPlacement) =
+        match (core.shape.as_ref(), core.cfg.builtin_shape) {
+            (Some(custom), _) => (
+                Some(custom),
+                RasterPlacement::RotatingCentered { display_size: 26.0 },
+            ),
+            (None, BuiltinShape::Teardrop) => (
+                Some(CursorShape::teardrop()),
+                RasterPlacement::RotatingCentered { display_size: 26.0 },
+            ),
+            (None, BuiltinShape::Cmux) => (
+                Some(CursorShape::cmux()),
+                RasterPlacement::UprightActionHotspot {
+                    display_size: 32.0,
+                    normalized_x: (179.0 - 65.0) / 140.0,
+                    normalized_y: (128.0 - 58.0) / 140.0,
+                },
+            ),
+            (None, BuiltinShape::Arrow) => {
+                let grad_override = if core.gradient_colors.is_empty() {
+                    None
+                } else {
+                    Some(&core.gradient_colors)
+                };
+                draw_default_arrow(
+                    pm,
+                    &core.palette,
+                    grad_override,
+                    px as f32,
+                    py as f32,
+                    heading as f32,
+                    alpha_scale,
+                );
+                (
+                    None,
+                    RasterPlacement::RotatingCentered { display_size: 26.0 },
+                )
+            }
+        };
     let shape = match shape {
         Some(s) => s,
         None => return,
@@ -818,7 +848,10 @@ pub fn paint_cursor(
     // rasterises at the destination pixmap's native resolution (e.g. 52 px
     // on a 2× retina display) — Core Animation then maps 1:1 to the screen
     // instead of upsampling a logical-pixel pixmap.
-    let display_size = 26.0_f32 * sf;
+    let display_size = match placement {
+        RasterPlacement::RotatingCentered { display_size }
+        | RasterPlacement::UprightActionHotspot { display_size, .. } => display_size * sf,
+    };
     let scale = display_size / shape.width as f32;
     if let Some(pix) =
         tiny_skia::PixmapRef::from_bytes(&shape.pixels, shape.width, shape.height)
@@ -827,19 +860,40 @@ pub fn paint_cursor(
         // Centres the source on its own origin, scales to display_size, rotates
         // around the scaled centre, lands the centre at (px, py).
         //
-        // +90° offset compensates for the SVG's intrinsic orientation: the
-        // cursor-up silhouette points UP at rest (CSS y-down angle -π/2),
-        // whereas the procedural arrow's rotation convention assumes the
-        // shape points RIGHT at rest (angle 0). Without the +90°, motion-
-        // right rotation would leave the tip still pointing up.
-        let rotation_deg = heading.to_degrees() as f32 + 180.0 + 90.0;
-        let transform = tiny_skia::Transform::from_translate(
-            -(shape.width as f32) / 2.0,
-            -(shape.height as f32) / 2.0,
-        )
-        .post_scale(scale, scale)
-        .post_rotate(rotation_deg)
-        .post_translate(px as f32, py as f32);
+        let transform = match placement {
+            RasterPlacement::UprightActionHotspot {
+                normalized_x,
+                normalized_y,
+                ..
+            } => {
+                // The official mark is directional branding, not a motion
+                // arrow: keep it upright. Cursor motion stores the silhouette
+                // centre 16 points behind the action point, so recover that
+                // point and land the chevron tip there.
+                const ACTION_OFFSET: f32 = 16.0;
+                let action_x = px as f32 - heading.cos() as f32 * ACTION_OFFSET * sf;
+                let action_y = py as f32 - heading.sin() as f32 * ACTION_OFFSET * sf;
+                tiny_skia::Transform::from_translate(
+                    -(shape.width as f32) * normalized_x,
+                    -(shape.height as f32) * normalized_y,
+                )
+                .post_scale(scale, scale)
+                .post_translate(action_x, action_y)
+            }
+            RasterPlacement::RotatingCentered { .. } => {
+                // +90° offset compensates for the teardrop/custom SVG's
+                // intrinsic upward orientation while the procedural arrow
+                // convention starts from a right-pointing silhouette.
+                let rotation_deg = heading.to_degrees() as f32 + 180.0 + 90.0;
+                tiny_skia::Transform::from_translate(
+                    -(shape.width as f32) / 2.0,
+                    -(shape.height as f32) / 2.0,
+                )
+                .post_scale(scale, scale)
+                .post_rotate(rotation_deg)
+                .post_translate(px as f32, py as f32)
+            }
+        };
         let mut paint = tiny_skia::PixmapPaint::default();
         paint.opacity = alpha_scale;
         pm.draw_pixmap(0, 0, pix, &paint, transform, None);

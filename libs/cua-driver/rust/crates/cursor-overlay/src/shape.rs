@@ -1,8 +1,8 @@
 //! Custom cursor shape — rasterised from SVG / ICO / PNG.
 //!
 //! Used when `--cursor-icon <path>` is passed to the MCP binary, plus the
-//! `teardrop()` built-in (`cursor-up` from svgrepo) selectable via
-//! `--cursor-shape teardrop`. Always produces a 64×64 RGBA pixel buffer.
+//! embedded `teardrop()` and `cmux()` built-ins selectable via
+//! `--cursor-shape`. Always produces a 52×52 RGBA pixel buffer.
 
 use anyhow::{bail, Result};
 
@@ -21,6 +21,9 @@ pub enum BuiltinShape {
     /// Embedded `cursor-up` SVG (teardrop with notched bottom). Rasterised
     /// once into a 52 px RGBA buffer and blitted with a runtime transform.
     Teardrop,
+    /// The official cmux gradient chevron. It stays upright while moving and
+    /// uses its right-hand point as the action hotspot.
+    Cmux,
 }
 
 impl BuiltinShape {
@@ -29,8 +32,11 @@ impl BuiltinShape {
     /// [`names_help`](Self::names_help), the CLI `--cursor-shape` help text, and
     /// every platform's MCP `cursor_icon` tool description. Add a built-in here
     /// and all of them pick it up — nothing else hardcodes the name list.
-    const TABLE: &'static [(&'static str, Self)] =
-        &[("arrow", Self::Arrow), ("teardrop", Self::Teardrop)];
+    const TABLE: &'static [(&'static str, Self)] = &[
+        ("arrow", Self::Arrow),
+        ("teardrop", Self::Teardrop),
+        ("cmux", Self::Cmux),
+    ];
 
     /// Parse the value of `--cursor-shape` / MCP `cursor_icon`. Case-insensitive.
     /// Returns `None` for unknown names so the caller can warn and fall back to
@@ -41,13 +47,13 @@ impl BuiltinShape {
     }
 
     /// The accepted built-in names in declaration order, e.g.
-    /// `["arrow", "teardrop"]`.
+    /// `["arrow", "teardrop", "cmux"]`.
     pub fn names() -> impl Iterator<Item = &'static str> {
         Self::TABLE.iter().map(|(name, _)| *name)
     }
 
     /// Human-facing list of built-in names for help / tool-description text,
-    /// e.g. `'arrow' | 'teardrop'`. The single string the CLI `--help` and every
+    /// e.g. `'arrow' | 'teardrop' | 'cmux'`. The single string the CLI `--help` and every
     /// MCP `cursor_icon` description render from, so the advertised vocabulary
     /// can never drift from what [`parse`](Self::parse) actually accepts.
     pub fn names_help() -> String {
@@ -81,7 +87,7 @@ pub enum CursorIconResolution {
 /// Resolve an MCP `cursor_icon` (or CLI) value into a [`CursorIconResolution`].
 ///
 /// - empty string → the configured default built-in ([`BuiltinShape::default`])
-/// - a built-in name (`arrow` / `teardrop`, case-insensitive) → that built-in
+/// - a built-in name (`arrow` / `teardrop` / `cmux`, case-insensitive) → that built-in
 /// - anything else → treated as a file path and loaded (`.svg` / `.png` / `.ico`)
 ///
 /// This is the single resolver shared by the CLI flags and every platform's MCP
@@ -97,7 +103,7 @@ pub fn resolve_cursor_icon(value: &str) -> Result<CursorIconResolution> {
     CursorShape::load(value).map(CursorIconResolution::Image)
 }
 
-/// Rasterised cursor shape at 64×64 RGBA.
+/// Rasterised cursor shape at 52×52 RGBA.
 #[derive(Debug, Clone)]
 pub struct CursorShape {
     /// Raw RGBA pixels, row-major top-to-bottom, 4 bytes per pixel.
@@ -130,6 +136,21 @@ const TEARDROP_CURSOR_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" 
 <path d="M19.87,19.21l-6-15.92a2,2,0,0,0-3.74,0l-6,15.92a2,2,0,0,0,.65,2.3A2.21,2.21,0,0,0,6.17,22a2.24,2.24,0,0,0,1.23-.37L12,18.57l4.6,3.06a2.22,2.22,0,0,0,2.62-.12A2,2,0,0,0,19.87,19.21Z" fill="url(#cursorGrad)" stroke="#FFFFFF" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
 </svg>"##;
 
+/// Official cmux chevron cropped into a square cursor canvas. The path and
+/// gradient stops match `web/public/cmux-icon.svg` in the cmux repository;
+/// only a thin white outline is added so the mark remains visible over both
+/// light and dark application content.
+const CMUX_CURSOR_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="65 58 140 140">
+<defs>
+<linearGradient id="cmux-chevron" x1="91" y1="128" x2="179" y2="128" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#12c7f5"/>
+<stop offset="0.52" stop-color="#2d8cff"/>
+<stop offset="1" stop-color="#6c5cff"/>
+</linearGradient>
+</defs>
+<path d="M91 65 L179 128 L91 191 L91 151 L139 128 L91 105 Z" fill="url(#cmux-chevron)" stroke="#FFFFFF" stroke-width="7" stroke-linejoin="round"/>
+</svg>"##;
+
 impl CursorShape {
     /// Load from `path`.  Supported: `.svg`, `.ico`, `.png`.
     pub fn load(path: &str) -> Result<Self> {
@@ -151,6 +172,15 @@ impl CursorShape {
         CACHE.get_or_init(|| {
             Self::load_svg_bytes(TEARDROP_CURSOR_SVG)
                 .expect("embedded teardrop SVG should parse")
+        })
+    }
+
+    /// The official cmux gradient chevron, rasterised once and shared by all
+    /// branded cursor instances.
+    pub fn cmux() -> &'static Self {
+        static CACHE: std::sync::OnceLock<CursorShape> = std::sync::OnceLock::new();
+        CACHE.get_or_init(|| {
+            Self::load_svg_bytes(CMUX_CURSOR_SVG).expect("embedded cmux SVG should parse")
         })
     }
 
