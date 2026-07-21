@@ -486,6 +486,40 @@ mod tests {
     }
 
     #[test]
+    fn owner_reenable_restores_hidden_feed_without_another_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = CursorFeed::new(dir.path().to_owned(), 5154, branding());
+        feed.update(Some("active-session"), 812.5, 417.25).unwrap();
+        assert!(feed.hide_if_owned("active-session").unwrap());
+
+        assert!(feed.show_if_owned("active-session").unwrap());
+        let state: CursorFeedState =
+            serde_json::from_slice(&std::fs::read(feed.path()).unwrap()).unwrap();
+        assert!(state.visible, "re-enabling must restore the host-rendered cursor");
+        assert_eq!(state.session.as_deref(), Some("active-session"));
+        assert_eq!(
+            (state.x, state.y),
+            (812.5, 417.25),
+            "re-enabling must reuse the last position without requiring movement"
+        );
+    }
+
+    #[test]
+    fn non_owner_reenable_does_not_restore_another_sessions_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let feed = CursorFeed::new(dir.path().to_owned(), 5155, branding());
+        feed.update(Some("active-session"), 75.0, 125.0).unwrap();
+        assert!(feed.hide_if_owned("active-session").unwrap());
+
+        assert!(!feed.show_if_owned("other-session").unwrap());
+        let state: CursorFeedState =
+            serde_json::from_slice(&std::fs::read(feed.path()).unwrap()).unwrap();
+        assert!(!state.visible, "a non-owner must not restore the cursor feed");
+        assert_eq!(state.session.as_deref(), Some("active-session"));
+        assert_eq!((state.x, state.y), (75.0, 125.0));
+    }
+
+    #[test]
     fn from_parts_gates_on_state_dir_only() {
         let dir = tempfile::tempdir().unwrap();
         // No state dir → no feed, in either mode.
