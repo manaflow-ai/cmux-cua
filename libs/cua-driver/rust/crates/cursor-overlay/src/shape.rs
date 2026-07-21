@@ -21,8 +21,8 @@ pub enum BuiltinShape {
     /// Embedded `cursor-up` SVG (teardrop with notched bottom). Rasterised
     /// once into a 52 px RGBA buffer and blitted with a runtime transform.
     Teardrop,
-    /// The official cmux gradient chevron. It stays upright while moving and
-    /// uses its right-hand point as the action hotspot.
+    /// Lawrence's Sky kite filled with the cmux brand gradient. It stays
+    /// upright while moving and uses its up-left tip as the action hotspot.
     Cmux,
 }
 
@@ -136,19 +136,22 @@ const TEARDROP_CURSOR_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" 
 <path d="M19.87,19.21l-6-15.92a2,2,0,0,0-3.74,0l-6,15.92a2,2,0,0,0,.65,2.3A2.21,2.21,0,0,0,6.17,22a2.24,2.24,0,0,0,1.23-.37L12,18.57l4.6,3.06a2.22,2.22,0,0,0,2.62-.12A2,2,0,0,0,19.87,19.21Z" fill="url(#cursorGrad)" stroke="#FFFFFF" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
 </svg>"##;
 
-/// Official cmux chevron cropped into a square cursor canvas. The path and
-/// gradient stops match `web/public/cmux-icon.svg` in the cmux repository;
-/// only a thin white outline is added so the mark remains visible over both
-/// light and dark application content.
-const CMUX_CURSOR_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="65 58 140 140">
+/// Lawrence's fixed up-left Sky kite from cua PR #1, filled with the cmux
+/// brand gradient used by `AgentCursorPointerView`. The outline is encoded as
+/// a stroke-only path below the fill-only path so rasterisation does not rely
+/// on SVG `paint-order` support.
+const CMUX_CURSOR_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18.59 18.59">
 <defs>
-<linearGradient id="cmux-chevron" x1="91" y1="128" x2="179" y2="128" gradientUnits="userSpaceOnUse">
+<linearGradient id="cmux-sky" x1="0.68" y1="0.68" x2="11" y2="11" gradientUnits="userSpaceOnUse">
 <stop offset="0" stop-color="#12c7f5"/>
-<stop offset="0.52" stop-color="#2d8cff"/>
+<stop offset="0.5" stop-color="#2d8cff"/>
 <stop offset="1" stop-color="#6c5cff"/>
 </linearGradient>
 </defs>
-<path d="M91 65 L179 128 L91 191 L91 151 L139 128 L91 105 Z" fill="url(#cmux-chevron)" stroke="#FFFFFF" stroke-width="7" stroke-linejoin="round"/>
+<g transform="translate(3,3)">
+<path d="M0.68 1.83 L3.63 9.78 Q4.67 12.59 5.3 9.66 L5.44 9.01 Q6.08 6.08 9.01 5.44 L9.66 5.3 Q12.59 4.67 9.78 3.63 L1.83 0.68 Q0 0 0.68 1.83 Z" fill="none" stroke="#FFFFFF" stroke-width="1.7" stroke-linejoin="round"/>
+<path d="M0.68 1.83 L3.63 9.78 Q4.67 12.59 5.3 9.66 L5.44 9.01 Q6.08 6.08 9.01 5.44 L9.66 5.3 Q12.59 4.67 9.78 3.63 L1.83 0.68 Q0 0 0.68 1.83 Z" fill="url(#cmux-sky)"/>
+</g>
 </svg>"##;
 
 impl CursorShape {
@@ -175,8 +178,8 @@ impl CursorShape {
         })
     }
 
-    /// The official cmux gradient chevron, rasterised once and shared by all
-    /// branded cursor instances.
+    /// Lawrence's Sky kite with cmux branding, rasterised once and shared by
+    /// all branded cursor instances.
     pub fn cmux() -> &'static Self {
         static CACHE: std::sync::OnceLock<CursorShape> = std::sync::OnceLock::new();
         CACHE.get_or_init(|| {

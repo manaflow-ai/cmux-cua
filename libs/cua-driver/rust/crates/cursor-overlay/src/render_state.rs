@@ -376,6 +376,21 @@ impl RenderStateCore {
         }
     }
 
+    /// The branded cmux built-in uses the Sky kite's real tip as its hotspot.
+    /// Custom assets retain the legacy centre hotspot even when they override
+    /// a `cmux` launch default.
+    fn active_shape_uses_cmux_tip_hotspot(&self) -> bool {
+        self.shape.is_none() && matches!(self.cfg.builtin_shape, BuiltinShape::Cmux)
+    }
+
+    fn click_offset_points(&self) -> f64 {
+        if self.active_shape_uses_cmux_tip_hotspot() {
+            0.0
+        } else {
+            16.0
+        }
+    }
+
     /// Handle the OverlayCommand variants that are identical across all
     /// three platforms.  Returns `true` if the command was consumed; `false`
     /// for variants the platform must handle itself (e.g. macOS's
@@ -403,14 +418,16 @@ impl RenderStateCore {
                 y,
                 end_heading_radians,
             } => {
-                // Apply click offset (16 pt along end_heading) before planning,
-                // matching Swift `moveTo(point:endAngleRadians:)`:
+                // Centre-anchored shapes keep the legacy 16 pt click offset
+                // before planning; the cmux Sky kite lands its tip directly
+                // at the event coordinate. This matches Swift
+                // `moveTo(point:endAngleRadians:)` for legacy shapes:
                 //   tx = clickPoint.x + cos(endAngle) * clickOffset
                 //   ty = clickPoint.y + sin(endAngle) * clickOffset
-                const CLICK_OFFSET: f64 = 16.0;
+                let click_offset = self.click_offset_points();
                 let turn_radius = self.motion.turn_radius;
-                let tx = x + end_heading_radians.cos() * CLICK_OFFSET;
-                let ty = y + end_heading_radians.sin() * CLICK_OFFSET;
+                let tx = x + end_heading_radians.cos() * click_offset;
+                let ty = y + end_heading_radians.sin() * click_offset;
 
                 // macOS-only: if the cursor is still at the initial off-screen
                 // sentinel, snap it to the offset target so the path starts on-screen.
@@ -460,12 +477,13 @@ impl RenderStateCore {
                     // macOS: only snap position on first placement (sentinel state).
                     // After that the cursor stays where the animation landed.
                     if self.is_unplaced() {
-                        // Apply same click offset so tip lands at click point.
-                        const CLICK_OFFSET: f64 = 16.0;
+                        // Apply the same centre-anchor offset as MoveTo; the
+                        // cmux Sky tip uses zero so it lands on the event.
                         let angle = std::f64::consts::FRAC_PI_4;
+                        let click_offset = self.click_offset_points();
                         self.place_at(
-                            x + angle.cos() * CLICK_OFFSET,
-                            y + angle.sin() * CLICK_OFFSET,
+                            x + angle.cos() * click_offset,
+                            y + angle.sin() * click_offset,
                         );
                     }
                 } else {
@@ -616,6 +634,8 @@ pub fn paint_cursor(
     let (px, py) = ((core.pos.0 - origin_x) * s, (core.pos.1 - origin_y) * s);
     let heading = core.heading;
     let alpha_scale = core.idle_alpha as f32;
+    let active_builtin_cmux =
+        core.shape.is_none() && matches!(core.cfg.builtin_shape, BuiltinShape::Cmux);
 
     // --- Bloom (radial gradient behind the arrow) ---
     let bloom_r: f32 = if core.pressed { 34.0 * sf } else { 22.0 * sf };
@@ -636,32 +656,37 @@ pub fn paint_cursor(
     let bloom_outer = tiny_skia::Color::from_rgba8(or_, og, ob, (26.0 * alpha_scale) as u8);
     let bloom_zero = tiny_skia::Color::from_rgba8(or_, og, ob, 0);
 
-    let bloom_paint = {
-        let mut p = tiny_skia::Paint::default();
-        p.shader = tiny_skia::RadialGradient::new(
-            tiny_skia::Point::from_xy(px as f32, py as f32),
-            tiny_skia::Point::from_xy(px as f32, py as f32), // focal = center
-            bloom_r,
-            vec![
-                tiny_skia::GradientStop::new(0.0, bloom_inner),
-                tiny_skia::GradientStop::new(0.5, bloom_outer),
-                tiny_skia::GradientStop::new(1.0, bloom_zero),
-            ],
-            tiny_skia::SpreadMode::Pad,
-            tiny_skia::Transform::identity(),
-        )
-        .unwrap_or(tiny_skia::Shader::SolidColor(bloom_inner));
-        p.anti_alias = true;
-        p
-    };
+    // Lawrence's Sky cursor intentionally has no decorative bloom. Keep the
+    // click pulse below, and preserve bloom for arrow, teardrop, and custom
+    // assets.
+    if !active_builtin_cmux {
+        let bloom_paint = {
+            let mut p = tiny_skia::Paint::default();
+            p.shader = tiny_skia::RadialGradient::new(
+                tiny_skia::Point::from_xy(px as f32, py as f32),
+                tiny_skia::Point::from_xy(px as f32, py as f32), // focal = center
+                bloom_r,
+                vec![
+                    tiny_skia::GradientStop::new(0.0, bloom_inner),
+                    tiny_skia::GradientStop::new(0.5, bloom_outer),
+                    tiny_skia::GradientStop::new(1.0, bloom_zero),
+                ],
+                tiny_skia::SpreadMode::Pad,
+                tiny_skia::Transform::identity(),
+            )
+            .unwrap_or(tiny_skia::Shader::SolidColor(bloom_inner));
+            p.anti_alias = true;
+            p
+        };
 
-    if let Some(r) = tiny_skia::Rect::from_xywh(
-        (px - bloom_r as f64) as f32,
-        (py - bloom_r as f64) as f32,
-        bloom_r * 2.0,
-        bloom_r * 2.0,
-    ) {
-        pm.fill_rect(r, &bloom_paint, tiny_skia::Transform::identity(), None);
+        if let Some(r) = tiny_skia::Rect::from_xywh(
+            (px - bloom_r as f64) as f32,
+            (py - bloom_r as f64) as f32,
+            bloom_r * 2.0,
+            bloom_r * 2.0,
+        ) {
+            pm.fill_rect(r, &bloom_paint, tiny_skia::Transform::identity(), None);
+        }
     }
 
     if core.pressed {
@@ -791,9 +816,8 @@ pub fn paint_cursor(
     //        rasterises.
     //      - `teardrop`: blit the cached `CursorShape::teardrop()` pixmap
     //        — rasterised once at 2× the display target.
-    //      - `cmux`: blit the official gradient chevron upright, with its
-    //        right-hand point anchored to the same action hotspot as the
-    //        procedural arrow tip.
+    //      - `cmux`: blit Lawrence's gradient Sky kite upright, with its
+    //        up-left tip anchored directly at the action hotspot.
     //
     // Teardrop is the default silhouette; `--cursor-shape arrow` (or
     // `cursor_icon: "arrow"`) selects the procedural arrow instead.
@@ -810,9 +834,9 @@ pub fn paint_cursor(
             (None, BuiltinShape::Cmux) => (
                 Some(CursorShape::cmux()),
                 RasterPlacement::UprightActionHotspot {
-                    display_size: 32.0,
-                    normalized_x: (179.0 - 65.0) / 140.0,
-                    normalized_y: (128.0 - 58.0) / 140.0,
+                    display_size: 26.0,
+                    normalized_x: 3.0 / 18.59,
+                    normalized_y: 3.0 / 18.59,
                 },
             ),
             (None, BuiltinShape::Arrow) => {
@@ -866,19 +890,16 @@ pub fn paint_cursor(
                 normalized_y,
                 ..
             } => {
-                // The official mark is directional branding, not a motion
-                // arrow: keep it upright. Cursor motion stores the silhouette
-                // centre 16 points behind the action point, so recover that
-                // point and land the chevron tip there.
-                const ACTION_OFFSET: f32 = 16.0;
-                let action_x = px as f32 - heading.cos() as f32 * ACTION_OFFSET * sf;
-                let action_y = py as f32 - heading.sin() as f32 * ACTION_OFFSET * sf;
+                // The Sky kite is a fixed pointer, not a motion arrow. Its
+                // event position already is the action point, so land the
+                // embedded SVG's up-left tip there without rotation or an
+                // additional heading-derived offset.
                 tiny_skia::Transform::from_translate(
                     -(shape.width as f32) * normalized_x,
                     -(shape.height as f32) * normalized_y,
                 )
                 .post_scale(scale, scale)
-                .post_translate(action_x, action_y)
+                .post_translate(px as f32, py as f32)
             }
             RasterPlacement::RotatingCentered { .. } => {
                 // +90° offset compensates for the teardrop/custom SVG's
@@ -1152,6 +1173,21 @@ mod cmux_cursor_tests {
         (min_x, min_y, max_x, max_y)
     }
 
+    fn max_alpha_in_rect(
+        pm: &tiny_skia::Pixmap,
+        x_range: std::ops::RangeInclusive<u32>,
+        y_range: std::ops::RangeInclusive<u32>,
+    ) -> u8 {
+        let mut max_alpha = 0;
+        for y in y_range {
+            for x in x_range.clone() {
+                let offset = ((y * pm.width() + x) * 4 + 3) as usize;
+                max_alpha = max_alpha.max(pm.data()[offset]);
+            }
+        }
+        max_alpha
+    }
+
     fn render_cmux(heading: f64) -> ((u32, u32, u32, u32), (f64, f64)) {
         let mut cfg = CursorConfig::default();
         cfg.builtin_shape = BuiltinShape::parse("cmux").expect("cmux should be a built-in");
@@ -1215,5 +1251,28 @@ mod cmux_cursor_tests {
             true,
         );
         assert_eq!(click_core.pos, event);
+    }
+
+    #[test]
+    fn cmux_sky_omits_decorative_bloom_but_keeps_click_pulse() {
+        let mut cfg = CursorConfig::default();
+        cfg.builtin_shape = BuiltinShape::parse("cmux").expect("cmux should be a built-in");
+        let mut core = RenderStateCore::new(cfg);
+        core.place_at(64.0, 64.0);
+        core.idle_alpha = 1.0;
+
+        let resting = render_frame(&core, 128, 128, 0.0, 0.0, None, 1.0);
+        assert_eq!(
+            max_alpha_in_rect(&resting, 48..=52, 62..=66),
+            0,
+            "Sky should not render the legacy decorative bloom"
+        );
+
+        core.click_t = Some(0.0);
+        let clicking = render_frame(&core, 128, 128, 0.0, 0.0, None, 1.0);
+        assert!(
+            max_alpha_in_rect(&clicking, 41..=44, 62..=66) > 0,
+            "Sky should retain the click-pulse ring"
+        );
     }
 }
