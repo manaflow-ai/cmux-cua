@@ -92,6 +92,12 @@ clicking and typing, AX tree reads, per-window screenshots — is unchanged.
 When embedded mode is off, nothing in this feature is active: standalone
 behavior is byte-for-byte what it was.
 
+Embedding does not implicitly enable watchable foregrounding. A host building
+an explicit visible-demo experience may separately set
+`CUA_DRIVER_WATCHABLE_FRONT=1`; that opt-in leaves launched/driven targets in
+front and therefore overrides the normal background/no-focus-steal contract.
+Any other value, or omitting the variable, preserves background delivery.
+
 ## The responsibility-chain requirement, exactly
 
 The host must be the responsible process for the driver. That holds

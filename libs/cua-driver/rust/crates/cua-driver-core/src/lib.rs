@@ -33,9 +33,21 @@ pub const DEFAULT_SESSION_ENV: &str = "CUA_DRIVER_DEFAULT_SESSION";
 /// OS responsibility chain.
 pub const HOST_BUNDLE_ID_ENV: &str = "CUA_DRIVER_HOST_BUNDLE_ID";
 
+/// Explicit host opt-in for watchable automation that leaves driven apps in
+/// the foreground. Embedding alone never changes background delivery or
+/// launch placement; hosts that want this visible-demo behavior must request
+/// it separately.
+pub const WATCHABLE_FRONT_ENV: &str = "CUA_DRIVER_WATCHABLE_FRONT";
+
 /// Only the exact value `1` counts — fail-safe for anything else.
 pub fn embedded_mode() -> bool {
     std::env::var_os(EMBEDDED_ENV).is_some_and(|v| v == "1")
+}
+
+/// Whether the host explicitly opted into foregrounding driven applications.
+/// Only the exact value `1` enables this delivery-contract override.
+pub fn watchable_front_mode() -> bool {
+    std::env::var_os(WATCHABLE_FRONT_ENV).is_some_and(|v| v == "1")
 }
 
 /// Return the default session owned by this embedded driver process.

@@ -39,83 +39,23 @@ pub const DEFAULT_MAX_ELEMENTS: usize = 2_000;
 /// the structured array and Markdown tree.
 pub const MAX_AX_VALUE_CHARS: usize = 512;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ActionableSignature {
-    role: String,
-    label: String,
-    frame_bits: [u64; 4],
-}
-
 #[derive(Default)]
-struct DuplicateTracker {
-    actionable_signatures: HashSet<ActionableSignature>,
+struct TopLevelWindowTracker {
+    window_ids: HashSet<u32>,
+    element_ptrs: HashSet<usize>,
 }
 
-impl DuplicateTracker {
-    fn should_emit(
-        &mut self,
-        is_actionable: bool,
-        role: &str,
-        label: Option<&str>,
-        frame: Option<[f64; 4]>,
-    ) -> bool {
-        !is_actionable || !self.is_duplicate_actionable(role, label, frame)
-    }
-
-    fn is_duplicate_actionable(
-        &mut self,
-        role: &str,
-        label: Option<&str>,
-        frame: Option<[f64; 4]>,
-    ) -> bool {
-        let (Some(label), Some(frame)) = (label.filter(|v| !v.is_empty()), frame) else {
+impl TopLevelWindowTracker {
+    /// Returns `true` only for a top-level window not already represented by
+    /// the same retained AX reference or stable CGWindowID.
+    fn insert(&mut self, element_ptr: usize, window_id: Option<u32>) -> bool {
+        if !self.element_ptrs.insert(element_ptr) {
             return false;
-        };
-        !self.actionable_signatures.insert(ActionableSignature {
-            role: role.to_owned(),
-            label: label.to_owned(),
-            frame_bits: frame.map(f64::to_bits),
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NodeEmissionPlan {
-    should_emit: bool,
-    element_index: Option<usize>,
-    descendants_parent_index: Option<usize>,
-}
-
-/// Plan this node's emission separately from descendant traversal. A mirrored
-/// actionable node consumes no index and does not become the descendants'
-/// parent, but its children must still be walked.
-fn plan_node_emission(
-    duplicates: &mut DuplicateTracker,
-    is_actionable: bool,
-    is_indexed: bool,
-    role: &str,
-    label: Option<&str>,
-    frame: Option<[f64; 4]>,
-    parent_index: Option<usize>,
-    counter: &mut usize,
-) -> NodeEmissionPlan {
-    if !duplicates.should_emit(is_actionable, role, label, frame) {
-        return NodeEmissionPlan {
-            should_emit: false,
-            element_index: None,
-            descendants_parent_index: parent_index,
-        };
-    }
-
-    let element_index = is_indexed.then(|| {
-        let index = *counter;
-        *counter += 1;
-        index
-    });
-    NodeEmissionPlan {
-        should_emit: true,
-        element_index,
-        descendants_parent_index: element_index.or(parent_index),
+        }
+        match window_id {
+            Some(window_id) => self.window_ids.insert(window_id),
+            None => true,
+        }
     }
 }
 
@@ -128,7 +68,7 @@ pub(crate) fn truncate_ax_value(value: String) -> String {
     truncated
 }
 
-/// Human-facing label shared by the Markdown/structured dedupe logic. Preserve
+/// Human-facing label shared by the Markdown and structured output. Preserve
 /// the established title-first order used by structured consumers.
 pub(crate) fn preferred_label<'a>(
     title: Option<&'a str>,
@@ -284,7 +224,6 @@ fn walk_tree_bounded_with_mode(
     let mut index_counter = 0usize;
     // Shared visited-node counter passed into walk_element to enforce the cap.
     let mut visited_count = 0usize;
-    let mut duplicates = DuplicateTracker::default();
     // Set to true only when walk_element actually stops early due to the cap —
     // avoids a false-positive when the tree naturally ends on exactly the cap.
     let mut truncated = false;
@@ -326,9 +265,16 @@ fn walk_tree_bounded_with_mode(
         let from_windows = copy_ax_windows(app_elem);
 
         let mut top_level = from_children;
+        let mut top_level_windows = TopLevelWindowTracker::default();
+        for element in &top_level {
+            top_level_windows.insert(*element as usize, ax_get_window_id(*element));
+        }
         for w in from_windows {
-            // Deduplicate by raw pointer identity.
-            if !top_level.iter().any(|&e| e == w) {
+            // `AXChildren` and `AXWindows` can return distinct AX wrapper
+            // objects for the same window. Deduplicate only by retained
+            // reference or stable CGWindowID; visual attributes are not
+            // identity and may legitimately match across separate controls.
+            if top_level_windows.insert(w as usize, ax_get_window_id(w)) {
                 top_level.push(w);
             } else {
                 // Already present — release the extra retain from copy_ax_windows.
@@ -368,7 +314,6 @@ fn walk_tree_bounded_with_mode(
                 max_elements,
                 max_depth,
                 mode,
-                &mut duplicates,
             );
         }
 
@@ -451,7 +396,6 @@ unsafe fn walk_element(
     max_elements: usize,
     max_depth: usize,
     mode: WalkMode,
-    duplicates: &mut DuplicateTracker,
 ) {
     if depth_limit_reached(depth, max_depth, truncated) {
         return;
@@ -492,7 +436,6 @@ unsafe fn walk_element(
                 max_elements,
                 max_depth,
                 mode,
-                duplicates,
             );
             CFRelease(child as CFTypeRef);
         }
@@ -540,7 +483,6 @@ unsafe fn walk_element(
                 max_elements,
                 max_depth,
                 mode,
-                duplicates,
             );
             CFRelease(child as CFTypeRef);
         }
@@ -554,67 +496,51 @@ unsafe fn walk_element(
 
     let element_ptr = element as usize;
     let frame = element_screen_rect(element);
-    let label = preferred_label(
-        (!visible_title.is_empty()).then_some(visible_title.as_str()),
-        (!visible_description.is_empty()).then_some(visible_description.as_str()),
-        (!visible_value.is_empty()).then_some(visible_value.as_str()),
-        identifier.as_deref(),
-    );
-    let emission = plan_node_emission(
-        duplicates,
-        is_actionable,
-        is_indexed,
-        &role,
-        label,
+    let element_index = is_indexed.then(|| {
+        let index = *counter;
+        *counter += 1;
+        // Retain so the element stays alive in the cache after `copy_children`
+        // releases the per-child ref at the end of the caller's loop.
+        CFRetain(element as CFTypeRef);
+        index
+    });
+    let node = AXNode {
+        element_index,
+        role: role.clone(),
+        title: if visible_title.is_empty() {
+            None
+        } else {
+            Some(visible_title.clone())
+        },
+        value: if visible_value.is_empty() {
+            None
+        } else {
+            Some(visible_value.clone())
+        },
+        description: if visible_description.is_empty() {
+            None
+        } else {
+            Some(visible_description.clone())
+        },
+        identifier: identifier.clone(),
+        help: help.clone(),
+        actions: actions.clone(),
+        element_ptr,
+        depth,
+        parent_element_index: parent_index,
         frame,
-        parent_index,
-        counter,
-    );
-    if emission.should_emit {
-        if emission.element_index.is_some() {
-            // Retain so the element stays alive in the cache after
-            // `copy_children` releases the per-child ref at the end of the
-            // caller's loop.
-            CFRetain(element as CFTypeRef);
-        }
-        let node = AXNode {
-            element_index: emission.element_index,
-            role: role.clone(),
-            title: if visible_title.is_empty() {
-                None
-            } else {
-                Some(visible_title.clone())
-            },
-            value: if visible_value.is_empty() {
-                None
-            } else {
-                Some(visible_value.clone())
-            },
-            description: if visible_description.is_empty() {
-                None
-            } else {
-                Some(visible_description.clone())
-            },
-            identifier: identifier.clone(),
-            help: help.clone(),
-            actions: actions.clone(),
-            element_ptr,
-            depth,
-            parent_element_index: parent_index,
-            frame,
-        };
-
-        let line = format_node_line(&node);
-        lines.push((depth, line));
-        nodes.push(node);
-    }
+    };
+    let descendants_parent_index = node.element_index.or(parent_index);
+    let line = format_node_line(&node);
+    lines.push((depth, line));
+    nodes.push(node);
 
     let children = copy_children(element);
     for child in children {
         walk_element(
             child,
             depth + 1,
-            emission.descendants_parent_index,
+            descendants_parent_index,
             nodes,
             lines,
             counter,
@@ -623,7 +549,6 @@ unsafe fn walk_element(
             max_elements,
             max_depth,
             mode,
-            duplicates,
         );
         CFRelease(child as CFTypeRef);
     }
@@ -789,30 +714,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_tracker_rejects_same_role_label_and_frame() {
-        let mut tracker = DuplicateTracker::default();
-        let frame = Some([10.0, 20.0, 30.0, 40.0]);
-        assert!(!tracker.is_duplicate_actionable("AXButton", Some("7"), frame));
-        assert!(tracker.is_duplicate_actionable("AXButton", Some("7"), frame));
-        assert!(!tracker.is_duplicate_actionable("AXButton", Some("8"), frame));
-    }
-
-    #[test]
-    fn duplicate_tracker_does_not_merge_same_label_at_different_frames() {
-        let mut tracker = DuplicateTracker::default();
-        assert!(!tracker.is_duplicate_actionable(
-            "AXButton",
-            Some("OK"),
-            Some([10.0, 20.0, 30.0, 40.0]),
-        ));
-        assert!(!tracker.is_duplicate_actionable(
-            "AXButton",
-            Some("OK"),
-            Some([50.0, 20.0, 30.0, 40.0]),
-        ));
-    }
-
-    #[test]
     fn codex_full_mode_indexes_only_nodes_consumable_by_compat_actions() {
         assert!(should_index_node(
             "AXStaticText",
@@ -870,88 +771,28 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_actionable_parent_is_suppressed_but_unique_child_is_addressable() {
-        let mut tracker = DuplicateTracker::default();
-        let mut counter = 0;
-        let outer_parent = Some(41);
-        let duplicate_frame = Some([10.0, 20.0, 30.0, 40.0]);
-
-        let original = plan_node_emission(
-            &mut tracker,
-            true,
-            true,
-            "AXButton",
-            Some("Mirrored parent"),
-            duplicate_frame,
-            outer_parent,
-            &mut counter,
+    fn top_level_window_tracker_deduplicates_distinct_wrappers_for_one_window() {
+        let mut tracker = TopLevelWindowTracker::default();
+        assert!(tracker.insert(0x1111, Some(7)));
+        assert!(
+            !tracker.insert(0x2222, Some(7)),
+            "one CGWindowID returned through two AX wrappers must be walked once"
         );
-        assert_eq!(original.element_index, Some(0));
-
-        let duplicate = plan_node_emission(
-            &mut tracker,
-            true,
-            true,
-            "AXButton",
-            Some("Mirrored parent"),
-            duplicate_frame,
-            outer_parent,
-            &mut counter,
+        assert!(tracker.insert(0x3333, None));
+        assert!(
+            !tracker.insert(0x3333, None),
+            "the same retained AX reference must be walked once"
         );
-        assert!(!duplicate.should_emit);
-        assert_eq!(duplicate.element_index, None);
-        assert_eq!(duplicate.descendants_parent_index, outer_parent);
-
-        let child = plan_node_emission(
-            &mut tracker,
-            true,
-            true,
-            "AXButton",
-            Some("Unique child"),
-            Some([15.0, 25.0, 10.0, 10.0]),
-            duplicate.descendants_parent_index,
-            &mut counter,
-        );
-        let returned_indices: Vec<_> = [duplicate, child]
-            .into_iter()
-            .filter(|plan| plan.should_emit)
-            .filter_map(|plan| plan.element_index)
-            .collect();
-
-        assert_eq!(returned_indices, vec![1]);
-        assert_eq!(counter, 2, "the duplicate parent must not consume an index");
     }
 
     #[test]
-    fn walk_with_interleaved_release_and_reallocation_keeps_distinct_elements() {
-        // AX child refs are released during a depth-first walk, so the allocator
-        // may reuse the same address for a later, logically distinct element.
-        // Pointer addresses must not participate in dedupe; only the stable
-        // role + label + frame signature does.
-        let simulated_addresses = [0x1234usize, 0x1234usize, 0x1234usize];
-        let mut tracker = DuplicateTracker::default();
-        let emitted = [
-            tracker.should_emit(
-                true,
-                "AXMenuItem",
-                Some("View"),
-                Some([10.0, 20.0, 30.0, 40.0]),
-            ),
-            tracker.should_emit(
-                false,
-                "AXStaticText",
-                Some("78+2"),
-                Some([50.0, 60.0, 70.0, 80.0]),
-            ),
-            tracker.should_emit(
-                false,
-                "AXStaticText",
-                Some("80"),
-                Some([50.0, 90.0, 70.0, 80.0]),
-            ),
-        ];
-        assert!(simulated_addresses.windows(2).all(|pair| pair[0] == pair[1]));
-        assert_eq!(emitted, [true, true, true]);
+    fn top_level_window_tracker_preserves_distinct_window_identity() {
+        let mut tracker = TopLevelWindowTracker::default();
+        assert!(tracker.insert(0x1111, Some(7)));
+        assert!(tracker.insert(0x2222, Some(8)));
+        // Role, label, and frame are deliberately absent from this identity
+        // seam: distinct overlapping controls with identical display
+        // attributes must remain separately addressable inside each window.
     }
 
     #[test]
