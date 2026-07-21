@@ -432,6 +432,25 @@ mod tests {
     }
 
     #[test]
+    fn disclaim_marker_cannot_spoof_responsible_helper_identity() {
+        let source = permission_source_for_context(
+            42,
+            99,
+            "/Applications/Untrusted.app/Contents/MacOS/cmux-cua-driver",
+            true,
+            false,
+            "",
+            Some("com.example.untrusted.computer-use"),
+        );
+
+        assert_eq!(
+            source.get("attribution").and_then(|value| value.as_str()),
+            Some("caller"),
+            "a caller-controlled environment marker is not proof of responsibility disclaim"
+        );
+    }
+
+    #[test]
     fn silent_check_reports_capture_unknown_without_running_probe() {
         let probe_called = std::cell::Cell::new(false);
         let capturable = maybe_screen_recording_capture_probe(false, || {

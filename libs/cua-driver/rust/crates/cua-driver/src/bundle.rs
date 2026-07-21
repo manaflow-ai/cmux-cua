@@ -139,6 +139,14 @@ mod tests {
     }
 
     #[test]
+    fn cmux_helper_path_is_recognized_as_an_app_bundle() {
+        let path = std::path::Path::new(
+            "/Library/Application Support/cmux/computer-use/helper/tag/cmux Computer Use.app/Contents/MacOS/cmux-cua-driver",
+        );
+        assert!(is_executable_inside_app_bundle_path(path));
+    }
+
+    #[test]
     fn unset_env_is_falsy() {
         // Use a deliberately unlikely name so we don't depend on the
         // surrounding shell environment.

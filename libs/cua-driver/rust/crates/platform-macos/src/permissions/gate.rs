@@ -661,6 +661,21 @@ mod tests {
     }
 
     #[test]
+    fn external_permission_flow_opts_out_of_gate() {
+        let _guard = env_lock();
+        std::env::remove_var("CUA_DRIVER_RS_PERMISSIONS_GATE");
+        std::env::remove_var(cua_driver_core::EMBEDDED_ENV);
+        std::env::set_var("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW", "1");
+
+        assert!(
+            GateOpts::from_env_and_flag(false).opt_out,
+            "an embedding host that owns permission UX must never run the standalone gate"
+        );
+
+        std::env::remove_var("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW");
+    }
+
+    #[test]
     fn env_var_truthy_values_do_not_opt_out() {
         let _guard = env_lock();
         // Only the explicit "off" sentinels disable the gate.  Anything

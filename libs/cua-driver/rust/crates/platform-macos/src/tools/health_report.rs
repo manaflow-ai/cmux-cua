@@ -446,6 +446,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn external_permission_flow_skips_live_screen_capture_probe() {
+        let entry = external_screen_capture_check(true)
+            .expect("host-owned permission flow must provide a silent check result");
+        assert_eq!(entry.status, CheckStatus::Skip);
+        assert_eq!(entry.name, NAME_SCREEN_CAPTURE_CAPABILITY);
+    }
+
     // End-to-end through the dispatcher — checks every macOS canonical
     // name appears in the response and the response shape matches the
     // documented contract.
