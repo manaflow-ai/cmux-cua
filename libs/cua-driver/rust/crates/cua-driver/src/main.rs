@@ -168,16 +168,11 @@ fn build_macos_registry_with_compat(compat: bool) -> cua_driver_core::tool::Tool
 fn main() {
     init_logging();
 
-    // Standalone-helper identity: when cmux spawns the bundled helper (both the
-    // long-running `mcp` server and one-shot `call check_permissions` status
-    // probes) it sets CUA_DRIVER_DISCLAIM, asking this process to disclaim
-    // responsibility so it becomes its own responsible process. Because the
-    // executable lives inside the helper's own .app bundle, macOS then
-    // attributes — and reports — its Accessibility / Screen Recording grants
-    // under that bundle's identity ("cmux Computer Use") instead of cmux's.
-    // Runs before command dispatch so it applies uniformly to every subcommand;
-    // reexec_disclaimed_if_needed is still a no-op for embedded mode, an
-    // already-disclaimed re-exec, or a binary inside CuaDriver.app.
+    // Legacy explicit responsibility-disclaim path for callers that launch a
+    // bare helper binary. Host-owned helpers launched inside their own app via
+    // LaunchServices are already responsible processes and skip the later
+    // `serve` re-exec; this path remains for non-LaunchServices integrations.
+    // Runs before command dispatch so it applies uniformly to every subcommand.
     if crate::bundle::is_env_truthy("CUA_DRIVER_DISCLAIM") {
         responsibility::reexec_disclaimed_if_needed();
     }

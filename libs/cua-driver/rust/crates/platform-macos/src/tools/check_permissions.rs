@@ -102,19 +102,15 @@ fn permission_source_for_context(
                      the driver never raises its own prompt.",
         });
     }
-    // The trustworthy, non-spoofable signal is the executable path: a caller
-    // can't run from inside the code-signed `CuaDriver.app` bundle without
-    // controlling that install. The disclaim env var is caller-controlled, so
-    // it is treated only as a corroborating signal that explains why a
-    // bundle-resident daemon has `ppid != 1` (it re-exec'd itself with
-    // responsibility disclaim, so launchd is no longer its parent). On its own
-    // — outside the bundle — the env var must NOT grant daemon attribution, or
-    // a caller could pre-set it and spoof the TCC source. Fail closed to
-    // "caller" whenever the bundle signal is absent.
+    // A LaunchServices-started app is launchd-parented. The disclaimer marker
+    // is caller-controlled diagnostic context only; it must never establish
+    // daemon attribution. Host-owned helpers already running inside their app
+    // bundle skip the standalone responsibility re-exec, preserving this
+    // launchd-parented signal.
     let inside_app_bundle = exe.contains(".app/Contents/MacOS/");
     let is_responsible_app = inside_app_bundle
         && bundle_identifier.is_some_and(|identifier| !identifier.is_empty())
-        && (ppid == 1 || disclaimed);
+        && ppid == 1;
 
     let (attribution, note) = if is_responsible_app
         && bundle_identifier == Some(super::health_report::CANONICAL_BUNDLE_ID)
@@ -205,7 +201,7 @@ impl Tool for CheckPermissionsTool {
         // unreachable when embedded.
         let should_prompt = args.bool_or("prompt", true)
             && !cua_driver_core::embedded_mode()
-            && !super::health_report::external_permission_flow_enabled();
+            && !crate::permissions::external_permission_flow_enabled();
         if should_prompt {
             let _ = request_accessibility();
             let _ = request_screen_recording();

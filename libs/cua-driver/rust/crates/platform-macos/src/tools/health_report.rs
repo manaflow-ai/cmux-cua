@@ -110,25 +110,11 @@ pub(crate) fn check_bundle_identity() -> CheckEntry {
         .and_then(|p| p.to_str().map(str::to_owned))
         .unwrap_or_default();
 
-    check_bundle_identity_for_context(bid, exe, external_permission_flow_enabled())
-}
-
-pub(crate) fn external_permission_flow_enabled() -> bool {
-    let from_environment = std::env::var("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW")
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false);
-    let cmux_branded_executable = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.file_name().map(|name| name.to_owned()))
-        .and_then(|name| name.to_str().map(str::to_owned))
-        .as_deref()
-        == Some("cmux-cua-driver");
-    from_environment || cmux_branded_executable
+    check_bundle_identity_for_context(
+        bid,
+        exe,
+        crate::permissions::external_permission_flow_enabled(),
+    )
 }
 
 fn check_bundle_identity_for_context(
@@ -209,7 +195,7 @@ fn check_tcc_accessibility() -> CheckEntry {
         return CheckEntry::pass(NAME_TCC_ACCESSIBILITY, "Accessibility is granted.")
             .with_data(data);
     }
-    let hint = if external_permission_flow_enabled() {
+    let hint = if crate::permissions::external_permission_flow_enabled() {
         "Grant Accessibility to the Computer Use helper reported by bundle_identity using the embedding host's onboarding. Do not run the standalone cua-driver permission flow."
     } else {
         "Grant Accessibility to CuaDriver.app in System Settings → Privacy & Security → Accessibility. If the process bundle is not com.trycua.driver (see bundle_identity), the grant must target the responsible app — restart via `cua-driver mcp` to relaunch inside CuaDriver.app."
@@ -232,7 +218,7 @@ fn check_tcc_screen_recording() -> CheckEntry {
         return CheckEntry::pass(NAME_TCC_SCREEN_RECORDING, "Screen Recording is granted.")
             .with_data(data);
     }
-    let hint = if external_permission_flow_enabled() {
+    let hint = if crate::permissions::external_permission_flow_enabled() {
         "Grant Screen Recording to the Computer Use helper reported by bundle_identity using the embedding host's onboarding. Do not run the standalone cua-driver permission flow."
     } else {
         "Grant Screen Recording to CuaDriver.app in System Settings → Privacy & Security → Screen Recording. The grant is attributed to the responsible process — see bundle_identity to confirm the right binary is being prompted."
@@ -263,6 +249,12 @@ fn check_ax_capability() -> CheckEntry {
 }
 
 async fn check_screen_capture_capability() -> CheckEntry {
+    if let Some(entry) = external_screen_capture_check(
+        crate::permissions::external_permission_flow_enabled(),
+    ) {
+        return entry;
+    }
+
     // Live ScreenCaptureKit probe — same shape as `check_permissions`'s
     // `screen_recording_capturable`, but answer the consumer-facing
     // capability question and surface the display count.
@@ -293,6 +285,15 @@ async fn check_screen_capture_capability() -> CheckEntry {
             ..Default::default()
         }),
     }
+}
+
+fn external_screen_capture_check(external_permission_flow: bool) -> Option<CheckEntry> {
+    external_permission_flow.then(|| {
+        CheckEntry::skip(
+            NAME_SCREEN_CAPTURE_CAPABILITY,
+            "Live ScreenCaptureKit probe skipped because the embedding host owns permission onboarding.",
+        )
+    })
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

@@ -46,6 +46,29 @@ pub fn is_executable_inside_cuadriver_app() -> bool {
     s.contains("/CuaDriver.app/Contents/MacOS/")
 }
 
+/// Returns `true` when the running image lives inside any macOS application
+/// bundle. Host-owned helpers launched through LaunchServices are already
+/// their own responsible process and must not be responsibility-reexecuted.
+#[cfg(target_os = "macos")]
+pub fn is_executable_inside_app_bundle() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .as_deref()
+        .is_some_and(is_executable_inside_app_bundle_path)
+}
+
+#[cfg(target_os = "macos")]
+fn is_executable_inside_app_bundle_path(path: &std::path::Path) -> bool {
+    path.to_str()
+        .is_some_and(|path| path.contains(".app/Contents/MacOS/"))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn is_executable_inside_app_bundle() -> bool {
+    false
+}
+
 #[cfg(not(target_os = "macos"))]
 #[allow(dead_code)] // Non-macOS stub kept for API symmetry — see module header.
 pub fn is_executable_inside_cuadriver_app() -> bool {
