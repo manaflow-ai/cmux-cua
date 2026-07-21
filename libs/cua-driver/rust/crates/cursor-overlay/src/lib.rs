@@ -41,7 +41,7 @@ pub struct CursorConfig {
 
     /// Which built-in silhouette to render when no custom `shape` is set.
     /// Defaults to [`BuiltinShape::Teardrop`]. Embedding hosts can select the
-    /// branded [`BuiltinShape::Cmux`] chevron with `--cursor-shape cmux`.
+    /// branded [`BuiltinShape::Cmux`] Sky kite with `--cursor-shape cmux`.
     pub builtin_shape: BuiltinShape,
 
     /// Initial motion config (can be updated at runtime via MCP tool).

@@ -302,7 +302,7 @@ pub fn parse_command() -> Command {
             cursor_overlay::BuiltinShape::names_help());
         println!("                          embedded cursor-up SVG; 'arrow' is the procedural gradient");
         println!("                          diamond; 'sky' is the gray kite cursor; 'cmux' is");
-        println!("                          the upright branded chevron).");
+        println!("                          Lawrence's fixed upright branded Sky kite).");
         println!("                          Same vocabulary as MCP `cursor_icon`.");
         println!("  --cursor-palette <name> Pick a built-in colour palette for the cursor.");
         println!("  (These are no-ops for one-shot CLI calls like `cua-driver call` — the overlay");

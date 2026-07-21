@@ -991,13 +991,17 @@ fn builtin_shape_code(core: &RenderStateCore) -> u8 {
         cursor_overlay::BuiltinShape::Arrow => 0,
         cursor_overlay::BuiltinShape::Teardrop => 1,
         cursor_overlay::BuiltinShape::Sky => 2,
+        cursor_overlay::BuiltinShape::Cmux => 3,
     }
 }
 
 fn active_shape_rotates_with_heading(rs: &RenderState) -> bool {
     match rs.core.shape.as_ref() {
         Some(shape) => shape.rotates_with_heading,
-        None => !matches!(rs.core.cfg.builtin_shape, cursor_overlay::BuiltinShape::Sky),
+        None => !matches!(
+            rs.core.cfg.builtin_shape,
+            cursor_overlay::BuiltinShape::Sky | cursor_overlay::BuiltinShape::Cmux
+        ),
     }
 }
 
