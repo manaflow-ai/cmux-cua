@@ -1215,3 +1215,67 @@ mod backing_scale_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod cmux_cursor_tests {
+    use super::*;
+    use crate::{BuiltinShape, CursorConfig};
+
+    fn opaque_bounds(pm: &tiny_skia::Pixmap) -> (u32, u32, u32, u32) {
+        let mut min_x = pm.width();
+        let mut min_y = pm.height();
+        let mut max_x = 0;
+        let mut max_y = 0;
+
+        for (index, pixel) in pm.data().chunks_exact(4).enumerate() {
+            if pixel[3] <= 200 {
+                continue;
+            }
+            let x = index as u32 % pm.width();
+            let y = index as u32 / pm.width();
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+
+        assert!(min_x <= max_x, "cmux cursor should render opaque pixels");
+        (min_x, min_y, max_x, max_y)
+    }
+
+    fn render_cmux(heading: f64) -> ((u32, u32, u32, u32), (f64, f64)) {
+        let mut cfg = CursorConfig::default();
+        cfg.builtin_shape = BuiltinShape::parse("cmux").expect("cmux should be a built-in");
+        let mut core = RenderStateCore::new(cfg);
+        core.place_at(64.0, 64.0);
+        core.heading = heading;
+        core.idle_alpha = 1.0;
+
+        let action_point = (
+            core.pos.0 - heading.cos() * 16.0,
+            core.pos.1 - heading.sin() * 16.0,
+        );
+        let pm = render_frame(&core, 128, 128, 0.0, 0.0, None, 1.0);
+        (opaque_bounds(&pm), action_point)
+    }
+
+    #[test]
+    fn cmux_chevron_stays_upright_and_points_at_action_target() {
+        let ((x0, y0, x1, y1), target_right) = render_cmux(0.0);
+        let ((rx0, ry0, rx1, ry1), target_down) =
+            render_cmux(std::f64::consts::FRAC_PI_2);
+
+        let width = x1 - x0 + 1;
+        let height = y1 - y0 + 1;
+        let rotated_width = rx1 - rx0 + 1;
+        let rotated_height = ry1 - ry0 + 1;
+
+        assert!(height > width, "cmux chevron should be taller than wide");
+        assert_eq!(width, rotated_width, "cmux mark should not rotate with motion");
+        assert_eq!(height, rotated_height, "cmux mark should not rotate with motion");
+        assert!((x1 as f64 - target_right.0).abs() <= 2.0);
+        assert!(((y0 + y1) as f64 / 2.0 - target_right.1).abs() <= 2.0);
+        assert!((rx1 as f64 - target_down.0).abs() <= 2.0);
+        assert!(((ry0 + ry1) as f64 / 2.0 - target_down.1).abs() <= 2.0);
+    }
+}

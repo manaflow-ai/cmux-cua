@@ -358,6 +358,9 @@ mod tests {
         assert_eq!(BuiltinShape::parse("sky"), Some(BuiltinShape::Sky));
         assert_eq!(BuiltinShape::parse("SKY"), Some(BuiltinShape::Sky));
         assert_eq!(BuiltinShape::parse("Sky"), Some(BuiltinShape::Sky));
+        assert!(BuiltinShape::parse("cmux").is_some());
+        assert!(BuiltinShape::parse("CMUX").is_some());
+        assert!(BuiltinShape::parse("Cmux").is_some());
     }
 
     #[test]
@@ -385,7 +388,7 @@ mod tests {
                 "{name} listed but unparseable"
             );
         }
-        assert_eq!(help, "'arrow' | 'teardrop' | 'sky'");
+        assert_eq!(help, "'arrow' | 'teardrop' | 'sky' | 'cmux'");
     }
 
     #[test]
@@ -410,6 +413,7 @@ mod tests {
             resolve_cursor_icon("sky").unwrap(),
             Builtin(BuiltinShape::Sky)
         ));
+        assert!(matches!(resolve_cursor_icon("CMUX").unwrap(), Builtin(_)));
         // A non-name, non-existent path is treated as a file and fails to load.
         assert!(resolve_cursor_icon("/no/such/cursor.png").is_err());
     }
