@@ -127,8 +127,8 @@ pub struct CursorFeed {
     driver_pid: u32,
     branding: CursorBranding,
     temp_counter: AtomicU64,
-    /// Last emitted `(session, x, y)`, so [`CursorFeed::hide`] can mark the
-    /// cursor invisible at its last on-screen position.
+    /// Last emitted `(session, x, y)`, so visibility changes can preserve the
+    /// cursor's last on-screen position without waiting for another move.
     last: Mutex<Option<(Option<String>, f64, f64)>>,
 }
 
@@ -206,6 +206,22 @@ impl CursorFeed {
             return Ok(false);
         }
         self.write_state(owner.as_deref(), false, *x, *y)?;
+        Ok(true)
+    }
+
+    /// Show only when `session` still owns the process-global feed. Returns
+    /// `true` when a visible state was written and `false` when no cursor has
+    /// moved yet or a newer/different session owns the feed. The prior position
+    /// is reused so re-enabling does not require another cursor movement.
+    pub fn show_if_owned(&self, session: &str) -> std::io::Result<bool> {
+        let last = self.last.lock().unwrap();
+        let Some((owner, x, y)) = last.as_ref() else {
+            return Ok(false);
+        };
+        if owner.as_deref() != Some(session) {
+            return Ok(false);
+        }
+        self.write_state(owner.as_deref(), true, *x, *y)?;
         Ok(true)
     }
 
@@ -307,6 +323,17 @@ pub fn emit_hidden_if_owned(session: &str) {
     if let Some(feed) = global() {
         if let Err(error) = feed.hide_if_owned(session) {
             eprintln!("[cua-driver] warning: failed to hide owned cursor feed: {error}");
+        }
+    }
+}
+
+/// Best-effort `visible=true` only when `session` still owns the last emitted
+/// cursor. Used when re-enabling a session so the host-rendered cursor returns
+/// at its prior position without allowing one session to reveal another's feed.
+pub fn emit_visible_if_owned(session: &str) {
+    if let Some(feed) = global() {
+        if let Err(error) = feed.show_if_owned(session) {
+            eprintln!("[cua-driver] warning: failed to show owned cursor feed: {error}");
         }
     }
 }
