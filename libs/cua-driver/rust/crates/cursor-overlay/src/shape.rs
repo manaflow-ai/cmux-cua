@@ -217,6 +217,9 @@ mod tests {
         assert_eq!(BuiltinShape::parse("teardrop"), Some(BuiltinShape::Teardrop));
         assert_eq!(BuiltinShape::parse("TEARDROP"), Some(BuiltinShape::Teardrop));
         assert_eq!(BuiltinShape::parse("Teardrop"), Some(BuiltinShape::Teardrop));
+        assert!(BuiltinShape::parse("cmux").is_some());
+        assert!(BuiltinShape::parse("CMUX").is_some());
+        assert!(BuiltinShape::parse("Cmux").is_some());
     }
 
     #[test]
@@ -241,7 +244,7 @@ mod tests {
             assert!(help.contains(name), "names_help() missing {name}: {help}");
             assert!(BuiltinShape::parse(name).is_some(), "{name} listed but unparseable");
         }
-        assert_eq!(help, "'arrow' | 'teardrop'");
+        assert_eq!(help, "'arrow' | 'teardrop' | 'cmux'");
     }
 
     #[test]
@@ -253,6 +256,7 @@ mod tests {
         // crucially `arrow` stays reachable even though teardrop is the default.
         assert!(matches!(resolve_cursor_icon("arrow").unwrap(), Builtin(BuiltinShape::Arrow)));
         assert!(matches!(resolve_cursor_icon("TEARDROP").unwrap(), Builtin(BuiltinShape::Teardrop)));
+        assert!(matches!(resolve_cursor_icon("CMUX").unwrap(), Builtin(_)));
         // A non-name, non-existent path is treated as a file and fails to load.
         assert!(resolve_cursor_icon("/no/such/cursor.png").is_err());
     }
