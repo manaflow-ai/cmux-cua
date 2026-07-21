@@ -57,10 +57,16 @@ impl Tool for MoveCursorTool {
         // above. Re-anchor the overlay above WindowServer's real frontmost
         // layer-0 window before animating so an explicit visual cursor move can
         // never remain hidden behind the app the user is looking at.
-        if let Some(window_id) = crate::windows::cursor_overlay_anchor_window(
-            &crate::windows::visible_windows(),
-            std::process::id() as i32,
-        ) {
+        let driver_pid = std::process::id() as i32;
+        let anchor_window_id = tokio::task::spawn_blocking(move || {
+            crate::windows::cursor_overlay_anchor_window(
+                &crate::windows::visible_windows(),
+                driver_pid,
+            )
+        })
+        .await
+        .unwrap_or(None);
+        if let Some(window_id) = anchor_window_id {
             crate::cursor::overlay::send_command(
                 cursor_id.clone(),
                 cursor_overlay::OverlayCommand::PinAbove(window_id as u64),
