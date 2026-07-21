@@ -60,7 +60,8 @@ pub fn embedded_default_session_id() -> Option<&'static str> {
 
 fn default_session_id_from_env(value: Option<&str>, pid: u32) -> String {
     value
-        .filter(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| format!("embedded-{pid}"))
 }
@@ -104,6 +105,10 @@ mod embedded_session_tests {
     fn default_session_uses_host_value_when_provided() {
         assert_eq!(
             default_session_id_from_env(Some("cmux-codex-42"), 123),
+            "cmux-codex-42"
+        );
+        assert_eq!(
+            default_session_id_from_env(Some("  cmux-codex-42  "), 123),
             "cmux-codex-42"
         );
     }
