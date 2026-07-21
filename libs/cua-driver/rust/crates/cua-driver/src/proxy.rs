@@ -2197,6 +2197,97 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_admission_rejects_malformed_unknown_and_invalid_calls() {
+        fn request(params: serde_json::Value) -> Request {
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": params,
+            }))
+            .expect("request envelope")
+        }
+
+        let registry = crate::build_macos_registry_with_compat(false);
+
+        let malformed = request(serde_json::json!({ "arguments": {} }));
+        assert!(matches!(
+            admit_bootstrap_tool_call(&malformed, &registry),
+            BootstrapToolCallAdmission::InvalidParams(_)
+        ));
+
+        let unknown = request(serde_json::json!({
+            "name": "definitely_not_a_tool",
+            "arguments": {},
+        }));
+        match admit_bootstrap_tool_call(&unknown, &registry) {
+            BootstrapToolCallAdmission::Rejected(result) => {
+                let value = serde_json::to_value(result).expect("serialize rejection");
+                assert_eq!(value["isError"], true);
+                assert_eq!(
+                    value["content"][0]["text"],
+                    "Unknown tool: definitely_not_a_tool"
+                );
+            }
+            _ => panic!("unknown tools must be rejected before daemon startup"),
+        }
+
+        let invalid = request(serde_json::json!({
+            "name": "set_agent_cursor_enabled",
+            "arguments": {},
+        }));
+        assert!(matches!(
+            admit_bootstrap_tool_call(&invalid, &registry),
+            BootstrapToolCallAdmission::Rejected(_)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_admission_accepts_only_real_calls_and_preserves_wait_policy() {
+        fn request(name: &str, arguments: serde_json::Value) -> Request {
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments },
+            }))
+            .expect("request envelope")
+        }
+
+        let registry = crate::build_macos_registry_with_compat(false);
+
+        match admit_bootstrap_tool_call(
+            &request("check_permissions", serde_json::json!({ "prompt": false })),
+            &registry,
+        ) {
+            BootstrapToolCallAdmission::Ready { wait_for_grants, .. } => {
+                assert!(!wait_for_grants, "permission status must remain prompt");
+            }
+            _ => panic!("check_permissions must be admitted"),
+        }
+
+        match admit_bootstrap_tool_call(
+            &request("set_agent_cursor_enabled", serde_json::json!({ "enabled": true })),
+            &registry,
+        ) {
+            BootstrapToolCallAdmission::Ready { wait_for_grants, .. } => {
+                assert!(wait_for_grants, "ordinary tools retain the onboarding wait");
+            }
+            _ => panic!("a schema-valid tool call must be admitted"),
+        }
+
+        assert!(matches!(
+            admit_bootstrap_tool_call(
+                &request("type_text_chars", serde_json::json!({ "text": "a" })),
+                &registry,
+            ),
+            BootstrapToolCallAdmission::Ready { .. }
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn external_proxy_waits_for_cmux_daemon_without_launching_standalone() {
         let probes = AtomicUsize::new(0);
