@@ -853,7 +853,7 @@ impl Tool for ClickTool {
     }
 }
 
-/// Side-effect-free validation performed before embedded watchable mode may
+/// Side-effect-free validation performed before explicit watchable mode may
 /// front the target. Runtime cache/AX failures remain ordinary dispatch
 /// failures, but malformed addressing and delivery requests cannot steal focus.
 fn click_dispatch_preflight(args: &Value) -> Result<(), ToolResult> {

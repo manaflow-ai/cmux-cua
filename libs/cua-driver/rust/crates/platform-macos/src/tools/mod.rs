@@ -137,17 +137,17 @@ pub(crate) fn preflight_action_address(
     })
 }
 
-// ── Embedded "watchable" target fronting ─────────────────────────────────────
+// ── Explicit "watchable" target fronting ─────────────────────────────────────
 //
-// In embedded mode the user WATCHES computer use (there is an on-screen agent
-// cursor overlay), so the app being driven must be visible/frontmost — unlike
-// serve/daemon mode, which deliberately drives apps in the background. The
-// shared action choke point (`ToolRegistry::invoke` in cua-driver-core) calls
-// [`front_target_if_embedded`] before each targeted drive action; this module
-// owns the activation + the front-once/dedupe state so we never flicker focus
-// by re-activating an already-frontmost target on every single action.
+// A host may explicitly request visible computer use, where the app being
+// driven stays frontmost. Embedding alone preserves the normal background
+// delivery contract. The shared action choke point (`ToolRegistry::invoke` in
+// cua-driver-core) calls [`front_target_if_watchable`] before each targeted
+// drive action; this module owns the activation + front-once/dedupe state so we
+// never flicker focus by re-activating an already-frontmost target on every
+// single action.
 
-/// The (session, target_pid) most recently fronted by [`front_target_if_embedded`].
+/// The (session, target_pid) most recently fronted by [`front_target_if_watchable`].
 /// One driver process ⇒ one dedupe cell. `None` until the first front.
 static LAST_FRONTED: std::sync::Mutex<Option<(Option<String>, i32)>> =
     std::sync::Mutex::new(None);
@@ -196,14 +196,15 @@ pub(crate) fn decide_front(
     FrontDecision { front, new_last: Some(key) }
 }
 
-/// Bring a driven target app to the foreground in embedded mode so the watching
-/// user sees the window being driven. Best-effort and deduped via
+/// Bring a driven target app to the foreground in explicit watchable mode so
+/// the watching user sees the window being driven. Best-effort and deduped via
 /// [`decide_front`]: a rejected/failed activation is only warned about, never an
 /// error — this is called from the shared action choke point and must never
-/// fail a tool call. No-op outside embedded mode (the core caller already gates
-/// on `embedded_mode()`, and this rechecks so a stray direct call stays safe).
-pub fn front_target_if_embedded(target_pid: i64, session: Option<&str>) {
-    if !cua_driver_core::embedded_mode() {
+/// fail a tool call. No-op without host opt-in (the core caller already gates
+/// on `watchable_front_mode()`, and this rechecks so a stray direct call stays
+/// safe).
+pub fn front_target_if_watchable(target_pid: i64, session: Option<&str>) {
+    if !cua_driver_core::watchable_front_mode() {
         return;
     }
     let Ok(pid) = i32::try_from(target_pid) else {
@@ -218,7 +219,7 @@ pub fn front_target_if_embedded(target_pid: i64, session: Option<&str>) {
             tracing::warn!(
                 target: "platform_macos::tools::watchable_front",
                 target_pid = pid,
-                "embedded watchable front: activation returned NO (app hidden, \
+                "watchable front: activation returned NO (app hidden, \
                  terminating, or denied) — proceeding with background drive"
             );
         }
@@ -549,11 +550,10 @@ pub fn register_all(registry: &mut ToolRegistry, compat: bool) {
     registry.set_target_app_resolver(|pid| {
         i32::try_from(pid).ok().and_then(crate::apps::get_app_name_for_pid)
     });
-    // Embedded "watchable" fronting: the core action choke point calls this
-    // before each targeted drive action (embedded mode only) so the app being
-    // driven is visible/frontmost for the watching user. No-op in serve/daemon
-    // mode (the caller gates on embedded_mode()).
-    registry.set_target_front_hook(front_target_if_embedded);
+    // Explicit "watchable" fronting: the core action choke point calls this
+    // before each targeted drive action only after host opt-in, so ordinary
+    // embedded and daemon sessions preserve background delivery semantics.
+    registry.set_target_front_hook(front_target_if_watchable);
     let state = Arc::new(ToolState::default());
     // Share the element cache with the recording-hook layer so it can
     // resolve element_index → window-local screenshot coords for click.png.
@@ -646,7 +646,7 @@ pub fn register_all(registry: &mut ToolRegistry, compat: bool) {
 
 #[cfg(test)]
 mod watchable_front_tests {
-    //! Pure front-once/dedupe decision for embedded "watchable" fronting.
+    //! Pure front-once/dedupe decision for explicit watchable fronting.
     //! Injects the frontmost pid + last-fronted state so no live WindowServer
     //! is needed.
     use super::{decide_front, FrontDecision};

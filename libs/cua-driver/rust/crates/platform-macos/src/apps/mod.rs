@@ -544,7 +544,7 @@ pub fn activate_pid(pid: i32) -> bool {
 /// `NSRunningApplication.activateWithOptions(NSApplicationActivateAllWindows)`
 /// — the same call `bring_to_front` uses, so a multi-window target lands
 /// entirely frontmost (not just its key window). Returns `true` when Cocoa
-/// accepted the swap. Used by the embedded "watchable" fronting path so the
+/// accepted the swap. Used by the explicit "watchable" fronting path so the
 /// user watching the agent cursor sees the driven app. Best-effort: callers
 /// treat a `false`/missing app as a warning, never a hard failure.
 pub fn activate_pid_all_windows(pid: i32) -> bool {

@@ -453,11 +453,12 @@ pub struct ToolRegistry {
     /// Platform hook for resolving a human-readable target application name.
     target_app_resolver: Option<fn(i64) -> Option<String>>,
     /// Platform hook that brings a driven target app to the foreground so the
-    /// watching user sees the window being driven. Only invoked in embedded
-    /// mode, from the shared action choke point, for targeted action tools.
+    /// watching user sees the window being driven. Only invoked after the host
+    /// explicitly opts into watchable foregrounding, from the shared action
+    /// choke point, for targeted action tools.
     /// The hook is best-effort and must never fail a tool call; it owns its own
-    /// front-once/dedupe state. Called with `(target_pid, session)`. Left `None`
-    /// on platforms/modes that keep the background-drive default (serve/daemon).
+    /// front-once/dedupe state. Called with `(target_pid, session)`. May remain
+    /// `None` on platforms that do not support visible foregrounding.
     target_front_hook: Option<fn(i64, Option<&str>)>,
 }
 
@@ -477,7 +478,7 @@ impl ToolRegistry {
         self.target_app_resolver = Some(resolver);
     }
 
-    /// Install the platform hook that fronts a driven target in embedded mode.
+    /// Install the platform hook that fronts a driven target in watchable mode.
     /// See [`ToolRegistry::target_front_hook`].
     pub fn set_target_front_hook(&mut self, hook: fn(i64, Option<&str>)) {
         self.target_front_hook = Some(hook);
@@ -607,7 +608,7 @@ impl ToolRegistry {
             .then(|| self.recording.begin_turn(resolved_name, &args, start_ms))
             .flatten();
 
-        // A rejected action must be side-effect free. In particular, embedded
+        // A rejected action must be side-effect free. In particular, explicit
         // watchable mode must not front a target until schema + tool-specific
         // delivery preflight has accepted the call. This is intentionally the
         // final boundary before invoke so accepted actions remain visible.
@@ -615,7 +616,7 @@ impl ToolRegistry {
             tool.as_ref(),
             resolved_name,
             &args,
-            crate::embedded_mode(),
+            crate::watchable_front_mode(),
             self.target_front_hook,
         ) {
             if let Some(pending_turn) = pending_turn {
@@ -715,17 +716,17 @@ impl ToolRegistry {
     }
 }
 
-/// Shared embedded-action boundary: validate first, then front exactly once.
+/// Shared watchable-action boundary: validate first, then front exactly once.
 /// Kept separate from [`ToolRegistry::invoke`] so focus ordering can be tested
-/// without mutating the process-wide embedded-mode environment.
+/// without mutating the process-wide watchable-mode environment.
 fn preflight_and_front_target(
     tool: &dyn Tool,
     name: &str,
     args: &Value,
-    embedded: bool,
+    watchable_front: bool,
     hook: Option<fn(i64, Option<&str>)>,
 ) -> Result<(), ToolResult> {
-    if !embedded || !action_targets_window(name, args) {
+    if !watchable_front || !action_targets_window(name, args) {
         return Ok(());
     }
 
@@ -747,12 +748,12 @@ impl Default for ToolRegistry {
 }
 
 /// The action tools that DRIVE a specific target window (as opposed to merely
-/// inspecting it). In embedded mode the driver fronts the target before these
-/// so the watching user sees the driven window. `get_window_state` is a
-/// perception tool and is fronted only when it carries an explicit `action`
-/// (it does not today — so it stays a pure read, never stealing focus on
-/// inspection). Serve/daemon modes never front (the embedded gate in `invoke`
-/// short-circuits first).
+/// inspecting it). In explicit watchable mode the driver fronts the target
+/// before these so the watching user sees the driven window.
+/// `get_window_state` is a perception tool and is fronted only when it carries
+/// an explicit `action` (it does not today — so it stays a pure read, never
+/// stealing focus on inspection). No mode fronts unless
+/// `CUA_DRIVER_WATCHABLE_FRONT=1`.
 const FRONT_ACTION_TOOLS: &[&str] = &[
     "click",
     "double_click",
@@ -766,7 +767,7 @@ const FRONT_ACTION_TOOLS: &[&str] = &[
 ];
 
 /// Whether a call is a targeted drive action that should front its target in
-/// embedded mode. `get_window_state` fronts only with an explicit non-null
+/// watchable mode. `get_window_state` fronts only with an explicit non-null
 /// `action` arg so ordinary perception never steals focus.
 fn action_targets_window(name: &str, args: &Value) -> bool {
     if FRONT_ACTION_TOOLS.contains(&name) {
@@ -827,7 +828,7 @@ fn synthesize_action_label(tool_name: &str, args: &Value) -> String {
 
 #[cfg(test)]
 mod front_gate_tests {
-    //! Which calls trigger embedded "watchable" fronting at the choke point.
+    //! Which calls trigger explicit watchable fronting at the choke point.
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -966,6 +967,16 @@ mod front_gate_tests {
             )
             .is_err()
         );
+        assert_eq!(FRONT_CALLS.load(Ordering::SeqCst), 0);
+
+        preflight_and_front_target(
+            &click,
+            "click",
+            &json!({"pid": 42, "x": 1, "y": 2}),
+            false,
+            Some(count_front),
+        )
+        .expect("background delivery without host opt-in should pass without fronting");
         assert_eq!(FRONT_CALLS.load(Ordering::SeqCst), 0);
 
         preflight_and_front_target(
