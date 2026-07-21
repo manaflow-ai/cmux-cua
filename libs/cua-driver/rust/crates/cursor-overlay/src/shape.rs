@@ -299,4 +299,32 @@ mod tests {
     fn default_builtin_shape_is_teardrop() {
         assert_eq!(BuiltinShape::default(), BuiltinShape::Teardrop);
     }
+
+    #[test]
+    fn cmux_raster_uses_lawrence_sky_kite_geometry() {
+        let shape = CursorShape::cmux();
+        let mut min_x = shape.width;
+        let mut min_y = shape.height;
+        let mut max_x = 0;
+        let mut max_y = 0;
+
+        for (index, pixel) in shape.pixels.chunks_exact(4).enumerate() {
+            if pixel[3] <= 200 {
+                continue;
+            }
+            let x = index as u32 % shape.width;
+            let y = index as u32 / shape.width;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+
+        let opaque_width = max_x - min_x + 1;
+        let opaque_height = max_y - min_y + 1;
+        assert!(
+            opaque_width.abs_diff(opaque_height) <= 2,
+            "Lawrence's Sky kite should have a nearly square opaque footprint, got {opaque_width}x{opaque_height}"
+        );
+    }
 }

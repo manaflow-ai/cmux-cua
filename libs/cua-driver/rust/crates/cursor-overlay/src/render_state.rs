@@ -1160,16 +1160,13 @@ mod cmux_cursor_tests {
         core.heading = heading;
         core.idle_alpha = 1.0;
 
-        let action_point = (
-            core.pos.0 - heading.cos() * 16.0,
-            core.pos.1 - heading.sin() * 16.0,
-        );
+        let action_point = core.pos;
         let pm = render_frame(&core, 128, 128, 0.0, 0.0, None, 1.0);
         (opaque_bounds(&pm), action_point)
     }
 
     #[test]
-    fn cmux_chevron_stays_upright_and_points_at_action_target() {
+    fn cmux_uses_lawrence_sky_kite_with_tip_at_action_target() {
         let ((x0, y0, x1, y1), target_right) = render_cmux(0.0);
         let ((rx0, ry0, rx1, ry1), target_down) =
             render_cmux(std::f64::consts::FRAC_PI_2);
@@ -1179,12 +1176,44 @@ mod cmux_cursor_tests {
         let rotated_width = rx1 - rx0 + 1;
         let rotated_height = ry1 - ry0 + 1;
 
-        assert!(height > width, "cmux chevron should be taller than wide");
+        assert!(width.abs_diff(height) <= 2, "Sky kite should be nearly square");
         assert_eq!(width, rotated_width, "cmux mark should not rotate with motion");
         assert_eq!(height, rotated_height, "cmux mark should not rotate with motion");
-        assert!((x1 as f64 - target_right.0).abs() <= 2.0);
-        assert!(((y0 + y1) as f64 / 2.0 - target_right.1).abs() <= 2.0);
-        assert!((rx1 as f64 - target_down.0).abs() <= 2.0);
-        assert!(((ry0 + ry1) as f64 / 2.0 - target_down.1).abs() <= 2.0);
+        assert_eq!((x0, y0, x1, y1), (rx0, ry0, rx1, ry1));
+        assert!((x0 as f64 - target_right.0).abs() <= 2.0);
+        assert!((y0 as f64 - target_right.1).abs() <= 2.0);
+        assert_eq!(target_right, target_down);
+        assert!(x1 as f64 > target_right.0 + 12.0);
+        assert!(y1 as f64 > target_right.1 + 12.0);
+    }
+
+    #[test]
+    fn cmux_sky_tip_skips_the_legacy_arrow_click_offset() {
+        let event = (100.0, 200.0);
+        let mut cfg = CursorConfig::default();
+        cfg.builtin_shape = BuiltinShape::parse("cmux").expect("cmux should be a built-in");
+
+        let mut move_core = RenderStateCore::new(cfg.clone());
+        move_core.apply_command_base(
+            OverlayCommand::MoveTo {
+                x: event.0,
+                y: event.1,
+                end_heading_radians: std::f64::consts::FRAC_PI_4,
+            },
+            true,
+            true,
+        );
+        assert_eq!(move_core.pos, event);
+
+        let mut click_core = RenderStateCore::new(cfg);
+        click_core.apply_command_base(
+            OverlayCommand::ClickPulse {
+                x: event.0,
+                y: event.1,
+            },
+            true,
+            true,
+        );
+        assert_eq!(click_core.pos, event);
     }
 }
