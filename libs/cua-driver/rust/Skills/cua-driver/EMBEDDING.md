@@ -136,7 +136,8 @@ a dialog (the `prompt` argument is ignored) and returns:
 {
   "accessibility": true,
   "screen_recording": true,
-  "screen_recording_capturable": true,
+  "screen_recording_capturable": null,
+  "screen_recording_probe_performed": false,
   "source": {
     "attribution": "host",
     "host_bundle_id": "com.yourco.yourapp",
@@ -153,10 +154,13 @@ a dialog (the `prompt` argument is ignored) and returns:
 - `accessibility` / `screen_recording` — the live TCC state *of your app's
   grant*, answered from inside the driver process (which shares your
   identity). If both are true, it is safe to drive the desktop.
-- `screen_recording_capturable` — a live ScreenCaptureKit probe
-  (`SCShareableContent`), the authoritative signal. If it disagrees with
-  `screen_recording`, the preflight boolean is stale or belongs to a
-  different identity — see troubleshooting.
+- `screen_recording_capturable` — `null` in embedded mode and on every
+  `prompt:false` check. A live ScreenCaptureKit query can itself register or
+  raise Screen Recording TCC, so silent/host-owned checks do not run it or
+  mislabel the preflight boolean as a live result.
+- `screen_recording_probe_performed` — `false` alongside that null. It is true
+  only when a non-embedded, prompt-capable check actually ran the live probe;
+  only then is `screen_recording_capturable` a boolean.
 - `source.attribution` values:
   - `host` — embedded mode; booleans reflect the host's grant. What you
     should always see when embedding.
@@ -366,15 +370,16 @@ daemon (`cua-driver stop`). To see exactly which identity macOS is charging,
 run: `log stream --debug --predicate 'subsystem == "com.apple.TCC" AND
 eventMessage BEGINSWITH "AttributionChain"'` and trigger the action again.
 
-**"Screenshots come back black (or `screen_recording: true` but
-`screen_recording_capturable: false`)."**
-The preflight boolean and the live probe disagree, which means the Screen
-Recording grant TCC found does not belong to the driver's current
-responsible identity. Either the host never actually got the grant (check
-System Settings), the grant was reset (`tccutil reset ScreenCapture`) after
-the app cached a `true`, or the driver escaped the host's chain (see the
-previous item). Restart the driver child after any grant change — TCC
-answers are cached per process.
+**"Screenshots come back black even though `screen_recording: true`."**
+Embedded status checks deliberately return `screen_recording_capturable:
+null` because probing it would no longer be a silent read. A black real
+capture means the preflight answer was stale, the host never actually got the
+grant, or the driver escaped the host's responsibility chain. Check System
+Settings and the `source` block, then restart the driver child after any grant
+change — TCC answers are cached per process. A non-embedded prompt-capable
+check may instead report an actual live disagreement as
+`screen_recording_capturable: false` with
+`screen_recording_probe_performed: true`.
 
 **"The AX tree comes back empty / clicks do nothing."**
 `AXIsProcessTrusted()` is false for the effective identity. The host hasn't

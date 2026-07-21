@@ -28,6 +28,16 @@ fn screen_recording_capturable() -> bool {
         .unwrap_or(false)
 }
 
+/// Run the ScreenCaptureKit probe only on an explicitly prompt-capable path.
+/// `SCShareableContent::get()` can itself register/raise TCC, so `None` is the
+/// only truthful answer when a silent or host-owned flow skips that probe.
+fn maybe_screen_recording_capture_probe(
+    should_probe: bool,
+    probe: impl FnOnce() -> bool,
+) -> Option<bool> {
+    should_probe.then(probe)
+}
+
 /// (B) Which TCC identity the booleans in this response reflect.
 ///
 /// macOS attributes Accessibility / Screen-Recording to the *responsible
@@ -154,9 +164,10 @@ fn def() -> &'static ToolDef {
             safe to call repeatedly. Pass {\"prompt\": false} for a purely read-only \
             status check.\n\n\
             Returns: `accessibility` + `screen_recording` (booleans from the TCC \
-            preflight APIs), `screen_recording_capturable` (a live ScreenCaptureKit \
-            probe — if it disagrees with `screen_recording`, the preflight grant \
-            belongs to a different process), and `source` (which TCC identity the \
+            preflight APIs), `screen_recording_capturable` (true/false only when a \
+            live ScreenCaptureKit probe ran; null for prompt:false, embedded, or \
+            external permission flows), `screen_recording_probe_performed`, and \
+            `source` (which TCC identity the \
             booleans reflect: the responsible daemon app vs the launching terminal/IDE). \
             macOS attributes grants to the responsible process, so a standalone call \
             from a terminal reports the terminal's grants, not the driver's.".into(),
@@ -210,64 +221,79 @@ impl Tool for CheckPermissionsTool {
         // (`prompt:false`) — e.g. a host app refreshing the helper's status when
         // an agent session merely starts — MUST stay silent; running the live
         // probe there pops a permission dialog before the user has done anything
-        // with computer use. When we're not allowed to prompt, fall back to the
-        // non-triggering preflight value instead of the live capture probe.
-        let screen_recording_capturable = if should_prompt {
-            screen_recording_capturable()
-        } else {
-            screen_recording
-        };
+        // with computer use. When we're not allowed to prompt, report capture
+        // status as unknown instead of mislabelling the preflight boolean as a
+        // live result.
+        let screen_recording_capturable = maybe_screen_recording_capture_probe(
+            should_prompt,
+            screen_recording_capturable,
+        );
         // (B) Which identity the booleans above belong to.
         let source = permission_source();
-        let is_caller = source.get("attribution").and_then(|v| v.as_str()) == Some("caller");
 
-        // Text format mirrors Swift 1:1:
-        //   "✅ Accessibility: granted.\n✅ Screen Recording: granted."
-        let ax_prefix = if accessibility { "✅" } else { "❌" };
-        let sr_prefix = if screen_recording { "✅" } else { "❌" };
-        let ax_state = if accessibility {
-            "granted"
-        } else {
-            "NOT granted"
-        };
-        let sr_state = if screen_recording {
-            "granted"
-        } else {
-            "NOT granted"
-        };
-        let mut summary = format!(
-            "{ax_prefix} Accessibility: {ax_state}.\n{sr_prefix} Screen Recording: {sr_state}."
-        );
-        // Flag a preflight/probe disagreement (the false-positive tell).
-        if screen_recording && !screen_recording_capturable {
-            summary.push_str(
-                "\n⚠️  Screen Recording reads granted but a live capture probe failed — \
-                 the grant likely belongs to a different process, not this one.",
-            );
-        }
-        // Make the attribution explicit when answering for a host or caller
-        // (not the daemon).
-        if source.get("attribution").and_then(|v| v.as_str()) == Some("host") {
-            summary.push_str(
-                "\nℹ️  Embedded mode: status reflects the HOST app's TCC grant. \
-                 If a permission is missing, the host must request it — the \
-                 driver will not prompt.",
-            );
-        }
-        if is_caller {
-            summary.push_str(
-                "\nℹ️  Status reflects the launching app's TCC identity, not the CuaDriver \
-                 daemon (com.trycua.driver). See `source` for details.",
-            );
-        }
-
-        ToolResult::text(summary).with_structured(serde_json::json!({
-            "accessibility":               accessibility,
-            "screen_recording":            screen_recording,
-            "screen_recording_capturable": screen_recording_capturable,
-            "source":                      source,
-        }))
+        permission_result(
+            accessibility,
+            screen_recording,
+            screen_recording_capturable,
+            source,
+        )
     }
+}
+
+fn permission_result(
+    accessibility: bool,
+    screen_recording: bool,
+    screen_recording_capturable: Option<bool>,
+    source: serde_json::Value,
+) -> ToolResult {
+    let is_caller = source.get("attribution").and_then(|v| v.as_str()) == Some("caller");
+    // Text format mirrors Swift 1:1:
+    //   "✅ Accessibility: granted.\n✅ Screen Recording: granted."
+    let ax_prefix = if accessibility { "✅" } else { "❌" };
+    let sr_prefix = if screen_recording { "✅" } else { "❌" };
+    let ax_state = if accessibility {
+        "granted"
+    } else {
+        "NOT granted"
+    };
+    let sr_state = if screen_recording {
+        "granted"
+    } else {
+        "NOT granted"
+    };
+    let mut summary = format!(
+        "{ax_prefix} Accessibility: {ax_state}.\n{sr_prefix} Screen Recording: {sr_state}."
+    );
+    // Flag a preflight/probe disagreement (the false-positive tell).
+    if screen_recording && screen_recording_capturable == Some(false) {
+        summary.push_str(
+            "\n⚠️  Screen Recording reads granted but a live capture probe failed — \
+             the grant likely belongs to a different process, not this one.",
+        );
+    }
+    // Make the attribution explicit when answering for a host or caller
+    // (not the daemon).
+    if source.get("attribution").and_then(|v| v.as_str()) == Some("host") {
+        summary.push_str(
+            "\nℹ️  Embedded mode: status reflects the HOST app's TCC grant. \
+             If a permission is missing, the host must request it — the \
+             driver will not prompt.",
+        );
+    }
+    if is_caller {
+        summary.push_str(
+            "\nℹ️  Status reflects the launching app's TCC identity, not the CuaDriver \
+             daemon (com.trycua.driver). See `source` for details.",
+        );
+    }
+
+    ToolResult::text(summary).with_structured(serde_json::json!({
+        "accessibility":               accessibility,
+        "screen_recording":            screen_recording,
+        "screen_recording_capturable": screen_recording_capturable,
+        "screen_recording_probe_performed": screen_recording_capturable.is_some(),
+        "source":                      source,
+    }))
 }
 
 #[cfg(test)]
@@ -403,5 +429,53 @@ mod tests {
                 .contains("permissions grant"),
             "a host-owned helper must never recommend the standalone permission flow",
         );
+    }
+
+    #[test]
+    fn silent_check_reports_capture_unknown_without_running_probe() {
+        let probe_called = std::cell::Cell::new(false);
+        let capturable = maybe_screen_recording_capture_probe(false, || {
+            probe_called.set(true);
+            true
+        });
+        assert_eq!(capturable, None);
+        assert!(!probe_called.get(), "silent status must not call SCShareableContent");
+
+        let result = permission_result(
+            true,
+            true,
+            capturable,
+            serde_json::json!({ "attribution": "helper-daemon" }),
+        );
+        let structured = result.structured_content.as_ref().expect("structured status");
+        assert!(structured["screen_recording_capturable"].is_null());
+        assert_eq!(structured["screen_recording_probe_performed"], false);
+        let text = result.content.iter().find_map(|content| match content {
+            cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        }).unwrap_or_default();
+        assert!(!text.contains("live capture probe failed"));
+    }
+
+    #[test]
+    fn live_check_reports_probe_true_or_false_and_warns_only_on_false() {
+        for (live, should_warn) in [(true, false), (false, true)] {
+            let capturable = maybe_screen_recording_capture_probe(true, || live);
+            assert_eq!(capturable, Some(live));
+            let result = permission_result(
+                true,
+                true,
+                capturable,
+                serde_json::json!({ "attribution": "helper-daemon" }),
+            );
+            let structured = result.structured_content.as_ref().expect("structured status");
+            assert_eq!(structured["screen_recording_capturable"], live);
+            assert_eq!(structured["screen_recording_probe_performed"], true);
+            let text = result.content.iter().find_map(|content| match content {
+                cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            }).unwrap_or_default();
+            assert_eq!(text.contains("live capture probe failed"), should_warn);
+        }
     }
 }

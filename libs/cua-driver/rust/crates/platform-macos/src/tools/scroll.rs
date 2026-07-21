@@ -318,6 +318,30 @@ impl Tool for ScrollTool {
         def()
     }
 
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        cua_driver_core::tool::validate_dispatch_args(self.def(), args)?;
+        let address = super::preflight_action_address(args, "scroll")?;
+        if address.element && address.window_id.is_none() {
+            return Err(ToolResult::error("window_id is required when element_index is used."));
+        }
+        if address.has_xy && address.window_id.is_none() {
+            return Err(ToolResult::error(
+                "window_id is required when scrolling by window-local x,y pixels.",
+            ));
+        }
+        use cua_driver_core::tool_args::ArgsExt;
+        let pid = args.require_i32("pid")?;
+        let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
+        if !delivery_mode.is_foreground() && crate::browser::ElectronJs::is_electron(pid) {
+            return Err(ToolResult::error(
+                "Background scroll is unavailable for Electron/Chromium windows on macOS."
+                    .to_owned(),
+            )
+            .with_structured(serde_json::json!({ "code": "background_unavailable" })));
+        }
+        Ok(())
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         let pid = match args.require_i32("pid") {

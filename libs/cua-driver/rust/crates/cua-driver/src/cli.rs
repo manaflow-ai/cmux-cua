@@ -1929,28 +1929,43 @@ fn run_permissions_status(json: bool) {
         return;
     }
 
+    for line in permission_status_lines(&structured) {
+        println!("{line}");
+    }
+}
+
+fn permission_status_lines(structured: &serde_json::Value) -> Vec<String> {
     let b = |k: &str| structured.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
     let ax = b("accessibility");
     let sr = b("screen_recording");
-    let cap = b("screen_recording_capturable");
+    let cap = structured
+        .get("screen_recording_capturable")
+        .and_then(|value| value.as_bool());
     let attribution = structured
         .get("source")
         .and_then(|s| s.get("attribution"))
         .and_then(|v| v.as_str())
         .unwrap_or("driver-daemon");
 
-    println!("Accessibility:    {}", if ax { "✅ granted" } else { "❌ not granted" });
-    println!("Screen Recording: {}", if sr { "✅ granted" } else { "❌ not granted" });
-    if sr && !cap {
-        println!(
-            "  ⚠️  preflight reports granted, but a live capture probe failed — the grant \
-             likely belongs to another process, not this one."
-        );
+    let mut lines = vec![
+        format!("Accessibility:    {}", if ax { "✅ granted" } else { "❌ not granted" }),
+        format!("Screen Recording: {}", if sr { "✅ granted" } else { "❌ not granted" }),
+    ];
+    match cap {
+        Some(false) if sr => lines.push(
+            "  ⚠️  preflight reports granted, but a live capture probe failed — the grant likely belongs to another process, not this one."
+                .to_owned(),
+        ),
+        None => lines.push(
+            "Live capture probe: ❓ not performed (silent status check)".to_owned(),
+        ),
+        _ => {}
     }
-    println!("Source: {attribution}");
+    lines.push(format!("Source: {attribution}"));
     if !(ax && sr) {
-        println!("  → To grant for the driver, run: cua-driver permissions grant");
+        lines.push("  → To grant for the driver, run: cua-driver permissions grant".to_owned());
     }
+    lines
 }
 
 /// Launch CuaDriver via LaunchServices so the permission prompt attributes to
@@ -3060,6 +3075,37 @@ mod tests {
         let sanitized = sanitize_tool_name(&long_name);
         assert_eq!(sanitized.len(), 64);
         assert!(sanitized.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn silent_permission_status_does_not_treat_unknown_probe_as_failure() {
+        let lines = permission_status_lines(&serde_json::json!({
+            "accessibility": true,
+            "screen_recording": true,
+            "screen_recording_capturable": null,
+            "screen_recording_probe_performed": false,
+            "source": { "attribution": "driver-daemon" }
+        }));
+        let output = lines.join("\n");
+        assert!(output.contains("not performed"));
+        assert!(!output.contains("live capture probe failed"));
+    }
+
+    #[test]
+    fn live_permission_probe_false_warns_but_true_does_not() {
+        for (capturable, should_warn) in [(false, true), (true, false)] {
+            let lines = permission_status_lines(&serde_json::json!({
+                "accessibility": true,
+                "screen_recording": true,
+                "screen_recording_capturable": capturable,
+                "screen_recording_probe_performed": true,
+                "source": { "attribution": "driver-daemon" }
+            }));
+            assert_eq!(
+                lines.join("\n").contains("live capture probe failed"),
+                should_warn,
+            );
+        }
     }
 
     // ── Surface 8: manifest shape ───────────────────────────────────────────

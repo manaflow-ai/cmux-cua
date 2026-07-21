@@ -112,6 +112,10 @@ impl Tool for DragTool {
         def()
     }
 
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        drag_dispatch_preflight(args)
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         let pid = match args.require_i32("pid") {
@@ -391,6 +395,33 @@ impl Tool for DragTool {
     }
 }
 
+/// Side-effect-free validation for the exact boundary before embedded mode
+/// fronts the target. Keep the foreground-only delivery rule and concrete
+/// window target here so rejected drags never change app focus.
+fn drag_dispatch_preflight(args: &Value) -> Result<(), ToolResult> {
+    use cua_driver_core::tool_args::ArgsExt;
+
+    if args.get("delivery_mode").is_some_and(|value| {
+        !matches!(value.as_str(), Some("background" | "foreground"))
+    }) {
+        cua_driver_core::tool::validate_dispatch_args(def(), args)?;
+    }
+    let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
+    if !delivery_mode.is_foreground() {
+        return Err(
+            ToolResult::error(
+                "Background drag is unavailable on macOS; use delivery_mode:\"foreground\"."
+                    .to_owned(),
+            )
+            .with_structured(serde_json::json!({ "code": "background_unavailable" })),
+        );
+    }
+    require_foreground_window_id(args)?;
+    cua_driver_core::tool::validate_dispatch_args(def(), args)?;
+    args.require_i32("pid")?;
+    Ok(())
+}
+
 fn require_foreground_window_id(args: &Value) -> Result<u32, ToolResult> {
     args.get("window_id")
         .and_then(Value::as_u64)
@@ -430,7 +461,7 @@ mod tests {
 
     #[test]
     fn foreground_drag_without_window_id_fails_at_the_dispatch_gate() {
-        let error = require_foreground_window_id(&serde_json::json!({
+        let error = drag_dispatch_preflight(&serde_json::json!({
             "pid": 42,
             "delivery_mode": "foreground",
             "from_x": 1,
@@ -448,6 +479,46 @@ mod tests {
         assert_eq!(
             error.structured_content.as_ref().expect("structured error")["field"],
             "window_id"
+        );
+    }
+
+    #[test]
+    fn background_drag_is_rejected_before_dispatch() {
+        let error = drag_dispatch_preflight(&serde_json::json!({
+            "pid": 42,
+            "window_id": 1234,
+            "delivery_mode": "background",
+            "from_x": 1,
+            "from_y": 2,
+            "to_x": 3,
+            "to_y": 4
+        }))
+        .expect_err("background drag must never reach focus or input dispatch");
+
+        assert_eq!(error.is_error, Some(true));
+        assert_eq!(
+            error.structured_content.as_ref().expect("structured error")["code"],
+            "background_unavailable"
+        );
+    }
+
+    #[test]
+    fn invalid_drag_window_id_is_rejected_before_dispatch() {
+        let error = drag_dispatch_preflight(&serde_json::json!({
+            "pid": 42,
+            "window_id": -1,
+            "delivery_mode": "foreground",
+            "from_x": 1,
+            "from_y": 2,
+            "to_x": 3,
+            "to_y": 4
+        }))
+        .expect_err("invalid window_id must never reach focus or input dispatch");
+
+        assert_eq!(error.is_error, Some(true));
+        assert_eq!(
+            error.structured_content.as_ref().expect("structured error")["code"],
+            "window_id_required"
         );
     }
 

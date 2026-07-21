@@ -85,6 +85,22 @@ fn def() -> &'static ToolDef {
 impl Tool for SetValueTool {
     fn def(&self) -> &ToolDef { def() }
 
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        cua_driver_core::tool::validate_dispatch_args(self.def(), args)?;
+        let address = super::preflight_action_address(args, "set_value")?;
+        if !address.element {
+            return Err(ToolResult::error(
+                "set_value requires element_index (+ window_id) or element_token to address the target element.",
+            ));
+        }
+        if address.window_id.is_none() {
+            return Err(ToolResult::error(
+                "set_value requires window_id when element_index is used (omit only when supplying element_token, which carries it).",
+            ));
+        }
+        Ok(())
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
         let pid = match args.require_i32("pid") { Ok(v) => v, Err(e) => return e };

@@ -679,7 +679,7 @@ All parameters are optional; omit any you do not want to change.
 
 Report TCC permission status for Accessibility and Screen Recording. By default also raises the system permission dialogs for any missing grants — Apple's request APIs are no-ops when the grant is already active, so this is safe to call repeatedly. Pass &#123;"prompt": false&#125; for a purely read-only status check.
 
-Returns: `accessibility` + `screen_recording` (booleans from the TCC preflight APIs), `screen_recording_capturable` (a live ScreenCaptureKit probe — if it disagrees with `screen_recording`, the preflight grant belongs to a different process), and `source` (which TCC identity the booleans reflect: the responsible daemon app vs the launching terminal/IDE). macOS attributes grants to the responsible process, so a standalone call from a terminal reports the terminal's grants, not the driver's.
+Returns: `accessibility` + `screen_recording` (booleans from the TCC preflight APIs), `screen_recording_capturable` (true/false only when a live ScreenCaptureKit probe ran; null for prompt:false, embedded, or external permission flows), `screen_recording_probe_performed`, and `source` (which TCC identity the booleans reflect: the responsible daemon app vs the launching terminal/IDE). macOS attributes grants to the responsible process, so a standalone call from a terminal reports the terminal's grants, not the driver's.
 
 **Arguments:**
 
