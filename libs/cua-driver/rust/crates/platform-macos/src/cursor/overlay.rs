@@ -582,6 +582,16 @@ fn overlay_surface_geometry(
     }
 }
 
+fn overlay_surface_geometries(screens: &[([f64; 4], f64)]) -> Vec<OverlaySurfaceGeometry> {
+    let Some((primary_frame, _)) = screens.first().copied() else {
+        return Vec::new();
+    };
+    screens
+        .iter()
+        .map(|(frame, scale)| overlay_surface_geometry(primary_frame, *frame, *scale))
+        .collect()
+}
+
 // ── AppKit / CGImage plumbing ─────────────────────────────────────────────
 
 unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMsg>) {
@@ -602,23 +612,14 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     let _: () = msg_send![app, finishLaunching];
 
     // ---- Complete virtual-desktop frame ----
-    let main_screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-    if main_screen.is_null() {
+    let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+    let screen_count: usize = msg_send![screens, count];
+    if screen_count == 0 {
         // Headless environment (CI without display) — skip overlay entirely.
         // The MCP server continues on the background thread.
         return;
     }
-    let main_frame: NSRect = msg_send![main_screen, frame];
-    let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
-    let screen_count: usize = msg_send![screens, count];
-    let primary_frame = [
-        main_frame.origin.x,
-        main_frame.origin.y,
-        main_frame.size.width,
-        main_frame.size.height,
-    ];
-    let mut screen_frames = Vec::with_capacity(screen_count);
-    let mut surface_geometries = Vec::with_capacity(screen_count);
+    let mut screen_specs = Vec::with_capacity(screen_count);
     for index in 0..screen_count {
         let screen: *mut AnyObject = msg_send![screens, objectAtIndex: index];
         let frame: NSRect = msg_send![screen, frame];
@@ -628,10 +629,18 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
             frame.size.width,
             frame.size.height,
         ];
-        screen_frames.push(appkit_frame);
         let scale: f64 = msg_send![screen, backingScaleFactor];
-        surface_geometries.push(overlay_surface_geometry(primary_frame, appkit_frame, scale));
+        screen_specs.push((appkit_frame, scale));
     }
+    // `NSScreen.screens[0]` is the menu-bar/primary display. `mainScreen`
+    // instead follows keyboard focus and may be a secondary display, so it
+    // cannot define the AppKit-to-WindowServer Y-axis conversion.
+    let primary_frame = screen_specs[0].0;
+    let screen_frames = screen_specs
+        .iter()
+        .map(|(frame, _)| *frame)
+        .collect::<Vec<_>>();
+    let surface_geometries = overlay_surface_geometries(&screen_specs);
     let geometry = virtual_desktop_geometry(primary_frame, &screen_frames);
     let [_frame_x, _frame_y, win_w, win_h] = geometry.appkit_frame;
 
@@ -1131,12 +1140,13 @@ mod tests {
     #[test]
     fn mixed_density_displays_keep_independent_pixel_surfaces() {
         let primary = [0.0, 0.0, 1_512.0, 982.0];
-        let retina = overlay_surface_geometry(primary, primary, 2.0);
-        let external = overlay_surface_geometry(
-            primary,
-            [-1_920.0, -98.0, 1_920.0, 1_080.0],
-            1.0,
-        );
+        let surfaces = overlay_surface_geometries(&[
+            (primary, 2.0),
+            ([-1_920.0, -98.0, 1_920.0, 1_080.0], 1.0),
+        ]);
+        let [retina, external] = surfaces.as_slice() else {
+            panic!("one overlay surface must be created per display");
+        };
 
         assert_eq!(retina.global_origin, (0.0, 0.0));
         assert_eq!(retina.pixel_size(), (3_024, 1_964));
@@ -1144,6 +1154,16 @@ mod tests {
         assert_eq!(external.pixel_size(), (1_920, 1_080));
         assert_eq!(retina.backing_scale, 2.0);
         assert_eq!(external.backing_scale, 1.0);
+    }
+
+    #[test]
+    fn screen_list_primary_defines_the_global_y_axis() {
+        let primary = [0.0, 0.0, 1_512.0, 982.0];
+        let upper_secondary = [-575.0, 982.0, 1_920.0, 1_080.0];
+        let surfaces = overlay_surface_geometries(&[(primary, 2.0), (upper_secondary, 1.0)]);
+
+        assert_eq!(surfaces[0].global_origin, (0.0, 0.0));
+        assert_eq!(surfaces[1].global_origin, (-575.0, -1_080.0));
     }
 
     #[test]

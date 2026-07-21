@@ -228,9 +228,9 @@ fn enumerate_windows_inner(options: u32, layer_zero_only: bool) -> Vec<WindowInf
     result
 }
 
-/// Return the first real input-owning window at a screen point after excluding
-/// windows owned by the driver itself (notably its cursor overlay) and
-/// detectably transparent overlay helpers.
+/// Return the first visually opaque window candidate at a screen point after
+/// excluding windows owned by the driver itself (notably its cursor overlay)
+/// and detectably transparent overlay helpers.
 ///
 /// `windows` must be ordered front-to-back, as returned by
 /// `CGWindowListCopyWindowInfo`. Kept as pure logic so obstruction behaviour is
@@ -254,9 +254,12 @@ fn frontmost_input_window_at_point(
         {
             return false;
         }
-        // A completely transparent window cannot own a meaningful visible
-        // pixel. Translucent non-normal layers are typically annotation/cursor
-        // overlays; skip them when WindowServer exposes that fact.
+        // CGWindow metadata does not expose `ignoresMouseEvents`. Fail closed
+        // for opaque windows from other processes: a click-through overlay can
+        // therefore cause a safe false positive, while treating it as absent
+        // could post into the wrong application. The structured error offers a
+        // foreground retry, which establishes the requested target Z order.
+        // Detectably transparent overlays remain safe to skip.
         if window.alpha <= 0.01 || (window.layer != 0 && window.alpha < 0.95) {
             return false;
         }
