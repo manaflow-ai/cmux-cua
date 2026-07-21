@@ -26,7 +26,8 @@
 use std::sync::Arc;
 
 use cua_driver_core::protocol::{
-    codex_computer_use_initialize_result, initialize_result, Request, Response,
+    codex_computer_use_initialize_result, initialize_result, Request, Response, ToolCall,
+    ToolResult,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
@@ -193,73 +194,126 @@ pub async fn run_proxy(
                 if req.method == "initialize" {
                     client_supports_elicitation = supports_elicitation(&req);
                 }
-                #[cfg(target_os = "macos")]
-                let daemon_start = if req.method == "tools/call" {
-                    let wait_for_grants = tool_call_requires_grant_wait(&req);
-                    ensure_daemon_started(
-                        &socket_path,
-                        &mut daemon_state,
-                        &session_id,
-                        claude_code_compat,
-                        expected_profile,
-                        &control_ready_tx,
-                        wait_for_grants,
-                        &daemon_lifecycle_tx,
-                    )
-                    .await
-                } else {
-                    Ok(())
-                };
-                #[cfg(not(target_os = "macos"))]
-                let daemon_start: anyhow::Result<()> = Ok(());
 
-                if let Err(error) = daemon_start {
-                    Response::error(
-                        id,
-                        -32603,
-                        format!("computer-use daemon failed to start: {error}"),
-                    )
-                } else if req.method == "tools/call"
-                    && expected_profile == DaemonProfile::CodexComputerUseCompat
-                {
-                    match req.tool_call() {
-                        Err(error) => Response::error(
-                            id,
-                            -32602,
-                            format!("Invalid params: {error}"),
-                        ),
-                        Ok(call) => {
-                            forward_tool_call_with_approval(
-                                id,
-                                call.name,
-                                call.args,
+                // macOS: bring the daemon (and the reaper control connection) up
+                // only after a tools/call passes permission-free protocol,
+                // roster, and schema admission. initialize/tools/list remain
+                // local so registering the server cannot trigger TCC prompts.
+                #[cfg(target_os = "macos")]
+                let platform_response = if req.method == "tools/call" {
+                    let tools_list = daemon_state.tools_list_or(&bootstrap_tools_list);
+                    match admit_bootstrap_tool_call(&req, tools_list) {
+                        BootstrapToolCallAdmission::InvalidParams(error) => {
+                            Response::error(id, -32602, format!("Invalid params: {error}"))
+                        }
+                        BootstrapToolCallAdmission::Rejected(result) => {
+                            response_from_tool_result(id, result)
+                        }
+                        BootstrapToolCallAdmission::Ready {
+                            call,
+                            wait_for_grants,
+                        } => {
+                            match ensure_daemon_started(
                                 &socket_path,
+                                &mut daemon_state,
                                 &session_id,
-                                &control_ready_rx,
-                                client_supports_elicitation,
-                                &mut lines,
-                                &mut writer,
+                                claude_code_compat,
+                                expected_profile,
+                                &control_ready_tx,
+                                wait_for_grants,
+                                &daemon_lifecycle_tx,
                             )
                             .await
+                            {
+                                Err(error) => Response::error(
+                                    id,
+                                    -32603,
+                                    format!("computer-use daemon failed to start: {error}"),
+                                ),
+                                Ok(()) if expected_profile
+                                    == DaemonProfile::CodexComputerUseCompat =>
+                                {
+                                    forward_tool_call_with_approval(
+                                        id,
+                                        call.name,
+                                        call.args,
+                                        &socket_path,
+                                        &session_id,
+                                        &control_ready_rx,
+                                        client_supports_elicitation,
+                                        &mut lines,
+                                        &mut writer,
+                                    )
+                                    .await
+                                }
+                                Ok(()) => {
+                                    forward_tool_call(
+                                        id,
+                                        call.name,
+                                        call.args,
+                                        &socket_path,
+                                        &session_id,
+                                        &control_ready_rx,
+                                    )
+                                    .await
+                                }
+                            }
                         }
                     }
                 } else {
-                    #[cfg(target_os = "macos")]
-                    let current_tools_list =
-                        daemon_state.tools_list_or(&bootstrap_tools_list);
-                    #[cfg(not(target_os = "macos"))]
-                    let current_tools_list = &cached_tools_list;
+                    let tools_list = daemon_state.tools_list_or(&bootstrap_tools_list);
                     handle_proxy_request(
                         req,
                         id,
                         &socket_path,
-                        current_tools_list,
+                        tools_list,
                         &session_id,
                         &control_ready_rx,
                         expected_profile,
                     )
                     .await
-                }
+                };
+
+                #[cfg(not(target_os = "macos"))]
+                let platform_response =
+                    if req.method == "tools/call"
+                        && expected_profile == DaemonProfile::CodexComputerUseCompat
+                    {
+                        match req.tool_call() {
+                            Err(error) => Response::error(
+                                id,
+                                -32602,
+                                format!("Invalid params: {error}"),
+                            ),
+                            Ok(call) => {
+                                forward_tool_call_with_approval(
+                                    id,
+                                    call.name,
+                                    call.args,
+                                    &socket_path,
+                                    &session_id,
+                                    &control_ready_rx,
+                                    client_supports_elicitation,
+                                    &mut lines,
+                                    &mut writer,
+                                )
+                                .await
+                            }
+                        }
+                    } else {
+                        handle_proxy_request(
+                            req,
+                            id,
+                            &socket_path,
+                            &cached_tools_list,
+                            &session_id,
+                            &control_ready_rx,
+                            expected_profile,
+                        )
+                        .await
+                    };
+
+                platform_response
             }
         };
 
@@ -1380,6 +1434,75 @@ fn tool_call_requires_grant_wait(req: &Request) -> bool {
         .unwrap_or(true)
 }
 
+/// Permission-free admission for macOS lazy proxy calls. Protocol shape, tool
+/// identity, and the advertised input schema are checked before the helper is
+/// started or health-recovered. The supplied list is the bootstrap registry
+/// while dormant and the cached daemon-authored list after connection.
+#[cfg(target_os = "macos")]
+enum BootstrapToolCallAdmission {
+    InvalidParams(String),
+    Rejected(ToolResult),
+    Ready {
+        call: ToolCall,
+        wait_for_grants: bool,
+    },
+}
+
+#[cfg(target_os = "macos")]
+fn admit_bootstrap_tool_call(
+    req: &Request,
+    tools_list: &serde_json::Value,
+) -> BootstrapToolCallAdmission {
+    let call = match req.tool_call() {
+        Ok(call) => call,
+        Err(error) => return BootstrapToolCallAdmission::InvalidParams(error.to_string()),
+    };
+
+    // Preserve the registry's sole deprecated alias even though aliases are
+    // intentionally omitted from tools/list.
+    let advertised_name = match call.name.as_str() {
+        "type_text_chars" => "type_text",
+        other => other,
+    };
+    let Some(entry) = tools_list
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|tools| {
+            tools.iter().find(|tool| {
+                tool.get("name").and_then(serde_json::Value::as_str)
+                    == Some(advertised_name)
+            })
+        })
+    else {
+        return BootstrapToolCallAdmission::Rejected(ToolResult::error(format!(
+            "Unknown tool: {}",
+            call.name
+        )));
+    };
+
+    let def = cua_driver_core::tool::ToolDef {
+        name: advertised_name.to_owned(),
+        description: String::new(),
+        input_schema: entry
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
+        read_only: false,
+        destructive: false,
+        idempotent: false,
+        open_world: false,
+    };
+    if let Err(result) = cua_driver_core::tool::validate_dispatch_args(&def, &call.args) {
+        return BootstrapToolCallAdmission::Rejected(result);
+    }
+
+    let wait_for_grants = tool_call_requires_grant_wait(req);
+    BootstrapToolCallAdmission::Ready {
+        call,
+        wait_for_grants,
+    }
+}
+
 #[cfg(target_os = "macos")]
 async fn ensure_daemon_started(
     socket_path: &str,
@@ -1597,6 +1720,14 @@ async fn handle_proxy_request(
             warn!(method = other, "unknown method");
             Response::method_not_found(id, other)
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn response_from_tool_result(id: serde_json::Value, result: ToolResult) -> Response {
+    match serde_json::to_value(result) {
+        Ok(value) => Response::ok(id, value),
+        Err(error) => Response::error(id, -32603, format!("Serialize error: {error}")),
     }
 }
 
@@ -2209,11 +2340,11 @@ mod tests {
             .expect("request envelope")
         }
 
-        let registry = crate::build_macos_registry_with_compat(false);
+        let tools_list = crate::build_macos_registry_with_compat(false, false).tools_list();
 
         let malformed = request(serde_json::json!({ "arguments": {} }));
         assert!(matches!(
-            admit_bootstrap_tool_call(&malformed, &registry),
+            admit_bootstrap_tool_call(&malformed, &tools_list),
             BootstrapToolCallAdmission::InvalidParams(_)
         ));
 
@@ -2221,7 +2352,7 @@ mod tests {
             "name": "definitely_not_a_tool",
             "arguments": {},
         }));
-        match admit_bootstrap_tool_call(&unknown, &registry) {
+        match admit_bootstrap_tool_call(&unknown, &tools_list) {
             BootstrapToolCallAdmission::Rejected(result) => {
                 let value = serde_json::to_value(result).expect("serialize rejection");
                 assert_eq!(value["isError"], true);
@@ -2238,7 +2369,7 @@ mod tests {
             "arguments": {},
         }));
         assert!(matches!(
-            admit_bootstrap_tool_call(&invalid, &registry),
+            admit_bootstrap_tool_call(&invalid, &tools_list),
             BootstrapToolCallAdmission::Rejected(_)
         ));
     }
@@ -2256,11 +2387,11 @@ mod tests {
             .expect("request envelope")
         }
 
-        let registry = crate::build_macos_registry_with_compat(false);
+        let tools_list = crate::build_macos_registry_with_compat(false, false).tools_list();
 
         match admit_bootstrap_tool_call(
             &request("check_permissions", serde_json::json!({ "prompt": false })),
-            &registry,
+            &tools_list,
         ) {
             BootstrapToolCallAdmission::Ready { wait_for_grants, .. } => {
                 assert!(!wait_for_grants, "permission status must remain prompt");
@@ -2270,7 +2401,7 @@ mod tests {
 
         match admit_bootstrap_tool_call(
             &request("set_agent_cursor_enabled", serde_json::json!({ "enabled": true })),
-            &registry,
+            &tools_list,
         ) {
             BootstrapToolCallAdmission::Ready { wait_for_grants, .. } => {
                 assert!(wait_for_grants, "ordinary tools retain the onboarding wait");
@@ -2280,8 +2411,11 @@ mod tests {
 
         assert!(matches!(
             admit_bootstrap_tool_call(
-                &request("type_text_chars", serde_json::json!({ "text": "a" })),
-                &registry,
+                &request(
+                    "type_text_chars",
+                    serde_json::json!({ "pid": 1, "text": "a" }),
+                ),
+                &tools_list,
             ),
             BootstrapToolCallAdmission::Ready { .. }
         ));
