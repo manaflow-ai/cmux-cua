@@ -68,12 +68,7 @@ impl DriverProcessState {
     fn for_action(driver_pid: u32, args: &serde_json::Value, target_app: Option<String>) -> Self {
         Self {
             driver_pid,
-            session: args
-                .get("session")
-                .or_else(|| args.get("_session_id"))
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
+            session: session_for_action(args, crate::embedded_default_session_id()),
             target_app,
             target_pid: args.get("pid").and_then(|value| value.as_i64()),
             target_window_id: args.get("window_id").and_then(|value| value.as_u64()),
@@ -83,6 +78,19 @@ impl DriverProcessState {
             schema: SCHEMA_VERSION,
         }
     }
+}
+
+fn session_for_action(
+    args: &serde_json::Value,
+    embedded_default: Option<&str>,
+) -> Option<String> {
+    args.get("session")
+        .or_else(|| args.get("_session_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(embedded_default)
+        .map(str::to_owned)
 }
 
 /// One state file for the current driver process. Writes are always performed
@@ -179,6 +187,22 @@ pub(crate) fn create_private_temp_file(path: &Path) -> std::io::Result<std::fs::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anonymous_embedded_action_uses_the_cursor_session_default() {
+        assert_eq!(
+            session_for_action(&serde_json::json!({"pid": 10}), Some("cmux-codex-42")),
+            Some("cmux-codex-42".to_owned())
+        );
+        assert_eq!(
+            session_for_action(
+                &serde_json::json!({"session": " explicit ", "_session_id": "proxy"}),
+                Some("embedded-default"),
+            ),
+            Some("explicit".to_owned()),
+            "an explicit session must retain precedence over proxy/default identity"
+        );
+    }
 
     #[test]
     fn update_atomically_replaces_the_process_file() {

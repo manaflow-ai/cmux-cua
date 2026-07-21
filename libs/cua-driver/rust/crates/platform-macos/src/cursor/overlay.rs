@@ -17,9 +17,10 @@
 //!
 //! All coordinates are **screen points** with the **top-left origin**
 //! (matching `OverlayCommand::MoveTo` and AX element coordinates).  The
-//! NSWindow covers the union of every `NSScreen` frame. AppKit places that
-//! window with a bottom-left origin, while the renderer subtracts the union's
-//! equivalent global top-left origin from cursor and focus coordinates.
+//! One NSWindow covers each `NSScreen` frame so every display renders at its
+//! own backing scale. AppKit places those windows with bottom-left origins,
+//! while each renderer surface subtracts that screen's equivalent global
+//! top-left origin from cursor and focus coordinates.
 //!
 //! ## Cross-platform note (2026-05 dedup audit)
 //!
@@ -87,12 +88,6 @@ struct RenderMap {
     /// Global WindowServer top-left origin of the virtual desktop union.
     origin_x: f64,
     origin_y: f64,
-    /// `NSScreen.backingScaleFactor` of the screen the overlay window sits on.
-    /// 1.0 on a non-retina display, 2.0 on a typical retina Mac. Drives the
-    /// physical-pixel pixmap sizing + `paint_cursor` `backing_scale` so the
-    /// rendered cursor is crisp at native resolution instead of being
-    /// bilinear-upsampled by Core Animation from a logical-pixel buffer.
-    backing_scale: f64,
     /// Frozen launch-time config used as the template for lazily-created
     /// cursors (its palette is overridden per-key via `Palette::for_instance`).
     template: CursorConfig,
@@ -173,7 +168,6 @@ pub fn init(cfg: CursorConfig) {
         win_h: 0.0,
         origin_x: 0.0,
         origin_y: 0.0,
-        backing_scale: 1.0, // overwritten in run_appkit() once the NSScreen is known
         template: cfg,
         ended: std::collections::HashSet::new(),
     });
@@ -512,6 +506,33 @@ struct VirtualDesktopGeometry {
     global_origin: (f64, f64),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OverlaySurfaceGeometry {
+    /// This display's frame in AppKit's bottom-left coordinate space.
+    appkit_frame: [f64; 4],
+    /// This display's origin in WindowServer's global top-left space.
+    global_origin: (f64, f64),
+    /// Native pixels per logical point for this display only.
+    backing_scale: f64,
+}
+
+impl OverlaySurfaceGeometry {
+    fn pixel_size(self) -> (u32, u32) {
+        let scale = self.backing_scale.max(1.0);
+        (
+            (self.appkit_frame[2] * scale).ceil().max(1.0) as u32,
+            (self.appkit_frame[3] * scale).ceil().max(1.0) as u32,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OverlaySurface {
+    win_ptr: usize,
+    layer_ptr: usize,
+    geometry: OverlaySurfaceGeometry,
+}
+
 #[cfg(test)]
 impl VirtualDesktopGeometry {
     fn window_local_point(self, global_x: f64, global_y: f64) -> (f64, f64) {
@@ -543,12 +564,30 @@ fn virtual_desktop_geometry(
     }
 }
 
+fn overlay_surface_geometry(
+    primary_frame: [f64; 4],
+    appkit_frame: [f64; 4],
+    backing_scale: f64,
+) -> OverlaySurfaceGeometry {
+    let primary_max_y = primary_frame[1] + primary_frame[3];
+    let [x, y, _width, height] = appkit_frame;
+    OverlaySurfaceGeometry {
+        appkit_frame,
+        global_origin: (x, primary_max_y - (y + height)),
+        backing_scale: if backing_scale.is_finite() && backing_scale > 0.0 {
+            backing_scale
+        } else {
+            1.0
+        },
+    }
+}
+
 // ── AppKit / CGImage plumbing ─────────────────────────────────────────────
 
 unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMsg>) {
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send};
-    use objc2_foundation::{NSPoint, NSRect, NSSize};
+    use objc2_foundation::NSRect;
 
     // ---- NSApplication ----
     // Verify main thread (MainThreadMarker is a zero-size compile-time token).
@@ -572,104 +611,42 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     let main_frame: NSRect = msg_send![main_screen, frame];
     let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
     let screen_count: usize = msg_send![screens, count];
+    let primary_frame = [
+        main_frame.origin.x,
+        main_frame.origin.y,
+        main_frame.size.width,
+        main_frame.size.height,
+    ];
     let mut screen_frames = Vec::with_capacity(screen_count);
-    let mut backing_scale = 1.0_f64;
+    let mut surface_geometries = Vec::with_capacity(screen_count);
     for index in 0..screen_count {
         let screen: *mut AnyObject = msg_send![screens, objectAtIndex: index];
         let frame: NSRect = msg_send![screen, frame];
-        screen_frames.push([
+        let appkit_frame = [
             frame.origin.x,
             frame.origin.y,
             frame.size.width,
             frame.size.height,
-        ]);
-        let scale: f64 = msg_send![screen, backingScaleFactor];
-        if scale.is_finite() && scale > backing_scale {
-            backing_scale = scale;
-        }
-    }
-    let geometry = virtual_desktop_geometry(
-        [
-            main_frame.origin.x,
-            main_frame.origin.y,
-            main_frame.size.width,
-            main_frame.size.height,
-        ],
-        &screen_frames,
-    );
-    let [frame_x, frame_y, win_w, win_h] = geometry.appkit_frame;
-    let screen_frame = NSRect::new(NSPoint::new(frame_x, frame_y), NSSize::new(win_w, win_h));
-    // NSScreen.backingScaleFactor is the most direct source of truth — it's
-    // what AppKit will use for the layer's native backing surface anyway.
-    // Fall back to the CG estimator (pixel mode width ÷ logical bounds) when
-    // the AppKit call returns a non-positive value, since downstream paint
-    // math divides by this and a 0.0 would zero out the cursor.
-    if !(backing_scale > 0.0) {
-        use core_graphics::display::{CGDisplayBounds, CGMainDisplayID};
-        let display_id = CGMainDisplayID();
-        let bounds = CGDisplayBounds(display_id);
-        backing_scale = crate::tools::get_screen_size::get_backing_scale(
-            display_id,
-            bounds.size.width as i64,
-        );
-        if !(backing_scale > 0.0) {
-            backing_scale = 1.0;
-        }
-    }
-
-    // ---- NSWindow: single alloc + initWithContentRect:... ----
-    let win: *mut AnyObject = {
-        let allocated: *mut AnyObject = msg_send![class!(NSWindow), alloc];
-        // NSWindowStyleMaskBorderless = 0
-        // NSBackingStoreBuffered = 2
-        let w: *mut AnyObject = msg_send![allocated,
-            initWithContentRect: screen_frame
-            styleMask: 0u64
-            backing: 2u64
-            defer: false
         ];
-        w
-    };
-    if win.is_null() {
+        screen_frames.push(appkit_frame);
+        let scale: f64 = msg_send![screen, backingScaleFactor];
+        surface_geometries.push(overlay_surface_geometry(primary_frame, appkit_frame, scale));
+    }
+    let geometry = virtual_desktop_geometry(primary_frame, &screen_frames);
+    let [_frame_x, _frame_y, win_w, win_h] = geometry.appkit_frame;
+
+    // A window has one backing scale. Use one borderless surface per NSScreen
+    // so a Retina + 1x desktop never stretches one maximum-scale raster across
+    // both displays. Each layer receives a pixmap at its own native density.
+    let mut surfaces = Vec::with_capacity(surface_geometries.len());
+    for surface_geometry in surface_geometries {
+        if let Some(surface) = create_overlay_surface(surface_geometry) {
+            surfaces.push(surface);
+        }
+    }
+    if surfaces.is_empty() {
         return;
     }
-
-    let _: () = msg_send![win, setOpaque: false];
-    let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
-    let _: () = msg_send![win, setBackgroundColor: clear];
-    let _: () = msg_send![win, setHasShadow: false];
-    // The overlay is visual-only. Keep both click/scroll hit-testing and
-    // mouse-move tracking disabled; obstruction detection separately excludes
-    // every window owned by this driver pid because WindowServer still lists
-    // this full-screen layer-0 window in its front-to-back stack.
-    let _: () = msg_send![win, setIgnoresMouseEvents: true];
-    let _: () = msg_send![win, setAcceptsMouseMovedEvents: false];
-    // NSNormalWindowLevel = 0.  The overlay lives at the normal window level so
-    // it appears in CGWindowList layer=0 results (which agents inspect via
-    // list_windows).  Z-ordering above the target is managed dynamically via
-    // orderWindow:relativeTo: (see dispatch_pin_above / render_loop repin).
-    let _: () = msg_send![win, setLevel: 0i64];
-    // NSWindowCollectionBehaviorCanJoinAllSpaces(1<<0) | FullScreenAuxiliary(1<<8) | Stationary(1<<4)
-    let _: () = msg_send![win, setCollectionBehavior: (1u64 | (1<<8) | (1<<4))];
-    let _: () = msg_send![win, setReleasedWhenClosed: false];
-    let _: () = msg_send![win, setHidesOnDeactivate: false];
-
-    // ---- Layer-backed content view ----
-    let content_view: *mut AnyObject = msg_send![win, contentView];
-    let _: () = msg_send![content_view, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![content_view, layer];
-
-    // Set layer geometry. contentsScale tells Core Animation that the CGImage
-    // we hand to setContents: is already at retina (`backing_scale`×) pixel
-    // density — without this, CA would treat our physical-pixel pixmap as a
-    // 1× asset and bilinear-downsample it back to logical pixels on screen,
-    // re-introducing the blur this pipeline exists to eliminate.
-    let _: () = msg_send![layer, setContentsScale: backing_scale];
-    // kCAGravityTopLeft — the string literal "topLeft"
-    let gravity_ns: *mut AnyObject = msg_send![class!(NSString),
-        stringWithUTF8String: b"topLeft\0".as_ptr()
-    ];
-    let _: () = msg_send![layer, setContentsGravity: gravity_ns];
 
     // ---- Update RenderMap header with screen size (screen-global) ----
     {
@@ -679,30 +656,72 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
             m.win_h = win_h;
             m.origin_x = geometry.global_origin.0;
             m.origin_y = geometry.global_origin.1;
-            m.backing_scale = backing_scale;
         }
     }
 
-    // ---- Show the window ----
-    let _: () = msg_send![win, orderFrontRegardless];
-
     // ---- Render thread (60 fps) ----
-    let layer_ptr = layer as usize;
-    let win_ptr = win as usize;
     std::thread::spawn(move || {
-        render_loop(layer_ptr, win_ptr, rx, win_w, win_h);
+        render_loop(surfaces, rx);
     });
 
     // ---- NSApplication run loop (blocks until process exits) ----
     let _: () = msg_send![app, run];
 }
 
+unsafe fn create_overlay_surface(geometry: OverlaySurfaceGeometry) -> Option<OverlaySurface> {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    let [frame_x, frame_y, width, height] = geometry.appkit_frame;
+    let screen_frame = NSRect::new(
+        NSPoint::new(frame_x, frame_y),
+        NSSize::new(width, height),
+    );
+    let allocated: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+    let win: *mut AnyObject = msg_send![allocated,
+        initWithContentRect: screen_frame
+        styleMask: 0u64
+        backing: 2u64
+        defer: false
+    ];
+    if win.is_null() {
+        return None;
+    }
+
+    let _: () = msg_send![win, setOpaque: false];
+    let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+    let _: () = msg_send![win, setBackgroundColor: clear];
+    let _: () = msg_send![win, setHasShadow: false];
+    // The overlay is visual-only. Obstruction detection separately excludes
+    // every layer-0 window owned by this driver pid.
+    let _: () = msg_send![win, setIgnoresMouseEvents: true];
+    let _: () = msg_send![win, setAcceptsMouseMovedEvents: false];
+    let _: () = msg_send![win, setLevel: 0i64];
+    let _: () = msg_send![win, setCollectionBehavior: (1u64 | (1<<8) | (1<<4))];
+    let _: () = msg_send![win, setReleasedWhenClosed: false];
+    let _: () = msg_send![win, setHidesOnDeactivate: false];
+
+    let content_view: *mut AnyObject = msg_send![win, contentView];
+    let _: () = msg_send![content_view, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![content_view, layer];
+    let _: () = msg_send![layer, setContentsScale: geometry.backing_scale];
+    let gravity_ns: *mut AnyObject = msg_send![class!(NSString),
+        stringWithUTF8String: b"topLeft\0".as_ptr()
+    ];
+    let _: () = msg_send![layer, setContentsGravity: gravity_ns];
+    let _: () = msg_send![win, orderFrontRegardless];
+
+    Some(OverlaySurface {
+        win_ptr: win as usize,
+        layer_ptr: layer as usize,
+        geometry,
+    })
+}
+
 fn render_loop(
-    layer_ptr: usize,
-    win_ptr: usize,
+    surfaces: Vec<OverlaySurface>,
     rx: std::sync::mpsc::Receiver<OverlayMsg>,
-    _win_w: f64,
-    _win_h: f64,
 ) {
     let target_frame_ms = Duration::from_millis(16); // ~60 fps while pixels can change
     let mut last_tick = Instant::now();
@@ -738,10 +757,10 @@ fn render_loop(
         last_tick = now;
 
         // ── Phase 1: drain + tick all cursors (one lock acquisition) ──────
-        // `pinned_wid` follows the most-recently-updated cursor: a single
-        // NSWindow can occupy only one z-band, so the last-active cursor's
-        // target wins. `arrived` collects the keys whose path just ended.
-        let (pinned_wid, arrived, win_w, win_h, origin_x, origin_y, had_msg, next_frame_tick_needed) = {
+        // `pinned_wid` follows the most-recently-updated cursor: all display
+        // windows share one target z-band, so the last-active cursor's target
+        // wins. `arrived` collects the keys whose path just ended.
+        let (pinned_wid, arrived, had_msg, next_frame_tick_needed) = {
             let mut guard = RENDER.lock().unwrap();
             match guard.as_mut() {
                 Some(map) => {
@@ -782,10 +801,6 @@ fn render_loop(
                     (
                         pinned,
                         arrived,
-                        map.win_w,
-                        map.win_h,
-                        map.origin_x,
-                        map.origin_y,
                         had_msg,
                         next_frame_tick_needed,
                     )
@@ -807,54 +822,53 @@ fn render_loop(
             let pin_changed = pinned_wid != last_pinned;
             last_pinned = pinned_wid;
             if pinned_wid.is_some() && (pin_changed || repin_frames >= 60) {
-                MacZOrderEnforcer { win_ptr }.reassert(pinned_wid);
+                MacZOrderEnforcer { surfaces: &surfaces }.reassert(pinned_wid);
                 repin_frames = 0;
             } else if repin_frames >= 60 {
                 repin_frames = 0;
             }
         }
 
-        // ── Phase 2: composite every cursor into ONE pixmap ───────────────
+        // ── Phase 2: composite every cursor into each display surface ─────
         // Render only when a command arrived or the previous/next tick can
         // change pixels. A final frame is emitted as animations/fades finish so
         // the layer is left in the completed/cleared state before blocking.
         if had_msg || frame_tick_needed || next_frame_tick_needed {
-            let pixmap = {
+            let frames = {
                 let guard = RENDER.lock().unwrap();
                 if let Some(map) = guard.as_ref() {
-                    // Allocate the pixmap at the screen's PHYSICAL pixel
-                    // dimensions so the cursor rasterises at retina resolution.
-                    // The cursor's logical coordinates are scaled into pixmap
-                    // pixels inside `paint_cursor` (it multiplies px/py/sizes
-                    // by `backing_scale`).
-                    let scale = map.backing_scale.max(1.0);
-                    let w = (win_w * scale).max(1.0) as u32;
-                    let h = (win_h * scale).max(1.0) as u32;
-                    let mut pm = tiny_skia::Pixmap::new(w.max(1), h.max(1))
-                        .unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap());
-                    let backing_scale_f32 = scale as f32;
-                    for (_k, rs) in &map.cursors {
-                        let focus = rs.focus_rect.map(|rect| FocusRect {
-                            rect,
-                            t: rs.focus_rect_t,
-                        });
-                        cursor_overlay::paint_cursor(
-                            &mut pm,
-                            &rs.core,
-                            origin_x,
-                            origin_y,
-                            focus,
-                            backing_scale_f32,
-                        );
-                    }
-                    pm
+                    surfaces
+                        .iter()
+                        .map(|surface| {
+                            let (w, h) = surface.geometry.pixel_size();
+                            let mut pm = tiny_skia::Pixmap::new(w, h)
+                                .unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap());
+                            for (_k, rs) in &map.cursors {
+                                let focus = rs.focus_rect.map(|rect| FocusRect {
+                                    rect,
+                                    t: rs.focus_rect_t,
+                                });
+                                cursor_overlay::paint_cursor(
+                                    &mut pm,
+                                    &rs.core,
+                                    surface.geometry.global_origin.0,
+                                    surface.geometry.global_origin.1,
+                                    focus,
+                                    surface.geometry.backing_scale as f32,
+                                );
+                            }
+                            (surface.layer_ptr, pm)
+                        })
+                        .collect::<Vec<_>>()
                 } else {
                     break;
                 }
             };
 
-            // Convert to CGImage and update layer on the main queue.
-            dispatch_set_layer_contents(layer_ptr, pixmap);
+            // Convert to CGImage and update each display layer on the main queue.
+            for (layer_ptr, pixmap) in frames {
+                dispatch_set_layer_contents(layer_ptr, pixmap);
+            }
         }
 
         frame_tick_needed = next_frame_tick_needed;
@@ -963,9 +977,8 @@ fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
 
 /// macOS implementation of [`cursor_overlay::ZOrderEnforcer`].
 ///
-/// Holds the NSWindow pointer as a `usize` and dispatches the
-/// `orderWindow:relativeTo:` call to the main queue (AppKit must run on
-/// the main thread).
+/// Holds every per-display NSWindow and dispatches `orderWindow:relativeTo:`
+/// calls to the main queue (AppKit must run on the main thread).
 ///
 /// `target = None` is treated as a no-op here rather than raising to the
 /// front: macOS creates the overlay at `NSNormalWindowLevel` and never
@@ -973,14 +986,16 @@ fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
 /// `HWND_TOPMOST`, so there is no topmost band to escape. Letting the
 /// overlay stay where the user's activations have left it keeps it out
 /// of the way when no agent action is in flight.
-struct MacZOrderEnforcer {
-    win_ptr: usize,
+struct MacZOrderEnforcer<'a> {
+    surfaces: &'a [OverlaySurface],
 }
 
-impl ZOrderEnforcer for MacZOrderEnforcer {
+impl ZOrderEnforcer for MacZOrderEnforcer<'_> {
     fn reassert(&self, target: Option<u64>) {
         if let Some(wid) = target {
-            dispatch_pin_above(self.win_ptr, wid);
+            for surface in self.surfaces {
+                dispatch_pin_above(surface.win_ptr, wid);
+            }
         }
         // target = None → no-op; see struct doc comment.
     }
@@ -1114,6 +1129,24 @@ mod tests {
     }
 
     #[test]
+    fn mixed_density_displays_keep_independent_pixel_surfaces() {
+        let primary = [0.0, 0.0, 1_512.0, 982.0];
+        let retina = overlay_surface_geometry(primary, primary, 2.0);
+        let external = overlay_surface_geometry(
+            primary,
+            [-1_920.0, -98.0, 1_920.0, 1_080.0],
+            1.0,
+        );
+
+        assert_eq!(retina.global_origin, (0.0, 0.0));
+        assert_eq!(retina.pixel_size(), (3_024, 1_964));
+        assert_eq!(external.global_origin, (-1_920.0, 0.0));
+        assert_eq!(external.pixel_size(), (1_920, 1_080));
+        assert_eq!(retina.backing_scale, 2.0);
+        assert_eq!(external.backing_scale, 1.0);
+    }
+
+    #[test]
     fn negative_x_cursor_is_not_the_unplaced_sentinel() {
         let mut core = RenderStateCore::new(CursorConfig::default());
         assert!(core.is_unplaced());
@@ -1137,7 +1170,6 @@ mod tests {
             win_h: 100.0,
             origin_x: 0.0,
             origin_y: 0.0,
-            backing_scale: 1.0,
             template: CursorConfig::default(),
             ended: std::collections::HashSet::new(),
         }
