@@ -40,8 +40,8 @@ pub struct CursorConfig {
     pub shape: Option<CursorShape>,
 
     /// Which built-in silhouette to render when no custom `shape` is set.
-    /// Defaults to [`BuiltinShape::Teardrop`]; opt into another built-in via
-    /// `--cursor-shape <name>`.
+    /// Defaults to [`BuiltinShape::Teardrop`]. Embedding hosts can select the
+    /// branded [`BuiltinShape::Cmux`] chevron with `--cursor-shape cmux`.
     pub builtin_shape: BuiltinShape,
 
     /// Initial motion config (can be updated at runtime via MCP tool).
@@ -181,8 +181,8 @@ impl CursorConfig {
     /// ```text
     /// --cursor-icon  <path.svg|path.ico|path.png>
     /// --cursor-id    <id>
-    /// --cursor-shape <arrow|teardrop|sky>  (selects a built-in silhouette;
-    ///                                       default: teardrop)
+    /// --cursor-shape <arrow|teardrop|sky|cmux>  (selects a built-in silhouette;
+    ///                                            default: teardrop)
     /// --cursor-palette <name>     (selects a named Palette)
     /// --no-overlay                (start with overlay disabled)
     /// --glide-ms     <f64>        (glideDurationMs override)
@@ -449,7 +449,8 @@ pub enum OverlayCommand {
     /// `None` clears the custom override so the configured `builtin_shape`
     /// shows again. Built-in silhouettes go through `SetBuiltinShape` instead.
     SetShape(Option<CursorShape>),
-    /// Select the built-in silhouette at runtime (`arrow` / `teardrop` / `sky`).
+    /// Select the built-in silhouette at runtime
+    /// (`arrow` / `teardrop` / `sky` / `cmux`).
     /// Sets `builtin_shape` and clears any custom `SetShape` override, so
     /// either built-in is reachable regardless of which one is the default.
     SetBuiltinShape(BuiltinShape),

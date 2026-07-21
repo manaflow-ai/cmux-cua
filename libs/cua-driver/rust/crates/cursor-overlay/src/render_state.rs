@@ -39,8 +39,8 @@
 //!   supplies one via the optional argument).
 
 use crate::{
-    shape::CURSOR_DISPLAY_POINTS, BuiltinShape, CursorConfig, CursorShape, MotionConfig,
-    OverlayCommand, Palette, PathPlanner, PathState, PlannedPath, Spring,
+    BuiltinShape, CursorConfig, CursorShape, MotionConfig, OverlayCommand, Palette, PathPlanner,
+    PathState, PlannedPath, Spring,
 };
 
 /// Platform-agnostic render state shared by macOS / Windows / Linux overlays.
@@ -74,7 +74,7 @@ pub struct RenderStateCore {
     pub click_t: Option<f64>,
     /// Whether a button is currently being held for this cursor.
     pub pressed: bool,
-    /// Custom cursor shape; `None` = built-in gradient arrow.
+    /// Custom cursor shape; `None` = the configured built-in silhouette.
     pub shape: Option<CursorShape>,
     /// User-controlled visibility.
     pub visible: bool,
@@ -381,7 +381,10 @@ impl RenderStateCore {
     fn active_shape_has_center_hotspot(&self) -> bool {
         match self.shape.as_ref() {
             Some(shape) => shape.has_center_hotspot(),
-            None => !matches!(self.cfg.builtin_shape, BuiltinShape::Sky),
+            None => !matches!(
+                self.cfg.builtin_shape,
+                BuiltinShape::Sky | BuiltinShape::Cmux
+            ),
         }
     }
 
@@ -784,13 +787,15 @@ pub fn paint_cursor(
     //   1. Per-instance custom asset loaded from `--cursor-icon <path>`
     //      (or runtime `set_agent_cursor_style.image_path`) wins.
     //   2. Else the built-in selected by `--cursor-shape`:
-    //      - `arrow` (default): call `draw_default_arrow` — procedural
+    //      - `arrow`: call `draw_default_arrow` — procedural
     //        gradient diamond, sharp at any backing scale because nothing
     //        rasterises.
     //      - `teardrop`: blit the cached `CursorShape::teardrop()` pixmap
     //        — rasterised once at 2× the display target.
     //      - `sky`: blit the cached `CursorShape::sky()` pixmap, anchored at
     //        the kite tip so the event coordinate is the click point.
+    //      - `cmux`: blit the official gradient chevron upright, anchored at
+    //        its right-hand action point.
     //
     // Teardrop is the default silhouette; `--cursor-shape arrow` (or
     // `cursor_icon: "arrow"`) selects the procedural arrow instead.
@@ -803,6 +808,7 @@ pub fn paint_cursor(
         (Some(custom), _) => Some(custom),
         (None, BuiltinShape::Teardrop) => Some(CursorShape::teardrop()),
         (None, BuiltinShape::Sky) => scaled_sky_shape.as_ref(),
+        (None, BuiltinShape::Cmux) => Some(CursorShape::cmux()),
         (None, BuiltinShape::Arrow) => {
             let grad_override = if core.gradient_colors.is_empty() {
                 None
@@ -833,7 +839,7 @@ pub fn paint_cursor(
     // rasterises at the destination pixmap's native resolution (e.g. 52 px
     // on a 2× retina display) — Core Animation then maps 1:1 to the screen
     // instead of upsampling a logical-pixel pixmap.
-    let display_size = CURSOR_DISPLAY_POINTS * sf;
+    let display_size = shape.display_points * sf;
     let scale = display_size / shape.width as f32;
     if let Some(pix) = tiny_skia::PixmapRef::from_bytes(&shape.pixels, shape.width, shape.height) {
         // T = Translate(px, py) * Rotate(angle) * Scale(s) * Translate(-hotspot)
@@ -844,7 +850,7 @@ pub fn paint_cursor(
         // The intrinsic offset compensates for heading-following raster source
         // art: teardrop/custom rasters point up (+90°). Sky opts out of
         // heading-following rotation entirely, so its up-left tip is static
-        // like the real macOS pointer.
+        // like the real macOS pointer; cmux likewise remains upright.
         let rotation_deg = raster_rotation_degrees(heading, shape);
         let identity_rotation = is_identity_rotation_degrees(rotation_deg);
         let mut transform =
@@ -853,7 +859,7 @@ pub fn paint_cursor(
         if !identity_rotation {
             transform = transform.post_rotate(rotation_deg);
         }
-        let (target_x, target_y) = if sky_builtin && identity_rotation {
+        let (target_x, target_y) = if !shape.rotates_with_heading && identity_rotation {
             ((px as f32).round(), (py as f32).round())
         } else {
             (px as f32, py as f32)
@@ -1251,10 +1257,7 @@ mod cmux_cursor_tests {
         core.heading = heading;
         core.idle_alpha = 1.0;
 
-        let action_point = (
-            core.pos.0 - heading.cos() * 16.0,
-            core.pos.1 - heading.sin() * 16.0,
-        );
+        let action_point = core.pos;
         let pm = render_frame(&core, 128, 128, 0.0, 0.0, None, 1.0);
         (opaque_bounds(&pm), action_point)
     }

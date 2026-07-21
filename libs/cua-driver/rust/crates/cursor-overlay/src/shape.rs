@@ -1,8 +1,8 @@
 //! Custom cursor shape — rasterised from SVG / ICO / PNG.
 //!
 //! Used when `--cursor-icon <path>` is passed to the MCP binary, plus the
-//! `teardrop()` and `sky()` built-ins selectable via `--cursor-shape <name>`.
-//! Always produces an RGBA pixel buffer.
+//! embedded `teardrop()`, `sky()`, and `cmux()` built-ins selectable via
+//! `--cursor-shape`. Always produces a premultiplied RGBA pixel buffer.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -28,6 +28,9 @@ pub enum BuiltinShape {
     /// Embedded Sky kite cursor. Rasterised at the destination display-pixel
     /// size by `paint_cursor`, with the kite tip as the hotspot.
     Sky,
+    /// The official cmux gradient chevron. It stays upright while moving and
+    /// uses its right-hand point as the action hotspot.
+    Cmux,
 }
 
 impl BuiltinShape {
@@ -40,6 +43,7 @@ impl BuiltinShape {
         ("arrow", Self::Arrow),
         ("teardrop", Self::Teardrop),
         ("sky", Self::Sky),
+        ("cmux", Self::Cmux),
     ];
 
     /// Parse the value of `--cursor-shape` / MCP `cursor_icon`. Case-insensitive.
@@ -54,16 +58,16 @@ impl BuiltinShape {
     }
 
     /// The accepted built-in names in declaration order, e.g.
-    /// `["arrow", "teardrop", "sky"]`.
+    /// `["arrow", "teardrop", "sky", "cmux"]`.
     pub fn names() -> impl Iterator<Item = &'static str> {
         Self::TABLE.iter().map(|(name, _)| *name)
     }
 
     /// Human-facing list of built-in names for help / tool-description text,
-    /// e.g. `'arrow' | 'teardrop' | 'sky'`. The single string the CLI `--help`
-    /// and every MCP `cursor_icon` description render from, so the advertised
-    /// vocabulary can never drift from what [`parse`](Self::parse) actually
-    /// accepts.
+    /// e.g. `'arrow' | 'teardrop' | 'sky' | 'cmux'`. The single string the CLI
+    /// `--help` and every
+    /// MCP `cursor_icon` description render from, so the advertised vocabulary
+    /// can never drift from what [`parse`](Self::parse) actually accepts.
     pub fn names_help() -> String {
         Self::names()
             .map(|n| format!("'{n}'"))
@@ -88,7 +92,8 @@ pub enum CursorIconResolution {
 /// Resolve an MCP `cursor_icon` (or CLI) value into a [`CursorIconResolution`].
 ///
 /// - empty string → the configured default built-in ([`BuiltinShape::default`])
-/// - a built-in name (`arrow` / `teardrop` / `sky`, case-insensitive) → that built-in
+/// - a built-in name (`arrow` / `teardrop` / `sky` / `cmux`, case-insensitive)
+///   → that built-in
 /// - anything else → treated as a file path and loaded (`.svg` / `.png` / `.ico`)
 ///
 /// This is the single resolver shared by the CLI flags and every platform's MCP
@@ -123,8 +128,10 @@ pub struct CursorShape {
     /// up at rest (+90°); Sky points up-left at rest (+135°).
     pub intrinsic_rotation_degrees: f32,
     /// Whether the raster rotates as the motion heading changes. Sky behaves
-    /// like the macOS pointer and keeps its up-left orientation fixed.
+    /// like the macOS pointer and cmux remains upright.
     pub rotates_with_heading: bool,
+    /// Runtime footprint in logical screen points.
+    pub display_points: f32,
 }
 
 /// Runtime cursor footprint in logical screen points.
@@ -173,6 +180,21 @@ const SKY_CURSOR_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width
     <path d="M0.68 1.83 L3.63 9.78 Q4.67 12.59 5.3 9.66 L5.44 9.01 Q6.08 6.08 9.01 5.44 L9.66 5.3 Q12.59 4.67 9.78 3.63 L1.83 0.68 Q0 0 0.68 1.83 Z" fill="none" stroke="#FFFFFF" stroke-width="1.7" stroke-linejoin="round"/>
     <path d="M0.68 1.83 L3.63 9.78 Q4.67 12.59 5.3 9.66 L5.44 9.01 Q6.08 6.08 9.01 5.44 L9.66 5.3 Q12.59 4.67 9.78 3.63 L1.83 0.68 Q0 0 0.68 1.83 Z" fill="#808080"/>
   </g>
+</svg>"##;
+
+/// Official cmux chevron cropped into a square cursor canvas. The path and
+/// gradient stops match `web/public/cmux-icon.svg` in the cmux repository;
+/// only a thin white outline is added so the mark remains visible over both
+/// light and dark application content.
+const CMUX_CURSOR_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="65 58 140 140">
+<defs>
+<linearGradient id="cmux-chevron" x1="91" y1="128" x2="179" y2="128" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="#12c7f5"/>
+<stop offset="0.52" stop-color="#2d8cff"/>
+<stop offset="1" stop-color="#6c5cff"/>
+</linearGradient>
+</defs>
+<path d="M91 65 L179 128 L91 191 L91 151 L139 128 L91 105 Z" fill="url(#cmux-chevron)" stroke="#FFFFFF" stroke-width="7" stroke-linejoin="round"/>
 </svg>"##;
 
 impl CursorShape {
@@ -230,6 +252,22 @@ impl CursorShape {
             && (self.hotspot_y - self.height as f32 / 2.0).abs() < EPS
     }
 
+    /// The official cmux gradient chevron, rasterised once and shared by all
+    /// branded cursor instances.
+    pub fn cmux() -> &'static Self {
+        static CACHE: OnceLock<CursorShape> = OnceLock::new();
+        CACHE.get_or_init(|| {
+            let mut shape =
+                Self::load_svg_bytes(CMUX_CURSOR_SVG).expect("embedded cmux SVG should parse");
+            shape.hotspot_x = shape.width as f32 * ((179.0 - 65.0) / 140.0);
+            shape.hotspot_y = shape.height as f32 * ((128.0 - 58.0) / 140.0);
+            shape.intrinsic_rotation_degrees = 0.0;
+            shape.rotates_with_heading = false;
+            shape.display_points = 32.0;
+            shape
+        })
+    }
+
     fn load_svg(path: &str) -> Result<Self> {
         let data = std::fs::read(path)?;
         Self::load_svg_bytes(&data)
@@ -266,6 +304,7 @@ impl CursorShape {
             hotspot_y: size as f32 / 2.0,
             intrinsic_rotation_degrees: DEFAULT_RASTER_INTRINSIC_ROTATION_DEGREES,
             rotates_with_heading: true,
+            display_points: CURSOR_DISPLAY_POINTS,
         })
     }
 
@@ -290,6 +329,7 @@ impl CursorShape {
             hotspot_y: CURSOR_SIZE as f32 / 2.0,
             intrinsic_rotation_degrees: DEFAULT_RASTER_INTRINSIC_ROTATION_DEGREES,
             rotates_with_heading: true,
+            display_points: CURSOR_DISPLAY_POINTS,
         })
     }
 }

@@ -9,7 +9,7 @@ use std::sync::Mutex;
 pub struct CursorConfig {
     /// Instance identifier for multi-cursor use cases. Default: "default".
     pub cursor_id: String,
-    /// Built-in icon name ("arrow", "crosshair", "hand") or path to PNG/SVG.
+    /// Built-in icon name ("arrow", "teardrop", "cmux") or path to PNG/SVG.
     pub cursor_icon: Option<String>,
     /// Hex color (e.g. "#00FFFF") or CSS name for the glow/indicator.
     pub cursor_color: Option<String>,
