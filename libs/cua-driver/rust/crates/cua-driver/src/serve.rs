@@ -393,6 +393,59 @@ fn clamp_external_permission_prompt(
     }
 }
 
+/// Requests one macOS TCC grant from the standalone helper process.
+///
+/// This daemon-only method is intentionally separate from the MCP tool
+/// registry. Embedding hosts can present their own explicit onboarding UI and
+/// ask the correctly attributed helper to raise one native permission request,
+/// while `check_permissions { prompt: true }` remains clamped for agents.
+fn validate_system_permission_request(permission: Option<&str>) -> DaemonResponse {
+    #[cfg(target_os = "macos")]
+    {
+        match permission {
+            Some("accessibility" | "screen_recording") => {}
+            Some(name) => {
+                return DaemonResponse::err(
+                    format!("Unknown system permission: {name}"),
+                    64,
+                );
+            }
+            None => {
+                return DaemonResponse::err(
+                    "System permission request is missing `name`",
+                    65,
+                );
+            }
+        }
+        DaemonResponse::ok(serde_json::json!({
+            "permission": permission,
+            "requested": true,
+        }))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = permission;
+        DaemonResponse::err(
+            "System permission requests are only supported on macOS",
+            64,
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn request_validated_system_permission(permission: &str) {
+    match permission {
+        "accessibility" => {
+            let _ = platform_macos::permissions::request_accessibility();
+        }
+        "screen_recording" => {
+            let _ = platform_macos::permissions::request_screen_recording();
+        }
+        _ => unreachable!("permission was validated before prompting"),
+    }
+}
+
 impl DaemonResponse {
     pub fn ok(result: serde_json::Value) -> Self {
         Self { ok: true, result: Some(result), error: None, exit_code: None }
@@ -686,6 +739,20 @@ pub async fn run_serve(
                                     let _ = tx.send(());
                                 }
                                 return;
+                            }
+                            "request_system_permission" => {
+                                let resp = validate_system_permission_request(req.name.as_deref());
+                                let response_sent = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await.is_ok();
+                                #[cfg(target_os = "macos")]
+                                if resp.ok && response_sent {
+                                    request_validated_system_permission(
+                                        req.name.as_deref().expect("validated permission has a name")
+                                    );
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                let _ = response_sent;
                             }
                             "list" => {
                                 // Include full ToolDef (input_schema + annotation
@@ -1251,6 +1318,20 @@ pub async fn run_serve(
                                 if let Some(tx) = guard.take() { let _ = tx.send(()); }
                                 return;
                             }
+                            "request_system_permission" => {
+                                let resp = validate_system_permission_request(req.name.as_deref());
+                                let response_sent = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await.is_ok();
+                                #[cfg(target_os = "macos")]
+                                if resp.ok && response_sent {
+                                    request_validated_system_permission(
+                                        req.name.as_deref().expect("validated permission has a name")
+                                    );
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                let _ = response_sent;
+                            }
                             "list" => {
                                 // Include full ToolDef so MCP proxy callers can
                                 // build a complete `tools/list` response from
@@ -1592,7 +1673,7 @@ pub fn run_status_cmd(socket_path: &str, pid_file_path: &str) {
 
 #[cfg(test)]
 mod external_permission_flow_tests {
-    use super::clamp_external_permission_prompt;
+    use super::{clamp_external_permission_prompt, validate_system_permission_request};
 
     #[test]
     fn external_permission_flow_clamps_agent_prompt_requests() {
@@ -1603,6 +1684,17 @@ mod external_permission_flow_tests {
         let mut ordinary_tool_args = serde_json::json!({ "prompt": true });
         clamp_external_permission_prompt(true, "click", &mut ordinary_tool_args);
         assert_eq!(ordinary_tool_args["prompt"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn host_permission_request_rejects_unknown_permission_without_prompting() {
+        let response = validate_system_permission_request(Some("camera"));
+        assert!(!response.ok);
+        assert_eq!(response.exit_code, Some(64));
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Unknown system permission: camera")
+        );
     }
 }
 
