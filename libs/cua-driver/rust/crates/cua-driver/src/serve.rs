@@ -19,6 +19,14 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Optional shared secret for authenticating daemon socket requests.
+///
+/// The default standalone driver remains backward-compatible when this is
+/// unset. Embedders that expose TCC- or input-capable tools over a predictable
+/// local socket set an unguessable value in both the daemon and its trusted
+/// proxy processes.
+pub const SOCKET_AUTH_TOKEN_ENV: &str = "CUA_DRIVER_SOCKET_AUTH_TOKEN";
+
 // ── Recording idle-TTL backstop (#1764) ─────────────────────────────────────────
 
 /// Default TTL of zero `call` activity after which an active recording is
@@ -299,6 +307,73 @@ pub struct DaemonResponse {
     pub exit_code: Option<i32>,
 }
 
+#[derive(Serialize)]
+struct AuthenticatedDaemonRequest<'a> {
+    auth_token: &'a str,
+    request: &'a DaemonRequest,
+}
+
+fn configured_socket_auth_token() -> Option<String> {
+    std::env::var(SOCKET_AUTH_TOKEN_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn auth_tokens_match(expected: &str, provided: &str) -> bool {
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    let mut difference = expected.len() ^ provided.len();
+    for index in 0..expected.len().max(provided.len()) {
+        difference |= usize::from(
+            expected.get(index).copied().unwrap_or(0)
+                ^ provided.get(index).copied().unwrap_or(0),
+        );
+    }
+    difference == 0
+}
+
+/// Serialize one daemon request, adding the authenticated envelope when the
+/// embedding host configured a socket credential.
+pub fn serialize_request(req: &DaemonRequest) -> anyhow::Result<String> {
+    match configured_socket_auth_token() {
+        Some(token) => Ok(serde_json::to_string(&AuthenticatedDaemonRequest {
+            auth_token: &token,
+            request: req,
+        })?),
+        None => Ok(serde_json::to_string(req)?),
+    }
+}
+
+fn parse_request(line: &str) -> Result<DaemonRequest, DaemonResponse> {
+    let configured = configured_socket_auth_token();
+    parse_request_with_token(line, configured.as_deref())
+}
+
+fn parse_request_with_token(
+    line: &str,
+    expected_token: Option<&str>,
+) -> Result<DaemonRequest, DaemonResponse> {
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| DaemonResponse::err(format!("JSON parse error: {error}"), 65))?;
+    let request = if let Some(expected) = expected_token {
+        let provided = value
+            .get("auth_token")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !auth_tokens_match(&expected, provided) {
+            return Err(DaemonResponse::err("Unauthorized daemon client", 77));
+        }
+        value
+            .get("request")
+            .cloned()
+            .ok_or_else(|| DaemonResponse::err("Authenticated request is missing `request`", 65))?
+    } else {
+        value
+    };
+    serde_json::from_value(request)
+        .map_err(|error| DaemonResponse::err(format!("JSON parse error: {error}"), 65))
+}
+
 /// Keep permission prompting under an embedding application's explicit UX.
 ///
 /// The daemon remains the permission-status authority, but an agent cannot
@@ -401,7 +476,7 @@ pub fn send_request(socket_path: &str, req: &DaemonRequest) -> anyhow::Result<Da
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
 
     let mut w = stream.try_clone()?;
-    let line = serde_json::to_string(req)? + "\n";
+    let line = serialize_request(req)? + "\n";
     // EAGAIN-aware write: a daemon momentarily too busy to read our request
     // (backpressure under concurrent slow tools) makes the 5s SO_SNDTIMEO write
     // time out. Treat that like the read loop below does (#1997) — keep retrying
@@ -483,7 +558,7 @@ pub fn send_request(socket_path: &str, req: &DaemonRequest) -> anyhow::Result<Da
         };
 
         let mut writer = pipe.try_clone()?;
-        let line = serde_json::to_string(req)? + "\n";
+        let line = serialize_request(req)? + "\n";
         writer.write_all(line.as_bytes())?;
         writer.flush()?;
 
@@ -519,7 +594,12 @@ pub async fn run_serve(
 
     // Create parent directory.
     if let Some(dir) = std::path::Path::new(socket_path).parent() {
+        let directory_already_existed = dir.exists();
         std::fs::create_dir_all(dir)?;
+        if !directory_already_existed {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
 
     // Remove stale socket file (from a crashed previous daemon).
@@ -527,6 +607,10 @@ pub async fn run_serve(
 
     let listener = UnixListener::bind(socket_path)
         .map_err(|e| anyhow::anyhow!("bind {socket_path}: {e}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+    }
 
     eprintln!("Cua Driver daemon listening on {socket_path}");
 
@@ -581,12 +665,9 @@ pub async fn run_serve(
                     let mut control_session_id: Option<String> = None;
 
                     while let Ok(Some(line)) = lines.next_line().await {
-                        let req: DaemonRequest = match serde_json::from_str(&line) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                let resp = DaemonResponse::err(
-                                    format!("JSON parse error: {e}"), 65
-                                );
+                        let req = match parse_request(&line) {
+                            Ok(request) => request,
+                            Err(resp) => {
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -1150,10 +1231,9 @@ pub async fn run_serve(
                     let mut control_session_id: Option<String> = None;
 
                     while let Ok(Some(line)) = lines.next_line().await {
-                        let req: DaemonRequest = match serde_json::from_str(&line) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                let resp = DaemonResponse::err(format!("JSON parse error: {e}"), 65);
+                        let req = match parse_request(&line) {
+                            Ok(request) => request,
+                            Err(resp) => {
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -1523,6 +1603,60 @@ mod external_permission_flow_tests {
         let mut ordinary_tool_args = serde_json::json!({ "prompt": true });
         clamp_external_permission_prompt(true, "click", &mut ordinary_tool_args);
         assert_eq!(ordinary_tool_args["prompt"], serde_json::json!(true));
+    }
+}
+
+#[cfg(test)]
+mod socket_authentication_tests {
+    use super::{parse_request_with_token, DaemonRequest};
+
+    fn list_request() -> DaemonRequest {
+        DaemonRequest {
+            method: "list".into(),
+            name: None,
+            args: None,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn authenticated_envelope_accepts_only_the_expected_token() {
+        let request = list_request();
+        let line = serde_json::json!({
+            "auth_token": "secret-A1B2C3",
+            "request": request,
+        })
+        .to_string();
+
+        let parsed = parse_request_with_token(&line, Some("secret-A1B2C3"))
+            .expect("matching token should authenticate");
+        assert_eq!(parsed.method, "list");
+
+        let rejected = parse_request_with_token(&line, Some("wrong-token"))
+            .expect_err("mismatched token must be rejected");
+        assert_eq!(rejected.exit_code, Some(77));
+        assert_eq!(rejected.error.as_deref(), Some("Unauthorized daemon client"));
+    }
+
+    #[test]
+    fn configured_authentication_rejects_legacy_and_missing_requests() {
+        let legacy = serde_json::to_string(&list_request()).expect("serialize request");
+        let rejected = parse_request_with_token(&legacy, Some("secret-A1B2C3"))
+            .expect_err("legacy request must not bypass configured auth");
+        assert_eq!(rejected.exit_code, Some(77));
+
+        let missing_request = r#"{"auth_token":"secret-A1B2C3"}"#;
+        let rejected = parse_request_with_token(missing_request, Some("secret-A1B2C3"))
+            .expect_err("authenticated envelope still requires a request");
+        assert_eq!(rejected.exit_code, Some(65));
+    }
+
+    #[test]
+    fn authentication_remains_opt_in_for_standalone_driver_clients() {
+        let legacy = serde_json::to_string(&list_request()).expect("serialize request");
+        let parsed = parse_request_with_token(&legacy, None)
+            .expect("legacy request should work when auth is not configured");
+        assert_eq!(parsed.method, "list");
     }
 }
 

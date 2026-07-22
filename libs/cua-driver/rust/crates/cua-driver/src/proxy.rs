@@ -31,7 +31,7 @@ use cua_driver_core::protocol::{ToolCall, ToolResult};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
-use crate::serve::{is_daemon_listening, send_request, DaemonRequest};
+use crate::serve::{is_daemon_listening, send_request, serialize_request, DaemonRequest};
 
 /// Run the MCP stdio proxy. Reads JSON-RPC lines from stdin, forwards
 /// the body of each `tools/list` / `tools/call` to the daemon at
@@ -257,7 +257,7 @@ async fn run_control_connection(socket_path: String, session_id: String) {
         args: None,
         session_id: Some(session_id.clone()),
     };
-    let line = match serde_json::to_string(&begin) {
+    let line = match serialize_request(&begin) {
         Ok(s) => s + "\n",
         Err(e) => {
             warn!("control connection: serialize session_begin failed: {e}");
