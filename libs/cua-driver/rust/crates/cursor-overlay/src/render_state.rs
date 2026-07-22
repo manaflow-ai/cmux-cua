@@ -440,10 +440,22 @@ impl RenderStateCore {
                     self.place_at(tx, ty);
                 }
                 let (x0, y0) = self.pos;
-                let th0 = self.heading + std::f64::consts::PI;
-                let th1 = end_heading_radians + std::f64::consts::PI;
-                let plan =
-                    PathPlanner::plan(x0, y0, th0, tx, ty, th1, end_heading_radians, turn_radius);
+                // Travel directly toward the target. The resting cursor angle
+                // is visual state, not a vehicle-like turning constraint; using
+                // it as the Dubins start/end heading can turn a short move into
+                // a full loop. The path tangent drives the cursor during the
+                // glide, while `end_heading_radians` remains its resting angle.
+                let travel_heading = (ty - y0).atan2(tx - x0);
+                let plan = PathPlanner::plan(
+                    x0,
+                    y0,
+                    travel_heading,
+                    tx,
+                    ty,
+                    travel_heading,
+                    end_heading_radians,
+                    turn_radius,
+                );
                 self.path = Some(plan);
                 self.dist = 0.0;
                 self.spring = None;
