@@ -33,7 +33,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRea
 use tracing::{debug, error, warn};
 
 use crate::serve::{
-    is_daemon_listening, send_request, DaemonProfile, DaemonRequest,
+    is_daemon_listening, send_request, serialize_request, DaemonProfile, DaemonRequest,
     DaemonResponse,
     CODEX_COMPUTER_USE_TOOL_NAMES,
 };
@@ -371,7 +371,7 @@ async fn run_control_connection(
             .then(|| serde_json::json!({"approval_broker": true})),
         session_id: Some(session_id.clone()),
     };
-    let line = match serde_json::to_string(&begin) {
+    let line = match serialize_request(&begin) {
         Ok(s) => s + "\n",
         Err(e) => {
             warn!("control connection: serialize session_begin failed: {e}");
