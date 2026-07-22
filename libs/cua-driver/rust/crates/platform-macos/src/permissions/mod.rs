@@ -22,7 +22,10 @@ pub mod status;
 #[cfg(target_os = "macos")]
 pub mod panel;
 
-pub use status::{PermissionGrantState, PermissionsStatus, current_status};
+pub use status::{
+    PermissionGrantState, PermissionsStatus, current_status, request_accessibility,
+    request_screen_recording,
+};
 pub use gate::{GateOpts, MissingPermission, run_if_needed};
 
 /// Crate-wide lock serializing tests that mutate process-global env vars.
