@@ -1337,6 +1337,31 @@ mod cmux_cursor_tests {
     }
 
     #[test]
+    fn cmux_cursor_glide_takes_the_direct_route_to_its_target() {
+        let mut cfg = CursorConfig::default();
+        cfg.builtin_shape = BuiltinShape::parse("cmux").expect("cmux should be a built-in");
+        let mut core = RenderStateCore::new(cfg);
+        core.place_at(100.0, 100.0);
+
+        core.apply_command_base(
+            OverlayCommand::MoveTo {
+                x: 260.0,
+                y: 100.0,
+                end_heading_radians: std::f64::consts::FRAC_PI_4,
+            },
+            true,
+            true,
+        );
+
+        let path = core.path.expect("move should create a glide path");
+        assert!(
+            path.length <= 161.0,
+            "a 160-point cursor move should slide directly, not loop for {:.1} points",
+            path.length
+        );
+    }
+
+    #[test]
     fn cmux_sky_omits_decorative_bloom_but_keeps_click_pulse() {
         let mut cfg = CursorConfig::default();
         cfg.builtin_shape = BuiltinShape::parse("cmux").expect("cmux should be a built-in");
