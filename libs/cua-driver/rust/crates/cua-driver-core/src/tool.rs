@@ -1036,7 +1036,6 @@ mod capability_tests {
     #[tokio::test]
     async fn successful_click_actions_update_embedded_process_state() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("5151.json");
         let mut registry = ToolRegistry::new();
         registry.set_state_file_for_test(crate::session_state::StateFile::new(
             dir.path().to_owned(),
@@ -1068,6 +1067,11 @@ mod capability_tests {
                 )
                 .await;
             assert_ne!(result.is_error, Some(true));
+            let path = registry
+                .state_file
+                .as_ref()
+                .unwrap()
+                .path_for_session(Some(&session));
             let state: crate::session_state::DriverProcessState =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(state.session.as_deref(), Some(session.as_str()));
