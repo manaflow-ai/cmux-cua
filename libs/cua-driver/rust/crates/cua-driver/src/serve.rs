@@ -222,6 +222,20 @@ fn register_recording_session_end_hook(
     });
 }
 
+/// Removes per-session activity state when the same lifecycle fan-out tears
+/// down cursor, recording, and config ownership. A weak registry avoids keeping
+/// a stopped daemon alive through the process-global hook list.
+fn register_state_file_session_end_hook(
+    registry: &std::sync::Arc<cua_driver_core::tool::ToolRegistry>,
+) {
+    let registry = std::sync::Arc::downgrade(registry);
+    cua_driver_core::session::register_session_end_hook(move |session_id| {
+        if let Some(registry) = registry.upgrade() {
+            registry.remove_session_state_file(session_id);
+        }
+    });
+}
+
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
 /// Returns the platform default socket/pipe path.
@@ -851,6 +865,7 @@ pub async fn run_serve(
         crate::mcp_http::spawn(registry.clone(), port);
     }
     register_recording_session_end_hook(registry.recording.clone());
+    register_state_file_session_end_hook(&registry);
 
     loop {
         tokio::select! {
@@ -1430,6 +1445,7 @@ pub async fn run_serve(
         crate::mcp_http::spawn(registry.clone(), port);
     }
     register_recording_session_end_hook(registry.recording.clone());
+    register_state_file_session_end_hook(&registry);
 
     loop {
         // Create a new pipe server instance to accept the next client.
