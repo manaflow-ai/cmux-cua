@@ -27,6 +27,13 @@ use serde::{Deserialize, Serialize};
 /// proxy processes.
 pub const SOCKET_AUTH_TOKEN_ENV: &str = "CUA_DRIVER_SOCKET_AUTH_TOKEN";
 
+/// Optional macOS process-ancestry root for daemon socket clients.
+///
+/// Embedders set this to their own PID. Even if another same-UID process finds
+/// the bearer token, the daemon rejects its socket unless the kernel-reported
+/// peer PID is the embedder or one of its descendants.
+pub const SOCKET_AUTHORIZED_ROOT_PID_ENV: &str = "CUA_DRIVER_SOCKET_AUTHORIZED_ROOT_PID";
+
 // ── Recording idle-TTL backstop (#1764) ─────────────────────────────────────────
 
 /// Default TTL of zero `call` activity after which an active recording is
@@ -330,6 +337,97 @@ fn auth_tokens_match(expected: &str, provided: &str) -> bool {
         );
     }
     difference == 0
+}
+
+fn process_descends_from(
+    mut process_id: u32,
+    root_process_id: u32,
+    parent_process_id: impl Fn(u32) -> Option<u32>,
+) -> bool {
+    if root_process_id <= 1 {
+        return false;
+    }
+    for _ in 0..128 {
+        if process_id == root_process_id {
+            return true;
+        }
+        if process_id <= 1 {
+            return false;
+        }
+        let Some(parent) = parent_process_id(process_id) else {
+            return false;
+        };
+        if parent == process_id {
+            return false;
+        }
+        process_id = parent;
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn configured_authorized_root_pid() -> anyhow::Result<Option<u32>> {
+    let Some(raw) = std::env::var(SOCKET_AUTHORIZED_ROOT_PID_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let pid = raw
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| anyhow::anyhow!("Invalid {SOCKET_AUTHORIZED_ROOT_PID_ENV}"))?;
+    Ok(Some(pid))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_parent_process_id(process_id: u32) -> Option<u32> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let expected_size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let result = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(process_id).ok()?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(expected_size).ok()?,
+        )
+    };
+    if usize::try_from(result).ok()? != expected_size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    (info.pbi_pid == process_id).then_some(info.pbi_ppid)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_peer_process_id(stream: &tokio::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+
+    let mut pid: libc::pid_t = 0;
+    let mut length = libc::socklen_t::try_from(std::mem::size_of_val(&pid)).ok()?;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 || pid <= 1 {
+        return None;
+    }
+    u32::try_from(pid).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_peer_is_authorized(stream: &tokio::net::UnixStream, root_process_id: u32) -> bool {
+    let Some(peer_process_id) = macos_peer_process_id(stream) else {
+        return false;
+    };
+    process_descends_from(peer_process_id, root_process_id, macos_parent_process_id)
 }
 
 /// Serialize one daemon request, adding the authenticated envelope when the
@@ -645,6 +743,9 @@ pub async fn run_serve(
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
+    #[cfg(target_os = "macos")]
+    let authorized_root_pid = configured_authorized_root_pid()?;
+
     // Create parent directory.
     if let Some(dir) = std::path::Path::new(socket_path).parent() {
         let directory_already_existed = dir.exists();
@@ -701,6 +802,13 @@ pub async fn run_serve(
         tokio::select! {
             result = listener.accept() => {
                 let (stream, _) = result?;
+                #[cfg(target_os = "macos")]
+                if let Some(root_process_id) = authorized_root_pid {
+                    if !macos_peer_is_authorized(&stream, root_process_id) {
+                        eprintln!("Rejected unauthorized daemon peer");
+                        continue;
+                    }
+                }
                 let reg = registry.clone();
                 let shutdown_tx2 = shutdown_tx.clone();
                 let last_activity = last_activity.clone();
@@ -1700,7 +1808,8 @@ mod external_permission_flow_tests {
 
 #[cfg(test)]
 mod socket_authentication_tests {
-    use super::{parse_request_with_token, DaemonRequest};
+    use super::{parse_request_with_token, process_descends_from, DaemonRequest};
+    use std::collections::HashMap;
 
     fn list_request() -> DaemonRequest {
         DaemonRequest {
@@ -1749,6 +1858,45 @@ mod socket_authentication_tests {
         let parsed = parse_request_with_token(&legacy, None)
             .expect("legacy request should work when auth is not configured");
         assert_eq!(parsed.method, "list");
+    }
+
+    #[test]
+    fn process_ancestry_accepts_only_the_configured_root_and_descendants() {
+        let parents = HashMap::from([(400, 300), (300, 200), (200, 1), (500, 1)]);
+        let parent = |pid| parents.get(&pid).copied();
+
+        assert!(process_descends_from(400, 300, parent));
+        assert!(process_descends_from(300, 300, parent));
+        assert!(!process_descends_from(400, 500, parent));
+        assert!(!process_descends_from(500, 300, parent));
+        assert!(!process_descends_from(400, 1, parent));
+    }
+
+    #[test]
+    fn process_ancestry_fails_closed_on_cycles_and_missing_metadata() {
+        let cycle = HashMap::from([(400, 300), (300, 400)]);
+        let parent = |pid| cycle.get(&pid).copied();
+        assert!(!process_descends_from(400, 200, parent));
+        assert!(!process_descends_from(400, 200, |_| None));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_kernel_peer_pid_enforces_the_process_root() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let socket = directory.path().join("peer.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind test socket");
+        let client = tokio::net::UnixStream::connect(&socket);
+        let accepted = listener.accept();
+        let (client, accepted) = tokio::join!(client, accepted);
+        let _client = client.expect("connect test client");
+        let (server, _) = accepted.expect("accept test client");
+
+        assert!(super::macos_peer_is_authorized(
+            &server,
+            std::process::id()
+        ));
+        assert!(!super::macos_peer_is_authorized(&server, u32::MAX - 1));
     }
 }
 
