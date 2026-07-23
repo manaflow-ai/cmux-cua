@@ -383,6 +383,32 @@ mod tests {
     }
 
     #[test]
+    fn session_teardown_removes_only_its_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = StateFile::new(dir.path().to_owned(), 4242);
+        for session in ["surface-a", "surface-b"] {
+            writer
+                .update(
+                    &serde_json::json!({
+                        "session": session,
+                        "pid": 10,
+                        "window_id": 20,
+                        "_state_writer_pid": 3131,
+                        "_state_writer_start_seconds": 1_700_000_000,
+                        "_state_writer_start_microseconds": 123_456,
+                    }),
+                    Some("Notes".to_owned()),
+                )
+                .unwrap();
+        }
+
+        writer.remove_session("surface-a").unwrap();
+
+        assert!(!writer.path_for_session(Some("surface-a")).exists());
+        assert!(writer.path_for_session(Some("surface-b")).exists());
+    }
+
+    #[test]
     fn malformed_state_directory_is_an_error_not_a_panic() {
         let dir = tempfile::tempdir().unwrap();
         let not_a_dir = dir.path().join("plain-file");
