@@ -221,6 +221,15 @@ impl StateFile {
         }
         Ok(())
     }
+
+    /// Removes the state owned by one ended logical session while preserving
+    /// concurrently active sessions served by the same daemon.
+    pub fn remove_session(&self, session: &str) -> std::io::Result<()> {
+        match std::fs::remove_file(self.path_for_session(Some(session))) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    }
 }
 
 impl Drop for StateFile {

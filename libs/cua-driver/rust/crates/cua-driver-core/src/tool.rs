@@ -519,6 +519,18 @@ impl ToolRegistry {
         crate::cursor_feed::remove();
     }
 
+    /// Best-effort cleanup for one ended daemon/proxy session.
+    pub fn remove_session_state_file(&self, session_id: &str) {
+        if let Some(state_file) = &self.state_file {
+            if let Err(error) = state_file.remove_session(session_id) {
+                eprintln!(
+                    "[cua-driver] warning: failed to remove state for session \
+                     {session_id}: {error}"
+                );
+            }
+        }
+    }
+
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         let name = tool.def().name.clone();
         self.order.push(name.clone());
