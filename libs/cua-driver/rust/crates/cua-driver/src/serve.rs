@@ -2797,6 +2797,37 @@ mod socket_authentication_tests {
         assert!(args.get("_state_writer_pid").is_none());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn authenticated_peer_generation_replaces_untrusted_state_writer_identity() {
+        let mut args = serde_json::json!({
+            "pid": 42,
+            "_state_writer_pid": 999_999,
+            "_state_writer_start_seconds": 999_999,
+            "_state_writer_start_microseconds": 999_999,
+        });
+
+        attach_state_writer_identity(&mut args, Some(std::process::id()));
+
+        assert_eq!(
+            args["_state_writer_pid"],
+            serde_json::json!(std::process::id())
+        );
+        assert_ne!(
+            args["_state_writer_start_seconds"],
+            serde_json::json!(999_999)
+        );
+        assert_ne!(
+            args["_state_writer_start_microseconds"],
+            serde_json::json!(999_999)
+        );
+
+        attach_state_writer_identity(&mut args, None);
+        assert!(args.get("_state_writer_pid").is_none());
+        assert!(args.get("_state_writer_start_seconds").is_none());
+        assert!(args.get("_state_writer_start_microseconds").is_none());
+    }
+
     #[test]
     fn process_ancestry_accepts_only_the_configured_root_and_descendants() {
         let parents = HashMap::from([(400, 300), (300, 200), (200, 1), (500, 1)]);
