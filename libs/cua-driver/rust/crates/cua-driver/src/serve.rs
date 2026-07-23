@@ -1808,7 +1808,10 @@ mod external_permission_flow_tests {
 
 #[cfg(test)]
 mod socket_authentication_tests {
-    use super::{parse_request_with_token, process_descends_from, DaemonRequest};
+    use super::{
+        attach_state_writer_identity, parse_request_with_token, process_descends_from,
+        DaemonRequest,
+    };
     use std::collections::HashMap;
 
     fn list_request() -> DaemonRequest {
@@ -1858,6 +1861,20 @@ mod socket_authentication_tests {
         let parsed = parse_request_with_token(&legacy, None)
             .expect("legacy request should work when auth is not configured");
         assert_eq!(parsed.method, "list");
+    }
+
+    #[test]
+    fn authenticated_peer_pid_replaces_untrusted_state_writer_identity() {
+        let mut args = serde_json::json!({
+            "pid": 42,
+            "_state_writer_pid": 999_999,
+        });
+
+        attach_state_writer_identity(&mut args, Some(4_321));
+        assert_eq!(args["_state_writer_pid"], serde_json::json!(4_321));
+
+        attach_state_writer_identity(&mut args, None);
+        assert!(args.get("_state_writer_pid").is_none());
     }
 
     #[test]
