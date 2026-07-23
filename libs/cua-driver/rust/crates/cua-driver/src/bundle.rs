@@ -112,6 +112,35 @@ fn is_cmux_branded_executable_path(path: &std::path::Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some("cmux-cua-driver")
 }
 
+/// Returns whether the current image is the executable of cmux's branded
+/// helper app. A copy under `Contents/Resources/bin` is only a proxy artifact;
+/// allowing it to own TCC-protected work creates a second path-based Privacy &
+/// Security identity beside `cmux Computer Use`.
+#[cfg(target_os = "macos")]
+pub fn is_executable_inside_cmux_helper_app() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .as_deref()
+        .is_some_and(is_executable_inside_cmux_helper_app_path)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn is_executable_inside_cmux_helper_app() -> bool {
+    false
+}
+
+fn is_executable_inside_cmux_helper_app_path(path: &std::path::Path) -> bool {
+    path.ends_with(std::path::Path::new(
+        "cmux Computer Use.app/Contents/MacOS/cmux-cua-driver",
+    ))
+}
+
+/// Recovery text returned to agents that encounter a missing cmux-owned
+/// daemon. It intentionally names the supported host action and forbids the
+/// raw CLI fallback that would create another macOS permission identity.
+pub const CMUX_RUNTIME_RECOVERY_GUIDANCE: &str = "Do not run `cmux-cua-driver serve`, `call`, or `permissions` directly. Open cmux Settings > Computer Use, or toggle Computer Use off and on, to recover the branded cmux Computer Use helper.";
+
 /// Whether an embedding host owns daemon lifecycle and permission UX.
 ///
 /// cmux sets both environment flags on its MCP proxy. The executable-name
@@ -179,6 +208,19 @@ mod tests {
         )));
         assert!(!is_cmux_branded_executable_path(std::path::Path::new(
             "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
+        )));
+    }
+
+    #[test]
+    fn only_the_branded_helper_bundle_is_a_cmux_permission_owner() {
+        assert!(is_executable_inside_cmux_helper_app_path(std::path::Path::new(
+            "/Applications/cmux.app/Contents/Library/cmux Computer Use.app/Contents/MacOS/cmux-cua-driver"
+        )));
+        assert!(is_executable_inside_cmux_helper_app_path(std::path::Path::new(
+            "/Library/Application Support/cmux/computer-use/helper/tag/cmux Computer Use.app/Contents/MacOS/cmux-cua-driver"
+        )));
+        assert!(!is_executable_inside_cmux_helper_app_path(std::path::Path::new(
+            "/Applications/cmux.app/Contents/Resources/bin/cmux-cua-driver"
         )));
     }
 }

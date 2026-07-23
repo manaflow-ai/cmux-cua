@@ -1533,7 +1533,8 @@ async fn ensure_daemon_started(
             )
             .await
             .map_err(|e| anyhow::anyhow!(
-                "the tag-scoped cmux Computer Use runtime is not listening on {socket_path}: {e}"
+                "the tag-scoped cmux Computer Use runtime is not listening on {socket_path}: {e}. {}",
+                crate::bundle::CMUX_RUNTIME_RECOVERY_GUIDANCE
             ))?;
         } else {
             let sp = socket_path.to_owned();

@@ -234,6 +234,16 @@ fn main() {
     // Handled before AppKit init so `list-tools` / `describe` / `call` exit
     // cleanly without starting the overlay or NSApplication.
     let command = cli::parse_command();
+    if cmux_command_requires_branded_helper(&command)
+        && crate::bundle::is_cmux_branded_executable()
+        && !crate::bundle::is_executable_inside_cmux_helper_app()
+    {
+        eprintln!(
+            "cmux-cua-driver: TCC-protected commands belong to cmux Computer Use. {}",
+            crate::bundle::CMUX_RUNTIME_RECOVERY_GUIDANCE
+        );
+        std::process::exit(78);
+    }
     emit_entry_telemetry(&command);
     match command {
         cli::Command::TelemetryInstallEvent => {
@@ -668,6 +678,18 @@ fn main() {
         platform_macos::pip::run_appkit_main_loop();
     }
     finish_appkit_worker(mcp_handle);
+}
+
+#[cfg(target_os = "macos")]
+fn cmux_command_requires_branded_helper(command: &cli::Command) -> bool {
+    matches!(
+        command,
+        cli::Command::Call { .. }
+            | cli::Command::Serve { .. }
+            | cli::Command::Doctor { .. }
+            | cli::Command::Diagnose
+            | cli::Command::Permissions { .. }
+    )
 }
 
 // ── Non-macOS entry-point ─────────────────────────────────────────────────
