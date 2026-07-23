@@ -423,11 +423,33 @@ fn macos_peer_process_id(stream: &tokio::net::UnixStream) -> Option<u32> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_peer_is_authorized(stream: &tokio::net::UnixStream, root_process_id: u32) -> bool {
-    let Some(peer_process_id) = macos_peer_process_id(stream) else {
+fn macos_process_is_authorized(
+    peer_process_id: Option<u32>,
+    root_process_id: u32,
+) -> bool {
+    let Some(peer_process_id) = peer_process_id else {
         return false;
     };
     process_descends_from(peer_process_id, root_process_id, macos_parent_process_id)
+}
+
+/// Replaces any caller-supplied state provenance with the kernel-authenticated
+/// peer pid captured from the accepted socket. A missing kernel identity removes
+/// the reserved field so standalone clients cannot spoof trusted provenance.
+fn attach_state_writer_identity(
+    args: &mut serde_json::Value,
+    peer_process_id: Option<u32>,
+) {
+    let Some(args) = args.as_object_mut() else {
+        return;
+    };
+    args.remove(cua_driver_core::session_state::STATE_WRITER_PID_ARG);
+    if let Some(process_id) = peer_process_id.filter(|process_id| *process_id > 1) {
+        args.insert(
+            cua_driver_core::session_state::STATE_WRITER_PID_ARG.to_owned(),
+            serde_json::json!(process_id),
+        );
+    }
 }
 
 /// Serialize one daemon request, adding the authenticated envelope when the
@@ -803,8 +825,12 @@ pub async fn run_serve(
             result = listener.accept() => {
                 let (stream, _) = result?;
                 #[cfg(target_os = "macos")]
+                let peer_process_id = macos_peer_process_id(&stream);
+                #[cfg(not(target_os = "macos"))]
+                let peer_process_id = None;
+                #[cfg(target_os = "macos")]
                 if let Some(root_process_id) = authorized_root_pid {
-                    if !macos_peer_is_authorized(&stream, root_process_id) {
+                    if !macos_process_is_authorized(peer_process_id, root_process_id) {
                         eprintln!("Rejected unauthorized daemon peer");
                         continue;
                     }
@@ -942,6 +968,7 @@ pub async fn run_serve(
                                 let mut args = req.args.unwrap_or(serde_json::Value::Object(
                                     serde_json::Map::new()
                                 ));
+                                attach_state_writer_identity(&mut args, peer_process_id);
                                 clamp_external_permission_prompt(
                                     crate::bundle::is_env_truthy(
                                         "CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW"
@@ -1909,11 +1936,16 @@ mod socket_authentication_tests {
         let _client = client.expect("connect test client");
         let (server, _) = accepted.expect("accept test client");
 
-        assert!(super::macos_peer_is_authorized(
-            &server,
+        let peer_process_id = super::macos_peer_process_id(&server);
+        assert_eq!(peer_process_id, Some(std::process::id()));
+        assert!(super::macos_process_is_authorized(
+            peer_process_id,
             std::process::id()
         ));
-        assert!(!super::macos_peer_is_authorized(&server, u32::MAX - 1));
+        assert!(!super::macos_process_is_authorized(
+            peer_process_id,
+            u32::MAX - 1
+        ));
     }
 }
 
