@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const STATE_DIR_ENV: &str = "CUA_DRIVER_STATE_DIR";
-const SCHEMA_VERSION: u8 = 1;
+pub const STATE_WRITER_PID_ARG: &str = "_state_writer_pid";
+const SCHEMA_VERSION: u8 = 2;
 
 /// Cross-platform fallback process-name resolver. Platform registries may
 /// replace this with a native resolver when they have one.
@@ -56,6 +57,9 @@ pub fn resolve_process_name(pid: i64) -> Option<String> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DriverProcessState {
     pub driver_pid: u32,
+    /// Kernel-authenticated process that sent the action to a long-running daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_pid: Option<u32>,
     pub session: Option<String>,
     pub target_app: Option<String>,
     pub target_pid: Option<i64>,
@@ -68,12 +72,12 @@ impl DriverProcessState {
     fn for_action(driver_pid: u32, args: &serde_json::Value, target_app: Option<String>) -> Self {
         Self {
             driver_pid,
-            session: args
-                .get("session")
-                .or_else(|| args.get("_session_id"))
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
+            writer_pid: args
+                .get(STATE_WRITER_PID_ARG)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value > 1),
+            session: session_for_action(args, crate::embedded_default_session_id()),
             target_app,
             target_pid: args.get("pid").and_then(|value| value.as_i64()),
             target_window_id: args.get("window_id").and_then(|value| value.as_u64()),
@@ -83,6 +87,19 @@ impl DriverProcessState {
             schema: SCHEMA_VERSION,
         }
     }
+}
+
+fn session_for_action(
+    args: &serde_json::Value,
+    embedded_default: Option<&str>,
+) -> Option<String> {
+    args.get("session")
+        .or_else(|| args.get("_session_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(embedded_default)
+        .map(str::to_owned)
 }
 
 /// One state file for the current driver process. Writes are always performed
@@ -181,6 +198,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn anonymous_embedded_action_uses_the_cursor_session_default() {
+        assert_eq!(
+            session_for_action(&serde_json::json!({"pid": 10}), Some("cmux-codex-42")),
+            Some("cmux-codex-42".to_owned())
+        );
+        assert_eq!(
+            session_for_action(
+                &serde_json::json!({"session": " explicit ", "_session_id": "proxy"}),
+                Some("embedded-default"),
+            ),
+            Some("explicit".to_owned()),
+            "an explicit session must retain precedence over proxy/default identity"
+        );
+    }
+
+    #[test]
     fn update_atomically_replaces_the_process_file() {
         let dir = tempfile::tempdir().unwrap();
         let writer = StateFile::new(dir.path().to_owned(), 4242);
@@ -192,7 +225,12 @@ mod tests {
             .unwrap();
         writer
             .update(
-                &serde_json::json!({"session":"second","pid":11,"window_id":21}),
+                &serde_json::json!({
+                    "session":"second",
+                    "pid":11,
+                    "window_id":21,
+                    "_state_writer_pid": 3131,
+                }),
                 Some("Safari".to_owned()),
             )
             .unwrap();
@@ -200,11 +238,12 @@ mod tests {
         let state: DriverProcessState =
             serde_json::from_slice(&std::fs::read(writer.path()).unwrap()).unwrap();
         assert_eq!(state.driver_pid, 4242);
+        assert_eq!(state.writer_pid, Some(3131));
         assert_eq!(state.session.as_deref(), Some("second"));
         assert_eq!(state.target_app.as_deref(), Some("Safari"));
         assert_eq!(state.target_pid, Some(11));
         assert_eq!(state.target_window_id, Some(21));
-        assert_eq!(state.schema, 1);
+        assert_eq!(state.schema, 2);
         assert!(time::OffsetDateTime::parse(
             &state.last_action_at,
             &time::format_description::well_known::Rfc3339,
