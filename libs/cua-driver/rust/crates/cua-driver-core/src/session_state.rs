@@ -1,6 +1,7 @@
 //! Best-effort embedded-driver process state file.
 
 use serde::{Deserialize, Serialize};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -102,8 +103,8 @@ fn session_for_action(
         .map(str::to_owned)
 }
 
-/// One state file for the current driver process. Writes are always performed
-/// through a same-directory temporary file followed by `rename`.
+/// Session-scoped state files for the current driver process. Writes are always
+/// performed through a same-directory temporary file followed by `rename`.
 pub struct StateFile {
     dir: PathBuf,
     driver_pid: u32,
@@ -124,7 +125,19 @@ impl StateFile {
     }
 
     pub fn path(&self) -> PathBuf {
-        self.dir.join(format!("{}.json", self.driver_pid))
+        self.path_for_session(None)
+    }
+
+    pub(crate) fn path_for_session(&self, session: Option<&str>) -> PathBuf {
+        let file_name = match session {
+            Some(session) => {
+                let mut hasher = DefaultHasher::new();
+                session.hash(&mut hasher);
+                format!("{}-{:016x}.json", self.driver_pid, hasher.finish())
+            }
+            None => format!("{}.json", self.driver_pid),
+        };
+        self.dir.join(file_name)
     }
 
     pub fn update(
@@ -134,19 +147,24 @@ impl StateFile {
     ) -> std::io::Result<()> {
         ensure_private_dir(&self.dir)?;
         let state = DriverProcessState::for_action(self.driver_pid, args, target_app);
+        let state_path = self.path_for_session(state.session.as_deref());
         let body = serde_json::to_vec(&state)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let sequence = self.temp_counter.fetch_add(1, Ordering::Relaxed);
-        let temp_path = self
-            .dir
-            .join(format!(".{}.json.tmp-{}", self.driver_pid, sequence));
+        let state_file_name = state_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid state filename")
+            })?;
+        let temp_path = self.dir.join(format!(".{state_file_name}.tmp-{sequence}"));
 
         let result = (|| {
             use std::io::Write;
             let mut file = create_private_temp_file(&temp_path)?;
             file.write_all(&body)?;
             file.sync_all()?;
-            std::fs::rename(&temp_path, self.path())
+            std::fs::rename(&temp_path, state_path)
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&temp_path);
@@ -155,10 +173,31 @@ impl StateFile {
     }
 
     pub fn remove(&self) -> std::io::Result<()> {
-        match std::fs::remove_file(self.path()) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            result => result,
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let anonymous_file_name = format!("{}.json", self.driver_pid);
+        let session_file_prefix = format!("{}-", self.driver_pid);
+        for entry in entries {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let is_owned_state = file_name == anonymous_file_name
+                || (file_name.starts_with(&session_file_prefix) && file_name.ends_with(".json"));
+            if !is_owned_state {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+                Ok(()) => {}
+            }
         }
+        Ok(())
     }
 }
 
@@ -219,14 +258,14 @@ mod tests {
         let writer = StateFile::new(dir.path().to_owned(), 4242);
         writer
             .update(
-                &serde_json::json!({"session":"first","pid":10,"window_id":20}),
+                &serde_json::json!({"session":"surface-a","pid":10,"window_id":20}),
                 Some("Notes".to_owned()),
             )
             .unwrap();
         writer
             .update(
                 &serde_json::json!({
-                    "session":"second",
+                    "session":"surface-a",
                     "pid":11,
                     "window_id":21,
                     "_state_writer_pid": 3131,
@@ -235,11 +274,13 @@ mod tests {
             )
             .unwrap();
 
-        let state: DriverProcessState =
-            serde_json::from_slice(&std::fs::read(writer.path()).unwrap()).unwrap();
+        let state: DriverProcessState = serde_json::from_slice(
+            &std::fs::read(writer.path_for_session(Some("surface-a"))).unwrap(),
+        )
+        .unwrap();
         assert_eq!(state.driver_pid, 4242);
         assert_eq!(state.writer_pid, Some(3131));
-        assert_eq!(state.session.as_deref(), Some("second"));
+        assert_eq!(state.session.as_deref(), Some("surface-a"));
         assert_eq!(state.target_app.as_deref(), Some("Safari"));
         assert_eq!(state.target_pid, Some(11));
         assert_eq!(state.target_window_id, Some(21));
@@ -290,12 +331,12 @@ mod tests {
         let mut states = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
+            .filter(|entry| {
+                entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            })
             .map(|entry| {
-                serde_json::from_slice::<DriverProcessState>(
-                    &std::fs::read(entry.path()).unwrap(),
-                )
-                .unwrap()
+                serde_json::from_slice::<DriverProcessState>(&std::fs::read(entry.path()).unwrap())
+                    .unwrap()
             })
             .collect::<Vec<_>>();
         states.sort_by(|lhs, rhs| lhs.session.cmp(&rhs.session));
@@ -338,7 +379,7 @@ mod tests {
             0o700
         );
         assert_eq!(
-            std::fs::metadata(writer.path())
+            std::fs::metadata(writer.path_for_session(Some("private")))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -350,14 +391,28 @@ mod tests {
     #[test]
     fn drop_removes_the_process_file_on_clean_shutdown() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("4444.json");
+        let first_path;
+        let second_path;
         {
             let writer = StateFile::new(dir.path().to_owned(), 4444);
             writer
-                .update(&serde_json::json!({"pid": 10}), Some("Notes".to_owned()))
+                .update(
+                    &serde_json::json!({"session": "surface-a", "pid": 10}),
+                    Some("Notes".to_owned()),
+                )
                 .unwrap();
-            assert!(path.exists());
+            writer
+                .update(
+                    &serde_json::json!({"session": "surface-b", "pid": 11}),
+                    Some("Safari".to_owned()),
+                )
+                .unwrap();
+            first_path = writer.path_for_session(Some("surface-a"));
+            second_path = writer.path_for_session(Some("surface-b"));
+            assert!(first_path.exists());
+            assert!(second_path.exists());
         }
-        assert!(!path.exists());
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
     }
 }
