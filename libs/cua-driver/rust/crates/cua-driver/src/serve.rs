@@ -383,6 +383,19 @@ fn configured_authorized_root_pid() -> anyhow::Result<Option<u32>> {
 
 #[cfg(target_os = "macos")]
 fn macos_parent_process_id(process_id: u32) -> Option<u32> {
+    macos_process_identity(process_id).map(|identity| identity.parent_process_id)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessIdentity {
+    process_id: u32,
+    parent_process_id: u32,
+    start_seconds: i64,
+    start_microseconds: i64,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_identity(process_id: u32) -> Option<ProcessIdentity> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let expected_size = std::mem::size_of::<libc::proc_bsdinfo>();
     let result = unsafe {
@@ -398,7 +411,15 @@ fn macos_parent_process_id(process_id: u32) -> Option<u32> {
         return None;
     }
     let info = unsafe { info.assume_init() };
-    (info.pbi_pid == process_id).then_some(info.pbi_ppid)
+    if info.pbi_pid != process_id {
+        return None;
+    }
+    Some(ProcessIdentity {
+        process_id,
+        parent_process_id: info.pbi_ppid,
+        start_seconds: i64::try_from(info.pbi_start_tvsec).ok()?,
+        start_microseconds: i64::try_from(info.pbi_start_tvusec).ok()?,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -434,20 +455,31 @@ fn macos_process_is_authorized(
 }
 
 /// Replaces any caller-supplied state provenance with the kernel-authenticated
-/// peer pid captured from the accepted socket. A missing kernel identity removes
-/// the reserved field so standalone clients cannot spoof trusted provenance.
+/// peer generation captured when the socket was accepted. Missing kernel
+/// identity removes every reserved field so standalone clients cannot spoof
+/// trusted provenance.
 fn attach_state_writer_identity(
     args: &mut serde_json::Value,
-    peer_process_id: Option<u32>,
+    peer_process_identity: Option<ProcessIdentity>,
 ) {
     let Some(args) = args.as_object_mut() else {
         return;
     };
     args.remove(cua_driver_core::session_state::STATE_WRITER_PID_ARG);
-    if let Some(process_id) = peer_process_id.filter(|process_id| *process_id > 1) {
+    args.remove(cua_driver_core::session_state::STATE_WRITER_START_SECONDS_ARG);
+    args.remove(cua_driver_core::session_state::STATE_WRITER_START_MICROSECONDS_ARG);
+    if let Some(identity) = peer_process_identity.filter(|identity| identity.process_id > 1) {
         args.insert(
             cua_driver_core::session_state::STATE_WRITER_PID_ARG.to_owned(),
-            serde_json::json!(process_id),
+            serde_json::json!(identity.process_id),
+        );
+        args.insert(
+            cua_driver_core::session_state::STATE_WRITER_START_SECONDS_ARG.to_owned(),
+            serde_json::json!(identity.start_seconds),
+        );
+        args.insert(
+            cua_driver_core::session_state::STATE_WRITER_START_MICROSECONDS_ARG.to_owned(),
+            serde_json::json!(identity.start_microseconds),
         );
     }
 }
@@ -826,8 +858,11 @@ pub async fn run_serve(
                 let (stream, _) = result?;
                 #[cfg(target_os = "macos")]
                 let peer_process_id = macos_peer_process_id(&stream);
+                #[cfg(target_os = "macos")]
+                let peer_process_identity =
+                    peer_process_id.and_then(macos_process_identity);
                 #[cfg(not(target_os = "macos"))]
-                let peer_process_id = None;
+                let peer_process_identity = None;
                 #[cfg(target_os = "macos")]
                 if let Some(root_process_id) = authorized_root_pid {
                     if !macos_process_is_authorized(peer_process_id, root_process_id) {
@@ -968,7 +1003,10 @@ pub async fn run_serve(
                                 let mut args = req.args.unwrap_or(serde_json::Value::Object(
                                     serde_json::Map::new()
                                 ));
-                                attach_state_writer_identity(&mut args, peer_process_id);
+                                attach_state_writer_identity(
+                                    &mut args,
+                                    peer_process_identity,
+                                );
                                 clamp_external_permission_prompt(
                                     crate::bundle::is_env_truthy(
                                         "CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW"
@@ -1837,7 +1875,7 @@ mod external_permission_flow_tests {
 mod socket_authentication_tests {
     use super::{
         attach_state_writer_identity, parse_request_with_token, process_descends_from,
-        DaemonRequest,
+        DaemonRequest, ProcessIdentity,
     };
     use std::collections::HashMap;
 
@@ -1897,8 +1935,24 @@ mod socket_authentication_tests {
             "_state_writer_pid": 999_999,
         });
 
-        attach_state_writer_identity(&mut args, Some(4_321));
+        attach_state_writer_identity(
+            &mut args,
+            Some(ProcessIdentity {
+                process_id: 4_321,
+                parent_process_id: 4_000,
+                start_seconds: 1_700_000_000,
+                start_microseconds: 123_456,
+            }),
+        );
         assert_eq!(args["_state_writer_pid"], serde_json::json!(4_321));
+        assert_eq!(
+            args["_state_writer_start_seconds"],
+            serde_json::json!(1_700_000_000)
+        );
+        assert_eq!(
+            args["_state_writer_start_microseconds"],
+            serde_json::json!(123_456)
+        );
 
         attach_state_writer_identity(&mut args, None);
         assert!(args.get("_state_writer_pid").is_none());
@@ -1914,19 +1968,21 @@ mod socket_authentication_tests {
             "_state_writer_start_microseconds": 999_999,
         });
 
-        attach_state_writer_identity(&mut args, Some(std::process::id()));
+        let identity = super::macos_process_identity(std::process::id())
+            .expect("current process identity");
+        attach_state_writer_identity(&mut args, Some(identity));
 
         assert_eq!(
             args["_state_writer_pid"],
-            serde_json::json!(std::process::id())
+            serde_json::json!(identity.process_id)
         );
-        assert_ne!(
+        assert_eq!(
             args["_state_writer_start_seconds"],
-            serde_json::json!(999_999)
+            serde_json::json!(identity.start_seconds)
         );
-        assert_ne!(
+        assert_eq!(
             args["_state_writer_start_microseconds"],
-            serde_json::json!(999_999)
+            serde_json::json!(identity.start_microseconds)
         );
 
         attach_state_writer_identity(&mut args, None);
@@ -1969,6 +2025,10 @@ mod socket_authentication_tests {
 
         let peer_process_id = super::macos_peer_process_id(&server);
         assert_eq!(peer_process_id, Some(std::process::id()));
+        assert_eq!(
+            peer_process_id.and_then(super::macos_process_identity),
+            super::macos_process_identity(std::process::id())
+        );
         assert!(super::macos_process_is_authorized(
             peer_process_id,
             std::process::id()

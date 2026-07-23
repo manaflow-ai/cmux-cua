@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const STATE_DIR_ENV: &str = "CUA_DRIVER_STATE_DIR";
 pub const STATE_WRITER_PID_ARG: &str = "_state_writer_pid";
-const SCHEMA_VERSION: u8 = 2;
+pub const STATE_WRITER_START_SECONDS_ARG: &str = "_state_writer_start_seconds";
+pub const STATE_WRITER_START_MICROSECONDS_ARG: &str = "_state_writer_start_microseconds";
+const SCHEMA_VERSION: u8 = 3;
 
 /// Cross-platform fallback process-name resolver. Platform registries may
 /// replace this with a native resolver when they have one.
@@ -61,6 +63,12 @@ pub struct DriverProcessState {
     /// Kernel-authenticated process that sent the action to a long-running daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writer_pid: Option<u32>,
+    /// Kernel-observed start time for `writer_pid`; together these identify one
+    /// process generation instead of trusting a reusable numeric pid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_start_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_start_microseconds: Option<i64>,
     pub session: Option<String>,
     pub target_app: Option<String>,
     pub target_pid: Option<i64>,
@@ -71,13 +79,27 @@ pub struct DriverProcessState {
 
 impl DriverProcessState {
     fn for_action(driver_pid: u32, args: &serde_json::Value, target_app: Option<String>) -> Self {
+        let writer_identity = args
+            .get(STATE_WRITER_PID_ARG)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 1)
+            .and_then(|process_id| {
+                let start_seconds = args
+                    .get(STATE_WRITER_START_SECONDS_ARG)?
+                    .as_i64()
+                    .filter(|value| *value > 0)?;
+                let start_microseconds = args
+                    .get(STATE_WRITER_START_MICROSECONDS_ARG)?
+                    .as_i64()
+                    .filter(|value| (0..1_000_000).contains(value))?;
+                Some((process_id, start_seconds, start_microseconds))
+            });
         Self {
             driver_pid,
-            writer_pid: args
-                .get(STATE_WRITER_PID_ARG)
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .filter(|value| *value > 1),
+            writer_pid: writer_identity.map(|identity| identity.0),
+            writer_start_seconds: writer_identity.map(|identity| identity.1),
+            writer_start_microseconds: writer_identity.map(|identity| identity.2),
             session: session_for_action(args, crate::embedded_default_session_id()),
             target_app,
             target_pid: args.get("pid").and_then(|value| value.as_i64()),
@@ -269,6 +291,8 @@ mod tests {
                     "pid":11,
                     "window_id":21,
                     "_state_writer_pid": 3131,
+                    "_state_writer_start_seconds": 1_700_000_000,
+                    "_state_writer_start_microseconds": 123_456,
                 }),
                 Some("Safari".to_owned()),
             )
@@ -280,11 +304,13 @@ mod tests {
         .unwrap();
         assert_eq!(state.driver_pid, 4242);
         assert_eq!(state.writer_pid, Some(3131));
+        assert_eq!(state.writer_start_seconds, Some(1_700_000_000));
+        assert_eq!(state.writer_start_microseconds, Some(123_456));
         assert_eq!(state.session.as_deref(), Some("surface-a"));
         assert_eq!(state.target_app.as_deref(), Some("Safari"));
         assert_eq!(state.target_pid, Some(11));
         assert_eq!(state.target_window_id, Some(21));
-        assert_eq!(state.schema, 2);
+        assert_eq!(state.schema, 3);
         assert!(time::OffsetDateTime::parse(
             &state.last_action_at,
             &time::format_description::well_known::Rfc3339,
@@ -312,6 +338,8 @@ mod tests {
                     "pid": 10,
                     "window_id": 20,
                     "_state_writer_pid": 3131,
+                    "_state_writer_start_seconds": 1_700_000_000,
+                    "_state_writer_start_microseconds": 123_456,
                 }),
                 Some("Notes".to_owned()),
             )
@@ -323,6 +351,8 @@ mod tests {
                     "pid": 11,
                     "window_id": 21,
                     "_state_writer_pid": 4141,
+                    "_state_writer_start_seconds": 1_700_000_001,
+                    "_state_writer_start_microseconds": 234_567,
                 }),
                 Some("Safari".to_owned()),
             )
@@ -344,8 +374,12 @@ mod tests {
         assert_eq!(states.len(), 2);
         assert_eq!(states[0].session.as_deref(), Some("surface-a"));
         assert_eq!(states[0].writer_pid, Some(3131));
+        assert_eq!(states[0].writer_start_seconds, Some(1_700_000_000));
+        assert_eq!(states[0].writer_start_microseconds, Some(123_456));
         assert_eq!(states[1].session.as_deref(), Some("surface-b"));
         assert_eq!(states[1].writer_pid, Some(4141));
+        assert_eq!(states[1].writer_start_seconds, Some(1_700_000_001));
+        assert_eq!(states[1].writer_start_microseconds, Some(234_567));
     }
 
     #[test]
