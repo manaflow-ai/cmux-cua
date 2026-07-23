@@ -261,6 +261,53 @@ mod tests {
     }
 
     #[test]
+    fn updates_for_distinct_sessions_preserve_both_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = StateFile::new(dir.path().to_owned(), 4242);
+        writer
+            .update(
+                &serde_json::json!({
+                    "session": "surface-a",
+                    "pid": 10,
+                    "window_id": 20,
+                    "_state_writer_pid": 3131,
+                }),
+                Some("Notes".to_owned()),
+            )
+            .unwrap();
+        writer
+            .update(
+                &serde_json::json!({
+                    "session": "surface-b",
+                    "pid": 11,
+                    "window_id": 21,
+                    "_state_writer_pid": 4141,
+                }),
+                Some("Safari".to_owned()),
+            )
+            .unwrap();
+
+        let mut states = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
+            .map(|entry| {
+                serde_json::from_slice::<DriverProcessState>(
+                    &std::fs::read(entry.path()).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        states.sort_by(|lhs, rhs| lhs.session.cmp(&rhs.session));
+
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].session.as_deref(), Some("surface-a"));
+        assert_eq!(states[0].writer_pid, Some(3131));
+        assert_eq!(states[1].session.as_deref(), Some("surface-b"));
+        assert_eq!(states[1].writer_pid, Some(4141));
+    }
+
+    #[test]
     fn malformed_state_directory_is_an_error_not_a_panic() {
         let dir = tempfile::tempdir().unwrap();
         let not_a_dir = dir.path().join("plain-file");
