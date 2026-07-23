@@ -1,15 +1,20 @@
 //! Best-effort embedded-driver process state file.
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
 pub const STATE_DIR_ENV: &str = "CUA_DRIVER_STATE_DIR";
 pub const STATE_WRITER_PID_ARG: &str = "_state_writer_pid";
 pub const STATE_WRITER_START_SECONDS_ARG: &str = "_state_writer_start_seconds";
 pub const STATE_WRITER_START_MICROSECONDS_ARG: &str = "_state_writer_start_microseconds";
-const SCHEMA_VERSION: u8 = 3;
+const UNSIGNED_SCHEMA_VERSION: u8 = 3;
+const AUTHENTICATED_SCHEMA_VERSION: u8 = 4;
+const AUTHENTICATION_DOMAIN: &[u8] = b"cmux-computer-use-state-v1\0";
 
 /// Cross-platform fallback process-name resolver. Platform registries may
 /// replace this with a native resolver when they have one.
@@ -75,6 +80,8 @@ pub struct DriverProcessState {
     pub target_window_id: Option<u64>,
     pub last_action_at: String,
     pub schema: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_authentication_code: Option<String>,
 }
 
 impl DriverProcessState {
@@ -107,8 +114,101 @@ impl DriverProcessState {
             last_action_at: time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned()),
-            schema: SCHEMA_VERSION,
+            schema: UNSIGNED_SCHEMA_VERSION,
+            state_authentication_code: None,
         }
+    }
+
+    /// Stable length-delimited bytes authenticated by the cmux-owned helper.
+    pub fn authentication_message(&self) -> Vec<u8> {
+        let mut message = Vec::with_capacity(256);
+        message.extend_from_slice(AUTHENTICATION_DOMAIN);
+        Self::append_integer(&mut message, self.driver_pid);
+        Self::append_optional_integer(&mut message, self.writer_pid);
+        Self::append_optional_integer(&mut message, self.writer_start_seconds);
+        Self::append_optional_integer(&mut message, self.writer_start_microseconds);
+        Self::append_optional_string(&mut message, self.session.as_deref());
+        Self::append_optional_string(&mut message, self.target_app.as_deref());
+        Self::append_optional_integer(&mut message, self.target_pid);
+        Self::append_optional_integer(&mut message, self.target_window_id);
+        Self::append_string(&mut message, &self.last_action_at);
+        Self::append_integer(&mut message, self.schema);
+        message
+    }
+
+    fn authenticate(&mut self, key: &[u8]) -> std::io::Result<()> {
+        self.schema = AUTHENTICATED_SCHEMA_VERSION;
+        self.state_authentication_code = None;
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid state authentication key",
+            )
+        })?;
+        mac.update(&self.authentication_message());
+        let code = mac.finalize().into_bytes();
+        self.state_authentication_code = Some(
+            code.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn has_valid_authentication_code(&self, key: &[u8]) -> bool {
+        let Some(provided) = self
+            .state_authentication_code
+            .as_deref()
+            .and_then(|value| Self::decode_hex(value))
+        else {
+            return false;
+        };
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key) else {
+            return false;
+        };
+        mac.update(&self.authentication_message());
+        mac.verify_slice(&provided).is_ok()
+    }
+
+    fn append_integer(message: &mut Vec<u8>, value: impl std::fmt::Display) {
+        message.extend_from_slice(value.to_string().as_bytes());
+        message.push(0);
+    }
+
+    fn append_optional_integer(
+        message: &mut Vec<u8>,
+        value: Option<impl std::fmt::Display>,
+    ) {
+        match value {
+            Some(value) => Self::append_integer(message, value),
+            None => message.extend_from_slice(b"-\0"),
+        }
+    }
+
+    fn append_string(message: &mut Vec<u8>, value: &str) {
+        message.extend_from_slice(value.len().to_string().as_bytes());
+        message.push(b':');
+        message.extend_from_slice(value.as_bytes());
+        message.push(0);
+    }
+
+    fn append_optional_string(message: &mut Vec<u8>, value: Option<&str>) {
+        match value {
+            Some(value) => Self::append_string(message, value),
+            None => message.extend_from_slice(b"-\0"),
+        }
+    }
+
+    #[cfg(test)]
+    fn decode_hex(value: &str) -> Option<Vec<u8>> {
+        if value.len() % 2 != 0 {
+            return None;
+        }
+        (0..value.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+            .collect()
     }
 }
 
@@ -131,6 +231,7 @@ pub struct StateFile {
     dir: PathBuf,
     driver_pid: u32,
     temp_counter: AtomicU64,
+    authentication_key: RwLock<Option<Vec<u8>>>,
 }
 
 impl StateFile {
@@ -143,7 +244,21 @@ impl StateFile {
             dir,
             driver_pid,
             temp_counter: AtomicU64::new(0),
+            authentication_key: RwLock::new(None),
         }
+    }
+
+    /// Replaces the in-memory state signing key. The key is never read from an
+    /// environment variable or file inherited by automation clients.
+    pub fn set_authentication_key(&self, key: Vec<u8>) -> bool {
+        if key.len() != 32 {
+            return false;
+        }
+        let Ok(mut current) = self.authentication_key.write() else {
+            return false;
+        };
+        *current = Some(key);
+        true
     }
 
     pub fn path(&self) -> PathBuf {
@@ -168,7 +283,20 @@ impl StateFile {
         target_app: Option<String>,
     ) -> std::io::Result<()> {
         ensure_private_dir(&self.dir)?;
-        let state = DriverProcessState::for_action(self.driver_pid, args, target_app);
+        let mut state = DriverProcessState::for_action(self.driver_pid, args, target_app);
+        let authentication_key = self
+            .authentication_key
+            .read()
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "state authentication key lock poisoned",
+                )
+            })?
+            .clone();
+        if let Some(key) = authentication_key {
+            state.authenticate(&key)?;
+        }
         let state_path = self.path_for_session(state.session.as_deref());
         let body = serde_json::to_vec(&state)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -334,6 +462,67 @@ mod tests {
             0,
             "rename must leave no temporary file behind",
         );
+    }
+
+    #[test]
+    fn configured_key_authenticates_state_and_detects_forgery() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = StateFile::new(dir.path().to_owned(), 4242);
+        let key = vec![0x5a; 32];
+        assert!(writer.set_authentication_key(key.clone()));
+        assert!(!writer.set_authentication_key(vec![0x5a; 31]));
+        writer
+            .update(
+                &serde_json::json!({
+                    "session": "surface-a",
+                    "pid": 10,
+                    "window_id": 20,
+                    "_state_writer_pid": 3131,
+                    "_state_writer_start_seconds": 1_700_000_000,
+                    "_state_writer_start_microseconds": 123_456,
+                }),
+                Some("Notes".to_owned()),
+            )
+            .unwrap();
+
+        let mut state: DriverProcessState = serde_json::from_slice(
+            &std::fs::read(writer.path_for_session(Some("surface-a"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.schema, AUTHENTICATED_SCHEMA_VERSION);
+        assert_eq!(
+            state.state_authentication_code.as_deref().map(str::len),
+            Some(64)
+        );
+        assert!(state.has_valid_authentication_code(&key));
+
+        state.target_pid = Some(11);
+        assert!(!state.has_valid_authentication_code(&key));
+    }
+
+    #[test]
+    fn authenticated_state_contract_matches_cmux() {
+        let key = vec![0x5a; 32];
+        let mut state = DriverProcessState {
+            driver_pid: 71_790,
+            writer_pid: Some(71_600),
+            writer_start_seconds: Some(1_700_000_000),
+            writer_start_microseconds: Some(123_456),
+            session: None,
+            target_app: Some("Calculator".to_owned()),
+            target_pid: Some(71_241),
+            target_window_id: Some(87_692),
+            last_action_at: "2026-07-14T01:09:37.745752Z".to_owned(),
+            schema: UNSIGNED_SCHEMA_VERSION,
+            state_authentication_code: None,
+        };
+        state.authenticate(&key).unwrap();
+
+        assert_eq!(
+            state.state_authentication_code.as_deref(),
+            Some("dba2b7a606e510db5908f7c77bcdf2224c7a9764569fee7ad32aa3926928a460")
+        );
+        assert!(state.has_valid_authentication_code(&key));
     }
 
     #[test]

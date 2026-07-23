@@ -501,6 +501,13 @@ impl ToolRegistry {
         self.target_front_hook = Some(hook);
     }
 
+    /// Installs the cmux host's in-memory key for authenticating state files.
+    pub fn set_state_authentication_key(&self, key: Vec<u8>) -> bool {
+        self.state_file
+            .as_ref()
+            .is_some_and(|state_file| state_file.set_authentication_key(key))
+    }
+
     #[cfg(test)]
     fn set_state_file_for_test(&mut self, state_file: crate::session_state::StateFile) {
         self.state_file = Some(state_file);

@@ -20,6 +20,7 @@
 //!   Linux  — ~/.cache/cua-driver/cua-driver.sock
 //!   Windows — \\.\pipe\cua-driver  (TODO: use named pipe; stubs only for now)
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 /// Tool surface owned by a daemon instance. The proxy validates this value
@@ -470,6 +471,10 @@ pub const SOCKET_AUTH_TOKEN_ENV: &str = "CUA_DRIVER_SOCKET_AUTH_TOKEN";
 /// the bearer token, the daemon rejects its socket unless the kernel-reported
 /// peer PID is the embedder or one of its descendants.
 pub const SOCKET_AUTHORIZED_ROOT_PID_ENV: &str = "CUA_DRIVER_SOCKET_AUTHORIZED_ROOT_PID";
+pub const SOCKET_AUTHORIZED_ROOT_START_SECONDS_ENV: &str =
+    "CUA_DRIVER_SOCKET_AUTHORIZED_ROOT_START_SECONDS";
+pub const SOCKET_AUTHORIZED_ROOT_START_MICROSECONDS_ENV: &str =
+    "CUA_DRIVER_SOCKET_AUTHORIZED_ROOT_START_MICROSECONDS";
 
 // ── Recording idle-TTL backstop (#1764) ─────────────────────────────────────────
 
@@ -820,6 +825,17 @@ fn auth_tokens_match(expected: &str, provided: &str) -> bool {
     difference == 0
 }
 
+fn state_authentication_key(args: Option<&serde_json::Value>) -> Option<Vec<u8>> {
+    let encoded = args?
+        .get("key_base64")
+        .and_then(serde_json::Value::as_str)?;
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    (key.len() == 32).then_some(key)
+}
+
+#[cfg(test)]
 fn process_descends_from(
     mut process_id: u32,
     root_process_id: u32,
@@ -846,33 +862,20 @@ fn process_descends_from(
     false
 }
 
-#[cfg(target_os = "macos")]
-fn configured_authorized_root_pid() -> anyhow::Result<Option<u32>> {
-    let Some(raw) = std::env::var(SOCKET_AUTHORIZED_ROOT_PID_ENV)
-        .ok()
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
-    let pid = raw
-        .parse::<u32>()
-        .ok()
-        .filter(|pid| *pid > 1)
-        .ok_or_else(|| anyhow::anyhow!("Invalid {SOCKET_AUTHORIZED_ROOT_PID_ENV}"))?;
-    Ok(Some(pid))
-}
-
-#[cfg(target_os = "macos")]
-fn macos_parent_process_id(process_id: u32) -> Option<u32> {
-    macos_process_identity(process_id).map(|identity| identity.parent_process_id)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProcessIdentity {
     process_id: u32,
     parent_process_id: u32,
     start_seconds: i64,
     start_microseconds: i64,
+}
+
+impl ProcessIdentity {
+    fn is_same_generation_as(self, other: Self) -> bool {
+        self.process_id == other.process_id
+            && self.start_seconds == other.start_seconds
+            && self.start_microseconds == other.start_microseconds
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -904,6 +907,48 @@ fn macos_process_identity(process_id: u32) -> Option<ProcessIdentity> {
 }
 
 #[cfg(target_os = "macos")]
+fn configured_authorized_root_identity() -> anyhow::Result<Option<ProcessIdentity>> {
+    let raw_pid = std::env::var(SOCKET_AUTHORIZED_ROOT_PID_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let raw_seconds = std::env::var(SOCKET_AUTHORIZED_ROOT_START_SECONDS_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let raw_microseconds = std::env::var(SOCKET_AUTHORIZED_ROOT_START_MICROSECONDS_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    if raw_pid.is_none() && raw_seconds.is_none() && raw_microseconds.is_none() {
+        return Ok(None);
+    }
+    let process_id = raw_pid
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 1)
+        .ok_or_else(|| anyhow::anyhow!("Invalid {SOCKET_AUTHORIZED_ROOT_PID_ENV}"))?;
+    let start_seconds = raw_seconds
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Invalid {SOCKET_AUTHORIZED_ROOT_START_SECONDS_ENV}")
+        })?;
+    let start_microseconds = raw_microseconds
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| (0..1_000_000).contains(value))
+        .ok_or_else(|| {
+            anyhow::anyhow!("Invalid {SOCKET_AUTHORIZED_ROOT_START_MICROSECONDS_ENV}")
+        })?;
+    let configured = ProcessIdentity {
+        process_id,
+        parent_process_id: 0,
+        start_seconds,
+        start_microseconds,
+    };
+    let current = macos_process_identity(process_id)
+        .filter(|identity| identity.is_same_generation_as(configured))
+        .ok_or_else(|| anyhow::anyhow!("Configured socket root process is no longer live"))?;
+    Ok(Some(current))
+}
+
+#[cfg(target_os = "macos")]
 fn macos_peer_process_id(stream: &tokio::net::UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
 
@@ -926,13 +971,28 @@ fn macos_peer_process_id(stream: &tokio::net::UnixStream) -> Option<u32> {
 
 #[cfg(target_os = "macos")]
 fn macos_process_is_authorized(
-    peer_process_id: Option<u32>,
-    root_process_id: u32,
+    peer_process_identity: Option<ProcessIdentity>,
+    root_process_identity: ProcessIdentity,
 ) -> bool {
-    let Some(peer_process_id) = peer_process_id else {
+    let Some(mut current) = peer_process_identity else {
         return false;
     };
-    process_descends_from(peer_process_id, root_process_id, macos_parent_process_id)
+    for _ in 0..128 {
+        if current.process_id == root_process_identity.process_id {
+            return current.is_same_generation_as(root_process_identity);
+        }
+        if current.process_id <= 1 || current.parent_process_id <= 1 {
+            return false;
+        }
+        let Some(parent) = macos_process_identity(current.parent_process_id) else {
+            return false;
+        };
+        if parent.process_id == current.process_id {
+            return false;
+        }
+        current = parent;
+    }
+    false
 }
 
 /// Replaces any caller-supplied state provenance with the kernel-authenticated
@@ -1421,7 +1481,9 @@ pub async fn run_serve(
     use tokio::net::UnixListener;
 
     #[cfg(target_os = "macos")]
-    let authorized_root_pid = configured_authorized_root_pid()?;
+    let authorized_root_identity = configured_authorized_root_identity()?;
+    #[cfg(not(target_os = "macos"))]
+    let authorized_root_identity: Option<ProcessIdentity> = None;
 
     let socket = std::path::Path::new(socket_path);
 
@@ -1471,6 +1533,8 @@ pub async fn run_serve(
     maybe_start_http_transport(registry.clone(), profile);
     register_recording_session_end_hook(registry.recording.clone());
     register_state_file_session_end_hook(&registry);
+    let mut authorized_root_health =
+        tokio::time::interval(std::time::Duration::from_secs(1));
 
     // Session id to one-time-random broker credential. Only an authenticated
     // long-lived control connection can populate this map. The credential is
@@ -1492,12 +1556,26 @@ pub async fn run_serve(
                 #[cfg(not(target_os = "macos"))]
                 let peer_process_identity = None;
                 #[cfg(target_os = "macos")]
-                if let Some(root_process_id) = authorized_root_pid {
-                    if !macos_process_is_authorized(peer_process_id, root_process_id) {
+                if let Some(root_process_identity) = authorized_root_identity {
+                    if !macos_process_is_authorized(
+                        peer_process_identity,
+                        root_process_identity,
+                    ) {
                         eprintln!("Rejected unauthorized daemon peer");
                         continue;
                     }
                 }
+                #[cfg(target_os = "macos")]
+                let peer_is_authorized_root = match (
+                    peer_process_identity,
+                    authorized_root_identity,
+                ) {
+                    (Some(peer), Some(root)) => peer.is_same_generation_as(root),
+                    (_, None) => true,
+                    _ => false,
+                };
+                #[cfg(not(target_os = "macos"))]
+                let peer_is_authorized_root = authorized_root_identity.is_none();
                 let reg = registry.clone();
                 let shutdown_tx2 = shutdown_tx.clone();
                 let last_activity = last_activity.clone();
@@ -1518,6 +1596,17 @@ pub async fn run_serve(
                     let mut control_approval_token: Option<(String, String)> = None;
 
                     while let Ok(Some(line)) = lines.next_line().await {
+                        #[cfg(target_os = "macos")]
+                        if let Some(root_process_identity) = authorized_root_identity {
+                            let root_is_still_live =
+                                macos_process_identity(root_process_identity.process_id)
+                                    .is_some_and(|identity| {
+                                        identity.is_same_generation_as(root_process_identity)
+                                    });
+                            if !root_is_still_live {
+                                return;
+                            }
+                        }
                         let req = match parse_request(&line) {
                             Ok(request) => request,
                             Err(resp) => {
@@ -1530,6 +1619,16 @@ pub async fn run_serve(
 
                         match req.method.as_str() {
                             "shutdown" => {
+                                if !peer_is_authorized_root {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
                                 let resp = DaemonResponse::ok(serde_json::json!({"shutdown": true}));
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -1629,6 +1728,16 @@ pub async fn run_serve(
                                 }
                             }
                             "request_system_permission" => {
+                                if !peer_is_authorized_root {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
                                 let resp = validate_system_permission_request(req.name.as_deref());
                                 let response_sent = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -1641,6 +1750,37 @@ pub async fn run_serve(
                                 }
                                 #[cfg(not(target_os = "macos"))]
                                 let _ = response_sent;
+                            }
+                            "configure_state_authentication" => {
+                                let response = if !peer_is_authorized_root
+                                    || authorized_root_identity.is_none()
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    )
+                                } else if let Some(key) =
+                                    state_authentication_key(req.args.as_ref())
+                                {
+                                    if reg.set_state_authentication_key(key) {
+                                        DaemonResponse::ok(serde_json::json!({
+                                            "state_authentication": true
+                                        }))
+                                    } else {
+                                        DaemonResponse::err(
+                                            "State authentication is unavailable".to_owned(),
+                                            1,
+                                        )
+                                    }
+                                } else {
+                                    DaemonResponse::err(
+                                        "Invalid state authentication key".to_owned(),
+                                        64,
+                                    )
+                                };
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&response).unwrap() + "\n").as_bytes()
+                                ).await;
                             }
                             "list" => {
                                 // Include full ToolDef (input_schema + annotation
@@ -2082,6 +2222,20 @@ pub async fn run_serve(
             _ = &mut shutdown_rx => {
                 eprintln!("Cua Driver daemon shutting down.");
                 break;
+            }
+            _ = authorized_root_health.tick(), if authorized_root_identity.is_some() => {
+                #[cfg(target_os = "macos")]
+                if let Some(root_process_identity) = authorized_root_identity {
+                    let root_is_still_live =
+                        macos_process_identity(root_process_identity.process_id)
+                            .is_some_and(|identity| {
+                                identity.is_same_generation_as(root_process_identity)
+                            });
+                    if !root_is_still_live {
+                        eprintln!("Authorized root process exited; shutting down daemon.");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -2784,7 +2938,7 @@ mod external_permission_flow_tests {
 mod socket_authentication_tests {
     use super::{
         attach_state_writer_identity, parse_request_with_token, process_descends_from,
-        DaemonRequest, ProcessIdentity,
+        state_authentication_key, DaemonRequest, ProcessIdentity,
     };
     use std::collections::HashMap;
 
@@ -2814,6 +2968,27 @@ mod socket_authentication_tests {
             .expect_err("mismatched token must be rejected");
         assert_eq!(rejected.exit_code, Some(77));
         assert_eq!(rejected.error.as_deref(), Some("Unauthorized daemon client"));
+    }
+
+    #[test]
+    fn state_authentication_configuration_accepts_only_32_byte_keys() {
+        use base64::Engine as _;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode([0x5a; 32]);
+        assert_eq!(
+            state_authentication_key(Some(&serde_json::json!({
+                "key_base64": encoded
+            }))),
+            Some(vec![0x5a; 32])
+        );
+        assert!(state_authentication_key(Some(&serde_json::json!({
+            "key_base64": base64::engine::general_purpose::STANDARD.encode([0x5a; 31])
+        })))
+        .is_none());
+        assert!(state_authentication_key(Some(&serde_json::json!({
+            "key_base64": "not-base64"
+        })))
+        .is_none());
     }
 
     #[test]
@@ -2938,13 +3113,19 @@ mod socket_authentication_tests {
             peer_process_id.and_then(super::macos_process_identity),
             super::macos_process_identity(std::process::id())
         );
+        let peer_identity = peer_process_id.and_then(super::macos_process_identity);
+        let root_identity =
+            super::macos_process_identity(std::process::id()).expect("root identity");
         assert!(super::macos_process_is_authorized(
-            peer_process_id,
-            std::process::id()
+            peer_identity,
+            root_identity
         ));
         assert!(!super::macos_process_is_authorized(
-            peer_process_id,
-            u32::MAX - 1
+            peer_identity,
+            ProcessIdentity {
+                start_seconds: root_identity.start_seconds.saturating_sub(1),
+                ..root_identity
+            }
         ));
     }
 }
