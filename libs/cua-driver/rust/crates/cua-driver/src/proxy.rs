@@ -1424,6 +1424,11 @@ mod tests {
 
         assert_eq!(args["session"], managed);
         assert_eq!(args["_session_id"], managed);
+        assert_eq!(
+            args["_host_session"],
+            "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF",
+            "the cursor and menu state need a stable identity across MCP proxy generations"
+        );
         assert_eq!(args["pid"], 84);
     }
 

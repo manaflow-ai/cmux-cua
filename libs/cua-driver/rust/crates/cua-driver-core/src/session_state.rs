@@ -412,6 +412,22 @@ mod tests {
     }
 
     #[test]
+    fn managed_host_session_survives_proxy_generation_turnover() {
+        let args = serde_json::json!({
+            "_host_session": "cmux-surface-a",
+            "session": "cmux-surface-a-mcp-4242-99",
+            "_session_id": "cmux-surface-a-mcp-4242-99",
+            "pid": 10,
+        });
+
+        assert_eq!(
+            session_for_action(&args, Some("embedded-default")),
+            Some("cmux-surface-a".to_owned()),
+            "durable host state must use the surface identity, not a short-lived proxy generation"
+        );
+    }
+
+    #[test]
     fn update_atomically_replaces_the_process_file() {
         let dir = tempfile::tempdir().unwrap();
         let writer = StateFile::new(dir.path().to_owned(), 4242);
@@ -604,6 +620,36 @@ mod tests {
 
         assert!(!writer.path_for_session(Some("surface-a")).exists());
         assert!(writer.path_for_session(Some("surface-b")).exists());
+    }
+
+    #[test]
+    fn proxy_teardown_preserves_managed_host_activity_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = StateFile::new(dir.path().to_owned(), 4242);
+        let host_session = "cmux-surface-a";
+        let proxy_session = "cmux-surface-a-mcp-4242-99";
+        writer
+            .update(
+                &serde_json::json!({
+                    "_host_session": host_session,
+                    "session": proxy_session,
+                    "_session_id": proxy_session,
+                    "pid": 10,
+                    "window_id": 20,
+                    "_state_writer_pid": 3131,
+                    "_state_writer_start_seconds": 1_700_000_000,
+                    "_state_writer_start_microseconds": 123_456,
+                }),
+                Some("Notes".to_owned()),
+            )
+            .unwrap();
+
+        writer.remove_session(proxy_session).unwrap();
+
+        assert!(
+            writer.path_for_session(Some(host_session)).exists(),
+            "the menu's last authenticated activity must outlive one MCP proxy process"
+        );
     }
 
     #[test]
