@@ -28,6 +28,12 @@ pub const EMBEDDED_ENV: &str = "CUA_DRIVER_EMBEDDED";
 /// empty), the driver mints a process-local `embedded-<pid>` id.
 pub const DEFAULT_SESSION_ENV: &str = "CUA_DRIVER_DEFAULT_SESSION";
 
+/// Reserved per-call argument carrying a host-managed session identity that is
+/// stable across short-lived MCP proxy generations. The daemon's lifecycle
+/// session remains generation-scoped for recording/config cleanup, while the
+/// cursor and activity state use this durable host scope.
+pub const HOST_SESSION_ARG: &str = "_host_session";
+
 /// Advisory label for the embedding host's bundle id, echoed in
 /// `check_permissions` output. NOT a trust signal — trust comes from the
 /// OS responsibility chain.

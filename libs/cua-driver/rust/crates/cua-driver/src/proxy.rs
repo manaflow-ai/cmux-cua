@@ -1340,6 +1340,20 @@ fn configured_default_session() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn configured_state_owner_pid() -> Option<u32> {
+    std::env::var("CUA_DRIVER_STATE_OWNER_PID")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 1)
+}
+
+fn managed_host_session(session_id: &str) -> Option<&str> {
+    session_id
+        .rfind("-mcp-")
+        .map(|marker| &session_id[..marker])
+        .filter(|value| !value.is_empty())
+}
+
 /// Binds one proxy connection to the embedding host's stable session while
 /// preserving a unique MCP-generation suffix for concurrent/restarted agents.
 fn proxy_session_identity(
@@ -1365,9 +1379,21 @@ fn enforce_proxy_session_identity(
 ) -> serde_json::Value {
     if managed_session {
         if let Some(object) = args.as_object_mut() {
-            let session_id = serde_json::Value::String(session_id.to_owned());
-            object.insert("session".to_owned(), session_id.clone());
-            object.insert("_session_id".to_owned(), session_id);
+            let lifecycle_session = serde_json::Value::String(session_id.to_owned());
+            object.insert("session".to_owned(), lifecycle_session.clone());
+            object.insert("_session_id".to_owned(), lifecycle_session);
+            if let Some(host_session) = managed_host_session(session_id) {
+                object.insert(
+                    cua_driver_core::HOST_SESSION_ARG.to_owned(),
+                    serde_json::Value::String(host_session.to_owned()),
+                );
+            }
+            if let Some(owner_pid) = configured_state_owner_pid() {
+                object.insert(
+                    cua_driver_core::session_state::STATE_OWNER_PID_ARG.to_owned(),
+                    serde_json::json!(owner_pid),
+                );
+            }
         }
     }
     args

@@ -17,17 +17,22 @@ pub(crate) const NO_CURSOR: &str = "";
 
 /// Resolve the cursor key for a tool invocation.
 ///
-/// Explicit `session` / `cursor_id` always wins. A daemon-proxy call then uses
-/// its connection-injected `_session_id`, which keeps the cursor scoped to the
-/// proxy lifecycle. A direct embedded stdio call instead receives the stable
-/// embedded session. Truly anonymous serve/CLI calls remain cursor-less.
+/// A host-managed stable session wins first so its cursor survives short-lived
+/// MCP proxy generations. Otherwise explicit `session` / `cursor_id` wins, then
+/// a daemon proxy's connection-injected `_session_id`, then the stable embedded
+/// process session. Truly anonymous serve/CLI calls remain cursor-less.
 pub(crate) fn resolve_cursor_key(args: &Value) -> String {
     resolve_cursor_key_with_default(args, cua_driver_core::embedded_default_session_id())
 }
 
 fn resolve_cursor_key_with_default(args: &Value, embedded_default: Option<&str>) -> String {
     use cua_driver_core::tool_args::ArgsExt;
-    for key in ["session", "cursor_id", "_session_id"] {
+    for key in [
+        cua_driver_core::HOST_SESSION_ARG,
+        "session",
+        "cursor_id",
+        "_session_id",
+    ] {
         if let Some(v) = args.opt_str(key) {
             if !v.is_empty() {
                 return v;
