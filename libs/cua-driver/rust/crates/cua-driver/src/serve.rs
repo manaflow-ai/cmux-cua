@@ -28,11 +28,23 @@ use serde::{Deserialize, Serialize};
 /// proxy processes.
 pub const SOCKET_AUTH_TOKEN_ENV: &str = "CUA_DRIVER_SOCKET_AUTH_TOKEN";
 
+/// Optional second capability reserved for embedding-host operations.
+///
+/// The ordinary socket token authorizes Computer Use tool calls. Embedders
+/// keep this separate token out of agent environments and attach it only to
+/// shutdown, permission, and state-authentication requests. When configured,
+/// authenticated agents may reconnect after an embedding host relaunch
+/// without gaining those host-only capabilities.
+pub const SOCKET_HOST_AUTH_TOKEN_ENV: &str = "CUA_DRIVER_SOCKET_HOST_AUTH_TOKEN";
+
 /// Optional macOS process-ancestry root for daemon socket clients.
 ///
 /// Embedders set this to their own PID. Even if another same-UID process finds
 /// the bearer token, the daemon rejects its socket unless the kernel-reported
-/// peer PID is the embedder or one of its descendants.
+/// peer PID is the embedder or one of its descendants. Embedders that configure
+/// a separate host capability use this identity as a lifecycle owner instead:
+/// ordinary authenticated agents may outlive and reconnect across host
+/// generations, while the daemon still exits when its current owner exits.
 pub const SOCKET_AUTHORIZED_ROOT_PID_ENV: &str = "CUA_DRIVER_SOCKET_AUTHORIZED_ROOT_PID";
 pub const SOCKET_AUTHORIZED_ROOT_START_SECONDS_ENV: &str =
     "CUA_DRIVER_SOCKET_AUTHORIZED_ROOT_START_SECONDS";
@@ -336,11 +348,25 @@ pub struct DaemonResponse {
 #[derive(Serialize)]
 struct AuthenticatedDaemonRequest<'a> {
     auth_token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_auth_token: Option<&'a str>,
     request: &'a DaemonRequest,
+}
+
+#[derive(Debug)]
+struct ParsedDaemonRequest {
+    request: DaemonRequest,
+    host_authenticated: bool,
 }
 
 fn configured_socket_auth_token() -> Option<String> {
     std::env::var(SOCKET_AUTH_TOKEN_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn configured_socket_host_auth_token() -> Option<String> {
+    std::env::var(SOCKET_HOST_AUTH_TOKEN_ENV)
         .ok()
         .filter(|value| !value.is_empty())
 }
@@ -356,6 +382,25 @@ fn auth_tokens_match(expected: &str, provided: &str) -> bool {
         );
     }
     difference == 0
+}
+
+fn socket_peer_requires_authorized_root(
+    authorized_root_configured: bool,
+    host_authority_configured: bool,
+) -> bool {
+    authorized_root_configured && !host_authority_configured
+}
+
+fn host_request_is_authorized(
+    host_authority_configured: bool,
+    host_authenticated: bool,
+    peer_is_authorized_root: bool,
+) -> bool {
+    if host_authority_configured {
+        host_authenticated
+    } else {
+        peer_is_authorized_root
+    }
 }
 
 fn state_authentication_key(args: Option<&serde_json::Value>) -> Option<Vec<u8>> {
@@ -562,25 +607,50 @@ fn attach_state_writer_identity(
 /// embedding host configured a socket credential.
 pub fn serialize_request(req: &DaemonRequest) -> anyhow::Result<String> {
     match configured_socket_auth_token() {
-        Some(token) => Ok(serde_json::to_string(&AuthenticatedDaemonRequest {
-            auth_token: &token,
-            request: req,
-        })?),
+        Some(token) => {
+            let host_token = configured_socket_host_auth_token();
+            Ok(serde_json::to_string(&AuthenticatedDaemonRequest {
+                auth_token: &token,
+                host_auth_token: host_token.as_deref(),
+                request: req,
+            })?)
+        }
         None => Ok(serde_json::to_string(req)?),
     }
 }
 
-fn parse_request(line: &str) -> Result<DaemonRequest, DaemonResponse> {
-    let configured = configured_socket_auth_token();
-    parse_request_with_token(line, configured.as_deref())
+fn parse_request(line: &str) -> Result<ParsedDaemonRequest, DaemonResponse> {
+    let configured_token = configured_socket_auth_token();
+    let configured_host_token = configured_socket_host_auth_token();
+    parse_request_with_tokens(
+        line,
+        configured_token.as_deref(),
+        configured_host_token.as_deref(),
+    )
 }
 
+#[cfg(test)]
 fn parse_request_with_token(
     line: &str,
     expected_token: Option<&str>,
 ) -> Result<DaemonRequest, DaemonResponse> {
+    parse_request_with_tokens(line, expected_token, None).map(|parsed| parsed.request)
+}
+
+fn parse_request_with_tokens(
+    line: &str,
+    expected_token: Option<&str>,
+    expected_host_token: Option<&str>,
+) -> Result<ParsedDaemonRequest, DaemonResponse> {
     let value: serde_json::Value = serde_json::from_str(line)
         .map_err(|error| DaemonResponse::err(format!("JSON parse error: {error}"), 65))?;
+    let host_authenticated = expected_host_token.is_some_and(|expected| {
+        let provided = value
+            .get("host_auth_token")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        auth_tokens_match(expected, provided)
+    });
     let request = if let Some(expected) = expected_token {
         let provided = value
             .get("auth_token")
@@ -596,8 +666,12 @@ fn parse_request_with_token(
     } else {
         value
     };
-    serde_json::from_value(request)
-        .map_err(|error| DaemonResponse::err(format!("JSON parse error: {error}"), 65))
+    let request = serde_json::from_value(request)
+        .map_err(|error| DaemonResponse::err(format!("JSON parse error: {error}"), 65))?;
+    Ok(ParsedDaemonRequest {
+        request,
+        host_authenticated,
+    })
 }
 
 /// Keep permission prompting under an embedding application's explicit UX.
@@ -875,6 +949,11 @@ pub async fn run_serve(
     let authorized_root_identity = configured_authorized_root_identity()?;
     #[cfg(not(target_os = "macos"))]
     let authorized_root_identity: Option<ProcessIdentity> = None;
+    let host_authority_configured = configured_socket_host_auth_token().is_some();
+    let enforce_authorized_root = socket_peer_requires_authorized_root(
+        authorized_root_identity.is_some(),
+        host_authority_configured,
+    );
 
     // Create parent directory.
     if let Some(dir) = std::path::Path::new(socket_path).parent() {
@@ -943,13 +1022,15 @@ pub async fn run_serve(
                 #[cfg(not(target_os = "macos"))]
                 let peer_process_identity = None;
                 #[cfg(target_os = "macos")]
-                if let Some(root_process_identity) = authorized_root_identity {
-                    if !macos_process_is_authorized(
-                        peer_process_identity,
-                        root_process_identity,
-                    ) {
-                        eprintln!("Rejected unauthorized daemon peer");
-                        continue;
+                if enforce_authorized_root {
+                    if let Some(root_process_identity) = authorized_root_identity {
+                        if !macos_process_is_authorized(
+                            peer_process_identity,
+                            root_process_identity,
+                        ) {
+                            eprintln!("Rejected unauthorized daemon peer");
+                            continue;
+                        }
                     }
                 }
                 #[cfg(target_os = "macos")]
@@ -991,7 +1072,7 @@ pub async fn run_serve(
                                 return;
                             }
                         }
-                        let req = match parse_request(&line) {
+                        let parsed = match parse_request(&line) {
                             Ok(request) => request,
                             Err(resp) => {
                                 let _ = writer.write_all(
@@ -1000,10 +1081,16 @@ pub async fn run_serve(
                                 continue;
                             }
                         };
+                        let host_request_authorized = host_request_is_authorized(
+                            host_authority_configured,
+                            parsed.host_authenticated,
+                            peer_is_authorized_root,
+                        );
+                        let req = parsed.request;
 
                         match req.method.as_str() {
                             "shutdown" => {
-                                if !peer_is_authorized_root {
+                                if !host_request_authorized {
                                     let resp = DaemonResponse::err(
                                         "Unauthorized host-only daemon request".to_owned(),
                                         77,
@@ -1024,7 +1111,7 @@ pub async fn run_serve(
                                 return;
                             }
                             "request_system_permission" => {
-                                if !peer_is_authorized_root {
+                                if !host_request_authorized {
                                     let resp = DaemonResponse::err(
                                         "Unauthorized host-only daemon request".to_owned(),
                                         77,
@@ -1048,8 +1135,9 @@ pub async fn run_serve(
                                 let _ = response_sent;
                             }
                             "configure_state_authentication" => {
-                                let response = if !peer_is_authorized_root
-                                    || authorized_root_identity.is_none()
+                                let response = if !host_request_authorized
+                                    || (!host_authority_configured
+                                        && authorized_root_identity.is_none())
                                 {
                                     DaemonResponse::err(
                                         "Unauthorized host-only daemon request".to_owned(),
@@ -2044,7 +2132,8 @@ mod external_permission_flow_tests {
 #[cfg(test)]
 mod socket_authentication_tests {
     use super::{
-        attach_state_writer_identity, parse_request_with_token, process_descends_from,
+        attach_state_writer_identity, host_request_is_authorized, parse_request_with_token,
+        parse_request_with_tokens, process_descends_from, socket_peer_requires_authorized_root,
         state_authentication_key, DaemonRequest, ProcessIdentity,
     };
     use std::collections::HashMap;
@@ -2075,6 +2164,47 @@ mod socket_authentication_tests {
             .expect_err("mismatched token must be rejected");
         assert_eq!(rejected.exit_code, Some(77));
         assert_eq!(rejected.error.as_deref(), Some("Unauthorized daemon client"));
+    }
+
+    #[test]
+    fn separate_host_capability_survives_agent_reparenting_without_leaking_host_authority() {
+        let request = list_request();
+        let host_line = serde_json::json!({
+            "auth_token": "agent-secret-A1B2C3",
+            "host_auth_token": "host-secret-D4E5F6",
+            "request": request,
+        })
+        .to_string();
+        let host = parse_request_with_tokens(
+            &host_line,
+            Some("agent-secret-A1B2C3"),
+            Some("host-secret-D4E5F6"),
+        )
+        .expect("the host should retain its separate authority");
+        assert!(host.host_authenticated);
+
+        let agent_line = serde_json::json!({
+            "auth_token": "agent-secret-A1B2C3",
+            "request": list_request(),
+        })
+        .to_string();
+        let agent = parse_request_with_tokens(
+            &agent_line,
+            Some("agent-secret-A1B2C3"),
+            Some("host-secret-D4E5F6"),
+        )
+        .expect("an authenticated agent request should remain usable");
+        assert!(!agent.host_authenticated);
+        assert!(!socket_peer_requires_authorized_root(true, true));
+        assert!(host_request_is_authorized(true, true, false));
+        assert!(!host_request_is_authorized(true, false, true));
+    }
+
+    #[test]
+    fn legacy_embedders_keep_process_ancestry_as_host_authority() {
+        assert!(socket_peer_requires_authorized_root(true, false));
+        assert!(host_request_is_authorized(false, false, true));
+        assert!(!host_request_is_authorized(false, false, false));
     }
 
     #[test]
