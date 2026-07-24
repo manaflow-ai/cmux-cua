@@ -1020,6 +1020,57 @@ mod tests {
     #[cfg(target_os = "macos")]
     use std::time::Duration;
 
+    #[test]
+    fn cmux_default_session_scopes_the_proxy_connection() {
+        assert_eq!(
+            proxy_session_identity(
+                "mcp-4242-99",
+                Some("cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF"),
+            ),
+            (
+                "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF-mcp-4242-99".to_owned(),
+                true,
+            ),
+        );
+        assert_eq!(
+            proxy_session_identity("mcp-4242-99", None),
+            ("mcp-4242-99".to_owned(), false),
+        );
+    }
+
+    #[test]
+    fn cmux_managed_proxy_rejects_agent_session_renaming() {
+        let managed = "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF-mcp-4242-99";
+        let args = enforce_proxy_session_identity(
+            serde_json::json!({
+                "session": "calculator-9-plus-10",
+                "_session_id": "caller-spoofed",
+                "pid": 84,
+            }),
+            managed,
+            true,
+        );
+
+        assert_eq!(args["session"], managed);
+        assert_eq!(args["_session_id"], managed);
+        assert_eq!(args["pid"], 84);
+    }
+
+    #[test]
+    fn ordinary_proxy_preserves_explicit_session_identity() {
+        let args = enforce_proxy_session_identity(
+            serde_json::json!({
+                "session": "research-1",
+                "pid": 84,
+            }),
+            "mcp-4242-99",
+            false,
+        );
+
+        assert_eq!(args["session"], "research-1");
+        assert!(args.get("_session_id").is_none());
+    }
+
     /// Reconstruct the `!resp.ok` branch in isolation so we can assert
     /// on the serialized shape without spinning up a real daemon /
     /// tokio runtime. Keep this in sync with `forward_tool_call`.
