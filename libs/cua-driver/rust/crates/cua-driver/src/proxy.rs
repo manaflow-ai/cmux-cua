@@ -72,8 +72,19 @@ pub async fn run_proxy(
     // a `session_end` signal. Dep-free `pid + start-nanos` is sufficient for
     // daemon-local uniqueness over this proxy's lifetime (no `uuid` crate dep
     // for one mint).
-    let session_id = mint_session_id();
+    let minted_session_id = mint_session_id();
+    let configured_default_session = configured_default_session();
+    let (session_id, managed_session) = proxy_session_identity(
+        &minted_session_id,
+        configured_default_session.as_deref(),
+    );
     debug!(session_id = %session_id, "proxy session minted");
+    if managed_session {
+        debug!(
+            session_id = %session_id,
+            "proxy session bound to host-managed default identity"
+        );
+    }
 
     // Serve `initialize` and `tools/list` WITHOUT the daemon so the
     // permission-requesting daemon stays DORMANT until the agent actually
@@ -1762,6 +1773,9 @@ async fn forward_tool_call(
             ),
         );
     }
+    let managed_session = configured_default_session()
+        .is_some_and(|base| session_id.starts_with(&format!("{base}-mcp-")));
+    let args = enforce_proxy_session_identity(args, session_id, managed_session);
     let response = match call_daemon_tool(socket_path, session_id, &name, args).await {
         Ok(response) => response,
         Err(error) => return Response::error(id, -32603, error),
@@ -1816,6 +1830,46 @@ fn daemon_response_to_mcp(
         })
     });
     Response::ok(id, result)
+}
+
+fn configured_default_session() -> Option<String> {
+    std::env::var(cua_driver_core::DEFAULT_SESSION_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Binds one proxy connection to the embedding host's stable session while
+/// preserving a unique MCP-generation suffix for concurrent/restarted agents.
+fn proxy_session_identity(
+    minted_session_id: &str,
+    configured_default_session: Option<&str>,
+) -> (String, bool) {
+    match configured_default_session.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(default_session) => (
+            format!("{default_session}-{minted_session_id}"),
+            true,
+        ),
+        None => (minted_session_id.to_owned(), false),
+    }
+}
+
+/// A cmux-managed proxy owns its surface identity. Agent-supplied session
+/// labels are useful for standalone CUA runs, but must not detach hosted
+/// activity from the menu/status/cleanup authority that launched the proxy.
+fn enforce_proxy_session_identity(
+    mut args: serde_json::Value,
+    session_id: &str,
+    managed_session: bool,
+) -> serde_json::Value {
+    if managed_session {
+        if let Some(object) = args.as_object_mut() {
+            let session_id = serde_json::Value::String(session_id.to_owned());
+            object.insert("session".to_owned(), session_id.clone());
+            object.insert("_session_id".to_owned(), session_id);
+        }
+    }
+    args
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
