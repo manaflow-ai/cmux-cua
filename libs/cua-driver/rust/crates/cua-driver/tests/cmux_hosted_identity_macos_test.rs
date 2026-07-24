@@ -1,5 +1,6 @@
 #![cfg(target_os = "macos")]
 
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -62,5 +63,73 @@ fn raw_cmux_binary_refuses_to_own_a_daemon() {
     assert!(
         stderr.contains("Settings"),
         "expected Settings recovery guidance, got: {stderr}"
+    );
+}
+
+#[test]
+fn cmux_proxy_advertises_one_round_trip_action_groups() {
+    let temporary = tempfile::tempdir().expect("create temporary directory");
+    let socket = temporary.path().join("dormant-daemon.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cua-driver"))
+        .args([
+            "mcp",
+            "--socket",
+            socket.to_str().expect("UTF-8 socket path"),
+        ])
+        .env("CUA_DRIVER_RS_MCP_FORCE_PROXY", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch dormant MCP proxy");
+
+    let mut stdin = child.stdin.take().expect("proxy stdin");
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": { "name": "cmux-regression", "version": "1" }
+            }
+        })
+    )
+    .expect("write initialize");
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        })
+    )
+    .expect("write tools/list");
+    drop(stdin);
+
+    let output = child.wait_with_output().expect("collect proxy output");
+    assert!(
+        output.status.success(),
+        "dormant proxy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let tools = String::from_utf8(output.stdout)
+        .expect("UTF-8 proxy output")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|response| response.get("id") == Some(&serde_json::json!(2)))
+        .and_then(|response| response["result"]["tools"].as_array().cloned())
+        .expect("tools/list response");
+
+    assert!(
+        tools.iter().any(|tool| tool["name"] == "perform_actions"),
+        "cmux proxy must expose a bounded action-group tool so stable controls \
+         do not require one model/MCP round trip per click"
     );
 }
