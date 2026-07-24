@@ -637,6 +637,27 @@ mod tests {
     }
 
     #[test]
+    fn managed_host_cursor_survives_proxy_generation_turnover() {
+        let first = json!({
+            "_host_session": "cmux-surface-a",
+            "session": "cmux-surface-a-mcp-111-1",
+            "_session_id": "cmux-surface-a-mcp-111-1",
+        });
+        let second = json!({
+            "_host_session": "cmux-surface-a",
+            "session": "cmux-surface-a-mcp-222-2",
+            "_session_id": "cmux-surface-a-mcp-222-2",
+        });
+
+        assert_eq!(resolve_cursor_key_with_default(&first, None), "cmux-surface-a");
+        assert_eq!(
+            resolve_cursor_key_with_default(&second, None),
+            "cmux-surface-a",
+            "foreground/background cursor state must be stable across proxy processes"
+        );
+    }
+
+    #[test]
     fn truly_anonymous_non_embedded_call_stays_cursorless() {
         let args = json!({ "x": 1 });
         assert_eq!(resolve_cursor_key_with_default(&args, None), NO_CURSOR);
