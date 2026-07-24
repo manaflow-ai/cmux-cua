@@ -47,6 +47,87 @@ enum ControlConnectionState {
     Rejected(String),
 }
 
+const PERFORM_ACTIONS_TOOL: &str = "perform_actions";
+const MAX_ACTION_GROUP_SIZE: usize = 20;
+const ACTION_GROUP_TOOLS: &[&str] = &[
+    "click",
+    "double_click",
+    "right_click",
+    "type_text",
+    "press_key",
+    "hotkey",
+    "scroll",
+    "drag",
+    "set_value",
+    "move_cursor",
+];
+
+fn perform_actions_tool_entry() -> serde_json::Value {
+    serde_json::json!({
+        "name": PERFORM_ACTIONS_TOOL,
+        "description": "Execute up to 20 already-grounded UI actions in order inside one \
+            persistent Computer Use proxy call. Use this after one get_window_state when \
+            the referenced controls remain stable (for example, a Calculator button \
+            sequence), then verify the completed group with one fresh snapshot. Each step \
+            reuses the existing element-token cache and the same visible agent cursor, \
+            avoiding a new model/MCP round trip and accessibility-tree scan per click. \
+            Do not group navigation, modal-opening, or layout-changing actions whose later \
+            controls require a fresh snapshot.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "actions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_ACTION_GROUP_SIZE,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "tool": {
+                                "type": "string",
+                                "enum": ACTION_GROUP_TOOLS,
+                            },
+                            "arguments": {
+                                "type": "object",
+                            },
+                        },
+                        "required": ["tool", "arguments"],
+                    },
+                },
+                "stop_on_error": {
+                    "type": "boolean",
+                    "description": "Stop before later actions after the first failed step. Default true.",
+                },
+            },
+            "required": ["actions"],
+        },
+        "annotations": {
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": false,
+            "openWorldHint": false,
+        },
+        "capabilities": ["input.action_group"],
+    })
+}
+
+fn with_proxy_tools(mut tools_list: serde_json::Value) -> serde_json::Value {
+    if let Some(tools) = tools_list
+        .get_mut("tools")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        if !tools.iter().any(|tool| {
+            tool.get("name").and_then(serde_json::Value::as_str)
+                == Some(PERFORM_ACTIONS_TOOL)
+        }) {
+            tools.push(perform_actions_tool_entry());
+        }
+    }
+    tools_list
+}
+
 /// Run the MCP stdio proxy. Reads JSON-RPC lines from stdin, forwards
 /// the body of each `tools/list` / `tools/call` to the daemon at
 /// `socket_path`, and writes the daemon's response back as a proper
@@ -137,7 +218,7 @@ pub async fn run_proxy(
         Arc::new(if expected_profile == DaemonProfile::CodexComputerUseCompat {
             registry.codex_computer_use_tools_list()
         } else {
-            registry.tools_list()
+            with_proxy_tools(registry.tools_list())
         })
     };
     #[cfg(not(target_os = "macos"))]
@@ -861,11 +942,11 @@ fn fetch_tools_list_from_daemon(
     if expected_profile == DaemonProfile::CodexComputerUseCompat {
         Ok(serde_json::json!({"tools": mcp_tools}))
     } else {
-        Ok(serde_json::json!({
+        Ok(with_proxy_tools(serde_json::json!({
             "tools": mcp_tools,
             "capability_version": capability_version,
             "schema_version": schema_version,
-        }))
+        })))
     }
 }
 
@@ -1756,6 +1837,233 @@ fn response_from_tool_result(id: serde_json::Value, result: ToolResult) -> Respo
 ///     task panic) → JSON-RPC error (`-32603`), because the MCP
 ///     client really does need to distinguish "tool said no" from
 ///     "I couldn't reach the tool at all."
+#[derive(Debug)]
+struct PreparedProxyAction {
+    tool: String,
+    request: DaemonRequest,
+}
+
+#[derive(Debug)]
+struct PreparedActionGroup {
+    actions: Vec<PreparedProxyAction>,
+    stop_on_error: bool,
+}
+
+fn prepare_action_group(
+    args: serde_json::Value,
+    session_id: &str,
+    managed_session: bool,
+) -> Result<PreparedActionGroup, String> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| "perform_actions arguments must be an object".to_owned())?;
+    let actions = object
+        .get("actions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "perform_actions requires an `actions` array".to_owned())?;
+    if actions.is_empty() {
+        return Err("perform_actions requires at least one action".to_owned());
+    }
+    if actions.len() > MAX_ACTION_GROUP_SIZE {
+        return Err(format!(
+            "perform_actions accepts at most {MAX_ACTION_GROUP_SIZE} actions"
+        ));
+    }
+    let stop_on_error = object
+        .get("stop_on_error")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+
+    let mut prepared = Vec::with_capacity(actions.len());
+    for (index, action) in actions.iter().enumerate() {
+        let action = action
+            .as_object()
+            .ok_or_else(|| format!("perform_actions step {index} must be an object"))?;
+        if let Some(field) = action
+            .keys()
+            .find(|field| field.as_str() != "tool" && field.as_str() != "arguments")
+        {
+            return Err(format!(
+                "perform_actions step {index} has unknown field `{field}`"
+            ));
+        }
+        let tool = action
+            .get("tool")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("perform_actions step {index} requires string `tool`"))?;
+        if !ACTION_GROUP_TOOLS.contains(&tool) {
+            return Err(format!(
+                "perform_actions step {index} cannot call `{tool}`; group only \
+                 already-grounded input actions"
+            ));
+        }
+        let arguments = action
+            .get("arguments")
+            .cloned()
+            .filter(serde_json::Value::is_object)
+            .ok_or_else(|| {
+                format!("perform_actions step {index} requires object `arguments`")
+            })?;
+        let arguments =
+            enforce_proxy_session_identity(arguments, session_id, managed_session);
+        prepared.push(PreparedProxyAction {
+            tool: tool.to_owned(),
+            request: DaemonRequest {
+                method: "call".into(),
+                name: Some(tool.to_owned()),
+                args: Some(arguments),
+                session_id: Some(session_id.to_owned()),
+            },
+        });
+    }
+
+    Ok(PreparedActionGroup {
+        actions: prepared,
+        stop_on_error,
+    })
+}
+
+fn action_group_error_response(
+    id: serde_json::Value,
+    message: String,
+    requested_count: usize,
+    results: Vec<serde_json::Value>,
+) -> Response {
+    let succeeded_count = results
+        .iter()
+        .filter(|result| result.get("isError") == Some(&serde_json::Value::Bool(false)))
+        .count();
+    Response::ok(
+        id,
+        serde_json::json!({
+            "content": [{ "type": "text", "text": message }],
+            "isError": true,
+            "structuredContent": {
+                "requested_count": requested_count,
+                "attempted_count": results.len(),
+                "succeeded_count": succeeded_count,
+                "results": results,
+            },
+        }),
+    )
+}
+
+async fn forward_action_group(
+    id: serde_json::Value,
+    args: serde_json::Value,
+    socket_path: &str,
+    session_id: &str,
+) -> Response {
+    let managed_session = configured_default_session().is_some_and(|base| {
+        session_id.starts_with(&format!("{base}-mcp-"))
+    });
+    let prepared = match prepare_action_group(args, session_id, managed_session) {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            return action_group_error_response(id, message, 0, Vec::new());
+        }
+    };
+    let requested_count = prepared.actions.len();
+    let socket = socket_path.to_owned();
+    let blocking = tokio::task::spawn_blocking(move || {
+        let mut results = Vec::with_capacity(requested_count);
+        let mut any_error = false;
+        for (index, action) in prepared.actions.into_iter().enumerate() {
+            let response = match send_request(&socket, &action.request) {
+                Ok(response) => response,
+                Err(error) => {
+                    return Err((
+                        format!(
+                            "Computer Use transport failed at perform_actions step {index} \
+                             (`{}`): {error}",
+                            action.tool
+                        ),
+                        results,
+                    ));
+                }
+            };
+
+            let transport_ok = response.ok;
+            let result = if transport_ok {
+                response.result.unwrap_or_else(|| {
+                    serde_json::json!({ "content": [], "isError": false })
+                })
+            } else {
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": response.error.unwrap_or_else(|| "daemon reported failure".into()),
+                    }],
+                    "isError": true,
+                    "structuredContent": {
+                        "exit_code": response.exit_code.unwrap_or(1),
+                    },
+                })
+            };
+            let is_error = !transport_ok
+                || result
+                    .get("isError")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+            results.push(serde_json::json!({
+                "index": index,
+                "tool": action.tool,
+                "isError": is_error,
+                "result": result,
+            }));
+            any_error |= is_error;
+            if is_error && prepared.stop_on_error {
+                break;
+            }
+        }
+        Ok((results, any_error))
+    })
+    .await;
+
+    let (results, any_error) = match blocking {
+        Err(error) => {
+            return Response::error(
+                id,
+                -32603,
+                format!("internal join error forwarding perform_actions: {error}"),
+            );
+        }
+        Ok(Err((message, results))) => {
+            return action_group_error_response(id, message, requested_count, results);
+        }
+        Ok(Ok(outcome)) => outcome,
+    };
+
+    let succeeded_count = results
+        .iter()
+        .filter(|result| result.get("isError") == Some(&serde_json::Value::Bool(false)))
+        .count();
+    let attempted_count = results.len();
+    let summary = if any_error {
+        format!(
+            "perform_actions attempted {attempted_count} of {requested_count} actions; \
+             {succeeded_count} succeeded."
+        )
+    } else {
+        format!(
+            "Completed all {requested_count} Computer Use actions in one ordered call."
+        )
+    };
+    Response::ok(
+        id,
+        serde_json::json!({
+            "content": [{ "type": "text", "text": summary }],
+            "isError": any_error,
+            "structuredContent": {
+                "requested_count": requested_count,
+                "attempted_count": attempted_count,
+                "succeeded_count": succeeded_count,
+                "results": results,
+            },
+        }),
+    )
+}
+
 async fn forward_tool_call(
     id: serde_json::Value,
     name: String,
@@ -1772,6 +2080,9 @@ async fn forward_tool_call(
                 "daemon session control connection unavailable before forwarding `{name}`: {error}"
             ),
         );
+    }
+    if name == PERFORM_ACTIONS_TOOL {
+        return forward_action_group(id, args, socket_path, session_id).await;
     }
     let managed_session = configured_default_session()
         .is_some_and(|base| session_id.starts_with(&format!("{base}-mcp-")));
@@ -2172,6 +2483,79 @@ mod tests {
 
         assert_eq!(args["session"], "research-1");
         assert!(args.get("_session_id").is_none());
+    }
+
+    #[test]
+    fn action_group_preserves_order_and_managed_cursor_identity() {
+        let managed = "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF-mcp-4242-99";
+        let group = prepare_action_group(
+            serde_json::json!({
+                "actions": [
+                    {
+                        "tool": "click",
+                        "arguments": {
+                            "pid": 84,
+                            "window_id": 9,
+                            "element_token": "first",
+                            "session": "agent-override",
+                        },
+                    },
+                    {
+                        "tool": "press_key",
+                        "arguments": {
+                            "pid": 84,
+                            "key": "return",
+                        },
+                    },
+                ],
+            }),
+            managed,
+            true,
+        )
+        .expect("valid action group");
+
+        assert!(group.stop_on_error);
+        assert_eq!(group.actions.len(), 2);
+        assert_eq!(group.actions[0].tool, "click");
+        assert_eq!(group.actions[1].tool, "press_key");
+        for action in group.actions {
+            assert_eq!(action.request.session_id.as_deref(), Some(managed));
+            let arguments = action.request.args.expect("action arguments");
+            assert_eq!(arguments["session"], managed);
+            assert_eq!(arguments["_session_id"], managed);
+        }
+    }
+
+    #[test]
+    fn action_group_rejects_scans_and_unbounded_sequences() {
+        let scan = prepare_action_group(
+            serde_json::json!({
+                "actions": [{
+                    "tool": "get_window_state",
+                    "arguments": { "pid": 84, "window_id": 9 },
+                }],
+            }),
+            "mcp-1",
+            false,
+        )
+        .expect_err("read/scanning tools must stay outside action groups");
+        assert!(scan.contains("already-grounded input actions"));
+
+        let actions: Vec<_> = (0..=MAX_ACTION_GROUP_SIZE)
+            .map(|_| {
+                serde_json::json!({
+                    "tool": "press_key",
+                    "arguments": { "pid": 84, "key": "return" },
+                })
+            })
+            .collect();
+        let oversized = prepare_action_group(
+            serde_json::json!({ "actions": actions }),
+            "mcp-1",
+            false,
+        )
+        .expect_err("action group must be bounded");
+        assert!(oversized.contains("at most"));
     }
 
     /// Reconstruct the `!resp.ok` branch in isolation so we can assert
