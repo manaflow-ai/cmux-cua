@@ -1040,10 +1040,11 @@ fn macos_process_is_authorized(
     false
 }
 
-/// Replaces any caller-supplied state provenance with the kernel-authenticated
-/// peer generation captured when the socket was accepted. Missing kernel
-/// identity removes every reserved field so standalone clients cannot spoof
-/// trusted provenance.
+/// Replaces any caller-supplied state provenance with a kernel-authenticated
+/// process generation. A managed proxy may nominate its long-lived agent PID;
+/// the daemon accepts it only when that exact live process is an ancestor of
+/// the kernel-reported socket peer. This lets authenticated activity outlive a
+/// short-lived proxy without allowing a client to nominate a sibling process.
 fn attach_state_writer_identity(
     args: &mut serde_json::Value,
     peer_process_identity: Option<ProcessIdentity>,
@@ -1051,10 +1052,25 @@ fn attach_state_writer_identity(
     let Some(args) = args.as_object_mut() else {
         return;
     };
+    let requested_owner_pid = args
+        .remove(cua_driver_core::session_state::STATE_OWNER_PID_ARG)
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 1);
     args.remove(cua_driver_core::session_state::STATE_WRITER_PID_ARG);
     args.remove(cua_driver_core::session_state::STATE_WRITER_START_SECONDS_ARG);
     args.remove(cua_driver_core::session_state::STATE_WRITER_START_MICROSECONDS_ARG);
-    if let Some(identity) = peer_process_identity.filter(|identity| identity.process_id > 1) {
+    #[cfg(target_os = "macos")]
+    let writer_identity = requested_owner_pid
+        .and_then(macos_process_identity)
+        .filter(|owner| macos_process_is_authorized(peer_process_identity, *owner))
+        .or(peer_process_identity);
+    #[cfg(not(target_os = "macos"))]
+    let writer_identity = {
+        let _ = requested_owner_pid;
+        peer_process_identity
+    };
+    if let Some(identity) = writer_identity.filter(|identity| identity.process_id > 1) {
         args.insert(
             cua_driver_core::session_state::STATE_WRITER_PID_ARG.to_owned(),
             serde_json::json!(identity.process_id),

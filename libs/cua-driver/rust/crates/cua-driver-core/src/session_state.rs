@@ -12,6 +12,7 @@ pub const STATE_DIR_ENV: &str = "CUA_DRIVER_STATE_DIR";
 pub const STATE_WRITER_PID_ARG: &str = "_state_writer_pid";
 pub const STATE_WRITER_START_SECONDS_ARG: &str = "_state_writer_start_seconds";
 pub const STATE_WRITER_START_MICROSECONDS_ARG: &str = "_state_writer_start_microseconds";
+pub const STATE_OWNER_PID_ARG: &str = "_state_owner_pid";
 const UNSIGNED_SCHEMA_VERSION: u8 = 3;
 const AUTHENTICATED_SCHEMA_VERSION: u8 = 4;
 const AUTHENTICATION_DOMAIN: &[u8] = b"cmux-computer-use-state-v1\0";
@@ -216,7 +217,8 @@ fn session_for_action(
     args: &serde_json::Value,
     embedded_default: Option<&str>,
 ) -> Option<String> {
-    args.get("session")
+    args.get(crate::HOST_SESSION_ARG)
+        .or_else(|| args.get("session"))
         .or_else(|| args.get("_session_id"))
         .and_then(|value| value.as_str())
         .map(str::trim)
