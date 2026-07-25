@@ -90,6 +90,20 @@ impl DaemonDriver {
         compat: bool,
         allow_unverified_client: bool,
     ) -> Self {
+        Self::spawn_with_environment(
+            socket,
+            compat,
+            allow_unverified_client,
+            &[],
+        )
+    }
+
+    fn spawn_with_environment(
+        socket: PathBuf,
+        compat: bool,
+        allow_unverified_client: bool,
+        environment: &[(&str, &str)],
+    ) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cua-driver"));
         command
             .arg("serve")
@@ -100,13 +114,17 @@ impl DaemonDriver {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .env_remove("CUA_DRIVER_CODEX_ALLOW_UNVERIFIED_CLIENT");
+            .env_remove("CUA_DRIVER_CODEX_ALLOW_UNVERIFIED_CLIENT")
+            .env_remove("CUA_DRIVER_SOCKET_AUTHORIZED_ROOT_PID")
+            .env_remove("CUA_DRIVER_SOCKET_AUTHORIZED_ROOT_START_SECONDS")
+            .env_remove("CUA_DRIVER_SOCKET_AUTHORIZED_ROOT_START_MICROSECONDS");
         if compat {
             command.arg("--codex-computer-use-compat");
         }
         if allow_unverified_client {
             command.env("CUA_DRIVER_CODEX_ALLOW_UNVERIFIED_CLIENT", "1");
         }
+        command.envs(environment.iter().copied());
         let mut child = command.spawn().expect("spawn cua-driver daemon");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -158,6 +176,21 @@ fn send_raw_daemon_request(socket: &std::path::Path, request: Value) -> Value {
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).unwrap();
     serde_json::from_str(line.trim()).unwrap()
+}
+
+fn send_authenticated_daemon_request(
+    socket: &std::path::Path,
+    request: Value,
+    include_host_authority: bool,
+) -> Value {
+    let mut envelope = serde_json::json!({
+        "auth_token": "agent-secret-A1B2C3",
+        "request": request,
+    });
+    if include_host_authority {
+        envelope["host_auth_token"] = Value::String("host-secret-D4E5F6".to_owned());
+    }
+    send_raw_daemon_request(socket, envelope)
 }
 
 impl Drop for DaemonDriver {
@@ -560,6 +593,82 @@ fn native_and_codex_compat_daemons_coexist_with_isolated_rosters() {
     drop(native_mcp);
     drop(compat);
     drop(native);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn hosted_codex_daemon_keeps_cursor_control_private_and_host_authenticated() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = unique_daemon_root();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = root.join("host-cursor.sock");
+    let daemon = DaemonDriver::spawn_with_environment(
+        socket.clone(),
+        true,
+        true,
+        &[
+            ("CUA_DRIVER_SOCKET_AUTH_TOKEN", "agent-secret-A1B2C3"),
+            (
+                "CUA_DRIVER_SOCKET_HOST_AUTH_TOKEN",
+                "host-secret-D4E5F6",
+            ),
+        ],
+    );
+
+    let listed = send_authenticated_daemon_request(
+        &socket,
+        serde_json::json!({"method":"list"}),
+        false,
+    );
+    assert!(listed["ok"].as_bool().unwrap_or(false));
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "list_apps",
+            "get_app_state",
+            "click",
+            "perform_secondary_action",
+            "set_value",
+            "select_text",
+            "scroll",
+            "drag",
+            "press_key",
+            "type_text",
+        ]
+    );
+
+    let unauthorized = send_authenticated_daemon_request(
+        &socket,
+        serde_json::json!({
+            "method":"set_cursor_enabled",
+            "args":{"session":"cmux-surface-A1B2C3","enabled":false},
+        }),
+        false,
+    );
+    assert_eq!(unauthorized["ok"], false);
+    assert_eq!(unauthorized["exit_code"], 77);
+
+    let authorized = send_authenticated_daemon_request(
+        &socket,
+        serde_json::json!({
+            "method":"set_cursor_enabled",
+            "args":{"session":"cmux-surface-A1B2C3","enabled":false},
+        }),
+        true,
+    );
+    assert_eq!(authorized["ok"], true);
+    assert_eq!(authorized["result"]["session"], "cmux-surface-A1B2C3");
+    assert_eq!(authorized["result"]["cursor_enabled"], false);
+
+    drop(daemon);
     let _ = std::fs::remove_dir_all(root);
 }
 
