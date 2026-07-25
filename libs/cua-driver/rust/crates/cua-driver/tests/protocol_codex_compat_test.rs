@@ -16,6 +16,64 @@ struct CompatDriver {
     stdout: BufReader<ChildStdout>,
 }
 
+struct ExplicitProxyDriver {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl ExplicitProxyDriver {
+    fn spawn(socket: &PathBuf, compat: bool) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cua-driver"));
+        command
+            .arg("mcp")
+            .arg("--socket")
+            .arg(socket)
+            .arg("--no-overlay")
+            .env("CUA_DRIVER_RS_MCP_FORCE_PROXY", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if compat {
+            command.arg("--codex-computer-use-compat");
+        }
+        let mut child = command.spawn().expect("spawn explicit-socket MCP proxy");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        Self {
+            child,
+            stdin,
+            stdout,
+        }
+    }
+
+    fn send(&mut self, value: Value) {
+        writeln!(self.stdin, "{}", value).unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    fn recv(&mut self) -> Value {
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
+    fn initialize(&mut self) {
+        self.send(serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize","params":{}
+        }));
+        let initialized = self.recv();
+        assert_eq!(initialized["id"], 1);
+    }
+}
+
+impl Drop for ExplicitProxyDriver {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl CompatDriver {
     fn spawn(compat: bool) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cua-driver"));
@@ -225,21 +283,34 @@ fn mcp_tool_names(driver: &mut CompatDriver) -> Vec<String> {
         .collect()
 }
 
-fn run_proxy_to_explicit_socket(socket: &PathBuf, compat: bool) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cua-driver"));
-    command
-        .arg("mcp")
-        .arg("--socket")
-        .arg(socket)
-        .arg("--no-overlay")
-        .env("CUA_DRIVER_RS_MCP_FORCE_PROXY", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if compat {
-        command.arg("--codex-computer-use-compat");
-    }
-    command.output().expect("run explicit-socket MCP proxy")
+fn mcp_tool_names_from_explicit_proxy(driver: &mut ExplicitProxyDriver) -> Vec<String> {
+    driver.send(serde_json::json!({
+        "jsonrpc":"2.0","id":99,"method":"tools/list"
+    }));
+    driver.recv()["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+fn codex_compat_tool_names() -> Vec<String> {
+    [
+        "list_apps",
+        "get_app_state",
+        "click",
+        "perform_secondary_action",
+        "set_value",
+        "select_text",
+        "scroll",
+        "drag",
+        "press_key",
+        "type_text",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 fn default_profile_socket(home: &std::path::Path, compat: bool) -> PathBuf {
@@ -686,31 +757,45 @@ fn explicit_socket_proxy_rejects_mismatched_daemon_profile() {
     let native = DaemonDriver::spawn(native_socket.clone(), false);
     let compat = DaemonDriver::spawn(compat_socket.clone(), true);
 
-    let matching_compat = run_proxy_to_explicit_socket(&compat_socket, true);
+    let mut matching_compat = ExplicitProxyDriver::spawn(&compat_socket, true);
+    matching_compat.initialize();
+
+    let mut compat_to_native = ExplicitProxyDriver::spawn(&native_socket, true);
+    compat_to_native.initialize();
+    assert_eq!(
+        mcp_tool_names_from_explicit_proxy(&mut compat_to_native),
+        codex_compat_tool_names()
+    );
+    compat_to_native.send(serde_json::json!({
+        "jsonrpc":"2.0",
+        "id":2,
+        "method":"tools/call",
+        "params":{"name":"list_apps","arguments":{}},
+    }));
+    let response = compat_to_native.recv();
+    let error = response["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        matching_compat.status.success(),
-        "matching compat proxy must authenticate its approval broker: {}",
-        String::from_utf8_lossy(&matching_compat.stderr)
+        error.contains("daemon profile mismatch")
+            && error.contains("MCP requested `codex-computer-use-compat`")
+            && error.contains("daemon reports `native`"),
+        "unexpected compat-to-native error: {response}"
     );
 
-    let compat_to_native = run_proxy_to_explicit_socket(&native_socket, true);
-    assert!(!compat_to_native.status.success());
-    let stderr = String::from_utf8_lossy(&compat_to_native.stderr);
+    let mut native_to_compat = ExplicitProxyDriver::spawn(&compat_socket, false);
+    native_to_compat.initialize();
+    native_to_compat.send(serde_json::json!({
+        "jsonrpc":"2.0",
+        "id":2,
+        "method":"tools/call",
+        "params":{"name":"list_apps","arguments":{}},
+    }));
+    let response = native_to_compat.recv();
+    let error = response["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        stderr.contains("daemon profile mismatch")
-            && stderr.contains("MCP requested `codex-computer-use-compat`")
-            && stderr.contains("daemon reports `native`"),
-        "unexpected compat-to-native error: {stderr}"
-    );
-
-    let native_to_compat = run_proxy_to_explicit_socket(&compat_socket, false);
-    assert!(!native_to_compat.status.success());
-    let stderr = String::from_utf8_lossy(&native_to_compat.stderr);
-    assert!(
-        stderr.contains("daemon profile mismatch")
-            && stderr.contains("MCP requested `native`")
-            && stderr.contains("daemon reports `codex-computer-use-compat`"),
-        "unexpected native-to-compat error: {stderr}"
+        error.contains("daemon profile mismatch")
+            && error.contains("MCP requested `native`")
+            && error.contains("daemon reports `codex-computer-use-compat`"),
+        "unexpected native-to-compat error: {response}"
     );
 
     drop(compat);
@@ -728,12 +813,23 @@ fn compat_approval_broker_fails_closed_without_signed_codex_parent() {
     let socket = root.join("compat.sock");
     let daemon = DaemonDriver::spawn_with_unverified_client_override(socket.clone(), true, false);
 
-    let output = run_proxy_to_explicit_socket(&socket, true);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut proxy = ExplicitProxyDriver::spawn(&socket, true);
+    proxy.initialize();
+    assert_eq!(
+        mcp_tool_names_from_explicit_proxy(&mut proxy),
+        codex_compat_tool_names()
+    );
+    proxy.send(serde_json::json!({
+        "jsonrpc":"2.0",
+        "id":2,
+        "method":"tools/call",
+        "params":{"name":"list_apps","arguments":{}},
+    }));
+    let response = proxy.recv();
+    let error = response["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        stderr.contains("Only the signed OpenAI Codex app may use this profile"),
-        "unexpected unsigned-parent rejection: {stderr}"
+        error.contains("Only the signed OpenAI Codex app may use this profile"),
+        "unexpected unsigned-parent rejection: {response}"
     );
 
     drop(daemon);
