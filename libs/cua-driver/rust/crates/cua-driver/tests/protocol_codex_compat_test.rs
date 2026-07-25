@@ -201,13 +201,15 @@ impl Drop for DaemonDriver {
 }
 
 fn unique_daemon_root() -> PathBuf {
+    static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
     PathBuf::from("/tmp").join(format!(
-        "cua-cdx-{}-{}",
+        "cua-cdx-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed),
     ))
 }
 

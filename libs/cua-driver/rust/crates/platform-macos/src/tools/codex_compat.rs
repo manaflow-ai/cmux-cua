@@ -684,13 +684,19 @@ impl CompatState {
         let session = session_key(args);
         let operation_lock = self.operation_lock(&session);
         let _operation = operation_lock.lock().await;
-        self.capture_app_state(&app_ref, &session, AppResolveMode::LaunchIfNeeded)
+        self.capture_app_state(
+            &app_ref,
+            args,
+            &session,
+            AppResolveMode::LaunchIfNeeded,
+        )
             .await
     }
 
     async fn capture_app_state(
         &self,
         app_ref: &str,
+        compat_args: &Value,
         session: &str,
         resolve_mode: AppResolveMode,
     ) -> ToolResult {
@@ -775,15 +781,18 @@ impl CompatState {
         }
 
         let native = self.native_for_session(session);
-        let native_args = json!({
-            "pid": app.pid,
-            "window_id": window_id,
-            "_session_id": session,
-            "include_screenshot": true,
-            "max_elements": 800,
-            "max_depth": 20,
-            "_codex_compat_full_ax_map": true,
-        });
+        let native_args = native_action_arguments(
+            json!({
+                "pid": app.pid,
+                "window_id": window_id,
+                "include_screenshot": true,
+                "max_elements": 800,
+                "max_depth": 20,
+                "_codex_compat_full_ax_map": true,
+            }),
+            compat_args,
+            session,
+        );
         if let Err(error) = validate_live_pid_identity(&app, &expected_identity) {
             return error.into_result();
         }
@@ -998,7 +1007,12 @@ impl CompatState {
             );
         }
         let mut refreshed = self
-            .capture_app_state(&app_ref, &session, AppResolveMode::RunningOnly)
+            .capture_app_state(
+                &app_ref,
+                &args,
+                &session,
+                AppResolveMode::RunningOnly,
+            )
             .await;
         if refreshed.is_error == Some(true) {
             return refresh_warning_after_success(
@@ -1047,13 +1061,16 @@ impl CompatState {
             return ToolResult::error("mouse_button must be left, right, or middle.");
         }
 
-        let mut native_args = json!({
-            "pid": snapshot.app.pid,
-            "window_id": snapshot.window_id,
-            "button": button,
-            "count": click_count,
-            "_session_id": session,
-        });
+        let mut native_args = native_action_arguments(
+            json!({
+                "pid": snapshot.app.pid,
+                "window_id": snapshot.window_id,
+                "button": button,
+                "count": click_count,
+            }),
+            args,
+            session,
+        );
         let mut uses_ax_element = false;
         if let Some(index) = element_index {
             let native_index = match snapshot_element_index(snapshot, index) {
@@ -1156,16 +1173,20 @@ impl CompatState {
         if let Err(result) = self.require_current_lock_epoch(lock_epoch) {
             return result;
         }
-        super::drag::DragTool::new(snapshot.native.clone())
-            .invoke(json!({
+        let native_args = native_action_arguments(
+            json!({
                 "pid": snapshot.app.pid,
                 "window_id": snapshot.window_id,
                 "from_x": from_x,
                 "from_y": from_y,
                 "to_x": to_x,
                 "to_y": to_y,
-                "_session_id": session,
-            }))
+            }),
+            args,
+            session,
+        );
+        super::drag::DragTool::new(snapshot.native.clone())
+            .invoke(native_args)
             .await
     }
 
@@ -1281,14 +1302,18 @@ impl CompatState {
         if let Err(result) = self.require_current_lock_epoch(lock_epoch) {
             return result;
         }
-        super::press_key::PressKeyTool::new(snapshot.native.clone())
-            .invoke(json!({
+        let native_args = native_action_arguments(
+            json!({
                 "pid": snapshot.app.pid,
                 "window_id": snapshot.window_id,
                 "key": key,
                 "modifiers": modifiers,
-                "_session_id": session,
-            }))
+            }),
+            args,
+            session,
+        );
+        super::press_key::PressKeyTool::new(snapshot.native.clone())
+            .invoke(native_args)
             .await
     }
 
@@ -1327,16 +1352,20 @@ impl CompatState {
         if let Err(result) = self.require_current_lock_epoch(lock_epoch) {
             return result;
         }
-        super::scroll::ScrollTool::new(snapshot.native.clone())
-            .invoke(json!({
+        let native_args = native_action_arguments(
+            json!({
                 "pid": snapshot.app.pid,
                 "window_id": snapshot.window_id,
                 "element_index": native_index,
                 "direction": direction,
                 "by": by,
                 "amount": amount,
-                "_session_id": session,
-            }))
+            }),
+            args,
+            session,
+        );
+        super::scroll::ScrollTool::new(snapshot.native.clone())
+            .invoke(native_args)
             .await
     }
 
@@ -1453,14 +1482,18 @@ impl CompatState {
         if let Err(result) = self.require_current_lock_epoch(lock_epoch) {
             return result;
         }
-        super::set_value::SetValueTool::new(snapshot.native.clone())
-            .invoke(json!({
+        let native_args = native_action_arguments(
+            json!({
                 "pid": snapshot.app.pid,
                 "window_id": snapshot.window_id,
                 "element_index": native_index,
                 "value": value,
-                "_session_id": session,
-            }))
+            }),
+            args,
+            session,
+        );
+        super::set_value::SetValueTool::new(snapshot.native.clone())
+            .invoke(native_args)
             .await
     }
 
@@ -1478,13 +1511,17 @@ impl CompatState {
         if let Err(result) = self.require_current_lock_epoch(lock_epoch) {
             return result;
         }
-        super::type_text::TypeTextTool::new(snapshot.native.clone())
-            .invoke(json!({
+        let native_args = native_action_arguments(
+            json!({
                 "pid": snapshot.app.pid,
                 "window_id": snapshot.window_id,
                 "text": text,
-                "_session_id": session,
-            }))
+            }),
+            args,
+            session,
+        );
+        super::type_text::TypeTextTool::new(snapshot.native.clone())
+            .invoke(native_args)
             .await
     }
 }
@@ -1672,6 +1709,31 @@ fn session_key(args: &Value) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or(ANONYMOUS_SESSION)
         .to_owned()
+}
+
+fn native_action_arguments(
+    mut native_args: Value,
+    compat_args: &Value,
+    lifecycle_session: &str,
+) -> Value {
+    let object = native_args
+        .as_object_mut()
+        .expect("native Computer Use arguments must be an object");
+    object.insert(
+        "_session_id".to_owned(),
+        Value::String(lifecycle_session.to_owned()),
+    );
+    if let Some(host_session) = compat_args
+        .get(cua_driver_core::HOST_SESSION_ARG)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert(
+            cua_driver_core::HOST_SESSION_ARG.to_owned(),
+            Value::String(host_session.to_owned()),
+        );
+    }
+    native_args
 }
 
 fn normalize_app_ref(value: &str) -> String {

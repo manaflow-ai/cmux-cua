@@ -303,6 +303,20 @@ pub fn send_command_default(cmd: OverlayCommand) {
     let _ = send_command("default".to_owned(), cmd);
 }
 
+/// Applies the embedding host's cursor visibility choice without exposing a
+/// public MCP tool in narrow compatibility profiles.
+pub fn set_enabled_for_host_session(key: CursorKey, enabled: bool) {
+    if key.is_empty() {
+        return;
+    }
+    let _ = send_command(key.clone(), OverlayCommand::SetEnabled(enabled));
+    if enabled {
+        cua_driver_core::cursor_feed::emit_visible_if_owned(&key);
+    } else {
+        cua_driver_core::cursor_feed::emit_hidden_if_owned(&key);
+    }
+}
+
 /// Remove a session's owned cursor from the render collection (fired from the
 /// `session_end` hook). The `"default"` key is guarded against removal on the
 /// render side, so this is a no-op for it; removing an absent key (anonymous

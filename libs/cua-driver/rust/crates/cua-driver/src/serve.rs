@@ -1886,6 +1886,49 @@ pub async fn run_serve(
                                     (serde_json::to_string(&response).unwrap() + "\n").as_bytes()
                                 ).await;
                             }
+                            "set_cursor_enabled" => {
+                                let response = if !host_request_authorized {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    )
+                                } else {
+                                    let session = req
+                                        .args
+                                        .as_ref()
+                                        .and_then(|args| args.get("session"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|value| {
+                                            !value.is_empty() && value.len() <= 1_024
+                                        });
+                                    let enabled = req
+                                        .args
+                                        .as_ref()
+                                        .and_then(|args| args.get("enabled"))
+                                        .and_then(serde_json::Value::as_bool);
+                                    match (session, enabled) {
+                                        (Some(session), Some(enabled)) => {
+                                            platform_macos::cursor::overlay::
+                                                set_enabled_for_host_session(
+                                                    session.to_owned(),
+                                                    enabled,
+                                                );
+                                            DaemonResponse::ok(serde_json::json!({
+                                                "session": session,
+                                                "cursor_enabled": enabled,
+                                            }))
+                                        }
+                                        _ => DaemonResponse::err(
+                                            "set_cursor_enabled requires a non-empty `session` and boolean `enabled`",
+                                            64,
+                                        ),
+                                    }
+                                };
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&response).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
                             "list" => {
                                 // Include full ToolDef (input_schema + annotation
                                 // hints + capabilities) so MCP proxy callers can
