@@ -236,6 +236,28 @@ pub async fn run_proxy(
     let (daemon_lifecycle_tx, mut daemon_lifecycle_rx) =
         tokio::sync::mpsc::unbounded_channel::<DaemonLifecycleEvent>();
 
+    // A host-owned proxy may be registered before its helper is enabled, so a
+    // missing socket must remain lazy. Once the host's socket is already
+    // listening, however, authenticate the persistent control connection
+    // before accepting MCP traffic. This fails closed on a mismatched daemon
+    // profile or an untrusted Codex approval broker instead of letting a
+    // stdin-EOF probe (or a local initialize/tools-list exchange) report a
+    // healthy proxy that cannot safely dispatch its first action.
+    #[cfg(target_os = "macos")]
+    if crate::bundle::requires_external_daemon() && is_daemon_listening(&socket_path) {
+        ensure_daemon_started(
+            &socket_path,
+            &mut daemon_state,
+            &session_id,
+            claude_code_compat,
+            expected_profile,
+            &control_ready_tx,
+            false,
+            &daemon_lifecycle_tx,
+        )
+        .await?;
+    }
+
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut lines = BufReader::new(stdin).lines();
@@ -1702,12 +1724,15 @@ async fn ensure_daemon_started(
     Ok(())
 }
 
-/// Poll the daemon's `check_permissions` (read-only, `prompt:false`) until both
+/// Poll the daemon's private `permissions_status` control method until both
 /// Accessibility and Screen Recording read granted, or a bounded deadline
-/// elapses. Kept under a typical MCP client tool-call timeout so a slow grant
-/// degrades to "first call fails, agent retries on the now-granted daemon"
-/// rather than a hung call. Every failure path (transport error during a gate
-/// re-exec, unexpected shape) just retries until the deadline.
+/// elapses. This must not dispatch the public `check_permissions` tool: the
+/// Codex compatibility roster intentionally omits that tool, and private
+/// daemon health must not consume or bypass an app-approval broker token.
+/// Kept under a typical MCP client tool-call timeout so a slow grant degrades
+/// to "first call fails, agent retries on the now-granted daemon" rather than
+/// a hung call. Every failure path (transport error during a gate re-exec,
+/// unexpected shape) just retries until the deadline.
 #[cfg(target_os = "macos")]
 async fn wait_for_daemon_grants(socket_path: &str, session_id: &str) {
     use std::time::{Duration, Instant};
@@ -1721,9 +1746,9 @@ async fn wait_for_daemon_grants(socket_path: &str, session_id: &str) {
         let sid = session_id.to_owned();
         let probe = tokio::task::spawn_blocking(move || {
             let req = DaemonRequest {
-                method: "call".into(),
-                name: Some("check_permissions".into()),
-                args: Some(serde_json::json!({ "prompt": false })),
+                method: "permissions_status".into(),
+                name: None,
+                args: None,
                 session_id: Some(sid),
             };
             send_request(&sp, &req)
@@ -1743,10 +1768,10 @@ async fn wait_for_daemon_grants(socket_path: &str, session_id: &str) {
     }
 }
 
-/// Recursively locate the `check_permissions` structured payload — an object
-/// carrying both `accessibility` and `screen_recording` booleans — wherever the
-/// daemon nests it, and return `(accessibility, screen_recording)`. Shape-
-/// tolerant so the poll doesn't depend on the exact result envelope.
+/// Recursively locate a permission-status payload — an object carrying both
+/// `accessibility` and `screen_recording` booleans — wherever the daemon nests
+/// it, and return `(accessibility, screen_recording)`. Shape-tolerant so the
+/// poll doesn't depend on the exact result envelope.
 #[cfg(target_os = "macos")]
 fn extract_grants(v: &serde_json::Value) -> Option<(bool, bool)> {
     match v {

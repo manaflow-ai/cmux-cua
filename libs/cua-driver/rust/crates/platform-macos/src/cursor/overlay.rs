@@ -1873,7 +1873,7 @@ mod tests {
         let mut core = RenderStateCore::new(CursorConfig::default());
         assert!(core.is_unplaced());
 
-        core.pos = (-420.0, 220.0);
+        core.place_at(-420.0, 220.0);
         assert!(
             !core.is_unplaced(),
             "a cursor on a left-hand display must remain renderable"
@@ -2186,7 +2186,11 @@ mod tests {
         let mut map = empty_map();
         // Put sessA on-screen first.
         seed_start_in_map(&mut map, &"sessA".to_owned(), 60.0, 60.0);
-        map.cursors.get_mut("sessA").unwrap().core.pos = (30.0, 30.0);
+        map.cursors
+            .get_mut("sessA")
+            .unwrap()
+            .core
+            .place_at(30.0, 30.0);
         let seeded_again = seed_start_in_map(&mut map, &"sessA".to_owned(), 80.0, 80.0);
         assert!(!seeded_again, "on-screen cursor must not be re-seeded");
         assert_eq!(
@@ -2253,7 +2257,7 @@ mod tests {
             rs.core.click_t = None;
             rs.focus_rect = None;
             rs.core.visible = true;
-            rs.core.pos = (60.0, 60.0);
+            rs.core.place_at(60.0, 60.0);
             rs.core.motion.idle_hide_ms = 20_000.0;
             rs.core.idle_secs = 5.0;
             rs.core.idle_alpha = 1.0;
@@ -2435,7 +2439,7 @@ mod tests {
 
         let mut rs = RenderState::new(CursorConfig::default());
         rs.core.visible = true;
-        rs.core.pos = (100.0, 400.0);
+        rs.core.place_at(100.0, 400.0);
         rs.core.idle_alpha = 1.0;
 
         let rect = cursor_window_rect(&rs).expect("visible cursor has a panel rect");
@@ -2482,7 +2486,7 @@ mod tests {
 
         let mut rs = RenderState::new(CursorConfig::default());
         rs.core.visible = true;
-        rs.core.pos = (60.0, 60.0);
+        rs.core.place_at(60.0, 60.0);
         rs.core.idle_alpha = 1.0;
 
         let rect = cursor_window_rect(&rs).unwrap();
@@ -2510,7 +2514,7 @@ mod tests {
     fn position_only_motion_moves_window_without_redrawing_bitmap() {
         let mut rs = RenderState::new(CursorConfig::default());
         rs.core.visible = true;
-        rs.core.pos = (60.0, 60.0);
+        rs.core.place_at(60.0, 60.0);
         rs.core.idle_alpha = 1.0;
         rs.core.heading = std::f64::consts::FRAC_PI_4;
 
@@ -2518,7 +2522,7 @@ mod tests {
         let app_a = appearance_signature(&rs);
         let size_a = rect_a.pixel_size(2.0);
 
-        rs.core.pos = (90.0, 75.0);
+        rs.core.place_at(90.0, 75.0);
         let rect_b = cursor_window_rect(&rs).unwrap();
         let app_b = appearance_signature(&rs);
         let size_b = rect_b.pixel_size(2.0);
@@ -2581,7 +2585,7 @@ mod tests {
         sky_cfg.builtin_shape = cursor_overlay::BuiltinShape::Sky;
         let mut sky = RenderState::new(sky_cfg);
         sky.core.visible = true;
-        sky.core.pos = (60.0, 60.0);
+        sky.core.place_at(60.0, 60.0);
         sky.core.idle_alpha = 1.0;
         sky.core.heading = 0.0;
         let sky_rect = cursor_window_rect(&sky).unwrap();
@@ -2618,7 +2622,7 @@ mod tests {
         {
             let default = map.cursors.get_mut("default").unwrap();
             default.core.visible = true;
-            default.core.pos = (20.0, 20.0);
+            default.core.place_at(20.0, 20.0);
             default.core.motion.idle_hide_ms = 20_000.0;
             default.core.idle_secs = 18.0;
             default.core.idle_alpha = 1.0;
@@ -2646,7 +2650,7 @@ mod tests {
             sess.core.click_t = None;
             sess.focus_rect = None;
             sess.core.visible = true;
-            sess.core.pos = (80.0, 80.0);
+            sess.core.place_at(80.0, 80.0);
             sess.core.motion.idle_hide_ms = 20_000.0;
             sess.core.idle_secs = 0.0;
             sess.core.idle_alpha = 1.0;

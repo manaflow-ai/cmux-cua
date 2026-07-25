@@ -800,10 +800,12 @@ fn compat_proxy_brokers_nested_app_approval_and_retries_once() {
     let stopping = Arc::new(AtomicBool::new(false));
     let calls = Arc::new(AtomicUsize::new(0));
     let resolutions = Arc::new(AtomicUsize::new(0));
+    let permission_statuses = Arc::new(AtomicUsize::new(0));
     let server = {
         let stopping = stopping.clone();
         let calls = calls.clone();
         let resolutions = resolutions.clone();
+        let permission_statuses = permission_statuses.clone();
         std::thread::spawn(move || {
             let mut workers = Vec::new();
             while !stopping.load(Ordering::SeqCst) {
@@ -811,6 +813,7 @@ fn compat_proxy_brokers_nested_app_approval_and_retries_once() {
                     Ok((mut stream, _)) => {
                         let calls = calls.clone();
                         let resolutions = resolutions.clone();
+                        let permission_statuses = permission_statuses.clone();
                         workers.push(std::thread::spawn(move || {
                             let mut reader = BufReader::new(stream.try_clone().unwrap());
                             let mut line = String::new();
@@ -856,6 +859,18 @@ fn compat_proxy_brokers_nested_app_approval_and_retries_once() {
                                                 "idempotent": false,
                                                 "open_world": false,
                                             })).collect::<Vec<_>>(),
+                                        }
+                                    })
+                                }
+                                "permissions_status" => {
+                                    permission_statuses.fetch_add(1, Ordering::SeqCst);
+                                    serde_json::json!({
+                                        "ok": true,
+                                        "result": {
+                                            "accessibility": true,
+                                            "screen_recording": true,
+                                            "all_granted": true,
+                                            "profile": "codex-computer-use-compat",
                                         }
                                     })
                                 }
@@ -1051,6 +1066,10 @@ fn compat_proxy_brokers_nested_app_approval_and_retries_once() {
 
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+    assert!(
+        permission_statuses.load(Ordering::SeqCst) >= 1,
+        "the first driving action must wait on the daemon-private permission status"
+    );
 
     let _ = child.kill();
     let _ = child.wait();
