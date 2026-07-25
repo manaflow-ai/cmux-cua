@@ -3155,6 +3155,24 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn native_actions_keep_lifecycle_and_host_cursor_sessions_distinct() {
+        let native = native_action_arguments(
+            json!({"pid":42,"window_id":7}),
+            &json!({
+                "_session_id":"cmux-surface-A1B2C3-mcp-42-1000",
+                "_host_session":"cmux-surface-A1B2C3",
+            }),
+            "cmux-surface-A1B2C3-mcp-42-1000",
+        );
+
+        assert_eq!(
+            native["_session_id"],
+            "cmux-surface-A1B2C3-mcp-42-1000"
+        );
+        assert_eq!(native["_host_session"], "cmux-surface-A1B2C3");
+    }
+
     #[tokio::test]
     async fn action_without_app_snapshot_fails_closed() {
         let state = CompatState::new();
