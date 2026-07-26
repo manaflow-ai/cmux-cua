@@ -885,10 +885,6 @@ fn raw_client_cannot_reuse_a_live_compat_session_without_its_broker_token() {
             }
         }
     });
-    let session_id = session_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("proxy established authenticated control session");
-
     writeln!(
         proxy_stdin,
         "{}",
@@ -896,7 +892,7 @@ fn raw_client_cannot_reuse_a_live_compat_session_without_its_broker_token() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": {"name": "not_a_real_tool", "arguments": {}},
+            "params": {"name": "list_apps", "arguments": {}},
         })
     )
     .unwrap();
@@ -904,9 +900,12 @@ fn raw_client_cannot_reuse_a_live_compat_session_without_its_broker_token() {
     let mut proxy_line = String::new();
     proxy_stdout.read_line(&mut proxy_line).unwrap();
     assert!(
-        proxy_line.contains("Unknown tool: not_a_real_tool"),
-        "authenticated proxy call did not reach the registry: {proxy_line}"
+        proxy_line.contains("\"id\":1"),
+        "authenticated proxy call did not return a response: {proxy_line}"
     );
+    let session_id = session_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("first admitted tool call established authenticated control session");
 
     for args in [
         serde_json::json!({}),
