@@ -685,6 +685,29 @@ fn render_map_idle_fade_due_in(map: &RenderMap) -> Option<Duration> {
         .min()
 }
 
+/// Static pinned panels still need an occasional target-relative order pass.
+/// AppKit can reshuffle another application's normal-level windows after the
+/// last cursor frame (activation, Space changes, sheets, or tab/window churn).
+/// Wake once per second while a visible cursor is pinned: this keeps the panel
+/// at target z+1 without burning a display-rate render loop while pixels are
+/// unchanged.
+const IDLE_PIN_REASSERT_INTERVAL: Duration = Duration::from_secs(1);
+
+fn render_map_idle_maintenance_due_in(map: &RenderMap) -> Option<Duration> {
+    let fade_due = render_map_idle_fade_due_in(map);
+    let pin_due = map
+        .cursors
+        .values()
+        .any(|state| state.visible_on_screen() && state.core.pinned_wid.is_some())
+        .then_some(IDLE_PIN_REASSERT_INTERVAL);
+    match (fade_due, pin_due) {
+        (Some(fade), Some(pin)) => Some(fade.min(pin)),
+        (Some(fade), None) => Some(fade),
+        (None, Some(pin)) => Some(pin),
+        (None, None) => None,
+    }
+}
+
 fn frame_budget_for_max_fps(max_fps: i64) -> Duration {
     let fps = if max_fps >= 30 { max_fps } else { 60 };
     Duration::from_secs_f64(1.0 / fps as f64)
@@ -1217,7 +1240,7 @@ fn render_loop(
 ) {
     let mut last_tick = Instant::now();
     let mut frame_tick_needed = false;
-    let mut idle_fade_due_in: Option<Duration> = None;
+    let mut idle_maintenance_due_in: Option<Duration> = None;
     let mut handles: HashMap<CursorKey, CursorWindowHandle> = HashMap::new();
     let mut pinned_bounds = HashMap::new();
     let mut last_geometry_refresh: Option<Instant> = None;
@@ -1225,16 +1248,16 @@ fn render_loop(
 
     loop {
         // When no cursor animation/fade is active, either block until the MCP
-        // side sends a command or, for an idle-hide dwell, sleep only until the
-        // fade is due. This avoids 60fps fullscreen compositing while the
-        // cursor is fully visible but static.
-        let mut woke_for_idle_fade = false;
-        let first_msg = match (frame_tick_needed, idle_fade_due_in) {
+        // side sends a command or until low-frequency idle maintenance is due.
+        // Maintenance starts an idle fade at the right time and re-pins static
+        // target-relative panels without 60fps rendering.
+        let mut woke_for_idle_maintenance = false;
+        let first_msg = match (frame_tick_needed, idle_maintenance_due_in) {
             (true, _) => None,
             (false, Some(timeout)) => match rx.recv_timeout(timeout) {
                 Ok(msg) => Some(msg),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    woke_for_idle_fade = true;
+                    woke_for_idle_maintenance = true;
                     None
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1263,10 +1286,10 @@ fn render_loop(
             // Do not charge that time to the first animation tick after a command;
             // let the wake-up frame render the newly-applied state at t=0.
             0.0
-        } else if woke_for_idle_fade {
-            // The dwell timeout exists solely to advance idle_secs to fade_start.
-            // Paths/springs/clicks are absent while dwelling, so feeding the full
-            // slept wall-clock duration into tick_idle is safe and intentional.
+        } else if woke_for_idle_maintenance {
+            // Paths/springs/clicks are absent while idle. Feeding the slept
+            // wall-clock duration into tick_idle is safe and lets an idle-hide
+            // fade begin even when the wake was also serving z-order upkeep.
             now.duration_since(last_tick).as_secs_f64()
         } else {
             now.duration_since(last_tick).as_secs_f64().min(0.05)
@@ -1278,7 +1301,7 @@ fn render_loop(
         // updates only the per-cursor panel frame; bitmap redraws are reserved
         // for appearance changes such as heading, click pulse, focus fade, or
         // idle fade alpha.
-        let (arrived, had_msg, next_frame_tick_needed, next_idle_fade_due_in, updates) = {
+        let (arrived, had_msg, next_frame_tick_needed, next_idle_maintenance_due_in, updates) = {
             let mut guard = RENDER.lock().unwrap();
             match guard.as_mut() {
                 Some(map) => {
@@ -1298,7 +1321,7 @@ fn render_loop(
                     // latter lets a just-created path/click/focus rect start on
                     // this frame without waiting for the next 16ms tick.
                     let mut arrived: Vec<CursorKey> = Vec::new();
-                    if frame_tick_needed || had_msg || woke_for_idle_fade {
+                    if frame_tick_needed || had_msg || woke_for_idle_maintenance {
                         for (k, rs) in map.cursors.iter_mut() {
                             if rs.tick(dt) {
                                 arrived.push(k.clone());
@@ -1306,10 +1329,10 @@ fn render_loop(
                         }
                     }
                     let next_frame_tick_needed = render_map_needs_frame_tick(map);
-                    let next_idle_fade_due_in = if next_frame_tick_needed {
+                    let next_idle_maintenance_due_in = if next_frame_tick_needed {
                         None
                     } else {
-                        render_map_idle_fade_due_in(map)
+                        render_map_idle_maintenance_due_in(map)
                     };
 
                     let updates = map
@@ -1364,7 +1387,7 @@ fn render_loop(
                         arrived,
                         had_msg,
                         next_frame_tick_needed,
-                        next_idle_fade_due_in,
+                        next_idle_maintenance_due_in,
                         updates,
                     )
                 }
@@ -1432,6 +1455,13 @@ fn render_loop(
                     } else if handle.repin_frames >= repin_interval_frames {
                         handle.repin_frames = 0;
                     }
+                    if woke_for_idle_maintenance && update.pinned_wid.is_some() {
+                        MacZOrderEnforcer {
+                            win_ptr: handle.win_ptr,
+                        }
+                        .reassert(update.pinned_wid);
+                        handle.repin_frames = 0;
+                    }
                 }
                 None => {
                     if let Some(handle) = handles.get_mut(&update.key) {
@@ -1468,7 +1498,7 @@ fn render_loop(
         });
 
         frame_tick_needed = next_frame_tick_needed;
-        idle_fade_due_in = next_idle_fade_due_in;
+        idle_maintenance_due_in = next_idle_maintenance_due_in;
         if frame_tick_needed {
             // Sleep remainder of frame budget.
             let elapsed = Instant::now().duration_since(last_tick);
