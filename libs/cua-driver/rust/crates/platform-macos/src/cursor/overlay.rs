@@ -2699,6 +2699,26 @@ mod tests {
     }
 
     #[test]
+    fn visible_pinned_cursor_arms_low_frequency_idle_repin() {
+        let mut map = empty_map();
+        let cursor = map.cursors.get_mut("default").unwrap();
+        cursor.core.visible = true;
+        cursor.core.place_at(80.0, 80.0);
+        cursor.core.motion.idle_hide_ms = 0.0;
+        cursor.core.pinned_wid = Some(42);
+
+        assert!(!render_map_needs_frame_tick(&map));
+        assert_eq!(
+            render_map_idle_maintenance_due_in(&map),
+            Some(Duration::from_secs(1)),
+            "a static cursor must periodically reassert z+1 without a 60fps render loop"
+        );
+
+        map.cursors.get_mut("default").unwrap().core.pinned_wid = None;
+        assert_eq!(render_map_idle_maintenance_due_in(&map), None);
+    }
+
+    #[test]
     fn per_key_arrival_isolation() {
         // Two concurrent waiters keyed A and B; firing A must not cancel B.
         // This mirrors the ARRIVAL_TX HashMap logic in isolation (no statics).
