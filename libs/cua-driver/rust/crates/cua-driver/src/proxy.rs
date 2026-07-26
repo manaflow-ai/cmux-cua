@@ -236,28 +236,6 @@ pub async fn run_proxy(
     let (daemon_lifecycle_tx, mut daemon_lifecycle_rx) =
         tokio::sync::mpsc::unbounded_channel::<DaemonLifecycleEvent>();
 
-    // A host-owned proxy may be registered before its helper is enabled, so a
-    // missing socket must remain lazy. Once the host's socket is already
-    // listening, however, authenticate the persistent control connection
-    // before accepting MCP traffic. This fails closed on a mismatched daemon
-    // profile or an untrusted Codex approval broker instead of letting a
-    // stdin-EOF probe (or a local initialize/tools-list exchange) report a
-    // healthy proxy that cannot safely dispatch its first action.
-    #[cfg(target_os = "macos")]
-    if crate::bundle::requires_external_daemon() && is_daemon_listening(&socket_path) {
-        ensure_daemon_started(
-            &socket_path,
-            &mut daemon_state,
-            &session_id,
-            claude_code_compat,
-            expected_profile,
-            &control_ready_tx,
-            false,
-            &daemon_lifecycle_tx,
-        )
-        .await?;
-    }
-
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut lines = BufReader::new(stdin).lines();
