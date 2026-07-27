@@ -920,6 +920,15 @@ mod tests {
     }
 
     #[test]
+    fn frame_ring_can_be_created_with_macos_shm_open() {
+        let ring = SharedFrameRing::create(2, 2).unwrap();
+        let descriptor = ring.descriptor();
+        assert_eq!(descriptor.width, 2);
+        assert_eq!(descriptor.height, 2);
+        assert_eq!(descriptor.slot_count, FRAME_SLOT_COUNT);
+    }
+
+    #[test]
     fn content_rect_rejects_letterbox_and_maps_live_content() {
         let rect =
             NormalizedContentRect::from_frame_rect(0.0, 250.0, 1000.0, 500.0, 1000, 1000).unwrap();
