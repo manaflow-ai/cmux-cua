@@ -2758,6 +2758,22 @@ mod tests {
     }
 
     #[test]
+    fn cursor_window_can_join_the_target_applications_window_group() {
+        let behavior = cursor_window_collection_behavior();
+        assert_ne!(
+            behavior & (1 << 18),
+            0,
+            "cross-application relative ordering requires CanJoinAllApplications"
+        );
+        assert_ne!(behavior & 1, 0, "cursor must continue joining every Space");
+        assert_ne!(
+            behavior & (1 << 8),
+            0,
+            "cursor must remain eligible beside full-screen targets"
+        );
+    }
+
+    #[test]
     fn last_active_arrival_dwell_is_not_shortened_by_stale_cursor() {
         let mut map = empty_map();
         {
