@@ -259,16 +259,33 @@ impl CursorShape {
     /// all branded cursor instances.
     pub fn cmux() -> &'static Self {
         static CACHE: OnceLock<CursorShape> = OnceLock::new();
-        CACHE.get_or_init(|| {
-            let mut shape =
-                Self::load_svg_bytes(CMUX_CURSOR_SVG).expect("embedded cmux SVG should parse");
-            shape.hotspot_x = shape.width as f32 * (3.0 / 18.59);
-            shape.hotspot_y = shape.height as f32 * (3.0 / 18.59);
-            shape.intrinsic_rotation_degrees = 0.0;
-            shape.rotates_with_heading = false;
-            shape.display_points = CURSOR_DISPLAY_POINTS;
-            shape
-        })
+        CACHE.get_or_init(|| Self::load_cmux_at_size(CURSOR_SIZE))
+    }
+
+    /// Rasterise the branded cmux cursor at the destination display's exact
+    /// pixel footprint so Retina displays never resample a fixed source image.
+    pub fn cmux_for_backing_scale(backing_scale: f32) -> Self {
+        static CACHE: OnceLock<Mutex<HashMap<u32, CursorShape>>> = OnceLock::new();
+        let size = sky_size_for_backing_scale(backing_scale);
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = cache.lock().unwrap();
+        if let Some(shape) = guard.get(&size) {
+            return shape.clone();
+        }
+        let shape = Self::load_cmux_at_size(size);
+        guard.insert(size, shape.clone());
+        shape
+    }
+
+    fn load_cmux_at_size(size: u32) -> Self {
+        let mut shape = Self::load_svg_bytes_at(CMUX_CURSOR_SVG, size)
+            .expect("embedded cmux SVG should parse");
+        shape.hotspot_x = shape.width as f32 * (3.0 / 18.59);
+        shape.hotspot_y = shape.height as f32 * (3.0 / 18.59);
+        shape.intrinsic_rotation_degrees = 0.0;
+        shape.rotates_with_heading = false;
+        shape.display_points = CURSOR_DISPLAY_POINTS;
+        shape
     }
 
     fn load_svg(path: &str) -> Result<Self> {

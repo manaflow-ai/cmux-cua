@@ -21,7 +21,7 @@ pub struct CheckPermissionsTool;
 /// documents. `SCShareableContent::get()` does a live query: it only
 /// returns displays when the answering process can genuinely capture. When
 /// it disagrees with the preflight boolean, the preflight one is lying.
-fn screen_recording_capturable() -> bool {
+pub(super) fn screen_recording_capturable() -> bool {
     use screencapturekit::prelude::SCShareableContent;
     SCShareableContent::get()
         .map(|c| !c.displays().is_empty())

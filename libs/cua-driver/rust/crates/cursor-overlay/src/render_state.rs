@@ -819,11 +819,16 @@ pub fn paint_cursor(
     } else {
         None
     };
+    let scaled_cmux_shape = if core.cfg.builtin_shape == BuiltinShape::Cmux {
+        Some(CursorShape::cmux_for_backing_scale(sf))
+    } else {
+        None
+    };
     let shape: Option<&CursorShape> = match (core.shape.as_ref(), core.cfg.builtin_shape) {
         (Some(custom), _) => Some(custom),
         (None, BuiltinShape::Teardrop) => Some(CursorShape::teardrop()),
         (None, BuiltinShape::Sky) => scaled_sky_shape.as_ref(),
-        (None, BuiltinShape::Cmux) => Some(CursorShape::cmux()),
+        (None, BuiltinShape::Cmux) => scaled_cmux_shape.as_ref(),
         (None, BuiltinShape::Arrow) => {
             let grad_override = if core.gradient_colors.is_empty() {
                 None
