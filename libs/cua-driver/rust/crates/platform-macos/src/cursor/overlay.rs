@@ -1753,8 +1753,7 @@ fn dispatch_update_cursor_window(
             CGImageRelease(payload.cg_image_ptr as *mut c_void);
         }
         if payload.should_order {
-            let relative_to = payload.order_target.unwrap_or(0) as i64;
-            let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: relative_to];
+            order_cursor_window_above(win, payload.order_target.unwrap_or(0));
         }
     }
 
@@ -1776,6 +1775,26 @@ fn dispatch_update_cursor_window(
         let main_queue = &raw const _dispatch_main_q as *const c_void;
         dispatch_async_f(main_queue, Box::into_raw(payload) as *mut c_void, update_cb);
     }
+}
+
+unsafe fn order_cursor_window_above(
+    win: *mut objc2::runtime::AnyObject,
+    target_window_id: u64,
+) {
+    let window_number: i64 = objc2::msg_send![win, windowNumber];
+    if let (Ok(window_id), Ok(target_window_id)) = (
+        u32::try_from(window_number),
+        u32::try_from(target_window_id),
+    ) {
+        if crate::input::skylight::order_window_above(window_id, target_window_id) {
+            return;
+        }
+    }
+
+    // Public AppKit fallback for older systems where the SkyLight symbols are
+    // unavailable. This is reliable for same-process targets but cannot always
+    // interleave windows owned by different applications.
+    let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_window_id as i64];
 }
 
 fn dispatch_hide_cursor_window(win_ptr: usize) {
@@ -1844,8 +1863,7 @@ fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
     unsafe extern "C" fn reorder_cb(ctx: *mut c_void) {
         let (win_ptr, target_wid): (usize, u64) = *Box::from_raw(ctx as *mut (usize, u64));
         let win = win_ptr as *mut objc2::runtime::AnyObject;
-        // NSWindowAbove = 1; relativeTo: takes NSInteger (i64 on 64-bit)
-        let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_wid as i64];
+        order_cursor_window_above(win, target_wid);
     }
 
     let payload = Box::new((win_ptr, target_wid));
