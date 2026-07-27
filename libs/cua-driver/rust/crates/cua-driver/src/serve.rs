@@ -10,6 +10,10 @@
 //!   {"method":"permissions_status"}       (private macOS operator control)
 //!   {"method":"permissions_present"}      (private macOS operator control)
 //!   {"method":"permissions_refresh"}      (private macOS operator control)
+//!   {"method":"application_windows"}      (private authenticated cmux host control)
+//!   {"method":"application_surface_start","args":{...}}
+//!   {"method":"application_surface_stop","args":{"session":"..."}}
+//!   {"method":"application_surface_event","args":{...}}
 //!
 //! Response shapes:
 //!   {"ok":true,"result":...}
@@ -1854,6 +1858,192 @@ pub async fn run_serve(
                                 #[cfg(not(target_os = "macos"))]
                                 let _ = response_sent;
                             }
+                            "application_windows" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    match tokio::task::spawn_blocking(
+                                        platform_macos::application_surface::list_windows,
+                                    ).await {
+                                        Ok(Ok(windows)) => DaemonResponse::ok(
+                                            serde_json::json!({"windows": windows}),
+                                        ),
+                                        Ok(Err(error)) => {
+                                            DaemonResponse::err(error.to_string(), 1)
+                                        }
+                                        Err(error) => DaemonResponse::err(
+                                            format!("Application-window task failed: {error}"),
+                                            1,
+                                        ),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_windows is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "application_surface_start" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    let request = req.args
+                                        .ok_or("Missing application-surface arguments")
+                                        .and_then(|args| {
+                                            serde_json::from_value::<
+                                                platform_macos::application_surface::
+                                                    ApplicationSurfaceStartRequest,
+                                            >(args)
+                                            .map_err(|_| {
+                                                "Invalid application-surface arguments"
+                                            })
+                                        });
+                                    match request {
+                                        Ok(request) => match tokio::task::spawn_blocking(
+                                            move || {
+                                                platform_macos::application_surface::start(request)
+                                            },
+                                        ).await {
+                                            Ok(Ok(result)) => DaemonResponse::ok(
+                                                serde_json::to_value(result).expect(
+                                                    "application start result is serializable"
+                                                ),
+                                            ),
+                                            Ok(Err(error)) => {
+                                                DaemonResponse::err(error.to_string(), 1)
+                                            }
+                                            Err(error) => DaemonResponse::err(
+                                                format!(
+                                                    "Application-capture task failed: {error}"
+                                                ),
+                                                1,
+                                            ),
+                                        },
+                                        Err(error) => DaemonResponse::err(error, 64),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_surface_start is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "application_surface_stop" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    let session = req.args.as_ref()
+                                        .and_then(|args| args.get("session"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|value| {
+                                            !value.is_empty() && value.len() <= 128
+                                        })
+                                        .map(str::to_owned);
+                                    match session {
+                                        Some(session) => {
+                                            let stopped = tokio::task::spawn_blocking(
+                                                move || {
+                                                    platform_macos::application_surface::stop(
+                                                        &session,
+                                                    )
+                                                },
+                                            ).await.unwrap_or(false);
+                                            DaemonResponse::ok(
+                                                serde_json::json!({"stopped": stopped}),
+                                            )
+                                        }
+                                        None => DaemonResponse::err(
+                                            "application_surface_stop requires a session",
+                                            64,
+                                        ),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_surface_stop is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "application_surface_event" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    let event = req.args
+                                        .ok_or("Missing application-surface event")
+                                        .and_then(|args| {
+                                            serde_json::from_value::<
+                                                platform_macos::application_surface::
+                                                    ApplicationSurfaceEvent,
+                                            >(args)
+                                            .map_err(|_| "Invalid application-surface event")
+                                        });
+                                    match event {
+                                        Ok(event) => match tokio::task::spawn_blocking(
+                                            move || {
+                                                platform_macos::application_surface::send_event(
+                                                    event,
+                                                )
+                                            },
+                                        ).await {
+                                            Ok(Ok(())) => DaemonResponse::ok(
+                                                serde_json::json!({"sent": true}),
+                                            ),
+                                            Ok(Err(error)) => {
+                                                DaemonResponse::err(error.to_string(), 1)
+                                            }
+                                            Err(error) => DaemonResponse::err(
+                                                format!(
+                                                    "Application-input task failed: {error}"
+                                                ),
+                                                1,
+                                            ),
+                                        },
+                                        Err(error) => DaemonResponse::err(error, 64),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_surface_event is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
                             "configure_state_authentication" => {
                                 let response = if !host_request_authorized
                                     || (!host_authority_configured
@@ -2388,6 +2578,8 @@ pub async fn run_serve(
     }
 
     // Clean up.
+    #[cfg(target_os = "macos")]
+    platform_macos::application_surface::stop_all();
     let _ = std::fs::remove_file(socket_path);
     if let Some(pid_path) = pid_file_path {
         let _ = std::fs::remove_file(pid_path);
