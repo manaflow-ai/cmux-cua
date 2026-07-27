@@ -3056,7 +3056,10 @@ pub fn run_status_cmd(socket_path: &str, pid_file_path: &str) {
 
 #[cfg(test)]
 mod external_permission_flow_tests {
-    use super::{clamp_external_permission_prompt, validate_system_permission_request};
+    use super::{
+        clamp_external_permission_prompt, screen_capture_verification_response,
+        validate_system_permission_request,
+    };
 
     #[test]
     fn external_permission_flow_clamps_agent_prompt_requests() {
@@ -3077,6 +3080,20 @@ mod external_permission_flow_tests {
         assert_eq!(
             response.error.as_deref(),
             Some("Unknown system permission: camera")
+        );
+    }
+
+    #[test]
+    fn host_screen_capture_verification_reports_live_readiness_explicitly() {
+        let ready = screen_capture_verification_response(true);
+        assert!(ready.ok);
+        assert_eq!(ready.result.unwrap()["capturable"], serde_json::json!(true));
+
+        let unavailable = screen_capture_verification_response(false);
+        assert!(unavailable.ok);
+        assert_eq!(
+            unavailable.result.unwrap()["capturable"],
+            serde_json::json!(false)
         );
     }
 }

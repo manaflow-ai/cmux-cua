@@ -559,6 +559,20 @@ mod tests {
     }
 
     #[test]
+    fn cmux_backing_scale_rasters_match_display_pixel_size() {
+        let cmux_1x = CursorShape::cmux_for_backing_scale(1.0);
+        let cmux_2x = CursorShape::cmux_for_backing_scale(2.0);
+        let cmux_3x = CursorShape::cmux_for_backing_scale(3.0);
+
+        assert_eq!((cmux_1x.width, cmux_1x.height), (26, 26));
+        assert_eq!((cmux_2x.width, cmux_2x.height), (52, 52));
+        assert_eq!((cmux_3x.width, cmux_3x.height), (78, 78));
+        assert_eq!(cmux_2x.intrinsic_rotation_degrees, 0.0);
+        assert!(!cmux_2x.has_center_hotspot());
+        assert!(!cmux_2x.rotates_with_heading);
+    }
+
+    #[test]
     fn straight_raster_pixels_are_premultiplied_exactly_once() {
         let pixels = premultiply_rgba(vec![
             255, 128, 64, 128, // translucent color
