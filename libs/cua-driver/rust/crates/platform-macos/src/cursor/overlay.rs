@@ -873,10 +873,37 @@ fn cursor_window_collection_behavior() -> u64 {
 
 fn appkit_frame_for_rect(rect: LogicalRect, screen: ScreenGeometry) -> AppKitRect {
     AppKitRect {
-        x: screen.origin_x + rect.left,
+        // Cursor positions originate in Quartz's global desktop space. AppKit
+        // shares that global x-axis, so applying the anchor screen's x origin
+        // again shifts every cursor on a non-primary mainScreen by one whole
+        // display.
+        x: rect.left,
         y: screen.origin_y + screen.height - rect.top - rect.height,
         width: rect.width,
         height: rect.height,
+    }
+}
+
+fn screen_geometry_for_primary_display(
+    primary_display: LogicalRect,
+    fallback_main_screen: LogicalRect,
+    fallback_backing_scale: f64,
+) -> ScreenGeometry {
+    // NSScreen.mainScreen follows the currently key window and can therefore
+    // be any external display. Quartz cursor coordinates, however, are
+    // globally anchored to CGMainDisplayID. Always derive the y-axis flip from
+    // that primary display; use the AppKit main screen only as a defensive
+    // fallback if CoreGraphics returns an invalid bound.
+    let anchor = if primary_display.is_valid() {
+        primary_display
+    } else {
+        fallback_main_screen
+    };
+    ScreenGeometry {
+        origin_x: anchor.left,
+        origin_y: anchor.top,
+        height: anchor.height,
+        fallback_backing_scale,
     }
 }
 
@@ -1279,12 +1306,25 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     }
 
     // ---- Render thread (display-rate while animating, quiescent while idle) ----
-    let screen = ScreenGeometry {
-        origin_x: screen_frame.origin.x,
-        origin_y: screen_frame.origin.y,
-        height: win_h,
-        fallback_backing_scale: backing_scale,
-    };
+    let primary_bounds = core_graphics::display::CGDisplay::new(
+        core_graphics::display::CGMainDisplayID(),
+    )
+    .bounds();
+    let screen = screen_geometry_for_primary_display(
+        LogicalRect {
+            left: primary_bounds.origin.x,
+            top: primary_bounds.origin.y,
+            width: primary_bounds.size.width,
+            height: primary_bounds.size.height,
+        },
+        LogicalRect {
+            left: screen_frame.origin.x,
+            top: screen_frame.origin.y,
+            width: screen_frame.size.width,
+            height: screen_frame.size.height,
+        },
+        backing_scale,
+    );
     std::thread::spawn(move || {
         render_loop(rx, screen, displays, frame_budget);
     });
