@@ -854,6 +854,12 @@ impl CompatState {
         if let Err(error) = self.validate_lock_epoch(lock_epoch) {
             return error.into_result();
         }
+        let cursor_target_bounds = bounds.clone().unwrap_or(crate::windows::WindowBounds {
+            x: window_origin_x,
+            y: window_origin_y,
+            width: logical_width as f64,
+            height: logical_height as f64,
+        });
         let snapshot = self.snapshots.insert(
             session,
             AppSnapshot {
@@ -869,7 +875,7 @@ impl CompatState {
                 logical_height,
                 window_origin_x,
                 window_origin_y,
-                native,
+                native: native.clone(),
             },
         );
         let revived_cursor = self.revive_cursor_after_fresh_state(session);
@@ -878,6 +884,18 @@ impl CompatState {
         }
         if revived_cursor {
             self.lock_removed_cursors.lock().unwrap().remove(session);
+        }
+        if let Some((x, y)) = crate::cursor::overlay::present_cursor_for_snapshot_target(
+            session.to_owned(),
+            window_id as u64,
+            &cursor_target_bounds,
+        )
+        .await
+        {
+            native.cursor_registry.update_position(session, x, y);
+        }
+        if let Err(error) = self.validate_lock_epoch(lock_epoch) {
+            return error.into_result();
         }
         let result = match state_result(native_result, &snapshot) {
             Ok(result) => result,

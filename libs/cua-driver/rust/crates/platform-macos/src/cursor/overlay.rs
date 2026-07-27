@@ -862,6 +862,15 @@ fn panel_level_for_pin(pinned_wid: Option<u64>) -> PanelLevel {
     }
 }
 
+fn cursor_window_collection_behavior() -> u64 {
+    // CanJoinAllSpaces | FullScreenAuxiliary | Stationary |
+    // CanJoinAllApplications. The final public AppKit behavior (macOS 13+)
+    // lets this accessory panel join the target application's window group,
+    // so orderWindow:relativeTo: can interleave it directly above a foreign
+    // target without promoting it over unrelated foreground applications.
+    1u64 | (1 << 8) | (1 << 4) | (1 << 18)
+}
+
 fn appkit_frame_for_rect(rect: LogicalRect, screen: ScreenGeometry) -> AppKitRect {
     AppKitRect {
         x: screen.origin_x + rect.left,
@@ -925,6 +934,85 @@ fn active_display_geometries(fallback_scale: f64) -> Vec<DisplayGeometry> {
         }
     }
     displays
+}
+
+fn cursor_target_entry_point(
+    map: &RenderMap,
+    key: &CursorKey,
+    target_window_id: u64,
+    target_bounds: LogicalRect,
+    displays: &[DisplayGeometry],
+) -> Option<(f64, f64)> {
+    if !target_bounds.is_valid() || map.ended.contains(key) {
+        return None;
+    }
+
+    let target_center = (
+        target_bounds.left + target_bounds.width / 2.0,
+        target_bounds.top + target_bounds.height / 2.0,
+    );
+    let Some(cursor) = map.cursors.get(key) else {
+        return map.template.enabled.then_some(target_center);
+    };
+    if !cursor.core.cfg.enabled || !cursor.core.visible {
+        return None;
+    }
+    if cursor.core.is_unplaced() {
+        return Some(target_center);
+    }
+
+    let cursor_point = cursor.core.pos;
+    let on_active_display = displays.is_empty()
+        || displays
+            .iter()
+            .any(|display| display.bounds.contains(cursor_point));
+    if !on_active_display {
+        return Some(target_center);
+    }
+
+    (cursor.core.pinned_wid != Some(target_window_id)
+        && !target_bounds.contains(cursor_point))
+    .then_some(target_center)
+}
+
+/// Keep a compatibility snapshot's cursor on the same target-relative layer.
+///
+/// A first snapshot has no action point yet, so it previously left the cursor
+/// unplaced and invisible. A cursor can also become stranded off-display when
+/// a monitor is detached between calls. Pin every successful snapshot to its
+/// exact window, and glide into the window centre only when placement or
+/// recovery is actually needed; repeated snapshots of the same live target
+/// retain the action's last cursor position.
+pub async fn present_cursor_for_snapshot_target(
+    key: CursorKey,
+    target_window_id: u64,
+    target_bounds: &crate::windows::WindowBounds,
+) -> Option<(f64, f64)> {
+    if key.is_empty() {
+        return None;
+    }
+    let target = LogicalRect {
+        left: target_bounds.x,
+        top: target_bounds.y,
+        width: target_bounds.width,
+        height: target_bounds.height,
+    };
+    let displays = active_display_geometries(1.0);
+    let entry_point = {
+        let guard = RENDER.lock().unwrap();
+        guard.as_ref().and_then(|map| {
+            cursor_target_entry_point(map, &key, target_window_id, target, &displays)
+        })
+    };
+
+    let _ = send_command(
+        key.clone(),
+        OverlayCommand::PinAbove(target_window_id),
+    );
+    if let Some((x, y)) = entry_point {
+        animate_cursor_to(key, x, y).await;
+    }
+    entry_point
 }
 
 fn window_bounds_snapshot() -> HashMap<u64, LogicalRect> {
@@ -1563,8 +1651,7 @@ fn dispatch_create_cursor_window(backing_scale: f64) -> Option<CursorWindowHandl
         // NSFloatingWindowLevel = 3: visible above normal app windows without
         // activating this accessory app.
         let _: () = msg_send![win, setLevel: 3i64];
-        // CanJoinAllSpaces | FullScreenAuxiliary | Stationary.
-        let _: () = msg_send![win, setCollectionBehavior: (1u64 | (1 << 8) | (1 << 4))];
+        let _: () = msg_send![win, setCollectionBehavior: cursor_window_collection_behavior()];
         let _: () = msg_send![win, setReleasedWhenClosed: false];
         let _: () = msg_send![win, setHidesOnDeactivate: false];
 
@@ -1747,8 +1834,8 @@ fn dispatch_window_lifecycle(win_ptr: usize, close: bool) {
 /// server list.  Called from the render thread; dispatches to the main queue
 /// (AppKit must be used on the main thread).
 ///
-/// `NSWindowAbove = 1`; `orderWindow:relativeTo:` accepts any CGWindowID as
-/// the `relativeTo` argument — it works cross-application via CGS.
+/// `NSWindowAbove = 1`; the panel's CanJoinAllApplications collection behavior
+/// lets AppKit order it relative to a window from another application.
 fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
     use std::ffi::c_void;
 
@@ -2661,6 +2748,22 @@ mod tests {
     }
 
     #[test]
+    fn cursor_window_can_join_the_target_applications_window_group() {
+        let behavior = cursor_window_collection_behavior();
+        assert_ne!(
+            behavior & (1 << 18),
+            0,
+            "cross-application relative ordering requires CanJoinAllApplications"
+        );
+        assert_ne!(behavior & 1, 0, "cursor must continue joining every Space");
+        assert_ne!(
+            behavior & (1 << 8),
+            0,
+            "cursor must remain eligible beside full-screen targets"
+        );
+    }
+
+    #[test]
     fn last_active_arrival_dwell_is_not_shortened_by_stale_cursor() {
         let mut map = empty_map();
         {
@@ -2746,6 +2849,70 @@ mod tests {
 
         map.cursors.get_mut("default").unwrap().core.pinned_wid = None;
         assert_eq!(render_map_idle_maintenance_due_in(&map), None);
+    }
+
+    #[test]
+    fn snapshot_target_bootstraps_or_recovers_cursor_without_recentring_valid_position() {
+        let mut map = empty_map();
+        let key = "codex-compat-session".to_owned();
+        let target = LogicalRect {
+            left: 1_000.0,
+            top: 300.0,
+            width: 230.0,
+            height: 408.0,
+        };
+        let displays = [DisplayGeometry {
+            bounds: LogicalRect {
+                left: 0.0,
+                top: 0.0,
+                width: 1_512.0,
+                height: 982.0,
+            },
+            backing_scale: 2.0,
+        }];
+        let target_center = (1_115.0, 504.0);
+
+        assert_eq!(
+            cursor_target_entry_point(&map, &key, 42, target, &displays),
+            Some(target_center),
+            "the first app snapshot must place a previously absent cursor inside its target"
+        );
+
+        let template = map.template.clone();
+        map.cursors
+            .insert(key.clone(), render_state_for_key(&template, &key));
+        {
+            let cursor = map.cursors.get_mut(&key).unwrap();
+            cursor.core.place_at(692.0, -501.0);
+            cursor.core.pinned_wid = Some(42);
+        }
+        assert_eq!(
+            cursor_target_entry_point(&map, &key, 42, target, &displays),
+            Some(target_center),
+            "a cursor stranded on a detached display must re-enter the live target"
+        );
+
+        {
+            let cursor = map.cursors.get_mut(&key).unwrap();
+            cursor.core.place_at(400.0, 400.0);
+            cursor.core.pinned_wid = Some(7);
+        }
+        assert_eq!(
+            cursor_target_entry_point(&map, &key, 42, target, &displays),
+            Some(target_center),
+            "switching to a different target must bring an unrelated cursor into that window"
+        );
+
+        {
+            let cursor = map.cursors.get_mut(&key).unwrap();
+            cursor.core.place_at(1_120.0, 520.0);
+            cursor.core.pinned_wid = Some(42);
+        }
+        assert_eq!(
+            cursor_target_entry_point(&map, &key, 42, target, &displays),
+            None,
+            "refreshing the same target must preserve the user's last valid cursor position"
+        );
     }
 
     #[test]
