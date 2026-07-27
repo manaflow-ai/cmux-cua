@@ -862,6 +862,15 @@ fn panel_level_for_pin(pinned_wid: Option<u64>) -> PanelLevel {
     }
 }
 
+fn cursor_window_collection_behavior() -> u64 {
+    // CanJoinAllSpaces | FullScreenAuxiliary | Stationary |
+    // CanJoinAllApplications. The final public AppKit behavior (macOS 13+)
+    // lets this accessory panel join the target application's window group,
+    // so orderWindow:relativeTo: can interleave it directly above a foreign
+    // target without promoting it over unrelated foreground applications.
+    1u64 | (1 << 8) | (1 << 4) | (1 << 18)
+}
+
 fn appkit_frame_for_rect(rect: LogicalRect, screen: ScreenGeometry) -> AppKitRect {
     AppKitRect {
         x: screen.origin_x + rect.left,
@@ -1642,8 +1651,7 @@ fn dispatch_create_cursor_window(backing_scale: f64) -> Option<CursorWindowHandl
         // NSFloatingWindowLevel = 3: visible above normal app windows without
         // activating this accessory app.
         let _: () = msg_send![win, setLevel: 3i64];
-        // CanJoinAllSpaces | FullScreenAuxiliary | Stationary.
-        let _: () = msg_send![win, setCollectionBehavior: (1u64 | (1 << 8) | (1 << 4))];
+        let _: () = msg_send![win, setCollectionBehavior: cursor_window_collection_behavior()];
         let _: () = msg_send![win, setReleasedWhenClosed: false];
         let _: () = msg_send![win, setHidesOnDeactivate: false];
 
@@ -1753,7 +1761,8 @@ fn dispatch_update_cursor_window(
             CGImageRelease(payload.cg_image_ptr as *mut c_void);
         }
         if payload.should_order {
-            order_cursor_window_above(win, payload.order_target.unwrap_or(0));
+            let relative_to = payload.order_target.unwrap_or(0) as i64;
+            let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: relative_to];
         }
     }
 
@@ -1775,26 +1784,6 @@ fn dispatch_update_cursor_window(
         let main_queue = &raw const _dispatch_main_q as *const c_void;
         dispatch_async_f(main_queue, Box::into_raw(payload) as *mut c_void, update_cb);
     }
-}
-
-unsafe fn order_cursor_window_above(
-    win: *mut objc2::runtime::AnyObject,
-    target_window_id: u64,
-) {
-    let window_number: i64 = objc2::msg_send![win, windowNumber];
-    if let (Ok(window_id), Ok(target_window_id)) = (
-        u32::try_from(window_number),
-        u32::try_from(target_window_id),
-    ) {
-        if crate::input::skylight::order_window_above(window_id, target_window_id) {
-            return;
-        }
-    }
-
-    // Public AppKit fallback for older systems where the SkyLight symbols are
-    // unavailable. This is reliable for same-process targets but cannot always
-    // interleave windows owned by different applications.
-    let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_window_id as i64];
 }
 
 fn dispatch_hide_cursor_window(win_ptr: usize) {
@@ -1845,8 +1834,8 @@ fn dispatch_window_lifecycle(win_ptr: usize, close: bool) {
 /// server list.  Called from the render thread; dispatches to the main queue
 /// (AppKit must be used on the main thread).
 ///
-/// `NSWindowAbove = 1`; `orderWindow:relativeTo:` accepts any CGWindowID as
-/// the `relativeTo` argument — it works cross-application via CGS.
+/// `NSWindowAbove = 1`; the panel's CanJoinAllApplications collection behavior
+/// lets AppKit order it relative to a window from another application.
 fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
     use std::ffi::c_void;
 
@@ -1863,7 +1852,8 @@ fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
     unsafe extern "C" fn reorder_cb(ctx: *mut c_void) {
         let (win_ptr, target_wid): (usize, u64) = *Box::from_raw(ctx as *mut (usize, u64));
         let win = win_ptr as *mut objc2::runtime::AnyObject;
-        order_cursor_window_above(win, target_wid);
+        // NSWindowAbove = 1; relativeTo: takes NSInteger (i64 on 64-bit)
+        let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_wid as i64];
     }
 
     let payload = Box::new((win_ptr, target_wid));

@@ -42,9 +42,6 @@ type SetIntFieldFn = unsafe extern "C" fn(*mut c_void, u32, i64);
 /// `uint32_t CGSMainConnectionID(void)`
 type ConnectionIDFn = unsafe extern "C" fn() -> u32;
 
-/// `OSStatus SLSOrderWindow(uint32_t cid, uint32_t wid, int32_t place, uint32_t relative_to)`
-type OrderWindowFn = unsafe extern "C" fn(u32, u32, i32, u32) -> i32;
-
 // ── NSMenu shortcut activation SPIs ──────────────────────────────────────────
 
 /// `OSStatus SLPSSetFrontProcessWithOptions(const void *psn, uint32_t windowID, uint32_t options)`
@@ -137,15 +134,6 @@ fn set_int_field_fn() -> Option<SetIntFieldFn> {
 fn connection_id_fn() -> Option<ConnectionIDFn> {
     static SYM: OnceLock<Option<ConnectionIDFn>> = OnceLock::new();
     *SYM.get_or_init(|| find_sym(b"CGSMainConnectionID\0").map(|p| unsafe { as_fn(p) }))
-}
-
-fn order_window_fn() -> Option<OrderWindowFn> {
-    static SYM: OnceLock<Option<OrderWindowFn>> = OnceLock::new();
-    *SYM.get_or_init(|| {
-        find_sym(b"SLSOrderWindow\0")
-            .or_else(|| find_sym(b"CGSOrderWindow\0"))
-            .map(|p| unsafe { as_fn(p) })
-    })
 }
 
 fn factory_msg_send_fn() -> Option<FactoryMsgSendFn> {
@@ -331,41 +319,6 @@ pub fn set_integer_field(event_ptr: *mut c_void, field: u32, value: i64) -> bool
 /// Return the Skylight main connection ID for the current process.
 pub fn main_connection_id() -> Option<u32> {
     connection_id_fn().map(|f| unsafe { f() })
-}
-
-fn order_window_above_with(
-    connection: Option<ConnectionIDFn>,
-    order: Option<OrderWindowFn>,
-    window_id: u32,
-    target_window_id: u32,
-) -> bool {
-    if window_id == 0 || target_window_id == 0 || window_id == target_window_id {
-        return false;
-    }
-    let (Some(connection), Some(order)) = (connection, order) else {
-        return false;
-    };
-    let connection_id = unsafe { connection() };
-    connection_id != 0
-        && unsafe { order(connection_id, window_id, 1, target_window_id) } == 0
-}
-
-/// Interleave one of this process's windows immediately above another
-/// application's WindowServer window without changing either window's level.
-///
-/// AppKit's `orderWindow:relativeTo:` does not reliably cross application
-/// ownership boundaries: a cursor panel can remain at the back of the normal
-/// window band even though the call succeeds. SkyLight performs the global
-/// WindowServer order using this helper process's owning connection. Callers
-/// retain their public-AppKit fallback for older systems where the symbols do
-/// not resolve.
-pub fn order_window_above(window_id: u32, target_window_id: u32) -> bool {
-    order_window_above_with(
-        connection_id_fn(),
-        order_window_fn(),
-        window_id,
-        target_window_id,
-    )
 }
 
 // ── Focus-without-raise ───────────────────────────────────────────────────────
@@ -574,51 +527,4 @@ pub(crate) fn with_menu_shortcut_activation_guarded(
 
     result?;
     Ok(true)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static ORDER_CONNECTION: AtomicU32 = AtomicU32::new(0);
-    static ORDER_WINDOW: AtomicU32 = AtomicU32::new(0);
-    static ORDER_MODE: AtomicU32 = AtomicU32::new(0);
-    static ORDER_RELATIVE_TO: AtomicU32 = AtomicU32::new(0);
-
-    unsafe extern "C" fn test_connection_id() -> u32 {
-        0xCAFE
-    }
-
-    unsafe extern "C" fn record_window_order(
-        connection: u32,
-        window: u32,
-        mode: i32,
-        relative_to: u32,
-    ) -> i32 {
-        ORDER_CONNECTION.store(connection, Ordering::SeqCst);
-        ORDER_WINDOW.store(window, Ordering::SeqCst);
-        ORDER_MODE.store(mode as u32, Ordering::SeqCst);
-        ORDER_RELATIVE_TO.store(relative_to, Ordering::SeqCst);
-        0
-    }
-
-    #[test]
-    fn global_window_ordering_uses_current_connection_and_exact_target() {
-        ORDER_CONNECTION.store(0, Ordering::SeqCst);
-        ORDER_WINDOW.store(0, Ordering::SeqCst);
-        ORDER_MODE.store(0, Ordering::SeqCst);
-        ORDER_RELATIVE_TO.store(0, Ordering::SeqCst);
-
-        assert!(order_window_above_with(
-            Some(test_connection_id),
-            Some(record_window_order),
-            42,
-            84,
-        ));
-        assert_eq!(ORDER_CONNECTION.load(Ordering::SeqCst), 0xCAFE);
-        assert_eq!(ORDER_WINDOW.load(Ordering::SeqCst), 42);
-        assert_eq!(ORDER_MODE.load(Ordering::SeqCst), 1);
-        assert_eq!(ORDER_RELATIVE_TO.load(Ordering::SeqCst), 84);
-    }
 }
