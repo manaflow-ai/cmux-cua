@@ -528,3 +528,50 @@ pub(crate) fn with_menu_shortcut_activation_guarded(
     result?;
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static ORDER_CONNECTION: AtomicU32 = AtomicU32::new(0);
+    static ORDER_WINDOW: AtomicU32 = AtomicU32::new(0);
+    static ORDER_MODE: AtomicU32 = AtomicU32::new(0);
+    static ORDER_RELATIVE_TO: AtomicU32 = AtomicU32::new(0);
+
+    unsafe extern "C" fn test_connection_id() -> u32 {
+        0xCAFE
+    }
+
+    unsafe extern "C" fn record_window_order(
+        connection: u32,
+        window: u32,
+        mode: i32,
+        relative_to: u32,
+    ) -> i32 {
+        ORDER_CONNECTION.store(connection, Ordering::SeqCst);
+        ORDER_WINDOW.store(window, Ordering::SeqCst);
+        ORDER_MODE.store(mode as u32, Ordering::SeqCst);
+        ORDER_RELATIVE_TO.store(relative_to, Ordering::SeqCst);
+        0
+    }
+
+    #[test]
+    fn global_window_ordering_uses_current_connection_and_exact_target() {
+        ORDER_CONNECTION.store(0, Ordering::SeqCst);
+        ORDER_WINDOW.store(0, Ordering::SeqCst);
+        ORDER_MODE.store(0, Ordering::SeqCst);
+        ORDER_RELATIVE_TO.store(0, Ordering::SeqCst);
+
+        assert!(order_window_above_with(
+            Some(test_connection_id),
+            Some(record_window_order),
+            42,
+            84,
+        ));
+        assert_eq!(ORDER_CONNECTION.load(Ordering::SeqCst), 0xCAFE);
+        assert_eq!(ORDER_WINDOW.load(Ordering::SeqCst), 42);
+        assert_eq!(ORDER_MODE.load(Ordering::SeqCst), 1);
+        assert_eq!(ORDER_RELATIVE_TO.load(Ordering::SeqCst), 84);
+    }
+}
