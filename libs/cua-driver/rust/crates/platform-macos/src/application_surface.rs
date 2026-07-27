@@ -13,9 +13,7 @@ use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use anyhow::{anyhow, bail, Context};
-use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventType, CGMouseButton, EventField, ScrollEventUnit,
-};
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton, ScrollEventUnit};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use foreign_types::ForeignType;
@@ -520,6 +518,7 @@ struct ApplicationSurfaceSession {
     target_process_id: i32,
     stream: SCStream,
     frame_state: Arc<CaptureFrameState>,
+    pointer_state: Arc<Mutex<ApplicationSurfacePointerState>>,
 }
 
 impl Drop for ApplicationSurfaceSession {
@@ -533,6 +532,53 @@ impl Drop for ApplicationSurfaceSession {
 #[derive(Default)]
 struct ApplicationSurfaceManager {
     sessions: HashMap<String, ApplicationSurfaceSession>,
+}
+
+#[derive(Default)]
+struct ApplicationSurfacePointerState {
+    left_click_group_id: Option<i64>,
+    right_click_group_id: Option<i64>,
+}
+
+impl ApplicationSurfacePointerState {
+    fn group_for(&mut self, kind: &str) -> i64 {
+        match kind {
+            "left_mouse_down" => {
+                let group = next_click_group_id();
+                self.left_click_group_id = Some(group);
+                group
+            }
+            "left_mouse_dragged" => *self
+                .left_click_group_id
+                .get_or_insert_with(next_click_group_id),
+            "left_mouse_up" => self
+                .left_click_group_id
+                .take()
+                .unwrap_or_else(next_click_group_id),
+            "right_mouse_down" => {
+                let group = next_click_group_id();
+                self.right_click_group_id = Some(group);
+                group
+            }
+            "right_mouse_dragged" => *self
+                .right_click_group_id
+                .get_or_insert_with(next_click_group_id),
+            "right_mouse_up" => self
+                .right_click_group_id
+                .take()
+                .unwrap_or_else(next_click_group_id),
+            "mouse_moved" => self
+                .left_click_group_id
+                .or(self.right_click_group_id)
+                .unwrap_or_else(next_click_group_id),
+            _ => next_click_group_id(),
+        }
+    }
+}
+
+fn next_click_group_id() -> i64 {
+    static NEXT_CLICK_GROUP_ID: AtomicU64 = AtomicU64::new(1);
+    (NEXT_CLICK_GROUP_ID.fetch_add(1, Ordering::Relaxed) & i64::MAX as u64) as i64
 }
 
 fn manager() -> &'static Mutex<ApplicationSurfaceManager> {
@@ -668,6 +714,7 @@ pub fn start(
             target_process_id: request.process_id,
             stream,
             frame_state,
+            pointer_state: Arc::new(Mutex::new(ApplicationSurfacePointerState::default())),
         },
     );
     Ok(result)
@@ -721,7 +768,7 @@ pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
     if !permissions::current_status().accessibility {
         bail!("accessibility_permission_required");
     }
-    let (target_window_id, target_process_id, frame_state) = {
+    let (target_window_id, target_process_id, frame_state, pointer_state) = {
         let manager = manager()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -733,6 +780,7 @@ pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
             session.target_window_id,
             session.target_process_id,
             session.frame_state.clone(),
+            session.pointer_state.clone(),
         )
     };
     if frame_state.failed.load(Ordering::Acquire) {
@@ -767,6 +815,7 @@ pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
                 source_y * target.bounds.height,
                 event.modifiers,
                 event.click_count,
+                &pointer_state,
             )
         }
         "scroll" => {
@@ -787,6 +836,7 @@ pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
                 event.delta_x,
                 event.delta_y,
                 event.modifiers,
+                &pointer_state,
             )
         }
         "key" => post_key(
@@ -819,6 +869,7 @@ fn post_mouse(
     local_y: f64,
     modifiers: u64,
     click_count: i64,
+    pointer_state: &Mutex<ApplicationSurfacePointerState>,
 ) -> anyhow::Result<()> {
     let (event_type, button, button_number) = match kind {
         "mouse_moved" => (CGEventType::MouseMoved, CGMouseButton::Left, 0),
@@ -832,20 +883,45 @@ fn post_mouse(
     };
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow!("could not create mouse event source"))?;
-    let event =
-        CGEvent::new_mouse_event(source, event_type, CGPoint::new(screen_x, screen_y), button)
-            .map_err(|_| anyhow!("could not create mouse event"))?;
+    let point = CGPoint::new(screen_x, screen_y);
+    let click_group_id = pointer_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .group_for(kind);
+    if matches!(kind, "left_mouse_down" | "right_mouse_down") {
+        crate::input::mouse::post_mouse_moved_primer(
+            process_id,
+            &source,
+            point,
+            Some((local_x, local_y)),
+            Some(window_id),
+            Some(click_group_id),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(12));
+    }
+    let event = CGEvent::new_mouse_event(source, event_type, point, button)
+        .map_err(|_| anyhow!("could not create mouse event"))?;
     event.set_flags(CGEventFlags::from_bits_truncate(modifiers));
-    event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, click_count.clamp(1, 3));
-    let pointer = event.as_ptr() as *mut c_void;
-    crate::input::skylight::set_window_location(pointer, local_x, local_y);
-    crate::input::skylight::set_integer_field(pointer, 3, button_number);
-    crate::input::skylight::set_integer_field(pointer, 40, process_id as i64);
-    crate::input::skylight::set_integer_field(pointer, 51, window_id as i64);
-    crate::input::skylight::set_integer_field(pointer, 91, window_id as i64);
-    crate::input::skylight::set_integer_field(pointer, 92, window_id as i64);
-    crate::input::skylight::post_to_pid(process_id as libc::pid_t, pointer, false);
-    event.post_to_pid(process_id as libc::pid_t);
+    let click_state = if kind == "mouse_moved" {
+        0
+    } else {
+        click_count.clamp(1, 3)
+    };
+    let subtype = if matches!(kind, "left_mouse_dragged" | "right_mouse_dragged") {
+        0
+    } else {
+        3
+    };
+    crate::input::mouse::post_mouse_event(
+        process_id,
+        &event,
+        Some((local_x, local_y)),
+        Some(window_id),
+        Some(click_group_id),
+        click_state,
+        button_number,
+        subtype,
+    );
     Ok(())
 }
 
@@ -860,6 +936,7 @@ fn post_scroll(
     delta_x: f64,
     delta_y: f64,
     modifiers: u64,
+    pointer_state: &Mutex<ApplicationSurfacePointerState>,
 ) -> anyhow::Result<()> {
     let wheel_x = delta_x.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32;
     let wheel_y = delta_y.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32;
@@ -877,6 +954,7 @@ fn post_scroll(
         local_y,
         modifiers,
         1,
+        pointer_state,
     )?;
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -963,5 +1041,18 @@ mod tests {
         assert_eq!(capture_pixel_size(800.0, 600.0).unwrap(), (1600, 1200));
         assert_eq!(capture_pixel_size(5000.0, 2500.0).unwrap(), (4096, 2048));
         assert!(capture_pixel_size(0.0, 600.0).is_err());
+    }
+
+    #[test]
+    fn pointer_click_group_survives_a_gesture_and_clears_on_release() {
+        let mut state = ApplicationSurfacePointerState::default();
+        let down = state.group_for("left_mouse_down");
+        assert_eq!(state.group_for("left_mouse_dragged"), down);
+        assert_eq!(state.group_for("mouse_moved"), down);
+        assert_eq!(state.group_for("left_mouse_up"), down);
+        assert!(state.left_click_group_id.is_none());
+
+        let next_down = state.group_for("left_mouse_down");
+        assert_ne!(next_down, down);
     }
 }
