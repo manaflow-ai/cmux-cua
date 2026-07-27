@@ -1875,7 +1875,7 @@ pub async fn run_serve(
                                             serde_json::json!({"windows": windows}),
                                         ),
                                         Ok(Err(error)) => {
-                                            DaemonResponse::err(error.to_string(), 1)
+                                            DaemonResponse::err(format!("{error:#}"), 1)
                                         }
                                         Err(error) => DaemonResponse::err(
                                             format!("Application-window task failed: {error}"),
@@ -1925,7 +1925,7 @@ pub async fn run_serve(
                                                 ),
                                             ),
                                             Ok(Err(error)) => {
-                                                DaemonResponse::err(error.to_string(), 1)
+                                                DaemonResponse::err(format!("{error:#}"), 1)
                                             }
                                             Err(error) => DaemonResponse::err(
                                                 format!(
@@ -2023,7 +2023,7 @@ pub async fn run_serve(
                                                 serde_json::json!({"sent": true}),
                                             ),
                                             Ok(Err(error)) => {
-                                                DaemonResponse::err(error.to_string(), 1)
+                                                DaemonResponse::err(format!("{error:#}"), 1)
                                             }
                                             Err(error) => DaemonResponse::err(
                                                 format!(
