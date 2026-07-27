@@ -2749,6 +2749,70 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_target_bootstraps_or_recovers_cursor_without_recentring_valid_position() {
+        let mut map = empty_map();
+        let key = "codex-compat-session".to_owned();
+        let target = LogicalRect {
+            left: 1_000.0,
+            top: 300.0,
+            width: 230.0,
+            height: 408.0,
+        };
+        let displays = [DisplayGeometry {
+            bounds: LogicalRect {
+                left: 0.0,
+                top: 0.0,
+                width: 1_512.0,
+                height: 982.0,
+            },
+            backing_scale: 2.0,
+        }];
+        let target_center = (1_115.0, 504.0);
+
+        assert_eq!(
+            cursor_target_entry_point(&map, &key, 42, target, &displays),
+            Some(target_center),
+            "the first app snapshot must place a previously absent cursor inside its target"
+        );
+
+        let template = map.template.clone();
+        map.cursors
+            .insert(key.clone(), render_state_for_key(&template, &key));
+        {
+            let cursor = map.cursors.get_mut(&key).unwrap();
+            cursor.core.place_at(692.0, -501.0);
+            cursor.core.pinned_wid = Some(42);
+        }
+        assert_eq!(
+            cursor_target_entry_point(&map, &key, 42, target, &displays),
+            Some(target_center),
+            "a cursor stranded on a detached display must re-enter the live target"
+        );
+
+        {
+            let cursor = map.cursors.get_mut(&key).unwrap();
+            cursor.core.place_at(400.0, 400.0);
+            cursor.core.pinned_wid = Some(7);
+        }
+        assert_eq!(
+            cursor_target_entry_point(&map, &key, 42, target, &displays),
+            Some(target_center),
+            "switching to a different target must bring an unrelated cursor into that window"
+        );
+
+        {
+            let cursor = map.cursors.get_mut(&key).unwrap();
+            cursor.core.place_at(1_120.0, 520.0);
+            cursor.core.pinned_wid = Some(42);
+        }
+        assert_eq!(
+            cursor_target_entry_point(&map, &key, 42, target, &displays),
+            None,
+            "refreshing the same target must preserve the user's last valid cursor position"
+        );
+    }
+
+    #[test]
     fn per_key_arrival_isolation() {
         // Two concurrent waiters keyed A and B; firing A must not cancel B.
         // This mirrors the ARRIVAL_TX HashMap logic in isolation (no statics).
