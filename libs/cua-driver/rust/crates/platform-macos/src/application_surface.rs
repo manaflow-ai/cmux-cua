@@ -541,9 +541,7 @@ fn manager() -> &'static Mutex<ApplicationSurfaceManager> {
 }
 
 pub fn list_windows() -> anyhow::Result<Vec<ApplicationWindow>> {
-    if !permissions::current_status().screen_recording {
-        bail!("screen_recording_permission_required");
-    }
+    require_application_surface_permissions()?;
     let content = SCShareableContent::create()
         .with_on_screen_windows_only(false)
         .with_exclude_desktop_windows(true)
@@ -592,9 +590,7 @@ pub fn list_windows() -> anyhow::Result<Vec<ApplicationWindow>> {
 pub fn start(
     request: ApplicationSurfaceStartRequest,
 ) -> anyhow::Result<ApplicationSurfaceStartResult> {
-    if !permissions::current_status().screen_recording {
-        bail!("screen_recording_permission_required");
-    }
+    require_application_surface_permissions()?;
     if !(1..=120).contains(&request.frame_rate) || request.window_id == 0 || request.process_id <= 0
     {
         bail!("invalid application-surface target or frame rate");
@@ -675,6 +671,17 @@ pub fn start(
         },
     );
     Ok(result)
+}
+
+fn require_application_surface_permissions() -> anyhow::Result<()> {
+    let status = permissions::current_status();
+    if !status.accessibility {
+        bail!("accessibility_permission_required");
+    }
+    if !status.screen_recording {
+        bail!("screen_recording_permission_required");
+    }
+    Ok(())
 }
 
 fn capture_pixel_size(width: f64, height: f64) -> anyhow::Result<(usize, usize)> {
