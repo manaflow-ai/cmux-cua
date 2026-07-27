@@ -191,11 +191,6 @@ impl SharedFrameRing {
     }
 
     fn map(name: CString, descriptor_handle: RawFd, layout: FrameLayout) -> anyhow::Result<Self> {
-        if unsafe { libc::fchmod(descriptor_handle, 0o600) } != 0 {
-            unlink_shared_memory(&name);
-            return Err(std::io::Error::last_os_error())
-                .context("could not restrict frame-ring permissions");
-        }
         if unsafe { libc::ftruncate(descriptor_handle, layout.total_byte_count as libc::off_t) }
             != 0
         {
@@ -355,11 +350,19 @@ fn create_shared_memory() -> anyhow::Result<(CString, RawFd)> {
         let handle = unsafe {
             libc::shm_open(
                 name.as_ptr(),
-                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_CLOEXEC,
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
                 0o600,
             )
         };
         if handle >= 0 {
+            if unsafe { libc::fcntl(handle, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe {
+                    libc::close(handle);
+                }
+                unlink_shared_memory(&name);
+                return Err(error).context("could not protect frame-ring descriptor");
+            }
             return Ok((name, handle));
         }
         let error = std::io::Error::last_os_error();
@@ -926,6 +929,17 @@ mod tests {
         assert_eq!(descriptor.width, 2);
         assert_eq!(descriptor.height, 2);
         assert_eq!(descriptor.slot_count, FRAME_SLOT_COUNT);
+
+        let name = CString::new(descriptor.shared_memory_name).unwrap();
+        let descriptor_handle = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(descriptor_handle >= 0);
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        assert_eq!(unsafe { libc::fstat(descriptor_handle, metadata.as_mut_ptr()) }, 0);
+        unsafe {
+            libc::close(descriptor_handle);
+        }
+        let metadata = unsafe { metadata.assume_init() };
+        assert_eq!(metadata.st_mode & 0o777, 0o600);
     }
 
     #[test]
