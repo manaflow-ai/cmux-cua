@@ -675,7 +675,9 @@ pub fn start(
         .with_height(height as u32)
         .with_minimum_frame_interval(&interval)
         .with_queue_depth(3)
-        .with_shows_cursor(true)
+        // The host already presents the local pointer over the pane. Capturing
+        // the target window's synthetic pointer would render a second cursor.
+        .with_shows_cursor(false)
         .with_pixel_format(PixelFormat::BGRA)
         .with_scales_to_fit(true)
         .with_preserves_aspect_ratio(true);
