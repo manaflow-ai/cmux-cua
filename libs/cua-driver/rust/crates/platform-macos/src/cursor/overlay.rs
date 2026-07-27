@@ -927,6 +927,85 @@ fn active_display_geometries(fallback_scale: f64) -> Vec<DisplayGeometry> {
     displays
 }
 
+fn cursor_target_entry_point(
+    map: &RenderMap,
+    key: &CursorKey,
+    target_window_id: u64,
+    target_bounds: LogicalRect,
+    displays: &[DisplayGeometry],
+) -> Option<(f64, f64)> {
+    if !target_bounds.is_valid() || map.ended.contains(key) {
+        return None;
+    }
+
+    let target_center = (
+        target_bounds.left + target_bounds.width / 2.0,
+        target_bounds.top + target_bounds.height / 2.0,
+    );
+    let Some(cursor) = map.cursors.get(key) else {
+        return map.template.enabled.then_some(target_center);
+    };
+    if !cursor.core.cfg.enabled || !cursor.core.visible {
+        return None;
+    }
+    if cursor.core.is_unplaced() {
+        return Some(target_center);
+    }
+
+    let cursor_point = cursor.core.pos;
+    let on_active_display = displays.is_empty()
+        || displays
+            .iter()
+            .any(|display| display.bounds.contains(cursor_point));
+    if !on_active_display {
+        return Some(target_center);
+    }
+
+    (cursor.core.pinned_wid != Some(target_window_id)
+        && !target_bounds.contains(cursor_point))
+    .then_some(target_center)
+}
+
+/// Keep a compatibility snapshot's cursor on the same target-relative layer.
+///
+/// A first snapshot has no action point yet, so it previously left the cursor
+/// unplaced and invisible. A cursor can also become stranded off-display when
+/// a monitor is detached between calls. Pin every successful snapshot to its
+/// exact window, and glide into the window centre only when placement or
+/// recovery is actually needed; repeated snapshots of the same live target
+/// retain the action's last cursor position.
+pub async fn present_cursor_for_snapshot_target(
+    key: CursorKey,
+    target_window_id: u64,
+    target_bounds: &crate::windows::WindowBounds,
+) -> Option<(f64, f64)> {
+    if key.is_empty() {
+        return None;
+    }
+    let target = LogicalRect {
+        left: target_bounds.x,
+        top: target_bounds.y,
+        width: target_bounds.width,
+        height: target_bounds.height,
+    };
+    let displays = active_display_geometries(1.0);
+    let entry_point = {
+        let guard = RENDER.lock().unwrap();
+        guard.as_ref().and_then(|map| {
+            cursor_target_entry_point(map, &key, target_window_id, target, &displays)
+        })
+    };
+
+    let _ = send_command(
+        key.clone(),
+        OverlayCommand::PinAbove(target_window_id),
+    );
+    if let Some((x, y)) = entry_point {
+        animate_cursor_to(key, x, y).await;
+    }
+    entry_point
+}
+
 fn window_bounds_snapshot() -> HashMap<u64, LogicalRect> {
     crate::windows::all_windows()
         .into_iter()
