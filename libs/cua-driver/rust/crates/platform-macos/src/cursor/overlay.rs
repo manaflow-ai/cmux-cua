@@ -2421,7 +2421,7 @@ mod tests {
     }
 
     #[test]
-    fn global_appkit_transform_preserves_left_and_above_main_coordinates() {
+    fn global_appkit_transform_does_not_reapply_the_anchor_display_origin() {
         let main = ScreenGeometry {
             origin_x: 10.0,
             origin_y: 20.0,
@@ -2437,7 +2437,10 @@ mod tests {
             },
             main,
         );
-        assert_eq!(left.x, -1790.0);
+        assert_eq!(
+            left.x, -1800.0,
+            "Quartz cursor coordinates are already global; a non-zero NSScreen origin must not be added again"
+        );
         assert_eq!(left.y, 676.0);
 
         let above = appkit_frame_for_rect(
@@ -2449,10 +2452,36 @@ mod tests {
             },
             main,
         );
-        assert_eq!(above.x, 310.0);
+        assert_eq!(above.x, 300.0);
         assert_eq!(above.y, 1376.0);
         assert_eq!(above.width, 144.0);
         assert_eq!(above.height, 144.0);
+    }
+
+    #[test]
+    fn primary_display_geometry_is_stable_when_main_screen_is_external() {
+        let external_main_screen = LogicalRect {
+            left: -575.0,
+            top: -1080.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        let primary_display = LogicalRect {
+            left: 0.0,
+            top: 0.0,
+            width: 1512.0,
+            height: 982.0,
+        };
+
+        let screen = screen_geometry_for_primary_display(
+            primary_display,
+            external_main_screen,
+            2.0,
+        );
+
+        assert_eq!(screen.origin_x, 0.0);
+        assert_eq!(screen.origin_y, 0.0);
+        assert_eq!(screen.height, 982.0);
     }
 
     #[test]
