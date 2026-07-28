@@ -1057,4 +1057,15 @@ mod tests {
         let next_down = state.group_for("left_mouse_down");
         assert_ne!(next_down, down);
     }
+
+    #[test]
+    fn keyboard_targets_keep_same_process_windows_distinct() {
+        let first = ApplicationSurfaceKeyboardTarget::new(101, 44).unwrap();
+        let second = ApplicationSurfaceKeyboardTarget::new(202, 44).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(first.window_id, 101);
+        assert_eq!(second.window_id, 202);
+        assert_eq!(first.process_id, second.process_id);
+    }
 }
