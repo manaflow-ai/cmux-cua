@@ -486,3 +486,32 @@ impl OverlayCommand {
         }
     }
 }
+
+#[cfg(test)]
+mod cursor_speed_arg_tests {
+    use super::{CursorConfig, MotionConfig};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn cursor_speed_flag_scales_glide_speed() {
+        let stock = MotionConfig::default();
+        let cfg = CursorConfig::parse(&args(&["--cursor-speed", "1.75"]));
+        assert_eq!(cfg.motion.peak_speed, stock.peak_speed * 1.75);
+        assert_eq!(cfg.motion.min_end_speed, stock.min_end_speed * 1.75);
+        // Click visuals keep their stock durations.
+        assert_eq!(cfg.motion.press_duration_ms, stock.press_duration_ms);
+        assert_eq!(cfg.motion.dwell_after_click_ms, stock.dwell_after_click_ms);
+    }
+
+    #[test]
+    fn cursor_speed_flag_tolerates_garbage_and_missing_values() {
+        let stock = MotionConfig::default();
+        let garbage = CursorConfig::parse(&args(&["--cursor-speed", "fast"]));
+        assert_eq!(garbage.motion.peak_speed, stock.peak_speed);
+        let missing = CursorConfig::parse(&args(&["--cursor-speed"]));
+        assert_eq!(missing.motion.peak_speed, stock.peak_speed);
+    }
+}
