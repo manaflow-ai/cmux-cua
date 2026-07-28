@@ -1220,6 +1220,12 @@ fn validate_system_permission_request(permission: Option<&str>) -> DaemonRespons
     }
 }
 
+fn screen_capture_verification_response(capturable: bool) -> DaemonResponse {
+    DaemonResponse::ok(serde_json::json!({
+        "capturable": capturable,
+    }))
+}
+
 #[cfg(target_os = "macos")]
 fn request_validated_system_permission(permission: &str) {
     match permission {
@@ -2038,6 +2044,35 @@ pub async fn run_serve(
                                 #[cfg(not(target_os = "macos"))]
                                 let resp = DaemonResponse::err(
                                     "application_surface_event is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "verify_screen_capture" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
+                                #[cfg(target_os = "macos")]
+                                let resp = {
+                                    let capturable = tokio::task::spawn_blocking(
+                                        platform_macos::tools::verify_screen_capture_ready,
+                                    )
+                                    .await
+                                    .unwrap_or(false);
+                                    screen_capture_verification_response(capturable)
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "Screen capture verification is available only on macOS",
                                     64,
                                 );
                                 let _ = writer.write_all(
@@ -2899,6 +2934,15 @@ pub async fn run_serve(
                                 #[cfg(not(target_os = "macos"))]
                                 let _ = response_sent;
                             }
+                            "verify_screen_capture" => {
+                                let resp = DaemonResponse::err(
+                                    "Screen capture verification is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
                             "list" => {
                                 // Include full ToolDef so MCP proxy callers can
                                 // build a complete `tools/list` response from
@@ -3248,7 +3292,10 @@ pub fn run_status_cmd(socket_path: &str, pid_file_path: &str) {
 
 #[cfg(test)]
 mod external_permission_flow_tests {
-    use super::{clamp_external_permission_prompt, validate_system_permission_request};
+    use super::{
+        clamp_external_permission_prompt, screen_capture_verification_response,
+        validate_system_permission_request,
+    };
 
     #[test]
     fn external_permission_flow_clamps_agent_prompt_requests() {
@@ -3269,6 +3316,20 @@ mod external_permission_flow_tests {
         assert_eq!(
             response.error.as_deref(),
             Some("Unknown system permission: camera")
+        );
+    }
+
+    #[test]
+    fn host_screen_capture_verification_reports_live_readiness_explicitly() {
+        let ready = screen_capture_verification_response(true);
+        assert!(ready.ok);
+        assert_eq!(ready.result.unwrap()["capturable"], serde_json::json!(true));
+
+        let unavailable = screen_capture_verification_response(false);
+        assert!(unavailable.ok);
+        assert_eq!(
+            unavailable.result.unwrap()["capturable"],
+            serde_json::json!(false)
         );
     }
 }

@@ -35,6 +35,16 @@ mod zoom;
 mod type_text_chars;
 mod page;
 
+/// Perform the prompt-capable live ScreenCaptureKit readiness check for an
+/// embedding host's explicit onboarding flow.
+///
+/// This is deliberately not registered as an MCP tool. Only the daemon's
+/// host-authenticated control request can reach it, so agents cannot raise
+/// Tahoe's private-window-picker consent outside the host UI.
+pub fn verify_screen_capture_ready() -> bool {
+    check_permissions::screen_recording_capturable()
+}
+
 use cua_driver_core::tool::ToolRegistry;
 use std::sync::Arc;
 use std::collections::HashMap;
