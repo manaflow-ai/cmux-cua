@@ -18,14 +18,41 @@ pub struct CheckPermissionsTool;
 /// `CGPreflightScreenCaptureAccess()` (used by `screen_recording_granted`)
 /// answers from a per-process cache that goes stale after `tccutil reset`
 /// and is unreliable for CLI / child processes — the same finding Peekaboo
-/// documents. `SCShareableContent::get()` does a live query: it only
-/// returns displays when the answering process can genuinely capture. When
-/// it disagrees with the preflight boolean, the preflight one is lying.
+/// documents. Display enumeration alone is not sufficient on macOS Tahoe:
+/// `SCShareableContent::get()` can return displays while the separate
+/// direct-capture consent alert is still waiting for a decision. Readiness
+/// therefore requires one real frame from `SCScreenshotManager`.
 pub(super) fn screen_recording_capturable() -> bool {
-    use screencapturekit::prelude::SCShareableContent;
-    SCShareableContent::get()
-        .map(|c| !c.displays().is_empty())
-        .unwrap_or(false)
+    use screencapturekit::{
+        prelude::{SCContentFilter, SCShareableContent, SCStreamConfiguration},
+        screenshot_manager::SCScreenshotManager,
+    };
+
+    verify_screen_capture_with(
+        || {
+            SCShareableContent::get()
+                .ok()?
+                .displays()
+                .into_iter()
+                .next()
+        },
+        |display| {
+            let filter = SCContentFilter::create()
+                .with_display(display)
+                .with_excluding_windows(&[])
+                .build();
+            let configuration = SCStreamConfiguration::new().with_width(1).with_height(1);
+            SCScreenshotManager::capture_image(&filter, &configuration)
+                .is_ok_and(|image| image.width() > 0 && image.height() > 0)
+        },
+    )
+}
+
+fn verify_screen_capture_with<Display>(
+    load_display: impl FnOnce() -> Option<Display>,
+    capture_frame: impl FnOnce(&Display) -> bool,
+) -> bool {
+    load_display().as_ref().is_some_and(capture_frame)
 }
 
 /// Run the ScreenCaptureKit probe only on an explicitly prompt-capable path.
@@ -455,6 +482,37 @@ mod tests {
             _ => None,
         }).unwrap_or_default();
         assert!(!text.contains("live capture probe failed"));
+    }
+
+    #[test]
+    fn capture_readiness_requires_a_real_frame_after_display_enumeration() {
+        let captures = std::cell::Cell::new(0);
+        assert!(!verify_screen_capture_with(
+            || None::<u8>,
+            |_| {
+                captures.set(captures.get() + 1);
+                true
+            }
+        ));
+        assert_eq!(captures.get(), 0);
+
+        assert!(!verify_screen_capture_with(
+            || Some(7_u8),
+            |_| {
+                captures.set(captures.get() + 1);
+                false
+            }
+        ));
+        assert_eq!(captures.get(), 1);
+
+        assert!(verify_screen_capture_with(
+            || Some(7_u8),
+            |_| {
+                captures.set(captures.get() + 1);
+                true
+            }
+        ));
+        assert_eq!(captures.get(), 2);
     }
 
     #[test]
