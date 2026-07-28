@@ -693,19 +693,46 @@ impl ToolRegistry {
             "drag",
             "set_value",
             "get_window_state",
+            // Codex compatibility surface. Its tools address the target by app
+            // NAME and resolve the pid internally, so the fallback below reads
+            // the resolved identity from the successful result instead.
+            "get_app_state",
+            "perform_secondary_action",
+            "select_text",
         ];
-        if result.is_error != Some(true)
-            && STATE_ACTION_TOOLS.contains(&resolved_name)
-            && (args.get("pid").and_then(Value::as_i64).is_some()
-                || args.get("window_id").and_then(Value::as_u64).is_some())
-        {
-            if let Some(state_file) = &self.state_file {
-                let target_pid = args
-                    .get("pid")
-                    .and_then(Value::as_i64);
+        if result.is_error != Some(true) && STATE_ACTION_TOOLS.contains(&resolved_name) {
+            // Native tools carry the target pid/window in their args. The
+            // Codex compatibility tools carry only an app name there; their
+            // successful results report the resolved "pid"/"window_id" in
+            // structuredContent. Without this fallback Codex sessions never
+            // produce the authenticated state files that power the embedding
+            // host's session controls (menu bar target, focus, stop).
+            let structured = result.structured_content.as_ref();
+            // Codex-compat results nest the resolved identity under "app"
+            // (see codex_compat::state_result), so check both shapes.
+            let target_pid = args
+                .get("pid")
+                .and_then(Value::as_i64)
+                .or_else(|| structured?.get("pid")?.as_i64())
+                .or_else(|| structured?.get("app")?.get("pid")?.as_i64());
+            let target_window = args
+                .get("window_id")
+                .and_then(Value::as_u64)
+                .or_else(|| structured?.get("window_id")?.as_u64());
+            if let Some(state_file) = self
+                .state_file
+                .as_ref()
+                .filter(|_| target_pid.is_some() || target_window.is_some())
+            {
                 let target_app = target_pid
                     .and_then(|pid| self.target_app_resolver.and_then(|resolver| resolver(pid)));
                 let mut state_args = args.clone();
+                if let Some(pid) = target_pid {
+                    state_args["pid"] = serde_json::json!(pid);
+                }
+                if let Some(window_id) = target_window {
+                    state_args["window_id"] = serde_json::json!(window_id);
+                }
                 if state_args.get("window_id").and_then(Value::as_u64).is_none() {
                     if let (Some(pid), Some(token)) = (
                         target_pid.and_then(|pid| i32::try_from(pid).ok()),
@@ -1125,6 +1152,143 @@ mod capability_tests {
             assert_eq!(state.target_app.as_deref(), Some(target_app.as_str()));
             assert_eq!(state.target_pid, Some(pid));
             assert_eq!(state.target_window_id, Some(window_id));
+        }
+    }
+
+    struct StructuredTargetTool {
+        def: ToolDef,
+        pid: i64,
+        window_id: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StructuredTargetTool {
+        fn def(&self) -> &ToolDef { &self.def }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            ToolResult {
+                content: vec![Content::text("ok")],
+                is_error: None,
+                structured_content: Some(serde_json::json!({
+                    "pid": self.pid,
+                    "window_id": self.window_id,
+                })),
+            }
+        }
+    }
+
+    /// Codex-surface tools address the target by app NAME; the resolved
+    /// pid/window arrive only in the successful result's structuredContent.
+    /// State must still be written, or Codex sessions never surface in the
+    /// embedding host's session controls.
+    #[tokio::test]
+    async fn app_named_actions_update_state_from_structured_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.set_state_file_for_test(crate::session_state::StateFile::new(
+            dir.path().to_owned(),
+            6161,
+        ));
+        registry.set_target_app_resolver(|pid| Some(format!("Target-{pid}")));
+        for name in ["click", "get_app_state", "perform_secondary_action"] {
+            registry.register(Box::new(StructuredTargetTool {
+                def: dummy_def(name),
+                pid: 4242,
+                window_id: 777,
+            }));
+        }
+
+        for name in ["click", "get_app_state", "perform_secondary_action"] {
+            let session = format!("codex-{name}");
+            let result = registry
+                .invoke(
+                    name,
+                    serde_json::json!({
+                        "session": session,
+                        "app": "Calculator",
+                    }),
+                )
+                .await;
+            assert_ne!(result.is_error, Some(true));
+            let path = registry
+                .state_file
+                .as_ref()
+                .unwrap()
+                .path_for_session(Some(&session));
+            let state: crate::session_state::DriverProcessState =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(state.session.as_deref(), Some(session.as_str()));
+            assert_eq!(state.target_app.as_deref(), Some("Target-4242"));
+            assert_eq!(state.target_pid, Some(4242));
+            assert_eq!(state.target_window_id, Some(777));
+        }
+    }
+
+    /// The real codex-compat results nest the resolved identity under "app"
+    /// (codex_compat::state_result) and expose no top-level pid/window_id.
+    /// This is the exact shape of the Calculator regression: actions ran,
+    /// cursor files appeared, but no session state was ever written.
+    #[tokio::test]
+    async fn app_named_actions_update_state_from_nested_app_identity() {
+        struct NestedAppTool {
+            def: ToolDef,
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for NestedAppTool {
+            fn def(&self) -> &ToolDef { &self.def }
+
+            async fn invoke(&self, _args: Value) -> ToolResult {
+                ToolResult {
+                    content: vec![Content::text("ok")],
+                    is_error: None,
+                    structured_content: Some(serde_json::json!({
+                        "app": {
+                            "name": "Calculator",
+                            "bundle_id": "com.apple.calculator",
+                            "pid": 40930,
+                        },
+                        "window_title": "Calculator",
+                    })),
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.set_state_file_for_test(crate::session_state::StateFile::new(
+            dir.path().to_owned(),
+            6262,
+        ));
+        registry.set_target_app_resolver(|pid| Some(format!("Target-{pid}")));
+        for name in ["click", "get_app_state", "type_text", "select_text"] {
+            registry.register(Box::new(NestedAppTool { def: dummy_def(name) }));
+        }
+
+        for name in ["click", "get_app_state", "type_text", "select_text"] {
+            let session = format!("codex-nested-{name}");
+            let result = registry
+                .invoke(
+                    name,
+                    serde_json::json!({
+                        "session": session,
+                        "app": "Calculator",
+                        "element_index": "6",
+                    }),
+                )
+                .await;
+            assert_ne!(result.is_error, Some(true));
+            let path = registry
+                .state_file
+                .as_ref()
+                .unwrap()
+                .path_for_session(Some(&session));
+            let state: crate::session_state::DriverProcessState =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(state.session.as_deref(), Some(session.as_str()));
+            assert_eq!(state.target_app.as_deref(), Some("Target-40930"));
+            assert_eq!(state.target_pid, Some(40930));
+            assert_eq!(state.target_window_id, None);
         }
     }
 
