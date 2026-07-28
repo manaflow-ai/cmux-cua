@@ -2112,6 +2112,7 @@ pub async fn run_serve(
                                 ).await;
                             }
                             "set_cursor_enabled" => {
+                                #[cfg(target_os = "macos")]
                                 let response = if !host_request_authorized {
                                     DaemonResponse::err(
                                         "Unauthorized host-only daemon request".to_owned(),
@@ -2150,6 +2151,11 @@ pub async fn run_serve(
                                         ),
                                     }
                                 };
+                                #[cfg(not(target_os = "macos"))]
+                                let response = DaemonResponse::err(
+                                    "set_cursor_enabled is available only on macOS",
+                                    64,
+                                );
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&response).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -2470,6 +2476,7 @@ pub async fn run_serve(
                                             .lock()
                                             .unwrap()
                                             .insert(sid.to_owned(), token.clone());
+                                        #[cfg(target_os = "macos")]
                                         platform_macos::app_approval::global()
                                             .register_broker(sid, &token);
                                         control_approval_token =
@@ -2555,6 +2562,7 @@ pub async fn run_serve(
                                             &token,
                                         ) =>
                                 {
+                                    #[cfg(target_os = "macos")]
                                     platform_macos::app_approval::global()
                                         .unregister_broker(&owner, &token);
                                     true

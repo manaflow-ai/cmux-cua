@@ -26,9 +26,10 @@
 use std::sync::Arc;
 
 use cua_driver_core::protocol::{
-    codex_computer_use_initialize_result, initialize_result, Request, Response, ToolCall,
-    ToolResult,
+    codex_computer_use_initialize_result, initialize_result, Request, Response,
 };
+#[cfg(target_os = "macos")]
+use cua_driver_core::protocol::{ToolCall, ToolResult};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
