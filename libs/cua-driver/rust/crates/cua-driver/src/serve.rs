@@ -2815,6 +2815,8 @@ pub async fn run_serve(
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ServerOptions;
 
+    let host_authority_configured = configured_socket_host_auth_token().is_some();
+
     eprintln!("Cua Driver daemon listening on {socket_path}");
 
     // Build the cross-IL security descriptor once, reuse on every pipe
@@ -2900,7 +2902,7 @@ pub async fn run_serve(
                     let mut control_session_id: Option<String> = None;
 
                     while let Ok(Some(line)) = lines.next_line().await {
-                        let req = match parse_request(&line) {
+                        let parsed = match parse_request(&line) {
                             Ok(request) => request,
                             Err(resp) => {
                                 let _ = writer.write_all(
@@ -2909,9 +2911,25 @@ pub async fn run_serve(
                                 continue;
                             }
                         };
+                        let host_request_authorized = host_request_is_authorized(
+                            host_authority_configured,
+                            parsed.host_authenticated,
+                            !host_authority_configured,
+                        );
+                        let req = parsed.request;
 
                         match req.method.as_str() {
                             "shutdown" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
                                 let resp = DaemonResponse::ok(serde_json::json!({"shutdown": true}));
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -2921,6 +2939,16 @@ pub async fn run_serve(
                                 return;
                             }
                             "request_system_permission" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
                                 let resp = validate_system_permission_request(req.name.as_deref());
                                 let response_sent = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -2935,6 +2963,16 @@ pub async fn run_serve(
                                 let _ = response_sent;
                             }
                             "verify_screen_capture" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
                                 let resp = DaemonResponse::err(
                                     "Screen capture verification is available only on macOS",
                                     64,
