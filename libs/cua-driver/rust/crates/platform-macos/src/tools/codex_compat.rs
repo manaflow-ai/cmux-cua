@@ -41,6 +41,7 @@ const ANONYMOUS_SESSION: &str = "__codex_compat_connection__";
 const MAX_CLICK_COUNT: u64 = 10;
 const MAX_SCROLL_PAGES: f64 = 10.0;
 const WINDOW_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[repr(C)]
 struct __AXObserver(c_void);
@@ -2727,17 +2728,40 @@ fn wait_for_key_window_blocking(pid: i32) -> Result<(u32, String), CompatError> 
         return Ok(window);
     }
 
-    let mut observer = WindowNotificationObserver::new(pid)?;
-    resolve_after_notifications(
-        WINDOW_WAIT_TIMEOUT,
-        || resolve_key_window_info(pid),
-        |remaining| observer.wait(remaining),
-    )
-    .ok_or_else(|| {
+    let resolved = match WindowNotificationObserver::new(pid) {
+        Ok(mut observer) => resolve_after_notifications(
+            WINDOW_WAIT_TIMEOUT,
+            || resolve_key_window_info(pid),
+            |remaining| observer.wait(remaining),
+        ),
+        // Calculator and some other system apps reject every AX window
+        // notification registration during their first launch on Tahoe even
+        // though their key window becomes queryable moments later. The
+        // observer is only a wake-up optimization; bounded polling preserves
+        // the same deadline without forcing a second get_app_state call.
+        Err(_) => resolve_after_polling(WINDOW_WAIT_TIMEOUT, WINDOW_POLL_INTERVAL, || {
+            resolve_key_window_info(pid)
+        }),
+    };
+    resolved.ok_or_else(|| {
         CompatError::new(
             "app_has_no_window",
             format!("App pid {pid} did not expose a key window within 5 seconds."),
         )
+    })
+}
+
+fn resolve_after_polling<T, Resolve>(
+    timeout: Duration,
+    poll_interval: Duration,
+    resolve: Resolve,
+) -> Option<T>
+where
+    Resolve: FnMut() -> Option<T>,
+{
+    resolve_after_notifications(timeout, resolve, |remaining| {
+        std::thread::sleep(remaining.min(poll_interval));
+        true
     })
 }
 
@@ -4049,6 +4073,18 @@ mod tests {
             final_resolve_count, 2,
             "timeout performs one final race-closing resolve"
         );
+    }
+
+    #[test]
+    fn polling_fallback_resolves_apps_without_window_notifications() {
+        let mut resolutions = 0;
+        let result = resolve_after_polling(Duration::from_secs(1), Duration::ZERO, || {
+            resolutions += 1;
+            (resolutions == 3).then_some("window")
+        });
+
+        assert_eq!(result, Some("window"));
+        assert_eq!(resolutions, 3);
     }
 
     #[tokio::test]
