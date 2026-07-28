@@ -104,6 +104,21 @@ pub struct ApplicationSurfaceEvent {
     pub delta_y: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApplicationSurfaceKeyboardTarget {
+    window_id: u32,
+    process_id: i32,
+}
+
+impl ApplicationSurfaceKeyboardTarget {
+    fn new(window_id: u32, process_id: i32) -> Option<Self> {
+        (window_id > 0 && process_id > 0).then_some(Self {
+            window_id,
+            process_id,
+        })
+    }
+}
+
 fn default_click_count() -> i64 {
     1
 }
@@ -841,12 +856,12 @@ pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
                 &pointer_state,
             )
         }
-        "key" => post_key(
-            target_process_id,
-            event.key_code,
-            event.key_down,
-            event.modifiers,
-        ),
+        "key" => {
+            let target = ApplicationSurfaceKeyboardTarget::new(target_window_id, target_process_id)
+                .ok_or_else(|| anyhow!("application_window_unavailable"))?;
+            post_key(target, event.key_code, event.key_down, event.modifiers)
+        }
+        "health" => Ok(()),
         _ => bail!("unsupported application-surface event"),
     }
 }
@@ -976,15 +991,30 @@ fn post_scroll(
     Ok(())
 }
 
-fn post_key(process_id: i32, key_code: u16, key_down: bool, modifiers: u64) -> anyhow::Result<()> {
+fn post_key(
+    target: ApplicationSurfaceKeyboardTarget,
+    key_code: u16,
+    key_down: bool,
+    modifiers: u64,
+) -> anyhow::Result<()> {
+    if !crate::input::skylight::activate_without_raise(
+        target.process_id as libc::pid_t,
+        target.window_id,
+    ) {
+        bail!("application_surface_window_focus_unavailable");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(8));
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow!("could not create keyboard event source"))?;
     let event = CGEvent::new_keyboard_event(source, key_code, key_down)
         .map_err(|_| anyhow!("could not create keyboard event"))?;
     event.set_flags(CGEventFlags::from_bits_truncate(modifiers));
     let pointer = event.as_ptr() as *mut c_void;
-    if !crate::input::skylight::post_to_pid(process_id as libc::pid_t, pointer, true) {
-        event.post_to_pid(process_id as libc::pid_t);
+    for field in [51, 91, 92] {
+        crate::input::skylight::set_integer_field(pointer, field, target.window_id as i64);
+    }
+    if !crate::input::skylight::post_to_pid(target.process_id as libc::pid_t, pointer, true) {
+        bail!("application_surface_window_input_unavailable");
     }
     Ok(())
 }
@@ -1021,7 +1051,10 @@ mod tests {
         let descriptor_handle = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
         assert!(descriptor_handle >= 0);
         let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-        assert_eq!(unsafe { libc::fstat(descriptor_handle, metadata.as_mut_ptr()) }, 0);
+        assert_eq!(
+            unsafe { libc::fstat(descriptor_handle, metadata.as_mut_ptr()) },
+            0
+        );
         unsafe {
             libc::close(descriptor_handle);
         }
