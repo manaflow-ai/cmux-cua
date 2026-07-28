@@ -403,25 +403,10 @@ pub(crate) fn click_at_xy_chromium_guarded(
 ) -> anyhow::Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Chromium's first-mouse handling rejects a background click delivered to
-    // a non-key window. This SkyLight focus record keys the requested window
-    // without raising it or moving the user's cursor.
-    if crate::input::skylight::activate_without_raise_guarded(
-        pid as libc::pid_t,
-        wid,
-        gate,
-    )? {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let target = CGPoint::new(screen_x, screen_y);
-    let off_screen = CGPoint::new(-1.0, -1.0);
     let win_local = (win_local_x, win_local_y);
-    let off_local = (-1.0_f64, -1.0_f64);
     let flags = parse_modifier_flags(modifiers);
     let click_pairs = count.max(1).min(2);
-    let window_id = wid as i64;
 
     // All 5 events share the same click-group ID so WindowServer / Chromium
     // treat the sequence as one gesture (Swift: field 58).
@@ -430,87 +415,17 @@ pub(crate) fn click_at_xy_chromium_guarded(
         .unwrap_or_default()
         .subsec_nanos() as i64;
 
-    // Stamp required fields onto a CGEvent.  All captured values are Copy so
-    // this closure is Fn (callable multiple times).
-    let stamp = |event: &CGEvent, local: (f64, f64), click_state: i64, phase: i64| {
-        let ptr = event.as_ptr() as *mut std::ffi::c_void;
-        let set = |f: u32, v: i64| {
-            crate::input::skylight::set_integer_field(ptr, f, v);
-        };
-        set(0, phase); // kCGMouseEventNumber (gesture phase)
-        set(1, click_state); // kCGMouseEventClickState
-        set(3, 0); // kCGMouseEventButtonNumber (left)
-        set(7, 3); // kCGMouseEventSubtype (NSEventSubtypeTouch)
-        set(40, pid as i64); // Chromium synthetic-event filter
-        if window_id != 0 {
-            set(51, window_id); // windowNumber (NSEvent bridge equivalent)
-            set(91, window_id); // kCGMouseEventWindowUnderMousePointer
-            set(92, window_id); // kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent
-        }
-        set(58, click_group_id); // click-group ID (gesture coalescing)
-        crate::input::skylight::set_window_location(ptr, local.0, local.1);
-        if flags != CGEventFlags::CGEventFlagNull {
-            event.set_flags(flags);
-        }
-    };
-
-    // Belt+suspenders: SkyLight path for Chromium/Catalyst + public API for AppKit.
-    let post = |event: &CGEvent| {
-        let ptr = event.as_ptr() as *mut std::ffi::c_void;
-        crate::input::skylight::post_to_pid(pid as libc::pid_t, ptr, false);
-        event.post_to_pid(pid as libc::pid_t);
-    };
-    let post_guarded = |event: &CGEvent| -> anyhow::Result<()> {
-        let ptr = event.as_ptr() as *mut std::ffi::c_void;
-        gate.check()?;
-        crate::input::skylight::post_to_pid(pid as libc::pid_t, ptr, false);
-        gate.check()?;
-        event.post_to_pid(pid as libc::pid_t);
-        Ok(())
-    };
-
-    // Step 1: mouseMoved at target (phase=2, clickState=0).
-    let move_event = CGEvent::new_mouse_event(
-        source.clone(),
-        CGEventType::MouseMoved,
-        target,
-        CGMouseButton::Left,
-    )
-    .map_err(|_| anyhow::anyhow!("mouseMoved event creation failed"))?;
-    stamp(&move_event, win_local, 0, 2);
-    post_guarded(&move_event)?;
-    std::thread::sleep(std::time::Duration::from_millis(15));
-
-    // Step 2: off-screen primer click — opens Chromium user-activation gate
-    // at an off-screen coordinate that can't hit any DOM element.
-    let primer_down = CGEvent::new_mouse_event(
-        source.clone(),
-        CGEventType::LeftMouseDown,
-        off_screen,
-        CGMouseButton::Left,
-    )
-    .map_err(|_| anyhow::anyhow!("primer down event creation failed"))?;
-    stamp(&primer_down, off_local, 1, 1);
-    let primer_up = CGEvent::new_mouse_event(
-        source.clone(),
-        CGEventType::LeftMouseUp,
-        off_screen,
-        CGMouseButton::Left,
-    )
-    .map_err(|_| anyhow::anyhow!("primer up event creation failed"))?;
-    stamp(&primer_up, off_local, 1, 2);
-    guarded_mouse_pair(
+    let source = prepare_chromium_background_gesture_guarded(
+        pid,
+        screen_x,
+        screen_y,
+        win_local_x,
+        win_local_y,
+        wid,
+        click_group_id,
+        flags,
         gate,
-        std::time::Duration::from_millis(1),
-        || post_guarded(&primer_down),
-        || post_guarded(&primer_up),
-        || {
-            post(&primer_up);
-            Ok(())
-        },
     )?;
-    // ≥1 frame so Chromium sees primer + target as separate gestures, not run-on.
-    std::thread::sleep(std::time::Duration::from_millis(100));
 
     // Step 3: target click pair(s) with clickState stepped 1→N for double-click
     // coalescing (Chromium renderer coalesces pairs into dblclick when state=1→2).
@@ -524,7 +439,14 @@ pub(crate) fn click_at_xy_chromium_guarded(
             CGMouseButton::Left,
         )
         .map_err(|_| anyhow::anyhow!("target down event creation failed"))?;
-        stamp(&down, win_local, click_state, 3);
+        if flags != CGEventFlags::CGEventFlagNull {
+            down.set_flags(flags);
+        }
+        crate::input::skylight::set_integer_field(
+            down.as_ptr() as *mut std::ffi::c_void,
+            0,
+            3,
+        );
         let up = CGEvent::new_mouse_event(
             source.clone(),
             CGEventType::LeftMouseUp,
@@ -532,14 +454,54 @@ pub(crate) fn click_at_xy_chromium_guarded(
             CGMouseButton::Left,
         )
         .map_err(|_| anyhow::anyhow!("target up event creation failed"))?;
-        stamp(&up, win_local, click_state, 3);
+        if flags != CGEventFlags::CGEventFlagNull {
+            up.set_flags(flags);
+        }
+        crate::input::skylight::set_integer_field(
+            up.as_ptr() as *mut std::ffi::c_void,
+            0,
+            3,
+        );
         guarded_mouse_pair(
             gate,
             std::time::Duration::from_millis(1),
-            || post_guarded(&down),
-            || post_guarded(&up),
             || {
-                post(&up);
+                post_mouse_event_guarded(
+                    pid,
+                    &down,
+                    Some(win_local),
+                    Some(wid),
+                    Some(click_group_id),
+                    click_state,
+                    0,
+                    3,
+                    gate,
+                )
+            },
+            || {
+                post_mouse_event_guarded(
+                    pid,
+                    &up,
+                    Some(win_local),
+                    Some(wid),
+                    Some(click_group_id),
+                    click_state,
+                    0,
+                    3,
+                    gate,
+                )
+            },
+            || {
+                post_mouse_event(
+                    pid,
+                    &up,
+                    Some(win_local),
+                    Some(wid),
+                    Some(click_group_id),
+                    click_state,
+                    0,
+                    3,
+                );
                 Ok(())
             },
         )?;
@@ -552,6 +514,165 @@ pub(crate) fn click_at_xy_chromium_guarded(
     }
 
     Ok(())
+}
+
+/// Prepare a background window for a streamed mouse gesture without posting
+/// the gesture's real down/up pair. Application surfaces call this on down and
+/// then preserve the caller's later drag/up events as one ordered gesture.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_chromium_background_gesture(
+    pid: i32,
+    screen_x: f64,
+    screen_y: f64,
+    win_local_x: f64,
+    win_local_y: f64,
+    wid: u32,
+    click_group_id: i64,
+    flags: CGEventFlags,
+) -> anyhow::Result<CGEventSource> {
+    prepare_chromium_background_gesture_guarded(
+        pid,
+        screen_x,
+        screen_y,
+        win_local_x,
+        win_local_y,
+        wid,
+        click_group_id,
+        flags,
+        &NativeDispatchGate::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_chromium_background_gesture_guarded(
+    pid: i32,
+    screen_x: f64,
+    screen_y: f64,
+    win_local_x: f64,
+    win_local_y: f64,
+    wid: u32,
+    click_group_id: i64,
+    flags: CGEventFlags,
+    gate: &NativeDispatchGate,
+) -> anyhow::Result<CGEventSource> {
+    // Chromium rejects the first click delivered to a background non-key
+    // window. Key the exact target without raising it or moving the pointer.
+    if crate::input::skylight::activate_without_raise_guarded(
+        pid as libc::pid_t,
+        wid,
+        gate,
+    )? {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    let target = CGPoint::new(screen_x, screen_y);
+    let target_local = Some((win_local_x, win_local_y));
+    let window_id = Some(wid);
+    let group_id = Some(click_group_id);
+
+    let move_event = CGEvent::new_mouse_event(
+        source.clone(),
+        CGEventType::MouseMoved,
+        target,
+        CGMouseButton::Left,
+    )
+    .map_err(|_| anyhow::anyhow!("mouseMoved event creation failed"))?;
+    if flags != CGEventFlags::CGEventFlagNull {
+        move_event.set_flags(flags);
+    }
+    crate::input::skylight::set_integer_field(
+        move_event.as_ptr() as *mut std::ffi::c_void,
+        0,
+        2,
+    );
+    post_mouse_event_guarded(
+        pid,
+        &move_event,
+        target_local,
+        window_id,
+        group_id,
+        0,
+        0,
+        3,
+        gate,
+    )?;
+    std::thread::sleep(std::time::Duration::from_millis(15));
+
+    // The off-screen primer opens Chromium's user-activation gate without
+    // hitting a target control. It shares the real gesture's group ID.
+    let off_screen = CGPoint::new(-1.0, -1.0);
+    let off_local = Some((-1.0, -1.0));
+    let primer_down = CGEvent::new_mouse_event(
+        source.clone(),
+        CGEventType::LeftMouseDown,
+        off_screen,
+        CGMouseButton::Left,
+    )
+    .map_err(|_| anyhow::anyhow!("primer down event creation failed"))?;
+    let primer_up = CGEvent::new_mouse_event(
+        source.clone(),
+        CGEventType::LeftMouseUp,
+        off_screen,
+        CGMouseButton::Left,
+    )
+    .map_err(|_| anyhow::anyhow!("primer up event creation failed"))?;
+    for (event, phase) in [(&primer_down, 1), (&primer_up, 2)] {
+        if flags != CGEventFlags::CGEventFlagNull {
+            event.set_flags(flags);
+        }
+        crate::input::skylight::set_integer_field(
+            event.as_ptr() as *mut std::ffi::c_void,
+            0,
+            phase,
+        );
+    }
+    guarded_mouse_pair(
+        gate,
+        std::time::Duration::from_millis(1),
+        || {
+            post_mouse_event_guarded(
+                pid,
+                &primer_down,
+                off_local,
+                window_id,
+                group_id,
+                1,
+                0,
+                3,
+                gate,
+            )
+        },
+        || {
+            post_mouse_event_guarded(
+                pid,
+                &primer_up,
+                off_local,
+                window_id,
+                group_id,
+                1,
+                0,
+                3,
+                gate,
+            )
+        },
+        || {
+            post_mouse_event(
+                pid,
+                &primer_up,
+                off_local,
+                window_id,
+                group_id,
+                1,
+                0,
+                3,
+            );
+            Ok(())
+        },
+    )?;
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    Ok(source)
 }
 
 /// Press-drag-release gesture from `(from_x, from_y)` to `(to_x, to_y)` in

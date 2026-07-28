@@ -13,9 +13,9 @@
 //!   `pinned_wid`, `gradient_colors`, `bloom_override`).
 //! - [`RenderStateCore::tick_motion`] — speed-profile + spring physics +
 //!   click-pulse + idle-fade using runtime [`MotionConfig`] (Windows + Linux).
-//! - [`RenderStateCore::tick_swift_constants`] — same physics but with the
-//!   hardcoded Swift reference constants used by macOS; returns whether the
-//!   path just ended (so the caller can fire arrival signals).
+//! - [`RenderStateCore::tick_swift_constants`] — configured glide speeds with
+//!   the Swift reference spring physics used by macOS; returns whether the path
+//!   just ended (so the caller can fire arrival signals).
 //! - [`RenderStateCore::apply_command_base`] — the OverlayCommand match arms
 //!   that all three platforms implement identically (MoveTo / ClickPulse /
 //!   SetEnabled / SetMotion / SetPalette / PinAbove / SetShape / SetGradient).
@@ -240,10 +240,10 @@ impl RenderStateCore {
         fire_arrival
     }
 
-    /// Advance the animation by `dt` seconds using the hardcoded Swift
-    /// reference constants (`peakSpeed=900`, `minStart=300`, `minEnd=200`,
-    /// `springK=400`, `springC=17`, `springOvershoot=0.8`).  Used by macOS,
-    /// which mirrors `AgentCursorRenderer.swift` 1:1.
+    /// Advance the animation by `dt` seconds using the Swift reference
+    /// spring constants and the configured glide speeds. Used by macOS,
+    /// which mirrors `AgentCursorRenderer.swift` while honoring runtime speed
+    /// overrides.
     ///
     /// Returns `true` when the path just ended (so the caller can fire its
     /// arrival oneshot to unblock `animate_cursor_to`).
@@ -253,9 +253,6 @@ impl RenderStateCore {
     /// peak at 1.0 at u=0.5.  The original Swift code uses the 30/1.875
     /// form so we preserve it here for parity.
     pub fn tick_swift_constants(&mut self, dt: f64) -> bool {
-        const PEAK_SPEED: f64 = 900.0;
-        const MIN_START_SPEED: f64 = 300.0;
-        const MIN_END_SPEED: f64 = 200.0;
         const SPRING_K: f64 = 400.0;
         const SPRING_C: f64 = 17.0;
         const SPRING_OVERSHOOT: f64 = 0.8;
@@ -269,11 +266,12 @@ impl RenderStateCore {
             // Smootherstep speed profile (normalised: peak = 1.0).
             let profile = (30.0 * u * u * (1.0 - u) * (1.0 - u)) / 1.875;
             let floor_speed = if u < 0.5 {
-                MIN_START_SPEED
+                self.motion.min_start_speed
             } else {
-                MIN_END_SPEED
+                self.motion.min_end_speed
             };
-            let speed_based = floor_speed + (PEAK_SPEED - floor_speed) * profile;
+            let speed_based =
+                floor_speed + (self.motion.peak_speed - floor_speed) * profile;
             // Fixed-duration override: when `glide_duration_ms > 0` the move
             // takes exactly that long regardless of distance, so an orchestrator
             // can lock glides to a known cadence. `0` (the default) keeps the
@@ -296,7 +294,7 @@ impl RenderStateCore {
                 // stays as crisp as a speed-based glide instead of overshooting
                 // proportionally to a short duration.
                 let impulse = if self.motion.glide_duration_ms > 0.0 {
-                    MIN_END_SPEED
+                    self.motion.min_end_speed
                 } else {
                     current_speed
                 };

@@ -25,9 +25,9 @@
 //!
 //! Animation state + render pipeline live in `cursor_overlay::render_state`
 //! (`RenderStateCore`, `tick_swift_constants`, `apply_command_base`,
-//! `render_frame`).  macOS uses the hardcoded Swift reference constants
-//! (peakSpeed=900, springK=400, overshoot=0.8) and the sentinel-snap
-//! variants of MoveTo / ClickPulse — see the wrapper around
+//! `render_frame`). macOS uses configured glide speeds with the Swift
+//! reference spring physics and the sentinel-snap variants of MoveTo /
+//! ClickPulse, see the wrapper around
 //! `apply_command_base` below.
 
 use std::collections::HashMap;
@@ -584,10 +584,10 @@ impl RenderState {
         }
     }
 
-    /// Advance the animation by `dt`.  Uses the Swift reference constants
-    /// (peakSpeed=900, springK=400, overshoot=0.8) — see
-    /// [`RenderStateCore::tick_swift_constants`].  Returns true if an
-    /// arrival signal should be fired (the path just ended).
+    /// Advance the animation by `dt`. Uses the configured glide speeds and
+    /// Swift reference spring constants, see
+    /// [`RenderStateCore::tick_swift_constants`]. Returns true if an arrival
+    /// signal should be fired (the path just ended).
     fn tick(&mut self, dt: f64) -> bool {
         let fire_arrival = self.core.tick_swift_constants(dt);
 

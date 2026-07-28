@@ -17,7 +17,7 @@ use core_graphics::event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton, Sc
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use foreign_types::ForeignType;
-use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt};
+use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt, SCFrameStatus};
 use screencapturekit::prelude::{
     PixelFormat, SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration,
     SCStreamOutputType,
@@ -480,8 +480,15 @@ struct CaptureFrameState {
     failed: AtomicBool,
 }
 
+fn capture_frame_status_is_publishable(status: Option<SCFrameStatus>) -> bool {
+    status == Some(SCFrameStatus::Complete)
+}
+
 impl CaptureFrameState {
     fn receive(&self, sample: screencapturekit::cm::CMSampleBuffer) {
+        if !capture_frame_status_is_publishable(sample.frame_status()) {
+            return;
+        }
         let Some(pixel_buffer) = sample.image_buffer() else {
             return;
         };
@@ -533,7 +540,7 @@ struct ApplicationSurfaceSession {
     target_process_id: i32,
     stream: SCStream,
     frame_state: Arc<CaptureFrameState>,
-    pointer_state: Arc<Mutex<ApplicationSurfacePointerState>>,
+    input_state: Arc<ApplicationSurfaceInputState>,
 }
 
 impl Drop for ApplicationSurfaceSession {
@@ -553,6 +560,33 @@ struct ApplicationSurfaceManager {
 struct ApplicationSurfacePointerState {
     left_click_group_id: Option<i64>,
     right_click_group_id: Option<i64>,
+}
+
+#[derive(Default)]
+struct ApplicationSurfaceInputState {
+    dispatch: Mutex<()>,
+    pointer: Mutex<ApplicationSurfacePointerState>,
+    active: AtomicBool,
+}
+
+impl ApplicationSurfaceInputState {
+    fn new() -> Self {
+        Self {
+            active: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
+    fn lock_dispatch(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.dispatch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn deactivate(&self) {
+        let _dispatch = self.lock_dispatch();
+        self.active.store(false, Ordering::Release);
+    }
 }
 
 impl ApplicationSurfacePointerState {
@@ -731,7 +765,7 @@ pub fn start(
             target_process_id: request.process_id,
             stream,
             frame_state,
-            pointer_state: Arc::new(Mutex::new(ApplicationSurfacePointerState::default())),
+            input_state: Arc::new(ApplicationSurfaceInputState::new()),
         },
     );
     Ok(result)
@@ -767,6 +801,9 @@ pub fn stop(session_id: &str) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .sessions
         .remove(session_id);
+    if let Some(session) = session.as_ref() {
+        session.input_state.deactivate();
+    }
     drop(session);
     true
 }
@@ -778,14 +815,14 @@ pub fn stop_all() {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut manager.sessions)
     };
+    for session in sessions.values() {
+        session.input_state.deactivate();
+    }
     drop(sessions);
 }
 
 pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
-    if !permissions::current_status().accessibility {
-        bail!("accessibility_permission_required");
-    }
-    let (target_window_id, target_process_id, frame_state, pointer_state) = {
+    let (target_window_id, target_process_id, frame_state, input_state) = {
         let manager = manager()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -797,9 +834,16 @@ pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
             session.target_window_id,
             session.target_process_id,
             session.frame_state.clone(),
-            session.pointer_state.clone(),
+            session.input_state.clone(),
         )
     };
+    let _dispatch = input_state.lock_dispatch();
+    if !input_state.active.load(Ordering::Acquire) {
+        bail!("application_surface_session_unavailable");
+    }
+    if !permissions::current_status().accessibility {
+        bail!("accessibility_permission_required");
+    }
     if frame_state.failed.load(Ordering::Acquire) {
         bail!("application_surface_capture_failed");
     }
@@ -832,7 +876,7 @@ pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
                 source_y * target.bounds.height,
                 event.modifiers,
                 event.click_count,
-                &pointer_state,
+                &input_state.pointer,
             )
         }
         "scroll" => {
@@ -853,7 +897,7 @@ pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
                 event.delta_x,
                 event.delta_y,
                 event.modifiers,
-                &pointer_state,
+                &input_state.pointer,
             )
         }
         "key" => {
@@ -873,6 +917,10 @@ fn live_target(window_id: u32, process_id: i32) -> Option<windows::WindowInfo> {
             && window.bounds.width > 0.0
             && window.bounds.height > 0.0
     })
+}
+
+fn mouse_event_requires_background_preparation(kind: &str) -> bool {
+    matches!(kind, "left_mouse_down" | "right_mouse_down")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -898,27 +946,30 @@ fn post_mouse(
         "right_mouse_dragged" => (CGEventType::RightMouseDragged, CGMouseButton::Right, 1),
         _ => bail!("unsupported mouse event"),
     };
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow!("could not create mouse event source"))?;
     let point = CGPoint::new(screen_x, screen_y);
     let click_group_id = pointer_state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .group_for(kind);
-    if matches!(kind, "left_mouse_down" | "right_mouse_down") {
-        crate::input::mouse::post_mouse_moved_primer(
+    let flags = CGEventFlags::from_bits_truncate(modifiers);
+    let source = if mouse_event_requires_background_preparation(kind) {
+        crate::input::mouse::prepare_chromium_background_gesture(
             process_id,
-            &source,
-            point,
-            Some((local_x, local_y)),
-            Some(window_id),
-            Some(click_group_id),
-        );
-        std::thread::sleep(std::time::Duration::from_millis(12));
-    }
+            screen_x,
+            screen_y,
+            local_x,
+            local_y,
+            window_id,
+            click_group_id,
+            flags,
+        )?
+    } else {
+        CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+            .map_err(|_| anyhow!("could not create mouse event source"))?
+    };
     let event = CGEvent::new_mouse_event(source, event_type, point, button)
         .map_err(|_| anyhow!("could not create mouse event"))?;
-    event.set_flags(CGEventFlags::from_bits_truncate(modifiers));
+    event.set_flags(flags);
     let click_state = if kind == "mouse_moved" {
         0
     } else {

@@ -158,7 +158,7 @@ pub enum Command {
 /// We skip both the flag and its value when scanning for the subcommand.
 const VALUE_FLAGS: &[&str] = &[
     "--cursor-icon", "--cursor-id", "--cursor-palette", "--cursor-shape",
-    "--glide-ms", "--dwell-ms", "--idle-hide-ms",
+    "--glide-ms", "--dwell-ms", "--idle-hide-ms", "--cursor-speed",
     "--screenshot-out-file", "--client", "--socket", "--pid-file", "--type",
     "--host-bundle-id",
     // Experimental PiP preview — value flag for the optional geometry
@@ -166,6 +166,23 @@ const VALUE_FLAGS: &[&str] = &[
     // need to be listed here).
     "--experimental-pip-geometry",
 ];
+
+fn subcommand_positionals(args: &[String]) -> Vec<&str> {
+    let mut positionals = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if VALUE_FLAGS.contains(&argument) {
+            index += 2;
+        } else if argument.starts_with('-') {
+            index += 1;
+        } else {
+            positionals.push(argument);
+            index += 1;
+        }
+    }
+    positionals
+}
 
 /// Parse cursor flags and apply the Codex compatibility default. Native mode
 /// remains teardrop; Codex compatibility uses Sky unless the caller explicitly
@@ -344,19 +361,7 @@ pub fn parse_command() -> Command {
     }
 
     // Strip cursor-overlay flags (and their values) to expose the subcommand.
-    let mut positionals: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i].as_str();
-        if VALUE_FLAGS.contains(&a) {
-            i += 2; // skip flag + value
-        } else if a.starts_with('-') {
-            i += 1; // skip bare flag
-        } else {
-            positionals.push(a);
-            i += 1;
-        }
-    }
+    let positionals = subcommand_positionals(&args);
 
     let no_daemon_relaunch = args.iter().any(|a| a == "--no-daemon-relaunch");
     let claude_code_compat = args.iter().any(|a| a == "--claude-code-computer-use-compat");
@@ -3615,6 +3620,10 @@ mod tests {
     #[test]
     fn cursor_speed_value_is_not_misread_as_the_subcommand() {
         assert!(VALUE_FLAGS.contains(&"--cursor-speed"));
+        let args = ["--cursor-speed", "1.75", "serve"]
+            .map(str::to_owned)
+            .to_vec();
+        assert_eq!(subcommand_positionals(&args), vec!["serve"]);
     }
 
     #[test]
