@@ -1027,6 +1027,9 @@ extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use screencapturekit::cm::SCFrameStatus;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn frame_layout_matches_cmux_triple_ring_protocol() {
@@ -1089,6 +1092,59 @@ mod tests {
 
         let next_down = state.group_for("left_mouse_down");
         assert_ne!(next_down, down);
+    }
+
+    #[test]
+    fn only_complete_capture_frames_are_publishable() {
+        assert!(capture_frame_status_is_publishable(Some(
+            SCFrameStatus::Complete
+        )));
+        for status in [
+            None,
+            Some(SCFrameStatus::Idle),
+            Some(SCFrameStatus::Blank),
+            Some(SCFrameStatus::Suspended),
+            Some(SCFrameStatus::Started),
+            Some(SCFrameStatus::Stopped),
+        ] {
+            assert!(!capture_frame_status_is_publishable(status));
+        }
+    }
+
+    #[test]
+    fn session_event_dispatch_is_serialized() {
+        let input = Arc::new(ApplicationSurfaceInputState::default());
+        let first = input.lock_dispatch();
+        let second_input = input.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _second = second_input.lock_dispatch();
+            entered_tx.send(()).unwrap();
+        });
+
+        assert!(entered_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        drop(first);
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn mouse_down_events_require_chromium_background_preparation() {
+        assert!(mouse_event_requires_background_preparation(
+            "left_mouse_down"
+        ));
+        assert!(mouse_event_requires_background_preparation(
+            "right_mouse_down"
+        ));
+        for kind in [
+            "mouse_moved",
+            "left_mouse_dragged",
+            "left_mouse_up",
+            "right_mouse_dragged",
+            "right_mouse_up",
+        ] {
+            assert!(!mouse_event_requires_background_preparation(kind));
+        }
     }
 
     #[test]

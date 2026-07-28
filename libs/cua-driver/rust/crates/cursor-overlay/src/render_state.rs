@@ -1033,8 +1033,15 @@ mod glide_duration_tests {
     /// Run a glide of `dist_pts` to completion and return how many seconds it
     /// took. `tick` selects the platform path: `false` = `tick_motion`
     /// (Windows/Linux), `true` = `tick_swift_constants` (macOS reference).
-    fn arrival_secs(glide_ms: f64, dist_pts: f64, swift: bool) -> f64 {
-        let mut core = RenderStateCore::new(CursorConfig::default());
+    fn arrival_secs_with_speed(
+        glide_ms: f64,
+        dist_pts: f64,
+        swift: bool,
+        speed_multiplier: f64,
+    ) -> f64 {
+        let mut config = CursorConfig::default();
+        config.motion = config.motion.scaled_by(speed_multiplier);
+        let mut core = RenderStateCore::new(config);
         core.motion.glide_duration_ms = glide_ms;
         core.motion.idle_hide_ms = 0.0;
         core.place_at(0.0, 0.0);
@@ -1059,6 +1066,10 @@ mod glide_duration_tests {
         t
     }
 
+    fn arrival_secs(glide_ms: f64, dist_pts: f64, swift: bool) -> f64 {
+        arrival_secs_with_speed(glide_ms, dist_pts, swift, 1.0)
+    }
+
     #[test]
     fn fixed_duration_is_distance_independent_on_both_paths() {
         for swift in [false, true] {
@@ -1080,6 +1091,18 @@ mod glide_duration_tests {
             assert!(
                 long > short + 0.2,
                 "swift={swift} short={short} long={long}"
+            );
+        }
+    }
+
+    #[test]
+    fn speed_multiplier_changes_arrival_timing_on_both_paths() {
+        for swift in [false, true] {
+            let baseline = arrival_secs_with_speed(0.0, 1400.0, swift, 1.0);
+            let fast = arrival_secs_with_speed(0.0, 1400.0, swift, 2.0);
+            assert!(
+                fast < baseline * 0.7,
+                "swift={swift} baseline={baseline} fast={fast}"
             );
         }
     }

@@ -3613,6 +3613,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cursor_speed_value_is_not_misread_as_the_subcommand() {
+        assert!(VALUE_FLAGS.contains(&"--cursor-speed"));
+    }
+
+    #[test]
     fn approvals_parser_accepts_list_revoke_clear_and_rejects_bad_shapes() {
         assert_eq!(parse_approvals_args(&[]).unwrap(), ApprovalsSubcommand::List);
         assert_eq!(
