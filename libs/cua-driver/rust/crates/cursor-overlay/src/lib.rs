@@ -188,6 +188,7 @@ impl CursorConfig {
     /// --glide-ms     <f64>        (glideDurationMs override)
     /// --dwell-ms     <f64>        (dwellAfterClickMs override)
     /// --idle-hide-ms <f64>        (idleHideMs override)
+    /// --cursor-speed <f64>        (glide speed multiplier, clamped to [0.25, 8])
     /// ```
     pub fn from_args() -> Self {
         let args: Vec<String> = std::env::args().collect();
@@ -254,6 +255,12 @@ impl CursorConfig {
                 "--idle-hide-ms" => {
                     if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
                         cfg.motion.idle_hide_ms = v;
+                        i += 1;
+                    }
+                }
+                "--cursor-speed" => {
+                    if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                        cfg.motion = cfg.motion.scaled_by(v);
                         i += 1;
                     }
                 }

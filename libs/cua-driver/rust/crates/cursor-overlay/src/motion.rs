@@ -90,6 +90,26 @@ impl MotionConfig {
     }
 }
 
+impl MotionConfig {
+    /// Uniformly scale glide speed for hosts that want snappier (or calmer)
+    /// cursor travel. Only the speed-based-mode knobs scale; click visuals
+    /// (dwell, press) keep their durations so faster glides do not truncate
+    /// the press animation. Non-finite multipliers fall back to 1.0.
+    pub fn scaled_by(&self, multiplier: f64) -> Self {
+        let multiplier = if multiplier.is_finite() {
+            multiplier.clamp(0.25, 8.0)
+        } else {
+            1.0
+        };
+        Self {
+            peak_speed: self.peak_speed * multiplier,
+            min_start_speed: self.min_start_speed * multiplier,
+            min_end_speed: self.min_end_speed * multiplier,
+            ..self.clone()
+        }
+    }
+}
+
 /// Post-arrival spring physics state.
 ///
 /// When the cursor reaches the end of a planned path the engine
@@ -105,4 +125,26 @@ pub struct Spring {
     pub oy: f64,
     pub vx: f64,
     pub vy: f64,
+}
+
+#[cfg(test)]
+mod scaled_by_tests {
+    use super::MotionConfig;
+
+    #[test]
+    fn scales_only_speed_knobs_and_clamps() {
+        let base = MotionConfig::default();
+        let fast = base.scaled_by(2.0);
+        assert_eq!(fast.peak_speed, base.peak_speed * 2.0);
+        assert_eq!(fast.min_start_speed, base.min_start_speed * 2.0);
+        assert_eq!(fast.min_end_speed, base.min_end_speed * 2.0);
+        assert_eq!(fast.dwell_after_click_ms, base.dwell_after_click_ms);
+        assert_eq!(fast.press_duration_ms, base.press_duration_ms);
+        assert_eq!(fast.turn_radius, base.turn_radius);
+
+        let clamped = base.scaled_by(100.0);
+        assert_eq!(clamped.peak_speed, base.peak_speed * 8.0);
+        let unscaled = base.scaled_by(f64::NAN);
+        assert_eq!(unscaled.peak_speed, base.peak_speed);
+    }
 }
