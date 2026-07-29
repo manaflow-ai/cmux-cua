@@ -812,6 +812,26 @@ impl ApplicationSurfacePointerState {
         }
     }
 
+    fn continued_delivery(
+        &mut self,
+        kind: &str,
+        modifiers: u64,
+        click_count: i64,
+    ) -> Option<ApplicationSurfacePointerDelivery> {
+        let previous = match kind {
+            "left_mouse_dragged" | "left_mouse_up" => self.left.pressed_delivery,
+            "right_mouse_dragged" | "right_mouse_up" => self.right.pressed_delivery,
+            _ => None,
+        }?;
+        let transition = self.transition_for(kind, click_count);
+        Some(ApplicationSurfacePointerDelivery {
+            modifiers,
+            click_count: click_count.clamp(1, 3),
+            group_id: transition.group_id,
+            ..previous
+        })
+    }
+
     fn take_pressed_releases(&mut self) -> Vec<ApplicationSurfacePointerRelease> {
         let mut releases = Vec::with_capacity(2);
         if let Some(delivery) = self.left.pressed_delivery.take() {
@@ -1105,9 +1125,25 @@ fn dispatch_event(
                 .content_rect
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (source_x, source_y) = content
-                .source_point(event.x, event.y)
-                .ok_or_else(|| anyhow!("application_surface_point_outside_content"))?;
+            let Some((source_x, source_y)) = content.source_point(event.x, event.y) else {
+                if matches!(
+                    event.kind.as_str(),
+                    "left_mouse_dragged"
+                        | "left_mouse_up"
+                        | "right_mouse_dragged"
+                        | "right_mouse_up"
+                ) {
+                    return post_mouse_continuation(
+                        target_process_id,
+                        target_window_id,
+                        event.kind.as_str(),
+                        event.modifiers,
+                        event.click_count,
+                        &input_state.pointer,
+                    );
+                }
+                bail!("application_surface_point_outside_content");
+            };
             let screen_x = target.bounds.x + source_x * target.bounds.width;
             let screen_y = target.bounds.y + source_y * target.bounds.height;
             post_mouse(
@@ -1206,6 +1242,27 @@ fn post_mouse(
         delivery,
         transition.should_prepare_background,
     )?;
+    pointer_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record_delivery(kind, delivery);
+    Ok(())
+}
+
+fn post_mouse_continuation(
+    process_id: i32,
+    window_id: u32,
+    kind: &str,
+    modifiers: u64,
+    click_count: i64,
+    pointer_state: &Mutex<ApplicationSurfacePointerState>,
+) -> anyhow::Result<()> {
+    let delivery = pointer_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .continued_delivery(kind, modifiers, click_count)
+        .ok_or_else(|| anyhow!("application_surface_point_outside_content"))?;
+    post_mouse_delivery(process_id, window_id, kind, delivery, false)?;
     pointer_state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
