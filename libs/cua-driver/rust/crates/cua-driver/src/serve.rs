@@ -1968,12 +1968,9 @@ pub async fn run_serve(
                                     }
                                 };
                                 #[cfg(not(target_os = "macos"))]
-                                let (resp, started_session_id): (DaemonResponse, Option<String>) = (
-                                    DaemonResponse::err(
-                                        "application_surface_start is available only on macOS",
-                                        64,
-                                    ),
-                                    None,
+                                let resp = DaemonResponse::err(
+                                    "application_surface_start is available only on macOS",
+                                    64,
                                 );
                                 let delivery = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
