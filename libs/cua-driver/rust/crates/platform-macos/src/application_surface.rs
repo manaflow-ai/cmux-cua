@@ -48,6 +48,43 @@ enum ApplicationSurfacePermissionUse {
     CaptureAndInput,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ApplicationSurfaceError {
+    #[error("accessibility_permission_required")]
+    AccessibilityPermissionRequired,
+    #[error("screen_recording_permission_required")]
+    ScreenRecordingPermissionRequired,
+    #[error("application_window_unavailable")]
+    WindowUnavailable,
+    #[error("application_surface_point_outside_content")]
+    PointOutsideContent,
+    #[error("application_surface_session_unavailable")]
+    SessionUnavailable,
+    #[error("application_surface_capture_failed")]
+    CaptureFailed,
+}
+
+impl ApplicationSurfaceError {
+    pub const fn protocol_code(self) -> &'static str {
+        match self {
+            Self::AccessibilityPermissionRequired | Self::ScreenRecordingPermissionRequired => {
+                "permission_required"
+            }
+            Self::WindowUnavailable => "window_unavailable",
+            Self::PointOutsideContent => "point_outside_content",
+            Self::SessionUnavailable => "session_unavailable",
+            Self::CaptureFailed => "capture_failed",
+        }
+    }
+}
+
+pub fn error_protocol_code(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<ApplicationSurfaceError>()
+        .map(|error| error.protocol_code())
+        .unwrap_or("application_surface_failed")
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplicationWindow {
     pub window_id: u32,
@@ -1020,7 +1057,7 @@ pub fn start(
                     .owning_application()
                     .is_some_and(|owner| owner.process_id() == request.process_id)
         })
-        .ok_or_else(|| anyhow!("application_window_unavailable"))?;
+        .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
     let source_frame = source_window.frame();
     let (width, height) = capture_pixel_size(source_frame.size.width, source_frame.size.height)?;
     let ring = SharedFrameRing::create(width, height)?;
@@ -1095,7 +1132,7 @@ fn require_application_surface_permissions(
         status.screen_recording,
         permission_use,
     ) {
-        bail!("{error}");
+        return Err(error.into());
     }
     Ok(())
 }
@@ -1104,11 +1141,11 @@ fn missing_application_surface_permission(
     accessibility: bool,
     screen_recording: bool,
     permission_use: ApplicationSurfacePermissionUse,
-) -> Option<&'static str> {
+) -> Option<ApplicationSurfaceError> {
     if permission_use == ApplicationSurfacePermissionUse::CaptureAndInput && !accessibility {
-        return Some("accessibility_permission_required");
+        return Some(ApplicationSurfaceError::AccessibilityPermissionRequired);
     }
-    (!screen_recording).then_some("screen_recording_permission_required")
+    (!screen_recording).then_some(ApplicationSurfaceError::ScreenRecordingPermissionRequired)
 }
 
 fn capture_pixel_size(width: f64, height: f64) -> anyhow::Result<(usize, usize)> {
@@ -1168,7 +1205,7 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
         let session = manager
             .sessions
             .get(&session_id)
-            .ok_or_else(|| anyhow!("application_surface_session_unavailable"))?;
+            .ok_or(ApplicationSurfaceError::SessionUnavailable)?;
         (
             session.target_window_id,
             session.target_process_id,
@@ -1178,16 +1215,16 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
     };
     let _dispatch = input_state.lock_dispatch();
     if !input_state.active.load(Ordering::Acquire) {
-        bail!("application_surface_session_unavailable");
+        return Err(ApplicationSurfaceError::SessionUnavailable.into());
     }
     if !permissions::current_status().accessibility {
-        bail!("accessibility_permission_required");
+        return Err(ApplicationSurfaceError::AccessibilityPermissionRequired.into());
     }
     if frame_state.failed.load(Ordering::Acquire) {
-        bail!("application_surface_capture_failed");
+        return Err(ApplicationSurfaceError::CaptureFailed.into());
     }
     let target = live_target(target_window_id, target_process_id)
-        .ok_or_else(|| anyhow!("application_window_unavailable"))?;
+        .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
     for event in events {
         dispatch_event(
             event,
@@ -1252,7 +1289,7 @@ fn dispatch_event(
                         &input_state.pointer,
                     );
                 }
-                bail!("application_surface_point_outside_content");
+                return Err(ApplicationSurfaceError::PointOutsideContent.into());
             };
             let screen_x = target.bounds.x + source_x * target.bounds.width;
             let screen_y = target.bounds.y + source_y * target.bounds.height;
@@ -1276,7 +1313,7 @@ fn dispatch_event(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let (source_x, source_y) = content
                 .source_point(event.x, event.y)
-                .ok_or_else(|| anyhow!("application_surface_point_outside_content"))?;
+                .ok_or(ApplicationSurfaceError::PointOutsideContent)?;
             post_scroll(
                 target_process_id,
                 target_window_id,
@@ -1293,7 +1330,7 @@ fn dispatch_event(
         }
         "key" => {
             let target = ApplicationSurfaceKeyboardTarget::new(target_window_id, target_process_id)
-                .ok_or_else(|| anyhow!("application_window_unavailable"))?;
+                .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
             post_key(target, event.key_code, event.key_down, event.modifiers)?;
             input_state
                 .keyboard
@@ -1372,7 +1409,7 @@ fn post_mouse_continuation(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .continued_delivery(kind, modifiers, click_count)
-        .ok_or_else(|| anyhow!("application_surface_point_outside_content"))?;
+        .ok_or(ApplicationSurfaceError::PointOutsideContent)?;
     post_mouse_delivery(process_id, window_id, kind, delivery, false)?;
     pointer_state
         .lock()
@@ -1519,7 +1556,7 @@ fn post_key(
         target.process_id as libc::pid_t,
         target.window_id,
     ) {
-        bail!("application_surface_window_focus_unavailable");
+        return Err(ApplicationSurfaceError::WindowUnavailable.into());
     }
     std::thread::sleep(std::time::Duration::from_millis(8));
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -1532,7 +1569,7 @@ fn post_key(
         crate::input::skylight::set_integer_field(pointer, field, target.window_id as i64);
     }
     if !crate::input::skylight::post_to_pid(target.process_id as libc::pid_t, pointer, true) {
-        bail!("application_surface_window_input_unavailable");
+        return Err(ApplicationSurfaceError::WindowUnavailable.into());
     }
     Ok(())
 }
@@ -1565,7 +1602,7 @@ mod tests {
                 false,
                 ApplicationSurfacePermissionUse::WindowListing,
             ),
-            Some("screen_recording_permission_required")
+            Some(ApplicationSurfaceError::ScreenRecordingPermissionRequired),
         );
         assert_eq!(
             missing_application_surface_permission(
@@ -1573,7 +1610,7 @@ mod tests {
                 true,
                 ApplicationSurfacePermissionUse::CaptureAndInput,
             ),
-            Some("accessibility_permission_required")
+            Some(ApplicationSurfaceError::AccessibilityPermissionRequired),
         );
     }
 

@@ -2621,6 +2621,7 @@ mod tests {
             ok: false,
             result: None,
             error: Some("missing required field `pid`".into()),
+            error_code: None,
             exit_code: Some(64),
         };
         let resp = build_tool_error_response(serde_json::json!(7), daemon_resp);
@@ -2648,6 +2649,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_code: None,
             exit_code: None,
         };
         let resp = build_tool_error_response(serde_json::json!("abc"), daemon_resp);

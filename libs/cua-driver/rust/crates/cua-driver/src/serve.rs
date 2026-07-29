@@ -19,7 +19,7 @@
 //!
 //! Response shapes:
 //!   {"ok":true,"result":...}
-//!   {"ok":false,"error":"...","exit_code":1}
+//!   {"ok":false,"error":"...","error_code":"...","exit_code":1}
 //!
 //! The socket file is at:
 //!   macOS  — ~/Library/Caches/cua-driver/cua-driver.sock
@@ -815,6 +815,8 @@ pub struct DaemonResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
 }
 
@@ -1264,10 +1266,32 @@ fn request_validated_system_permission(permission: &str) {
 
 impl DaemonResponse {
     pub fn ok(result: serde_json::Value) -> Self {
-        Self { ok: true, result: Some(result), error: None, exit_code: None }
+        Self {
+            ok: true,
+            result: Some(result),
+            error: None,
+            error_code: None,
+            exit_code: None,
+        }
     }
     pub fn err(msg: impl Into<String>, code: i32) -> Self {
-        Self { ok: false, result: None, error: Some(msg.into()), exit_code: Some(code) }
+        Self {
+            ok: false,
+            result: None,
+            error: Some(msg.into()),
+            error_code: None,
+            exit_code: Some(code),
+        }
+    }
+
+    pub fn coded_err(msg: impl Into<String>, code: i32, error_code: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            result: None,
+            error: Some(msg.into()),
+            error_code: Some(error_code.into()),
+            exit_code: Some(code),
+        }
     }
 
     pub fn tool_error(result: serde_json::Value, msg: impl Into<String>, code: i32) -> Self {
@@ -1275,9 +1299,16 @@ impl DaemonResponse {
             ok: false,
             result: Some(result),
             error: Some(msg.into()),
+            error_code: None,
             exit_code: Some(code),
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn application_surface_failure_response(error: anyhow::Error) -> DaemonResponse {
+    let error_code = platform_macos::application_surface::error_protocol_code(&error);
+    DaemonResponse::coded_err(format!("{error:#}"), 1, error_code)
 }
 
 #[cfg(target_os = "macos")]
@@ -1907,7 +1938,7 @@ pub async fn run_serve(
                                             serde_json::json!({"windows": windows}),
                                         ),
                                         Ok(Err(error)) => {
-                                            DaemonResponse::err(format!("{error:#}"), 1)
+                                            application_surface_failure_response(error)
                                         }
                                         Err(error) => DaemonResponse::err(
                                             format!("Application-window task failed: {error}"),
@@ -1966,7 +1997,7 @@ pub async fn run_serve(
                                                 )
                                             }
                                             Ok(Err(error)) => (
-                                                DaemonResponse::err(format!("{error:#}"), 1),
+                                                application_surface_failure_response(error),
                                                 None,
                                             ),
                                             Err(error) => (
@@ -2140,7 +2171,7 @@ pub async fn run_serve(
                                                 serde_json::json!({"sent": true}),
                                             ),
                                             Ok(Err(error)) => {
-                                                DaemonResponse::err(format!("{error:#}"), 1)
+                                                application_surface_failure_response(error)
                                             }
                                             Err(error) => DaemonResponse::err(
                                                 format!(
@@ -2201,7 +2232,7 @@ pub async fn run_serve(
                                                     }),
                                                 ),
                                                 Ok(Err(error)) => {
-                                                    DaemonResponse::err(format!("{error:#}"), 1)
+                                                    application_surface_failure_response(error)
                                                 }
                                                 Err(error) => DaemonResponse::err(
                                                     format!(
