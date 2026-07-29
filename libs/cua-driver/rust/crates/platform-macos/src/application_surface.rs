@@ -38,6 +38,7 @@ const FRAME_PIXEL_BYTE_COUNT: usize = 4;
 const FRAME_SLOT_COUNT: usize = 3;
 const MAXIMUM_FRAME_DIMENSION: usize = 16_384;
 const MAXIMUM_FRAME_RING_BYTE_COUNT: usize = 256 * 1_024 * 1_024;
+pub const MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT: usize = 64;
 const BGRA_PIXEL_FORMAT: u32 = u32::from_be_bytes(*b"BGRA");
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,6 +103,19 @@ pub struct ApplicationSurfaceEvent {
     pub delta_x: f64,
     #[serde(default)]
     pub delta_y: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApplicationSurfaceEventBatchRequest {
+    pub events: Vec<ApplicationSurfaceEvent>,
+}
+
+impl ApplicationSurfaceEventBatchRequest {
+    pub fn into_validated_events(self) -> Result<Vec<ApplicationSurfaceEvent>, &'static str> {
+        validate_event_batch(&self.events)
+            .map_err(|_| "Invalid application-surface event batch")?;
+        Ok(self.events)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -570,6 +584,8 @@ struct ApplicationSurfaceSession {
 
 impl Drop for ApplicationSurfaceSession {
     fn drop(&mut self) {
+        self.input_state
+            .deactivate(self.target_process_id, self.target_window_id);
         if let Err(error) = self.stream.stop_capture() {
             tracing::warn!(%error, "application surface capture did not stop cleanly");
         }
@@ -581,10 +597,40 @@ struct ApplicationSurfaceManager {
     sessions: HashMap<String, ApplicationSurfaceSession>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ApplicationSurfacePointerDelivery {
+    screen_x: f64,
+    screen_y: f64,
+    local_x: f64,
+    local_y: f64,
+    modifiers: u64,
+    click_count: i64,
+    group_id: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ApplicationSurfacePointerRelease {
+    kind: &'static str,
+    delivery: ApplicationSurfacePointerDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApplicationSurfacePointerTransition {
+    group_id: i64,
+    should_prepare_background: bool,
+}
+
+#[derive(Default)]
+struct ApplicationSurfacePointerButtonState {
+    group_id: Option<i64>,
+    last_completed_click_count: i64,
+    pressed_delivery: Option<ApplicationSurfacePointerDelivery>,
+}
+
 #[derive(Default)]
 struct ApplicationSurfacePointerState {
-    left_click_group_id: Option<i64>,
-    right_click_group_id: Option<i64>,
+    left: ApplicationSurfacePointerButtonState,
+    right: ApplicationSurfacePointerButtonState,
 }
 
 #[derive(Default)]
@@ -608,45 +654,134 @@ impl ApplicationSurfaceInputState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn deactivate(&self) {
+    fn deactivate(&self, process_id: i32, window_id: u32) {
+        self.deactivate_with(|release| {
+            if let Err(error) = post_mouse_delivery(
+                process_id,
+                window_id,
+                release.kind,
+                release.delivery,
+                false,
+            ) {
+                tracing::warn!(
+                    %error,
+                    kind = release.kind,
+                    "application surface pointer release did not post cleanly"
+                );
+            }
+        });
+    }
+
+    fn deactivate_with(
+        &self,
+        mut release: impl FnMut(ApplicationSurfacePointerRelease),
+    ) {
         let _dispatch = self.lock_dispatch();
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        let releases = self
+            .pointer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_pressed_releases();
+        for pending in releases {
+            release(pending);
+        }
         self.active.store(false, Ordering::Release);
     }
 }
 
 impl ApplicationSurfacePointerState {
-    fn group_for(&mut self, kind: &str) -> i64 {
-        match kind {
-            "left_mouse_down" => {
-                let group = next_click_group_id();
-                self.left_click_group_id = Some(group);
-                group
+    fn transition_for(
+        &mut self,
+        kind: &str,
+        click_count: i64,
+    ) -> ApplicationSurfacePointerTransition {
+        let click_count = click_count.clamp(1, 3);
+        let button = match kind {
+            "left_mouse_down" | "left_mouse_dragged" | "left_mouse_up" => {
+                Some(&mut self.left)
             }
-            "left_mouse_dragged" => *self
-                .left_click_group_id
-                .get_or_insert_with(next_click_group_id),
-            "left_mouse_up" => self
-                .left_click_group_id
-                .take()
-                .unwrap_or_else(next_click_group_id),
-            "right_mouse_down" => {
-                let group = next_click_group_id();
-                self.right_click_group_id = Some(group);
-                group
+            "right_mouse_down" | "right_mouse_dragged" | "right_mouse_up" => {
+                Some(&mut self.right)
             }
-            "right_mouse_dragged" => *self
-                .right_click_group_id
-                .get_or_insert_with(next_click_group_id),
-            "right_mouse_up" => self
-                .right_click_group_id
-                .take()
-                .unwrap_or_else(next_click_group_id),
-            "mouse_moved" => self
-                .left_click_group_id
-                .or(self.right_click_group_id)
-                .unwrap_or_else(next_click_group_id),
-            _ => next_click_group_id(),
+            _ => None,
+        };
+        let Some(button) = button else {
+            let group_id = self
+                .left
+                .pressed_delivery
+                .or(self.right.pressed_delivery)
+                .map(|delivery| delivery.group_id)
+                .unwrap_or_else(next_click_group_id);
+            return ApplicationSurfacePointerTransition {
+                group_id,
+                should_prepare_background: false,
+            };
+        };
+
+        let is_down = matches!(kind, "left_mouse_down" | "right_mouse_down");
+        let continues_click_series = is_down
+            && button.group_id.is_some()
+            && button.pressed_delivery.is_none()
+            && click_count > 1
+            && click_count == button.last_completed_click_count + 1;
+        if is_down && !continues_click_series {
+            button.group_id = Some(next_click_group_id());
+            button.last_completed_click_count = 0;
         }
+        let group_id = *button.group_id.get_or_insert_with(next_click_group_id);
+        if matches!(kind, "left_mouse_up" | "right_mouse_up") {
+            button.last_completed_click_count = click_count;
+        }
+        ApplicationSurfacePointerTransition {
+            group_id,
+            should_prepare_background: is_down && !continues_click_series,
+        }
+    }
+
+    fn record_delivery(
+        &mut self,
+        kind: &str,
+        delivery: ApplicationSurfacePointerDelivery,
+    ) {
+        match kind {
+            "left_mouse_down" | "left_mouse_dragged" => {
+                self.left.pressed_delivery = Some(delivery);
+            }
+            "left_mouse_up" => {
+                self.left.pressed_delivery = None;
+            }
+            "right_mouse_down" | "right_mouse_dragged" => {
+                self.right.pressed_delivery = Some(delivery);
+            }
+            "right_mouse_up" => {
+                self.right.pressed_delivery = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn take_pressed_releases(&mut self) -> Vec<ApplicationSurfacePointerRelease> {
+        let mut releases = Vec::with_capacity(2);
+        if let Some(delivery) = self.left.pressed_delivery.take() {
+            releases.push(ApplicationSurfacePointerRelease {
+                kind: "left_mouse_up",
+                delivery,
+            });
+        }
+        if let Some(delivery) = self.right.pressed_delivery.take() {
+            releases.push(ApplicationSurfacePointerRelease {
+                kind: "right_mouse_up",
+                delivery,
+            });
+        }
+        self.left.group_id = None;
+        self.left.last_completed_click_count = 0;
+        self.right.group_id = None;
+        self.right.last_completed_click_count = 0;
+        releases
     }
 }
 
@@ -826,9 +961,6 @@ pub fn stop(session_id: &str) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .sessions
         .remove(session_id);
-    if let Some(session) = session.as_ref() {
-        session.input_state.deactivate();
-    }
     drop(session);
     true
 }
@@ -840,20 +972,22 @@ pub fn stop_all() {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut manager.sessions)
     };
-    for session in sessions.values() {
-        session.input_state.deactivate();
-    }
     drop(sessions);
 }
 
 pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
+    send_events(vec![event])
+}
+
+pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
+    let session_id = validate_event_batch(&events)?.to_owned();
     let (target_window_id, target_process_id, frame_state, input_state) = {
         let manager = manager()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let session = manager
             .sessions
-            .get(&event.session)
+            .get(&session_id)
             .ok_or_else(|| anyhow!("application_surface_session_unavailable"))?;
         (
             session.target_window_id,
@@ -874,6 +1008,41 @@ pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
     }
     let target = live_target(target_window_id, target_process_id)
         .ok_or_else(|| anyhow!("application_window_unavailable"))?;
+    for event in events {
+        dispatch_event(
+            event,
+            target_window_id,
+            target_process_id,
+            &target,
+            &frame_state,
+            &input_state,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_event_batch(events: &[ApplicationSurfaceEvent]) -> anyhow::Result<&str> {
+    if events.is_empty() || events.len() > MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT {
+        bail!("application-surface event batch is outside supported bounds");
+    }
+    let session = events[0].session.trim();
+    if session.is_empty()
+        || session.len() > 128
+        || events.iter().any(|event| event.session != session)
+    {
+        bail!("application-surface event batch must target one valid session");
+    }
+    Ok(session)
+}
+
+fn dispatch_event(
+    event: ApplicationSurfaceEvent,
+    target_window_id: u32,
+    target_process_id: i32,
+    target: &windows::WindowInfo,
+    frame_state: &CaptureFrameState,
+    input_state: &ApplicationSurfaceInputState,
+) -> anyhow::Result<()> {
     match event.kind.as_str() {
         "mouse_moved"
         | "left_mouse_down"
@@ -961,6 +1130,40 @@ fn post_mouse(
     click_count: i64,
     pointer_state: &Mutex<ApplicationSurfacePointerState>,
 ) -> anyhow::Result<()> {
+    let transition = pointer_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .transition_for(kind, click_count);
+    let delivery = ApplicationSurfacePointerDelivery {
+        screen_x,
+        screen_y,
+        local_x,
+        local_y,
+        modifiers,
+        click_count,
+        group_id: transition.group_id,
+    };
+    post_mouse_delivery(
+        process_id,
+        window_id,
+        kind,
+        delivery,
+        transition.should_prepare_background,
+    )?;
+    pointer_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record_delivery(kind, delivery);
+    Ok(())
+}
+
+fn post_mouse_delivery(
+    process_id: i32,
+    window_id: u32,
+    kind: &str,
+    delivery: ApplicationSurfacePointerDelivery,
+    should_prepare_background: bool,
+) -> anyhow::Result<()> {
     let (event_type, button, button_number) = match kind {
         "mouse_moved" => (CGEventType::MouseMoved, CGMouseButton::Left, 0),
         "left_mouse_down" => (CGEventType::LeftMouseDown, CGMouseButton::Left, 0),
@@ -971,21 +1174,19 @@ fn post_mouse(
         "right_mouse_dragged" => (CGEventType::RightMouseDragged, CGMouseButton::Right, 1),
         _ => bail!("unsupported mouse event"),
     };
-    let point = CGPoint::new(screen_x, screen_y);
-    let click_group_id = pointer_state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .group_for(kind);
-    let flags = CGEventFlags::from_bits_truncate(modifiers);
-    let source = if mouse_event_requires_background_preparation(kind) {
+    let point = CGPoint::new(delivery.screen_x, delivery.screen_y);
+    let flags = CGEventFlags::from_bits_truncate(delivery.modifiers);
+    let source = if should_prepare_background
+        && mouse_event_requires_background_preparation(kind)
+    {
         crate::input::mouse::prepare_chromium_background_gesture(
             process_id,
-            screen_x,
-            screen_y,
-            local_x,
-            local_y,
+            delivery.screen_x,
+            delivery.screen_y,
+            delivery.local_x,
+            delivery.local_y,
             window_id,
-            click_group_id,
+            delivery.group_id,
             flags,
         )?
     } else {
@@ -995,10 +1196,15 @@ fn post_mouse(
     let event = CGEvent::new_mouse_event(source, event_type, point, button)
         .map_err(|_| anyhow!("could not create mouse event"))?;
     event.set_flags(flags);
+    crate::input::skylight::set_integer_field(
+        event.as_ptr() as *mut c_void,
+        0,
+        application_surface_target_phase(kind),
+    );
     let click_state = if kind == "mouse_moved" {
         0
     } else {
-        click_count.clamp(1, 3)
+        delivery.click_count.clamp(1, 3)
     };
     let subtype = if matches!(kind, "left_mouse_dragged" | "right_mouse_dragged") {
         0
@@ -1008,14 +1214,22 @@ fn post_mouse(
     crate::input::mouse::post_mouse_event(
         process_id,
         &event,
-        Some((local_x, local_y)),
+        Some((delivery.local_x, delivery.local_y)),
         Some(window_id),
-        Some(click_group_id),
+        Some(delivery.group_id),
         click_state,
         button_number,
         subtype,
     );
     Ok(())
+}
+
+fn application_surface_target_phase(kind: &str) -> i64 {
+    if kind == "mouse_moved" {
+        2
+    } else {
+        3
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

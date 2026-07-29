@@ -14,6 +14,7 @@
 //!   {"method":"application_surface_start","args":{...}}
 //!   {"method":"application_surface_stop","args":{"session":"..."}}
 //!   {"method":"application_surface_event","args":{...}}
+//!   {"method":"application_surface_events","args":{"events":[...]}}
 //!
 //! Response shapes:
 //!   {"ok":true,"result":...}
@@ -872,6 +873,13 @@ fn host_request_is_authorized(
     } else {
         peer_is_authorized_root
     }
+}
+
+fn application_surface_session_to_reap_after_delivery<'a>(
+    started_session_id: Option<&'a str>,
+    response_delivered: bool,
+) -> Option<&'a str> {
+    (!response_delivered).then_some(started_session_id).flatten()
 }
 
 fn state_authentication_key(args: Option<&serde_json::Value>) -> Option<Vec<u8>> {
@@ -1900,12 +1908,15 @@ pub async fn run_serve(
                             }
                             "application_surface_start" => {
                                 #[cfg(target_os = "macos")]
-                                let resp = if !host_request_authorized
+                                let (resp, started_session_id) = if !host_request_authorized
                                     || profile != DaemonProfile::Native
                                 {
-                                    DaemonResponse::err(
-                                        "Unauthorized host-only application-surface request",
-                                        77,
+                                    (
+                                        DaemonResponse::err(
+                                            "Unauthorized host-only application-surface request",
+                                            77,
+                                        ),
+                                        None,
                                     )
                                 } else {
                                     let request = req.args
@@ -1925,32 +1936,64 @@ pub async fn run_serve(
                                                 platform_macos::application_surface::start(request)
                                             },
                                         ).await {
-                                            Ok(Ok(result)) => DaemonResponse::ok(
-                                                serde_json::to_value(result).expect(
-                                                    "application start result is serializable"
-                                                ),
-                                            ),
-                                            Ok(Err(error)) => {
-                                                DaemonResponse::err(format!("{error:#}"), 1)
+                                            Ok(Ok(result)) => {
+                                                let session_id = result.session_id.clone();
+                                                (
+                                                    DaemonResponse::ok(
+                                                        serde_json::to_value(result).expect(
+                                                            "application start result is serializable"
+                                                        ),
+                                                    ),
+                                                    Some(session_id),
+                                                )
                                             }
-                                            Err(error) => DaemonResponse::err(
-                                                format!(
-                                                    "Application-capture task failed: {error}"
+                                            Ok(Err(error)) => (
+                                                DaemonResponse::err(format!("{error:#}"), 1),
+                                                None,
+                                            ),
+                                            Err(error) => (
+                                                DaemonResponse::err(
+                                                    format!(
+                                                        "Application-capture task failed: {error}"
+                                                    ),
+                                                    1,
                                                 ),
-                                                1,
+                                                None,
                                             ),
                                         },
-                                        Err(error) => DaemonResponse::err(error, 64),
+                                        Err(error) => (
+                                            DaemonResponse::err(error, 64),
+                                            None,
+                                        ),
                                     }
                                 };
                                 #[cfg(not(target_os = "macos"))]
-                                let resp = DaemonResponse::err(
-                                    "application_surface_start is available only on macOS",
-                                    64,
+                                let (resp, started_session_id): (DaemonResponse, Option<String>) = (
+                                    DaemonResponse::err(
+                                        "application_surface_start is available only on macOS",
+                                        64,
+                                    ),
+                                    None,
                                 );
-                                let _ = writer.write_all(
+                                let delivery = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
+                                #[cfg(target_os = "macos")]
+                                if let Some(session_id) =
+                                    application_surface_session_to_reap_after_delivery(
+                                        started_session_id.as_deref(),
+                                        delivery.is_ok(),
+                                    )
+                                {
+                                    let session_id = session_id.to_owned();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        platform_macos::application_surface::stop(&session_id)
+                                    })
+                                    .await;
+                                }
+                                if delivery.is_err() {
+                                    return;
+                                }
                             }
                             "application_surface_stop" => {
                                 #[cfg(target_os = "macos")]
@@ -2044,6 +2087,68 @@ pub async fn run_serve(
                                 #[cfg(not(target_os = "macos"))]
                                 let resp = DaemonResponse::err(
                                     "application_surface_event is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "application_surface_events" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    let events = req.args
+                                        .ok_or("Missing application-surface event batch")
+                                        .and_then(|args| {
+                                            serde_json::from_value::<
+                                                platform_macos::application_surface::
+                                                    ApplicationSurfaceEventBatchRequest,
+                                            >(args)
+                                            .map_err(|_| {
+                                                "Invalid application-surface event batch"
+                                            })
+                                        })
+                                        .and_then(|request| {
+                                            request.into_validated_events()
+                                        });
+                                    match events {
+                                        Ok(events) => {
+                                            let event_count = events.len();
+                                            match tokio::task::spawn_blocking(move || {
+                                                platform_macos::application_surface::send_events(
+                                                    events,
+                                                )
+                                            })
+                                            .await
+                                            {
+                                                Ok(Ok(())) => DaemonResponse::ok(
+                                                    serde_json::json!({
+                                                        "sent": event_count
+                                                    }),
+                                                ),
+                                                Ok(Err(error)) => {
+                                                    DaemonResponse::err(format!("{error:#}"), 1)
+                                                }
+                                                Err(error) => DaemonResponse::err(
+                                                    format!(
+                                                        "Application-input task failed: {error}"
+                                                    ),
+                                                    1,
+                                                ),
+                                            }
+                                        }
+                                        Err(error) => DaemonResponse::err(error, 64),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_surface_events is available only on macOS",
                                     64,
                                 );
                                 let _ = writer.write_all(
