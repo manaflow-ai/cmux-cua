@@ -829,6 +829,7 @@ pub fn launch_daemon_and_wait(
     timeout_secs: u64,
     claude_code_compat: bool,
     codex_computer_use_compat: bool,
+    cursor_speed: Option<&str>,
 ) -> anyhow::Result<()> {
     use std::process::{Command as Cmd, Stdio};
     use std::time::{Duration, Instant};
@@ -840,7 +841,6 @@ pub fn launch_daemon_and_wait(
     // user-supplied path that never comes up. Only added when the path
     // actually differs from the default, so the common case keeps the
     // shorter `open` argv (and matches Swift's invocation byte-for-byte).
-    let pass_socket = socket_path != crate::serve::default_socket_path();
     // cmux sets CUA_DRIVER_DAEMON_APP to its bundled "cmux Computer Use.app" so
     // LaunchServices launches THAT app as the serve daemon. A LaunchServices-
     // launched app is its own responsible process (launchd-parented), so macOS
@@ -848,29 +848,14 @@ pub fn launch_daemon_and_wait(
     // — the permission prompt names "cmux Computer Use", not the host app.
     let daemon_app =
         std::env::var("CUA_DRIVER_DAEMON_APP").unwrap_or_else(|_| "CuaDriver".to_string());
-    let mut open_args: Vec<&str> =
-        vec!["-n", "-g", "-a", daemon_app.as_str(), "--args", "serve"];
-    if pass_socket {
-        open_args.push("--socket");
-        open_args.push(socket_path);
-    }
-    // Thread the Claude-Code compat flag through to the daemon. Without this
-    // the proxy-spawned daemon always called build_macos_registry() (compat
-    // hardcoded false), so `cua-driver mcp --claude-code-computer-use-compat`
-    // SILENTLY DROPPED the flag on the proxy path — the path users actually
-    // run on an installed bundle. Today this is latent: the compat screenshot
-    // tool was removed in #1692, so `register_all(compat)` ignores the flag and
-    // the served surface is identical either way. But the flag was being lost
-    // before reaching the daemon at all, so the moment any compat-gated tool is
-    // re-introduced the proxy path would not honour it. This makes the flag
-    // travel end-to-end. Only honoured on a freshly-launched daemon — a
-    // pre-existing daemon keeps whatever surface it launched with.
-    if claude_code_compat {
-        open_args.push("--claude-code-computer-use-compat");
-    }
-    if codex_computer_use_compat {
-        open_args.push("--codex-computer-use-compat");
-    }
+    let open_args = daemon_open_arguments(
+        &daemon_app,
+        socket_path,
+        claude_code_compat,
+        codex_computer_use_compat,
+        cursor_speed,
+    );
+    let pass_socket = socket_path != crate::serve::default_socket_path();
 
     let status = Cmd::new("/usr/bin/open")
         // `-n` forces a new instance: CuaDriver.app might already be
@@ -918,6 +903,33 @@ pub fn launch_daemon_and_wait(
     );
 }
 
+fn daemon_open_arguments(
+    daemon_app: &str,
+    socket_path: &str,
+    claude_code_compat: bool,
+    codex_computer_use_compat: bool,
+    cursor_speed: Option<&str>,
+) -> Vec<String> {
+    let mut arguments = ["-n", "-g", "-a", daemon_app, "--args", "serve"]
+        .map(str::to_owned)
+        .to_vec();
+    if socket_path != crate::serve::default_socket_path() {
+        arguments.push("--socket".to_owned());
+        arguments.push(socket_path.to_owned());
+    }
+    if claude_code_compat {
+        arguments.push("--claude-code-computer-use-compat".to_owned());
+    }
+    if codex_computer_use_compat {
+        arguments.push("--codex-computer-use-compat".to_owned());
+    }
+    if let Some(cursor_speed) = cursor_speed {
+        arguments.push("--cursor-speed".to_owned());
+        arguments.push(cursor_speed.to_owned());
+    }
+    arguments
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MissingDaemonAction {
     EnterLazyProxy,
@@ -953,6 +965,8 @@ pub fn run_mcp_via_daemon_proxy(
     claude_code_compat: bool,
     codex_computer_use_compat: bool,
 ) -> anyhow::Result<()> {
+    let process_arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let cursor_speed = flag_value(&process_arguments, "--cursor-speed");
     // Windows: prefer the uiAccess'd worker pipe over the regular daemon pipe
     // when both are running, so MCP tool calls land in a process that can
     // bypass UIPI for UWP apps. The protocol on both pipes is identical so
@@ -1028,6 +1042,7 @@ pub fn run_mcp_via_daemon_proxy(
         crate::serve::DaemonProfile::for_codex_compat(
             codex_computer_use_compat,
         ),
+        cursor_speed,
     ))
 }
 
@@ -2530,7 +2545,7 @@ fn run_permissions_grant_macos() -> anyhow::Result<()> {
             .find(|endpoint| endpoint.profile == crate::serve::DaemonProfile::Native)
             .expect("native permission endpoint");
         println!("Launching CuaDriver permission onboarding.");
-        launch_daemon_and_wait(&native.socket, 10, false, false)?;
+        launch_daemon_and_wait(&native.socket, 10, false, false, None)?;
         let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Some(state) = query_permission_daemon(&native)? {

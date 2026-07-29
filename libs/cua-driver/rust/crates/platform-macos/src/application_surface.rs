@@ -199,6 +199,7 @@ struct SharedFrameRing {
     layout: FrameLayout,
     next_sequence: AtomicU64,
     is_closed: AtomicBool,
+    is_unlinked: AtomicBool,
 }
 
 // SAFETY: publication is serialized by ScreenCaptureKit's screen-output queue.
@@ -261,6 +262,7 @@ impl SharedFrameRing {
             layout,
             next_sequence: AtomicU64::new(0),
             is_closed: AtomicBool::new(false),
+            is_unlinked: AtomicBool::new(false),
         };
         ring.initialize_header();
         Ok(ring)
@@ -391,6 +393,18 @@ impl SharedFrameRing {
         fence(Ordering::SeqCst);
         post_frame_notification(&self.name)
     }
+
+    fn acknowledge_attachment(&self) -> bool {
+        if self.is_unlinked.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        if unlink_shared_memory(&self.name) {
+            true
+        } else {
+            self.is_unlinked.store(false, Ordering::Release);
+            false
+        }
+    }
 }
 
 impl Drop for SharedFrameRing {
@@ -404,7 +418,9 @@ impl Drop for SharedFrameRing {
                 self.layout.total_byte_count,
             );
         }
-        unlink_shared_memory(&self.name);
+        if !self.is_unlinked.swap(true, Ordering::AcqRel) {
+            unlink_shared_memory(&self.name);
+        }
     }
 }
 
@@ -439,10 +455,9 @@ fn create_shared_memory() -> anyhow::Result<(CString, RawFd)> {
     bail!("could not reserve a unique frame-ring name")
 }
 
-fn unlink_shared_memory(name: &CString) {
-    unsafe {
-        libc::shm_unlink(name.as_ptr());
-    }
+fn unlink_shared_memory(name: &CString) -> bool {
+    let result = unsafe { libc::shm_unlink(name.as_ptr()) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
 }
 
 fn post_frame_notification(shared_memory_name: &CString) -> anyhow::Result<()> {
@@ -673,9 +688,40 @@ struct ApplicationSurfacePointerState {
 }
 
 #[derive(Default)]
+struct ApplicationSurfaceScrollState {
+    remainder_x: f64,
+    remainder_y: f64,
+}
+
+impl ApplicationSurfaceScrollState {
+    fn consume(&mut self, delta_x: f64, delta_y: f64) -> Option<(i32, i32)> {
+        if !delta_x.is_finite() || !delta_y.is_finite() {
+            return None;
+        }
+        let (wheel_x, remainder_x) = Self::consume_axis(self.remainder_x + delta_x);
+        let (wheel_y, remainder_y) = Self::consume_axis(self.remainder_y + delta_y);
+        self.remainder_x = remainder_x;
+        self.remainder_y = remainder_y;
+        Some((wheel_x, wheel_y))
+    }
+
+    fn consume_axis(value: f64) -> (i32, f64) {
+        let bounded = value.clamp(i32::MIN as f64, i32::MAX as f64);
+        let whole = bounded.trunc() as i32;
+        let remainder = if bounded == value {
+            value - f64::from(whole)
+        } else {
+            0.0
+        };
+        (whole, remainder)
+    }
+}
+
+#[derive(Default)]
 struct ApplicationSurfaceInputState {
     dispatch: Mutex<()>,
     pointer: Mutex<ApplicationSurfacePointerState>,
+    scroll: Mutex<ApplicationSurfaceScrollState>,
     keyboard: Mutex<ApplicationSurfaceKeyboardState>,
     active: AtomicBool,
 }
@@ -1069,6 +1115,16 @@ pub fn stop(session_id: &str) -> bool {
     stopped
 }
 
+pub fn acknowledge_attachment(session_id: &str) -> bool {
+    let ring = manager()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .sessions
+        .get(session_id)
+        .map(|session| session.frame_state.ring.clone());
+    ring.is_some_and(|ring| ring.acknowledge_attachment())
+}
+
 pub fn stop_all() {
     let sessions = {
         let mut manager = manager()
@@ -1212,6 +1268,7 @@ fn dispatch_event(
                 event.delta_y,
                 event.modifiers,
                 &input_state.pointer,
+                &input_state.scroll,
             )
         }
         "key" => {
@@ -1391,9 +1448,13 @@ fn post_scroll(
     delta_y: f64,
     modifiers: u64,
     pointer_state: &Mutex<ApplicationSurfacePointerState>,
+    scroll_state: &Mutex<ApplicationSurfaceScrollState>,
 ) -> anyhow::Result<()> {
-    let wheel_x = delta_x.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32;
-    let wheel_y = delta_y.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+    let (wheel_x, wheel_y) = scroll_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .consume(delta_x, delta_y)
+        .ok_or_else(|| anyhow!("application surface scroll delta is invalid"))?;
     if wheel_x == 0 && wheel_y == 0 {
         return Ok(());
     }

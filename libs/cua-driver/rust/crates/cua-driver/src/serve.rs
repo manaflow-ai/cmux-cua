@@ -12,6 +12,7 @@
 //!   {"method":"permissions_refresh"}      (private macOS operator control)
 //!   {"method":"application_windows"}      (private authenticated cmux host control)
 //!   {"method":"application_surface_start","args":{...}}
+//!   {"method":"application_surface_attach","args":{"session":"..."}}
 //!   {"method":"application_surface_stop","args":{"session":"..."}}
 //!   {"method":"application_surface_event","args":{...}}
 //!   {"method":"application_surface_events","args":{"events":[...]}}
@@ -2032,6 +2033,51 @@ pub async fn run_serve(
                                 #[cfg(not(target_os = "macos"))]
                                 let resp = DaemonResponse::err(
                                     "application_surface_stop is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "application_surface_attach" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    let session = req.args.as_ref()
+                                        .and_then(|args| args.get("session"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|value| {
+                                            !value.is_empty() && value.len() <= 128
+                                        })
+                                        .map(str::to_owned);
+                                    match session {
+                                        Some(session) => {
+                                            let attached = tokio::task::spawn_blocking(
+                                                move || {
+                                                    platform_macos::application_surface::
+                                                        acknowledge_attachment(&session)
+                                                },
+                                            ).await.unwrap_or(false);
+                                            DaemonResponse::ok(
+                                                serde_json::json!({"attached": attached}),
+                                            )
+                                        }
+                                        None => DaemonResponse::err(
+                                            "application_surface_attach requires a session",
+                                            64,
+                                        ),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_surface_attach is available only on macOS",
                                     64,
                                 );
                                 let _ = writer.write_all(

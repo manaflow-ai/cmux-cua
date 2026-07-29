@@ -146,6 +146,7 @@ pub async fn run_proxy(
     socket_path: String,
     claude_code_compat: bool,
     expected_profile: DaemonProfile,
+    cursor_speed: Option<String>,
 ) -> anyhow::Result<()> {
     // Mint this MCP session's identity once at proxy startup. One proxy process
     // == one MCP session; the daemon outlives it. We stamp this id on every
@@ -311,6 +312,7 @@ pub async fn run_proxy(
                                 &mut daemon_state,
                                 &session_id,
                                 claude_code_compat,
+                                cursor_speed.as_deref(),
                                 expected_profile,
                                 &control_ready_tx,
                                 wait_for_grants,
@@ -1602,6 +1604,7 @@ async fn ensure_daemon_started(
     state: &mut DaemonStartState,
     session_id: &str,
     claude_code_compat: bool,
+    cursor_speed: Option<&str>,
     expected_profile: DaemonProfile,
     control_ready: &tokio::sync::watch::Sender<ControlConnectionState>,
     wait_for_grants: bool,
@@ -1631,12 +1634,14 @@ async fn ensure_daemon_started(
             ))?;
         } else {
             let sp = socket_path.to_owned();
+            let cursor_speed = cursor_speed.map(str::to_owned);
             tokio::task::spawn_blocking(move || {
                 crate::cli::launch_daemon_and_wait(
                     &sp,
                     10,
                     claude_code_compat,
                     expected_profile == DaemonProfile::CodexComputerUseCompat,
+                    cursor_speed.as_deref(),
                 )
             })
             .await
