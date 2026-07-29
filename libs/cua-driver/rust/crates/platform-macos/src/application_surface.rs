@@ -1938,16 +1938,18 @@ mod tests {
     }
 
     #[test]
-    fn only_complete_capture_frames_are_publishable() {
+    fn content_bearing_capture_frames_are_publishable() {
         assert!(capture_frame_status_is_publishable(Some(
             SCFrameStatus::Complete
+        )));
+        assert!(capture_frame_status_is_publishable(Some(
+            SCFrameStatus::Started
         )));
         for status in [
             None,
             Some(SCFrameStatus::Idle),
             Some(SCFrameStatus::Blank),
             Some(SCFrameStatus::Suspended),
-            Some(SCFrameStatus::Started),
             Some(SCFrameStatus::Stopped),
         ] {
             assert!(!capture_frame_status_is_publishable(status));

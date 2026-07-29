@@ -2351,6 +2351,39 @@ mod tests {
     }
 
     #[test]
+    fn first_seed_uses_the_containing_displays_global_bounds() {
+        let displays = [
+            DisplayGeometry {
+                bounds: LogicalRect {
+                    left: -1920.0,
+                    top: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                },
+                backing_scale: 1.0,
+            },
+            DisplayGeometry {
+                bounds: LogicalRect {
+                    left: 0.0,
+                    top: -1080.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                },
+                backing_scale: 2.0,
+            },
+        ];
+
+        assert_eq!(
+            seed_point_for_target(-1700.0, 400.0, &displays, None),
+            (-1840.0, 260.0)
+        );
+        assert_eq!(
+            seed_point_for_target(400.0, -800.0, &displays, None),
+            (260.0, -940.0)
+        );
+    }
+
+    #[test]
     fn seed_is_noop_when_cursor_already_on_screen() {
         // A second action: the cursor already landed somewhere on-screen, so the
         // seed must NOT move it (the MoveTo path should start from where it is).
