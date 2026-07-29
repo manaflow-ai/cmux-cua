@@ -92,15 +92,33 @@ async fn capture_one_frame_with_stream(
         cm::{CMSampleBufferExt, CMSampleBufferSCExt},
         prelude::SCStreamOutputType,
     };
+    use std::sync::{Arc, Mutex};
 
-    let stream = AsyncSCStream::new(filter, configuration, 1, SCStreamOutputType::Screen);
-    if stream.start_capture().is_err() {
-        return false;
-    }
-    let received = capture_probe_with_timeout(
+    let stream = Arc::new(AsyncSCStream::new(
+        filter,
+        configuration,
+        1,
+        SCStreamOutputType::Screen,
+    ));
+    let lifecycle = Arc::new(Mutex::new(()));
+    let start_task = {
+        let stream = Arc::clone(&stream);
+        let lifecycle = Arc::clone(&lifecycle);
+        tokio::task::spawn_blocking(move || {
+            let _guard = lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            stream.start_capture().is_ok()
+        })
+    };
+    let receive_stream = Arc::clone(&stream);
+    let stop_stream = Arc::clone(&stream);
+    let stop_lifecycle = Arc::clone(&lifecycle);
+    capture_stream_lifecycle_with_timeout(
         SCREEN_CAPTURE_PROBE_TIMEOUT,
-        async {
-            while let Some(sample) = stream.next().await {
+        start_task,
+        move || async move {
+            while let Some(sample) = receive_stream.next().await {
                 if crate::application_surface::capture_frame_status_is_publishable(
                     sample.frame_status(),
                 )
@@ -113,10 +131,54 @@ async fn capture_one_frame_with_stream(
             }
             false
         },
+        move || {
+            tokio::task::spawn_blocking(move || {
+                let _guard = stop_lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                stop_stream.stop_capture().is_ok()
+            })
+        },
     )
-    .await;
-    let _ = stream.stop_capture();
-    received
+    .await
+}
+
+async fn capture_stream_lifecycle_with_timeout<Receive, ReceiveFuture, Stop>(
+    timeout: std::time::Duration,
+    start_task: tokio::task::JoinHandle<bool>,
+    receive: Receive,
+    stop: Stop,
+) -> bool
+where
+    Receive: FnOnce() -> ReceiveFuture,
+    ReceiveFuture: std::future::Future<Output = bool>,
+    Stop: FnOnce() -> tokio::task::JoinHandle<bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let started = capture_probe_task_before(deadline, start_task).await;
+    let received = if started {
+        tokio::time::timeout_at(deadline, receive())
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    // Schedule shutdown even after the deadline. The lifecycle mutex keeps it
+    // behind an in-flight start, while spawn_blocking keeps both synchronous
+    // ScreenCaptureKit completion waits off Tokio's async worker threads.
+    let stop_task = stop();
+    let stopped = capture_probe_task_before(deadline, stop_task).await;
+    started && received && stopped
+}
+
+async fn capture_probe_task_before(
+    deadline: tokio::time::Instant,
+    task: tokio::task::JoinHandle<bool>,
+) -> bool {
+    tokio::time::timeout_at(deadline, task)
+        .await
+        .is_ok_and(|result| result.unwrap_or(false))
 }
 
 async fn capture_probe_with_timeout(
@@ -627,6 +689,49 @@ mod tests {
             )
             .await
         );
+    }
+
+    #[tokio::test]
+    async fn stream_probe_bounds_start_and_still_schedules_shutdown() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let receive_called = Arc::new(AtomicBool::new(false));
+        let stop_scheduled = Arc::new(AtomicBool::new(false));
+        let receive_marker = Arc::clone(&receive_called);
+        let stop_marker = Arc::clone(&stop_scheduled);
+        let result = capture_stream_lifecycle_with_timeout(
+            std::time::Duration::from_millis(10),
+            tokio::spawn(std::future::pending::<bool>()),
+            move || {
+                receive_marker.store(true, Ordering::Release);
+                std::future::ready(true)
+            },
+            move || {
+                stop_marker.store(true, Ordering::Release);
+                tokio::spawn(async { true })
+            },
+        )
+        .await;
+
+        assert!(!result);
+        assert!(!receive_called.load(Ordering::Acquire));
+        assert!(stop_scheduled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn stream_probe_timeout_includes_shutdown() {
+        let result = capture_stream_lifecycle_with_timeout(
+            std::time::Duration::from_millis(10),
+            tokio::spawn(async { true }),
+            || std::future::ready(true),
+            || tokio::spawn(std::future::pending::<bool>()),
+        )
+        .await;
+
+        assert!(!result);
     }
 
     #[tokio::test]

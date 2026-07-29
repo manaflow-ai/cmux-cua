@@ -833,7 +833,7 @@ pub fn paint_cursor(
             } else {
                 Some(&core.gradient_colors)
             };
-            draw_default_arrow(
+            draw_default_arrow_at_backing_scale(
                 pm,
                 &core.palette,
                 grad_override,
@@ -841,6 +841,7 @@ pub fn paint_cursor(
                 py as f32,
                 heading as f32,
                 alpha_scale,
+                sf,
             );
             None
         }
@@ -930,8 +931,36 @@ pub fn draw_default_arrow(
     heading: f32,
     alpha_scale: f32,
 ) {
+    draw_default_arrow_at_backing_scale(
+        pm,
+        palette,
+        gradient_override,
+        px,
+        py,
+        heading,
+        alpha_scale,
+        1.0,
+    );
+}
+
+fn draw_default_arrow_at_backing_scale(
+    pm: &mut tiny_skia::Pixmap,
+    palette: &Palette,
+    gradient_override: Option<&Vec<[u8; 4]>>,
+    px: f32,
+    py: f32,
+    heading: f32,
+    alpha_scale: f32,
+    backing_scale: f32,
+) {
+    let scale = backing_scale.max(1.0);
     // Arrow vertices (tip at +x).
-    let verts: [(f32, f32); 4] = [(14.0, 0.0), (-8.0, -9.0), (-3.0, 0.0), (-8.0, 9.0)];
+    let verts: [(f32, f32); 4] = [
+        (14.0 * scale, 0.0),
+        (-8.0 * scale, -9.0 * scale),
+        (-3.0 * scale, 0.0),
+        (-8.0 * scale, 9.0 * scale),
+    ];
 
     // Rotate by (heading + π) so tip points in the motion direction.
     let angle = heading + std::f64::consts::PI as f32;
@@ -1011,7 +1040,7 @@ pub fn draw_default_arrow(
         tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(255, 255, 255, a));
     stroke_paint.anti_alias = true;
     let stroke = tiny_skia::Stroke {
-        width: 1.5,
+        width: 1.5 * scale,
         ..Default::default()
     };
     pm.stroke_path(

@@ -577,8 +577,8 @@ impl NormalizedContentRect {
         let rect = info.content_rect?;
         let scale_factor = info.scale_factor.unwrap_or(1.0);
         Self::from_frame_rect(
-            rect.origin.x * scale_factor,
-            rect.origin.y * scale_factor,
+            rect.origin.x,
+            rect.origin.y,
             rect.size.width * scale_factor,
             rect.size.height * scale_factor,
             frame_width,
@@ -666,9 +666,10 @@ impl CaptureFrameState {
             return;
         }
         if let Some(info) = sample.frame_info() {
-            // ScreenCaptureKit reports contentRect in source points. scaleFactor
-            // converts those points to pixels; contentScale independently reports
-            // source resizing and must not be applied to the rectangle again.
+            // ScreenCaptureKit reports contentRect's origin as an offset in the
+            // output surface, while scaleFactor converts its source-point size
+            // to output pixels. contentScale independently reports source
+            // resizing and must not be applied to the rectangle again.
             if let Some(normalized) = NormalizedContentRect::from_frame_info(
                 &info,
                 pixel_buffer.width(),
