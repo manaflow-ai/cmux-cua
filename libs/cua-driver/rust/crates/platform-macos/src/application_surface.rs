@@ -1490,6 +1490,39 @@ mod tests {
     }
 
     #[test]
+    fn out_of_content_release_reuses_the_last_delivered_pointer_position() {
+        let mut state = ApplicationSurfacePointerState::default();
+        let down = state.transition_for("left_mouse_down", 1);
+        state.record_delivery(
+            "left_mouse_down",
+            ApplicationSurfacePointerDelivery {
+                screen_x: 10.0,
+                screen_y: 20.0,
+                local_x: 3.0,
+                local_y: 4.0,
+                modifiers: 0,
+                click_count: 1,
+                group_id: down.group_id,
+            },
+        );
+
+        let release = state
+            .continued_delivery("left_mouse_up", 99, 2)
+            .expect("a delivered press must have a fallback release");
+
+        assert_eq!(release.screen_x, 10.0);
+        assert_eq!(release.screen_y, 20.0);
+        assert_eq!(release.local_x, 3.0);
+        assert_eq!(release.local_y, 4.0);
+        assert_eq!(release.modifiers, 99);
+        assert_eq!(release.click_count, 2);
+        assert_eq!(release.group_id, down.group_id);
+
+        state.record_delivery("left_mouse_up", release);
+        assert!(state.take_pressed_releases().is_empty());
+    }
+
+    #[test]
     fn deactivation_yields_a_release_for_each_pressed_button() {
         let input = ApplicationSurfaceInputState::new();
         let mut pointer = input
