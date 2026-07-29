@@ -611,7 +611,7 @@ struct CaptureFrameState {
 pub(crate) fn capture_frame_status_is_publishable(status: Option<SCFrameStatus>) -> bool {
     matches!(
         status,
-        Some(SCFrameStatus::Complete | SCFrameStatus::Started)
+        None | Some(SCFrameStatus::Complete | SCFrameStatus::Started)
     )
 }
 
@@ -1941,7 +1941,11 @@ mod tests {
     }
 
     #[test]
-    fn content_bearing_capture_frames_are_publishable() {
+    fn content_bearing_and_statusless_capture_frames_are_publishable() {
+        // macOS 26 can omit SCFrameStatus while still supplying a valid pixel
+        // buffer. `CaptureFrameState::receive` validates that buffer before
+        // publishing, so a missing optional attachment must not discard it.
+        assert!(capture_frame_status_is_publishable(None));
         assert!(capture_frame_status_is_publishable(Some(
             SCFrameStatus::Complete
         )));
@@ -1949,7 +1953,6 @@ mod tests {
             SCFrameStatus::Started
         )));
         for status in [
-            None,
             Some(SCFrameStatus::Idle),
             Some(SCFrameStatus::Blank),
             Some(SCFrameStatus::Suspended),
