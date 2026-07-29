@@ -1078,7 +1078,7 @@ extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use screencapturekit::cm::SCFrameStatus;
+    use screencapturekit::cm::{FrameInfo, SCFrameStatus};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -1117,11 +1117,50 @@ mod tests {
     }
 
     #[test]
+    fn mmap_failure_unlinks_shared_memory() {
+        let layout = FrameLayout::new(2, 2).unwrap();
+        let (name, descriptor_handle) = create_shared_memory().unwrap();
+        let result = SharedFrameRing::map_with(
+            name.clone(),
+            descriptor_handle,
+            layout,
+            || libc::MAP_FAILED,
+        );
+        unsafe {
+            libc::close(descriptor_handle);
+        }
+
+        assert!(result.is_err());
+        let reopened = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        if reopened >= 0 {
+            unsafe {
+                libc::close(reopened);
+            }
+            unlink_shared_memory(&name);
+        }
+        assert_eq!(reopened, -1, "failed mmap must unlink the named object");
+    }
+
+    #[test]
     fn content_rect_rejects_letterbox_and_maps_live_content() {
         let rect =
             NormalizedContentRect::from_frame_rect(0.0, 250.0, 1000.0, 500.0, 1000, 1000).unwrap();
         assert_eq!(rect.source_point(0.5, 0.25), Some((0.5, 0.0)));
         assert_eq!(rect.source_point(0.5, 0.75), Some((0.5, 1.0)));
+        assert_eq!(rect.source_point(0.5, 0.1), None);
+    }
+
+    #[test]
+    fn content_rect_uses_display_scale_without_double_applying_capture_scale() {
+        let info = FrameInfo {
+            scale_factor: Some(2.0),
+            content_scale: Some(0.5),
+            content_rect: Some(screencapturekit::cg::CGRect::new(0.0, 125.0, 500.0, 250.0)),
+            ..FrameInfo::default()
+        };
+
+        let rect = NormalizedContentRect::from_frame_info(&info, 1000, 1000).unwrap();
+        assert_eq!(rect.source_point(0.75, 0.5), Some((0.75, 0.5)));
         assert_eq!(rect.source_point(0.5, 0.1), None);
     }
 
