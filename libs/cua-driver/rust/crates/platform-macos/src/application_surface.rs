@@ -17,7 +17,7 @@ use core_graphics::event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton, Sc
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use foreign_types::ForeignType;
-use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt, SCFrameStatus};
+use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt, FrameInfo, SCFrameStatus};
 use screencapturekit::prelude::{
     PixelFormat, SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration,
     SCStreamOutputType,
@@ -204,13 +204,7 @@ impl SharedFrameRing {
     }
 
     fn map(name: CString, descriptor_handle: RawFd, layout: FrameLayout) -> anyhow::Result<Self> {
-        if unsafe { libc::ftruncate(descriptor_handle, layout.total_byte_count as libc::off_t) }
-            != 0
-        {
-            unlink_shared_memory(&name);
-            return Err(std::io::Error::last_os_error()).context("could not size frame ring");
-        }
-        let raw_mapping = unsafe {
+        Self::map_with(name, descriptor_handle, layout, || unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 layout.total_byte_count,
@@ -219,11 +213,32 @@ impl SharedFrameRing {
                 descriptor_handle,
                 0,
             )
-        };
-        let mapping = NonNull::new(raw_mapping.cast::<u8>())
+        })
+    }
+
+    fn map_with<F>(
+        name: CString,
+        descriptor_handle: RawFd,
+        layout: FrameLayout,
+        map: F,
+    ) -> anyhow::Result<Self>
+    where
+        F: FnOnce() -> *mut c_void,
+    {
+        if unsafe { libc::ftruncate(descriptor_handle, layout.total_byte_count as libc::off_t) }
+            != 0
+        {
+            unlink_shared_memory(&name);
+            return Err(std::io::Error::last_os_error()).context("could not size frame ring");
+        }
+        let raw_mapping = map();
+        let Some(mapping) = NonNull::new(raw_mapping.cast::<u8>())
             .filter(|pointer| pointer.as_ptr().cast::<c_void>() != libc::MAP_FAILED)
-            .ok_or_else(std::io::Error::last_os_error)
-            .context("could not map frame ring")?;
+        else {
+            let error = std::io::Error::last_os_error();
+            unlink_shared_memory(&name);
+            return Err(error).context("could not map frame ring");
+        };
 
         let ring = Self {
             name,
@@ -433,6 +448,23 @@ impl Default for NormalizedContentRect {
 }
 
 impl NormalizedContentRect {
+    fn from_frame_info(
+        info: &FrameInfo,
+        frame_width: usize,
+        frame_height: usize,
+    ) -> Option<Self> {
+        let rect = info.content_rect?;
+        let scale_factor = info.scale_factor.unwrap_or(1.0);
+        Self::from_frame_rect(
+            rect.origin.x * scale_factor,
+            rect.origin.y * scale_factor,
+            rect.size.width * scale_factor,
+            rect.size.height * scale_factor,
+            frame_width,
+            frame_height,
+        )
+    }
+
     fn from_frame_rect(
         x: f64,
         y: f64,
@@ -500,25 +532,18 @@ impl CaptureFrameState {
             return;
         }
         if let Some(info) = sample.frame_info() {
-            if let Some(rect) = info.content_rect {
-                // ScreenCaptureKit reports this rectangle in source points.
-                // Convert it into configured output pixels before normalizing.
-                let output_scale =
-                    info.scale_factor.unwrap_or(1.0) * info.content_scale.unwrap_or(1.0);
-                let normalized = NormalizedContentRect::from_frame_rect(
-                    rect.origin.x * output_scale,
-                    rect.origin.y * output_scale,
-                    rect.size.width * output_scale,
-                    rect.size.height * output_scale,
-                    pixel_buffer.width(),
-                    pixel_buffer.height(),
-                );
-                if let Some(normalized) = normalized {
-                    *self
-                        .content_rect
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = normalized;
-                }
+            // ScreenCaptureKit reports contentRect in source points. scaleFactor
+            // converts those points to pixels; contentScale independently reports
+            // source resizing and must not be applied to the rectangle again.
+            if let Some(normalized) = NormalizedContentRect::from_frame_info(
+                &info,
+                pixel_buffer.width(),
+                pixel_buffer.height(),
+            ) {
+                *self
+                    .content_rect
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = normalized;
             }
         }
         let Ok(guard) = pixel_buffer.lock_read_only() else {
