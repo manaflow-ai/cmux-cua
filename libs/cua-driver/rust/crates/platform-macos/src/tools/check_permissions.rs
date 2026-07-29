@@ -516,6 +516,18 @@ mod tests {
     }
 
     #[test]
+    fn capture_probe_keeps_the_macos_thirteen_compatible_backend() {
+        assert_eq!(
+            screen_capture_probe_backend(13),
+            ScreenCaptureProbeBackend::Stream
+        );
+        assert_eq!(
+            screen_capture_probe_backend(14),
+            ScreenCaptureProbeBackend::ScreenshotManager
+        );
+    }
+
+    #[test]
     fn live_check_reports_probe_true_or_false_and_warns_only_on_false() {
         for (live, should_warn) in [(true, false), (false, true)] {
             let capturable = maybe_screen_recording_capture_probe(true, || live);

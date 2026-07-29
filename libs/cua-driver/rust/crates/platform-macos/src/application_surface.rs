@@ -1469,7 +1469,7 @@ mod tests {
         drop(pointer);
 
         let mut releases = Vec::new();
-        input.deactivate_with(|release| releases.push(release));
+        input.deactivate_with(|release| releases.push(release), |_| {});
 
         assert!(!input.active.load(Ordering::Acquire));
         assert_eq!(releases.len(), 2);
@@ -1483,6 +1483,31 @@ mod tests {
                 && release.delivery.screen_x == 30.0
                 && release.delivery.group_id == right.group_id
         }));
+    }
+
+    #[test]
+    fn deactivation_yields_key_releases_in_reverse_press_order() {
+        let input = ApplicationSurfaceInputState::new();
+        let mut keyboard = input
+            .keyboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        keyboard.record_delivery(56, true);
+        keyboard.record_delivery(0, true);
+        keyboard.record_delivery(0, false);
+        keyboard.record_delivery(1, true);
+        drop(keyboard);
+
+        let mut releases = Vec::new();
+        input.deactivate_with(|_| {}, |key_code| releases.push(key_code));
+
+        assert!(!input.active.load(Ordering::Acquire));
+        assert_eq!(releases, vec![1, 56]);
+    }
+
+    #[test]
+    fn stopping_an_unknown_application_surface_reports_false() {
+        assert!(!stop(&Uuid::new_v4().to_string()));
     }
 
     #[test]
