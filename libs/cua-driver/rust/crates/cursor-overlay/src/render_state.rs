@@ -1211,7 +1211,7 @@ mod hotspot_shape_tests {
 #[cfg(test)]
 mod backing_scale_tests {
     use super::*;
-    use crate::CursorConfig;
+    use crate::{BuiltinShape, CursorConfig};
 
     /// Count opaque (alpha > 0) pixels in the pixmap — a proxy for the
     /// cursor's on-pixmap footprint that's independent of palette / gradient.
@@ -1235,6 +1235,40 @@ mod backing_scale_tests {
         let mut pm = tiny_skia::Pixmap::new(pm_size, pm_size).unwrap();
         paint_cursor(&mut pm, &core, 0.0, 0.0, None, backing_scale);
         pm
+    }
+
+    fn render_arrow_at(backing_scale: f32, logical_size: u32) -> tiny_skia::Pixmap {
+        let mut config = CursorConfig::default();
+        config.builtin_shape = BuiltinShape::Arrow;
+        let mut core = RenderStateCore::new(config);
+        let centre = logical_size as f64 / 2.0;
+        core.place_at(centre, centre);
+        core.idle_alpha = 1.0;
+        core.visible = true;
+
+        let pm_size = (logical_size as f32 * backing_scale) as u32;
+        let mut pm = tiny_skia::Pixmap::new(pm_size, pm_size).unwrap();
+        paint_cursor(&mut pm, &core, 0.0, 0.0, None, backing_scale);
+        pm
+    }
+
+    fn high_alpha_bounds(pm: &tiny_skia::Pixmap) -> (u32, u32) {
+        let mut min_x = pm.width();
+        let mut min_y = pm.height();
+        let mut max_x = 0;
+        let mut max_y = 0;
+        for (index, pixel) in pm.data().chunks_exact(4).enumerate() {
+            if pixel[3] <= 200 {
+                continue;
+            }
+            let x = index as u32 % pm.width();
+            let y = index as u32 / pm.width();
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+        (max_x - min_x + 1, max_y - min_y + 1)
     }
 
     /// Doubling `backing_scale` doubles every linear dimension of the cursor's
@@ -1263,6 +1297,21 @@ mod backing_scale_tests {
             ratio > 3.0 && ratio < 5.0,
             "2× backing_scale should produce ~4× more opaque pixels — \
              got n_1x={n_1x}, n_2x={n_2x}, ratio={ratio:.2}"
+        );
+    }
+
+    #[test]
+    fn procedural_arrow_keeps_its_logical_size_on_retina() {
+        let (width_1x, height_1x) = high_alpha_bounds(&render_arrow_at(1.0, 200));
+        let (width_2x, height_2x) = high_alpha_bounds(&render_arrow_at(2.0, 200));
+
+        assert!(
+            width_2x >= width_1x * 2 - 2 && width_2x <= width_1x * 2 + 2,
+            "arrow width should double at 2×: {width_1x} -> {width_2x}"
+        );
+        assert!(
+            height_2x >= height_1x * 2 - 2 && height_2x <= height_1x * 2 + 2,
+            "arrow height should double at 2×: {height_1x} -> {height_2x}"
         );
     }
 }

@@ -1848,16 +1848,19 @@ mod tests {
     }
 
     #[test]
-    fn content_rect_uses_display_scale_without_double_applying_capture_scale() {
+    fn content_rect_scales_size_but_preserves_output_offset() {
         let info = FrameInfo {
             scale_factor: Some(2.0),
             content_scale: Some(0.5),
-            content_rect: Some(screencapturekit::cg::CGRect::new(0.0, 125.0, 500.0, 250.0)),
+            content_rect: Some(screencapturekit::cg::CGRect::new(
+                125.0, 125.0, 500.0, 250.0,
+            )),
             ..FrameInfo::default()
         };
 
         let rect = NormalizedContentRect::from_frame_info(&info, 1000, 1000).unwrap();
-        assert_eq!(rect.source_point(0.75, 0.5), Some((0.75, 0.5)));
+        assert_eq!(rect.source_point(0.625, 0.375), Some((0.5, 0.5)));
+        assert_eq!(rect.source_point(0.1, 0.375), None);
         assert_eq!(rect.source_point(0.5, 0.1), None);
     }
 
