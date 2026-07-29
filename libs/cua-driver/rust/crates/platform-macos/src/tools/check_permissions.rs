@@ -12,6 +12,8 @@ use crate::permissions::status::{
 
 pub struct CheckPermissionsTool;
 
+const SCREEN_CAPTURE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScreenCaptureProbeBackend {
     Stream,
@@ -38,83 +40,95 @@ fn screen_capture_probe_backend(macos_major_version: isize) -> ScreenCaptureProb
 /// therefore requires one real frame. macOS 14 and newer use
 /// `SCScreenshotManager`; macOS 13 uses its supported one-frame `SCStream`
 /// equivalent.
-pub(super) fn screen_recording_capturable() -> bool {
+pub(super) async fn screen_recording_capturable() -> bool {
     use screencapturekit::{
-        prelude::{SCContentFilter, SCShareableContent, SCStreamConfiguration},
-        screenshot_manager::SCScreenshotManager,
+        async_api::{AsyncSCScreenshotManager, AsyncSCShareableContent},
+        prelude::{SCContentFilter, SCStreamConfiguration},
     };
 
-    verify_screen_capture_with(
-        || {
-            SCShareableContent::get()
-                .ok()?
-                .displays()
-                .into_iter()
-                .next()
-        },
-        |display| {
-            let filter = SCContentFilter::create()
-                .with_display(display)
-                .with_excluding_windows(&[])
-                .build();
-            let configuration = SCStreamConfiguration::new().with_width(1).with_height(1);
-            let major_version = objc2_foundation::NSProcessInfo::processInfo()
-                .operatingSystemVersion()
-                .majorVersion;
-            match screen_capture_probe_backend(major_version) {
-                ScreenCaptureProbeBackend::Stream => {
-                    capture_one_frame_with_stream(&filter, configuration)
-                }
-                ScreenCaptureProbeBackend::ScreenshotManager => {
-                    SCScreenshotManager::capture_image(&filter, &configuration)
-                        .is_ok_and(|image| image.width() > 0 && image.height() > 0)
-                }
-            }
-        },
+    let Ok(Ok(content)) = tokio::time::timeout(
+        SCREEN_CAPTURE_PROBE_TIMEOUT,
+        AsyncSCShareableContent::get(),
     )
+    .await
+    else {
+        return false;
+    };
+    let Some(display) = content.displays().into_iter().next() else {
+        return false;
+    };
+    let filter = SCContentFilter::create()
+        .with_display(&display)
+        .with_excluding_windows(&[])
+        .build();
+    let configuration = SCStreamConfiguration::new().with_width(1).with_height(1);
+    let major_version = objc2_foundation::NSProcessInfo::processInfo()
+        .operatingSystemVersion()
+        .majorVersion;
+    match screen_capture_probe_backend(major_version) {
+        ScreenCaptureProbeBackend::Stream => {
+            capture_one_frame_with_stream(&filter, &configuration).await
+        }
+        ScreenCaptureProbeBackend::ScreenshotManager => {
+            capture_probe_with_timeout(
+                SCREEN_CAPTURE_PROBE_TIMEOUT,
+                async {
+                    AsyncSCScreenshotManager::capture_image(&filter, &configuration)
+                        .await
+                        .is_ok_and(|image| image.width() > 0 && image.height() > 0)
+                },
+            )
+            .await
+        }
+    }
 }
 
-fn capture_one_frame_with_stream(
+async fn capture_one_frame_with_stream(
     filter: &screencapturekit::prelude::SCContentFilter,
-    configuration: screencapturekit::prelude::SCStreamConfiguration,
+    configuration: &screencapturekit::prelude::SCStreamConfiguration,
 ) -> bool {
     use screencapturekit::{
+        async_api::AsyncSCStream,
         cm::{CMSampleBufferExt, CMSampleBufferSCExt},
-        prelude::{SCStream, SCStreamOutputType},
+        prelude::SCStreamOutputType,
     };
 
-    let (frame_sender, frame_receiver) = std::sync::mpsc::sync_channel(1);
-    let mut stream = SCStream::new(filter, &configuration);
-    if stream
-        .add_output_handler(
-            move |sample: screencapturekit::cm::CMSampleBuffer, output_type: SCStreamOutputType| {
-                if output_type == SCStreamOutputType::Screen
-                    && crate::application_surface::capture_frame_status_is_publishable(
-                        sample.frame_status(),
-                    )
+    let stream = AsyncSCStream::new(filter, configuration, 1, SCStreamOutputType::Screen);
+    if stream.start_capture().is_err() {
+        return false;
+    }
+    let received = capture_probe_with_timeout(
+        SCREEN_CAPTURE_PROBE_TIMEOUT,
+        async {
+            while let Some(sample) = stream.next().await {
+                if crate::application_surface::capture_frame_status_is_publishable(
+                    sample.frame_status(),
+                )
                     && sample.image_buffer().is_some_and(|pixel_buffer| {
                         pixel_buffer.width() > 0 && pixel_buffer.height() > 0
                     })
                 {
-                    let _ = frame_sender.try_send(());
+                    return true;
                 }
-            },
-            SCStreamOutputType::Screen,
-        )
-        .is_none()
-    {
-        return false;
-    }
-    if stream.start_capture().is_err() {
-        return false;
-    }
-    let received = frame_receiver
-        .recv_timeout(std::time::Duration::from_secs(2))
-        .is_ok();
+            }
+            false
+        },
+    )
+    .await;
     let _ = stream.stop_capture();
     received
 }
 
+async fn capture_probe_with_timeout(
+    timeout: std::time::Duration,
+    probe: impl std::future::Future<Output = bool>,
+) -> bool {
+    tokio::time::timeout(timeout, probe)
+        .await
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
 fn verify_screen_capture_with<Display>(
     load_display: impl FnOnce() -> Option<Display>,
     capture_frame: impl FnOnce(&Display) -> bool,
@@ -125,11 +139,19 @@ fn verify_screen_capture_with<Display>(
 /// Run the ScreenCaptureKit probe only on an explicitly prompt-capable path.
 /// `SCShareableContent::get()` can itself register/raise TCC, so `None` is the
 /// only truthful answer when a silent or host-owned flow skips that probe.
-fn maybe_screen_recording_capture_probe(
+async fn maybe_screen_recording_capture_probe<Probe, ProbeFuture>(
     should_probe: bool,
-    probe: impl FnOnce() -> bool,
-) -> Option<bool> {
-    should_probe.then(probe)
+    probe: Probe,
+) -> Option<bool>
+where
+    Probe: FnOnce() -> ProbeFuture,
+    ProbeFuture: std::future::Future<Output = bool>,
+{
+    if should_probe {
+        Some(probe().await)
+    } else {
+        None
+    }
 }
 
 /// (B) Which TCC identity the booleans in this response reflect.
@@ -321,7 +343,8 @@ impl Tool for CheckPermissionsTool {
         let screen_recording_capturable = maybe_screen_recording_capture_probe(
             should_prompt,
             screen_recording_capturable,
-        );
+        )
+        .await;
         // (B) Which identity the booleans above belong to.
         let source = permission_source();
 
@@ -525,13 +548,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn silent_check_reports_capture_unknown_without_running_probe() {
+    #[tokio::test]
+    async fn silent_check_reports_capture_unknown_without_running_probe() {
         let probe_called = std::cell::Cell::new(false);
         let capturable = maybe_screen_recording_capture_probe(false, || {
             probe_called.set(true);
-            true
-        });
+            std::future::ready(true)
+        })
+        .await;
         assert_eq!(capturable, None);
         assert!(!probe_called.get(), "silent status must not call SCShareableContent");
 
@@ -594,10 +618,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn live_check_reports_probe_true_or_false_and_warns_only_on_false() {
+    #[tokio::test]
+    async fn capture_probe_timeout_reports_not_ready() {
+        assert!(
+            !capture_probe_with_timeout(
+                std::time::Duration::from_millis(10),
+                std::future::pending(),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn live_check_reports_probe_true_or_false_and_warns_only_on_false() {
         for (live, should_warn) in [(true, false), (false, true)] {
-            let capturable = maybe_screen_recording_capture_probe(true, || live);
+            let capturable =
+                maybe_screen_recording_capture_probe(true, || std::future::ready(live)).await;
             assert_eq!(capturable, Some(live));
             let result = permission_result(
                 true,

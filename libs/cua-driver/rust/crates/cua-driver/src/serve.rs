@@ -2267,11 +2267,8 @@ pub async fn run_serve(
                                 }
                                 #[cfg(target_os = "macos")]
                                 let resp = {
-                                    let capturable = tokio::task::spawn_blocking(
-                                        platform_macos::tools::verify_screen_capture_ready,
-                                    )
-                                    .await
-                                    .unwrap_or(false);
+                                    let capturable =
+                                        platform_macos::tools::verify_screen_capture_ready().await;
                                     screen_capture_verification_response(capturable)
                                 };
                                 #[cfg(not(target_os = "macos"))]

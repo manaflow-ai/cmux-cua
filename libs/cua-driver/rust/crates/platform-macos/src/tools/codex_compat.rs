@@ -1022,6 +1022,7 @@ impl CompatState {
                 &action_name,
                 action_summary,
                 action_structured,
+                &snapshot,
                 error.into_result(),
             );
         }
@@ -1038,6 +1039,7 @@ impl CompatState {
                 &action_name,
                 action_summary,
                 action_structured,
+                &snapshot,
                 refreshed,
             );
         }
@@ -1810,6 +1812,7 @@ fn refresh_warning_after_success(
     action_name: &str,
     action_summary: String,
     action_structured: Option<Value>,
+    snapshot: &AppSnapshot,
     refreshed: ToolResult,
 ) -> ToolResult {
     let refresh_error = first_text(&refreshed);
@@ -1817,6 +1820,8 @@ fn refresh_warning_after_success(
         "{action_name} completed, but refreshing the app state failed. Do not repeat the action; call get_app_state again. {refresh_error}"
     ))
     .with_structured(json!({
+        "pid": snapshot.app.pid,
+        "window_id": snapshot.window_id,
         "state_refresh_failed_after_success": true,
         "warning": "The action completed, but the required refreshed app state and screenshot are unavailable. Do not retry the action automatically.",
         "refresh_error": refresh_error,
@@ -3700,6 +3705,7 @@ mod tests {
             "click",
             "clicked".to_owned(),
             None,
+            &stored,
             CompatError::new("screen_capture_failed", "capture failed").into_result(),
         );
         assert_ne!(result.is_error, Some(true));
@@ -4005,14 +4011,18 @@ mod tests {
 
     #[test]
     fn completed_action_with_failed_refresh_is_degraded_success_not_retryable_error() {
+        let app_snapshot = snapshot("Calculator", Arc::new(ToolState::default()));
         let result = refresh_warning_after_success(
             "click",
             "clicked".to_owned(),
             Some(json!({"verified": true})),
+            &app_snapshot,
             CompatError::new("screen_capture_failed", "capture failed").into_result(),
         );
         assert_ne!(result.is_error, Some(true));
         let structured = result.structured_content.unwrap();
+        assert_eq!(structured["pid"], app_snapshot.app.pid);
+        assert_eq!(structured["window_id"], app_snapshot.window_id);
         assert_eq!(structured["state_refresh_failed_after_success"], true);
         assert_eq!(structured["action_result"]["text"], "clicked");
         assert_eq!(structured["action_result"]["structured"]["verified"], true);

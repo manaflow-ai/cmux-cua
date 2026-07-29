@@ -129,24 +129,49 @@ fn default_frame_rate() -> u32 {
 pub struct ApplicationSurfaceEvent {
     pub session: String,
     pub kind: String,
-    #[serde(default)]
-    pub x: f64,
-    #[serde(default)]
-    pub y: f64,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
     #[serde(default)]
     pub button: String,
-    #[serde(default)]
-    pub key_code: u16,
-    #[serde(default)]
-    pub key_down: bool,
+    pub key_code: Option<u16>,
+    pub key_down: Option<bool>,
     #[serde(default)]
     pub modifiers: u64,
     #[serde(default = "default_click_count")]
     pub click_count: i64,
-    #[serde(default)]
-    pub delta_x: f64,
-    #[serde(default)]
-    pub delta_y: f64,
+    pub delta_x: Option<f64>,
+    pub delta_y: Option<f64>,
+}
+
+impl ApplicationSurfaceEvent {
+    fn pointer_coordinates(&self) -> anyhow::Result<(f64, f64)> {
+        let (Some(x), Some(y)) = (self.x, self.y) else {
+            bail!("application-surface pointer coordinates are required");
+        };
+        if !x.is_finite() || !y.is_finite() {
+            bail!("application-surface pointer coordinates must be finite");
+        }
+        Ok((x, y))
+    }
+
+    fn scroll_values(&self) -> anyhow::Result<(f64, f64, f64, f64)> {
+        let (Some(x), Some(y), Some(delta_x), Some(delta_y)) =
+            (self.x, self.y, self.delta_x, self.delta_y)
+        else {
+            bail!("application-surface scroll values are required");
+        };
+        if !x.is_finite() || !y.is_finite() || !delta_x.is_finite() || !delta_y.is_finite() {
+            bail!("application-surface scroll values must be finite");
+        }
+        Ok((x, y, delta_x, delta_y))
+    }
+
+    fn key_values(&self) -> anyhow::Result<(u16, bool)> {
+        let (Some(key_code), Some(key_down)) = (self.key_code, self.key_down) else {
+            bail!("application-surface key values are required");
+        };
+        Ok((key_code, key_down))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1272,20 +1297,15 @@ fn validate_event_shape(event: &ApplicationSurfaceEvent) -> anyhow::Result<()> {
         | "right_mouse_down"
         | "right_mouse_up"
         | "right_mouse_dragged" => {
-            if !event.x.is_finite() || !event.y.is_finite() {
-                bail!("application-surface pointer coordinates must be finite");
-            }
+            event.pointer_coordinates()?;
         }
         "scroll" => {
-            if !event.x.is_finite()
-                || !event.y.is_finite()
-                || !event.delta_x.is_finite()
-                || !event.delta_y.is_finite()
-            {
-                bail!("application-surface scroll values must be finite");
-            }
+            event.scroll_values()?;
         }
-        "key" | "health" => {}
+        "key" => {
+            event.key_values()?;
+        }
+        "health" => {}
         _ => bail!("unsupported application-surface event"),
     }
     Ok(())
@@ -1314,7 +1334,8 @@ fn validate_event_deliveries(
             | "right_mouse_down"
             | "right_mouse_up"
             | "right_mouse_dragged" => {
-                let is_inside_content = content.source_point(event.x, event.y).is_some();
+                let (x, y) = event.pointer_coordinates()?;
+                let is_inside_content = content.source_point(x, y).is_some();
                 let can_continue_outside = match kind {
                     "left_mouse_dragged" | "left_mouse_up" => left_pressed,
                     "right_mouse_dragged" | "right_mouse_up" => right_pressed,
@@ -1332,8 +1353,9 @@ fn validate_event_deliveries(
                 }
             }
             "scroll" => {
+                let (x, y, _, _) = event.scroll_values()?;
                 content
-                    .source_point(event.x, event.y)
+                    .source_point(x, y)
                     .ok_or(ApplicationSurfaceError::PointOutsideContent)?;
             }
             "key" | "health" => {}
@@ -1359,7 +1381,8 @@ fn dispatch_event(
         | "right_mouse_down"
         | "right_mouse_up"
         | "right_mouse_dragged" => {
-            let Some((source_x, source_y)) = content.source_point(event.x, event.y) else {
+            let (x, y) = event.pointer_coordinates()?;
+            let Some((source_x, source_y)) = content.source_point(x, y) else {
                 if matches!(
                     event.kind.as_str(),
                     "left_mouse_dragged"
@@ -1394,8 +1417,9 @@ fn dispatch_event(
             )
         }
         "scroll" => {
+            let (x, y, delta_x, delta_y) = event.scroll_values()?;
             let (source_x, source_y) = content
-                .source_point(event.x, event.y)
+                .source_point(x, y)
                 .ok_or(ApplicationSurfaceError::PointOutsideContent)?;
             post_scroll(
                 target_process_id,
@@ -1404,22 +1428,23 @@ fn dispatch_event(
                 target.bounds.y + source_y * target.bounds.height,
                 source_x * target.bounds.width,
                 source_y * target.bounds.height,
-                event.delta_x,
-                event.delta_y,
+                delta_x,
+                delta_y,
                 event.modifiers,
                 &input_state.pointer,
                 &input_state.scroll,
             )
         }
         "key" => {
+            let (key_code, key_down) = event.key_values()?;
             let target = ApplicationSurfaceKeyboardTarget::new(target_window_id, target_process_id)
                 .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
-            post_key(target, event.key_code, event.key_down, event.modifiers)?;
+            post_key(target, key_code, key_down, event.modifiers)?;
             input_state
                 .keyboard
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .record_delivery(event.key_code, event.key_down);
+                .record_delivery(key_code, key_down);
             Ok(())
         }
         "health" => Ok(()),
@@ -1996,15 +2021,15 @@ mod tests {
         let event = |session: &str| ApplicationSurfaceEvent {
             session: session.to_owned(),
             kind: "health".to_owned(),
-            x: 0.0,
-            y: 0.0,
+            x: Some(0.0),
+            y: Some(0.0),
             button: String::new(),
-            key_code: 0,
-            key_down: false,
+            key_code: Some(0),
+            key_down: Some(false),
             modifiers: 0,
             click_count: 1,
-            delta_x: 0.0,
-            delta_y: 0.0,
+            delta_x: Some(0.0),
+            delta_y: Some(0.0),
         };
 
         assert!(validate_event_batch(&[event("one")]).is_ok());
@@ -2021,15 +2046,66 @@ mod tests {
 
         let mut key_down = event("one");
         key_down.kind = "key".to_owned();
-        key_down.key_down = true;
+        key_down.key_down = Some(true);
         let mut unsupported = event("one");
         unsupported.kind = "unsupported".to_owned();
         assert!(validate_event_batch(&[key_down.clone(), unsupported]).is_err());
 
         let mut invalid_scroll = event("one");
         invalid_scroll.kind = "scroll".to_owned();
-        invalid_scroll.delta_y = f64::NAN;
+        invalid_scroll.delta_y = Some(f64::NAN);
         assert!(validate_event_batch(&[key_down, invalid_scroll]).is_err());
+    }
+
+    #[test]
+    fn event_deserialization_rejects_omitted_kind_specific_fields() {
+        for event in [
+            serde_json::json!({
+                "session": "one",
+                "kind": "left_mouse_down",
+            }),
+            serde_json::json!({
+                "session": "one",
+                "kind": "mouse_moved",
+                "x": 0.5,
+            }),
+            serde_json::json!({
+                "session": "one",
+                "kind": "scroll",
+                "x": 0.5,
+                "y": 0.5,
+                "delta_x": 0.0,
+            }),
+            serde_json::json!({
+                "session": "one",
+                "kind": "key",
+                "key_down": false,
+            }),
+            serde_json::json!({
+                "session": "one",
+                "kind": "key",
+                "key_code": 0,
+            }),
+        ] {
+            let request: ApplicationSurfaceEventBatchRequest =
+                serde_json::from_value(serde_json::json!({
+                    "events": [event],
+                }))
+                .unwrap();
+            assert!(request.into_validated_events().is_err());
+        }
+
+        let request: ApplicationSurfaceEventBatchRequest =
+            serde_json::from_value(serde_json::json!({
+                "events": [{
+                    "session": "one",
+                    "kind": "key",
+                    "key_code": 0,
+                    "key_down": false,
+                }],
+            }))
+            .unwrap();
+        assert!(request.into_validated_events().is_ok());
     }
 
     #[test]
@@ -2037,15 +2113,15 @@ mod tests {
         let event = |kind: &str, x: f64, y: f64| ApplicationSurfaceEvent {
             session: "one".to_owned(),
             kind: kind.to_owned(),
-            x,
-            y,
+            x: Some(x),
+            y: Some(y),
             button: String::new(),
-            key_code: 0,
-            key_down: false,
+            key_code: Some(0),
+            key_down: Some(false),
             modifiers: 0,
             click_count: 1,
-            delta_x: 0.0,
-            delta_y: 0.0,
+            delta_x: Some(0.0),
+            delta_y: Some(0.0),
         };
         let content = NormalizedContentRect {
             x: 0.0,
