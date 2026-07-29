@@ -1524,6 +1524,31 @@ mod tests {
     }
 
     #[test]
+    fn attached_frame_ring_unlinks_its_persistent_name() {
+        let ring = SharedFrameRing::create(2, 2).unwrap();
+        let name = ring.name.clone();
+        let frame = [0x5A; 16];
+
+        let handle_before_attach =
+            unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(handle_before_attach >= 0);
+        unsafe {
+            libc::close(handle_before_attach);
+        }
+
+        assert!(ring.acknowledge_attachment());
+        let handle_after_attach =
+            unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        assert_eq!(handle_after_attach, -1);
+        assert!(ring.publish(&frame, 8).is_ok());
+    }
+
+    #[test]
+    fn unknown_frame_ring_attachment_is_rejected() {
+        assert!(!acknowledge_attachment("missing-session"));
+    }
+
+    #[test]
     fn mmap_failure_unlinks_shared_memory() {
         let layout = FrameLayout::new(2, 2).unwrap();
         let (name, descriptor_handle) = create_shared_memory().unwrap();
@@ -1555,6 +1580,17 @@ mod tests {
         assert_eq!(rect.source_point(0.5, 0.25), Some((0.5, 0.0)));
         assert_eq!(rect.source_point(0.5, 0.75), Some((0.5, 1.0)));
         assert_eq!(rect.source_point(0.5, 0.1), None);
+    }
+
+    #[test]
+    fn fractional_scroll_deltas_accumulate_per_session() {
+        let mut state = ApplicationSurfaceScrollState::default();
+
+        assert_eq!(state.consume(0.25, -0.25), Some((0, 0)));
+        assert_eq!(state.consume(0.25, -0.25), Some((0, 0)));
+        assert_eq!(state.consume(0.25, -0.25), Some((0, 0)));
+        assert_eq!(state.consume(0.25, -0.25), Some((1, -1)));
+        assert_eq!(state.consume(f64::NAN, 0.0), None);
     }
 
     #[test]

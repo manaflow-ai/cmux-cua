@@ -3627,6 +3627,19 @@ mod tests {
     }
 
     #[test]
+    fn daemon_launch_forwards_cursor_speed() {
+        let args = daemon_open_arguments(
+            "CuaDriver",
+            "/tmp/custom-cua.sock",
+            false,
+            false,
+            Some("1.75"),
+        );
+
+        assert!(args.windows(2).any(|pair| pair == ["--cursor-speed", "1.75"]));
+    }
+
+    #[test]
     fn approvals_parser_accepts_list_revoke_clear_and_rejects_bad_shapes() {
         assert_eq!(parse_approvals_args(&[]).unwrap(), ApprovalsSubcommand::List);
         assert_eq!(
