@@ -3339,6 +3339,7 @@ pub fn run_status_cmd(socket_path: &str, pid_file_path: &str) {
 #[cfg(test)]
 mod external_permission_flow_tests {
     use super::{
+        application_surface_session_to_reap_after_delivery,
         clamp_external_permission_prompt, screen_capture_verification_response,
         validate_system_permission_request,
     };
@@ -3389,6 +3390,28 @@ mod external_permission_flow_tests {
         assert_eq!(
             unavailable.result.unwrap()["capturable"],
             serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn undelivered_application_surface_start_is_reaped() {
+        assert_eq!(
+            application_surface_session_to_reap_after_delivery(
+                Some("surface-session"),
+                false
+            ),
+            Some("surface-session")
+        );
+        assert_eq!(
+            application_surface_session_to_reap_after_delivery(
+                Some("surface-session"),
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            application_surface_session_to_reap_after_delivery(None, false),
+            None
         );
     }
 }

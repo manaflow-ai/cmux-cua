@@ -1197,16 +1197,122 @@ mod tests {
     }
 
     #[test]
-    fn pointer_click_group_survives_a_gesture_and_clears_on_release() {
+    fn pointer_click_group_survives_multi_click_pairs() {
         let mut state = ApplicationSurfacePointerState::default();
-        let down = state.group_for("left_mouse_down");
-        assert_eq!(state.group_for("left_mouse_dragged"), down);
-        assert_eq!(state.group_for("mouse_moved"), down);
-        assert_eq!(state.group_for("left_mouse_up"), down);
-        assert!(state.left_click_group_id.is_none());
+        let first_down = state.transition_for("left_mouse_down", 1);
+        assert!(first_down.should_prepare_background);
+        assert_eq!(
+            state.transition_for("left_mouse_up", 1).group_id,
+            first_down.group_id
+        );
 
-        let next_down = state.group_for("left_mouse_down");
-        assert_ne!(next_down, down);
+        let second_down = state.transition_for("left_mouse_down", 2);
+        assert_eq!(second_down.group_id, first_down.group_id);
+        assert!(!second_down.should_prepare_background);
+        assert_eq!(
+            state.transition_for("left_mouse_up", 2).group_id,
+            first_down.group_id
+        );
+
+        let next_single = state.transition_for("left_mouse_down", 1);
+        assert_ne!(next_single.group_id, first_down.group_id);
+        assert!(next_single.should_prepare_background);
+    }
+
+    #[test]
+    fn deactivation_yields_a_release_for_each_pressed_button() {
+        let input = ApplicationSurfaceInputState::new();
+        let mut pointer = input
+            .pointer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let left = pointer.transition_for("left_mouse_down", 1);
+        pointer.record_delivery(
+            "left_mouse_down",
+            ApplicationSurfacePointerDelivery {
+                screen_x: 10.0,
+                screen_y: 20.0,
+                local_x: 3.0,
+                local_y: 4.0,
+                modifiers: 0,
+                click_count: 1,
+                group_id: left.group_id,
+            },
+        );
+        let right = pointer.transition_for("right_mouse_down", 1);
+        pointer.record_delivery(
+            "right_mouse_down",
+            ApplicationSurfacePointerDelivery {
+                screen_x: 30.0,
+                screen_y: 40.0,
+                local_x: 5.0,
+                local_y: 6.0,
+                modifiers: 0,
+                click_count: 1,
+                group_id: right.group_id,
+            },
+        );
+        drop(pointer);
+
+        let mut releases = Vec::new();
+        input.deactivate_with(|release| releases.push(release));
+
+        assert!(!input.active.load(Ordering::Acquire));
+        assert_eq!(releases.len(), 2);
+        assert!(releases.iter().any(|release| {
+            release.kind == "left_mouse_up"
+                && release.delivery.screen_x == 10.0
+                && release.delivery.group_id == left.group_id
+        }));
+        assert!(releases.iter().any(|release| {
+            release.kind == "right_mouse_up"
+                && release.delivery.screen_x == 30.0
+                && release.delivery.group_id == right.group_id
+        }));
+    }
+
+    #[test]
+    fn streamed_target_events_use_chromium_target_phase() {
+        for kind in [
+            "left_mouse_down",
+            "left_mouse_up",
+            "left_mouse_dragged",
+            "right_mouse_down",
+            "right_mouse_up",
+            "right_mouse_dragged",
+        ] {
+            assert_eq!(application_surface_target_phase(kind), 3);
+        }
+        assert_eq!(application_surface_target_phase("mouse_moved"), 2);
+    }
+
+    #[test]
+    fn application_surface_event_batches_are_bounded_and_session_scoped() {
+        let event = |session: &str| ApplicationSurfaceEvent {
+            session: session.to_owned(),
+            kind: "health".to_owned(),
+            x: 0.0,
+            y: 0.0,
+            button: String::new(),
+            key_code: 0,
+            key_down: false,
+            modifiers: 0,
+            click_count: 1,
+            delta_x: 0.0,
+            delta_y: 0.0,
+        };
+
+        assert!(validate_event_batch(&[event("one")]).is_ok());
+        assert!(validate_event_batch(&[]).is_err());
+        assert!(validate_event_batch(&[event("one"), event("two")]).is_err());
+        assert!(
+            validate_event_batch(
+                &(0..=MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT)
+                    .map(|_| event("one"))
+                    .collect::<Vec<_>>()
+            )
+            .is_err()
+        );
     }
 
     #[test]
