@@ -79,7 +79,7 @@ fn capture_one_frame_with_stream(
     configuration: screencapturekit::prelude::SCStreamConfiguration,
 ) -> bool {
     use screencapturekit::{
-        cm::{CMSampleBufferExt, CMSampleBufferSCExt, SCFrameStatus},
+        cm::{CMSampleBufferExt, CMSampleBufferSCExt},
         prelude::{SCStream, SCStreamOutputType},
     };
 
@@ -89,7 +89,9 @@ fn capture_one_frame_with_stream(
         .add_output_handler(
             move |sample: screencapturekit::cm::CMSampleBuffer, output_type: SCStreamOutputType| {
                 if output_type == SCStreamOutputType::Screen
-                    && sample.frame_status() == Some(SCFrameStatus::Complete)
+                    && crate::application_surface::capture_frame_status_is_publishable(
+                        sample.frame_status(),
+                    )
                     && sample.image_buffer().is_some_and(|pixel_buffer| {
                         pixel_buffer.width() > 0 && pixel_buffer.height() > 0
                     })

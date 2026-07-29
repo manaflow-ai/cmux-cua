@@ -608,8 +608,11 @@ struct CaptureFrameState {
     failed: AtomicBool,
 }
 
-fn capture_frame_status_is_publishable(status: Option<SCFrameStatus>) -> bool {
-    status == Some(SCFrameStatus::Complete)
+pub(crate) fn capture_frame_status_is_publishable(status: Option<SCFrameStatus>) -> bool {
+    matches!(
+        status,
+        Some(SCFrameStatus::Complete | SCFrameStatus::Started)
+    )
 }
 
 impl CaptureFrameState {

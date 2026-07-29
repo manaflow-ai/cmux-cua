@@ -118,16 +118,15 @@ static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
 
 /// The keyed, insertion-ordered collection of owned cursors that the render
 /// loop composites every frame. Insertion order = stable z-order (later keys
-/// paint on top). `win_w` / `win_h` are screen-global, hoisted out of the
-/// per-cursor `RenderState` (written once in `run_appkit`).
+/// paint on top). The launch screen bounds are a defensive fallback when
+/// CoreGraphics cannot enumerate the active global display layout.
 struct RenderMap {
     cursors: IndexMap<CursorKey, RenderState>,
     /// Most recent cursor key touched by an inbound command. Idle-dwell
     /// timeout selection prefers this cursor so a stale visible cursor cannot
     /// shorten the dwell of the cursor the user just moved.
     last_active_key: Option<CursorKey>,
-    win_w: f64,
-    win_h: f64,
+    fallback_display_bounds: Option<LogicalRect>,
     /// Frozen launch-time config used as the template for lazily-created
     /// cursors (its palette is overridden per-key via `Palette::for_instance`).
     template: CursorConfig,
@@ -225,8 +224,7 @@ pub fn init(cfg: CursorConfig) {
     *RENDER.lock().unwrap() = Some(RenderMap {
         cursors,
         last_active_key: None,
-        win_w: 0.0,
-        win_h: 0.0,
+        fallback_display_bounds: None,
         template: cfg,
         ended: std::collections::HashSet::new(),
     });
@@ -373,26 +371,35 @@ pub fn current_motion(key: &str) -> MotionConfig {
 /// Returns true if a seed was applied (i.e. the cursor was at the sentinel and
 /// is now primed to glide).
 fn seed_start_if_sentinel(key: &CursorKey, target_x: f64, target_y: f64) -> bool {
+    let displays = active_display_geometries(1.0);
     let mut guard = RENDER.lock().unwrap();
     let Some(map) = guard.as_mut() else {
         return false;
     };
-    seed_start_in_map(map, key, target_x, target_y)
+    seed_start_in_map_with_displays(map, key, target_x, target_y, &displays)
 }
 
 /// Pure seed step operating on a borrowed [`RenderMap`] — factored out of
 /// `seed_start_if_sentinel` so the get-or-create + clamp logic is unit-testable
 /// without the global `RENDER` static or AppKit.
+#[cfg(test)]
 fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target_y: f64) -> bool {
-    // Offset the start up-left of the target so the Dubins path has room to
-    // curve in; 140pt is enough to read as motion at 900pt/s peak speed.
-    const SEED_OFFSET: f64 = 140.0;
-    let (win_w, win_h) = (map.win_w, map.win_h);
+    seed_start_in_map_with_displays(map, key, target_x, target_y, &[])
+}
+
+fn seed_start_in_map_with_displays(
+    map: &mut RenderMap,
+    key: &CursorKey,
+    target_x: f64,
+    target_y: f64,
+    displays: &[DisplayGeometry],
+) -> bool {
     // Respect the resurrection guard: never seed (and thus re-create) a cursor
     // whose session already ended.
     if map.ended.contains(key) {
         return false;
     }
+    let fallback_display_bounds = map.fallback_display_bounds;
     // Get-or-create the cursor so the very first AX action seeds + glides even
     // when the lazy render-thread creation hasn't drained the PinAbove yet
     // (the render loop's drain would otherwise win the race and the seed read
@@ -406,23 +413,43 @@ fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target
     if !(rs.core.cfg.enabled && rs.core.is_unplaced()) {
         return false;
     }
-    let mut sx = target_x - SEED_OFFSET;
-    let mut sy = target_y - SEED_OFFSET;
-    // Clamp into the screen frame when we know it (win_w/h are 0 until the
-    // AppKit window is up; in that headless case the unclamped seed is still
-    // on-screen-by-construction for any realistic target).
-    if win_w > 0.0 && win_h > 0.0 {
-        sx = sx.clamp(2.0, win_w - 2.0);
-        sy = sy.clamp(2.0, win_h - 2.0);
-        // If clamping collapsed the seed onto the target (target in a corner),
-        // nudge it the other way so there is still a visible glide distance.
-        if (sx - target_x).abs() < 8.0 && (sy - target_y).abs() < 8.0 {
-            sx = (target_x + SEED_OFFSET).min(win_w - 2.0);
-            sy = (target_y + SEED_OFFSET).min(win_h - 2.0);
-        }
-    }
+    let (sx, sy) = seed_point_for_target(target_x, target_y, displays, fallback_display_bounds);
     rs.core.place_at(sx, sy);
     true
+}
+
+fn seed_point_for_target(
+    target_x: f64,
+    target_y: f64,
+    displays: &[DisplayGeometry],
+    fallback_display_bounds: Option<LogicalRect>,
+) -> (f64, f64) {
+    // Offset the start up-left of the target so the Dubins path has room to
+    // curve in; 140pt is enough to read as motion at 900pt/s peak speed.
+    const SEED_OFFSET: f64 = 140.0;
+    let mut seed = (target_x - SEED_OFFSET, target_y - SEED_OFFSET);
+    let bounds = display_for_cursor(displays, (target_x, target_y), None)
+        .map(|display| display.bounds)
+        .or_else(|| fallback_display_bounds.filter(|bounds| bounds.is_valid()));
+    let Some(bounds) = bounds else {
+        return seed;
+    };
+    let minimum_x = bounds.left + 2.0;
+    let maximum_x = bounds.left + bounds.width - 2.0;
+    let minimum_y = bounds.top + 2.0;
+    let maximum_y = bounds.top + bounds.height - 2.0;
+    if minimum_x > maximum_x || minimum_y > maximum_y {
+        return seed;
+    }
+    seed.0 = seed.0.clamp(minimum_x, maximum_x);
+    seed.1 = seed.1.clamp(minimum_y, maximum_y);
+    // If clamping collapsed the seed onto a corner target, nudge it in the
+    // opposite direction while remaining inside that same global display.
+    if (seed.0 - target_x).abs() < 8.0 && (seed.1 - target_y).abs() < 8.0 {
+        seed.0 = (target_x + SEED_OFFSET).clamp(minimum_x, maximum_x);
+        seed.1 = (target_y + SEED_OFFSET).clamp(minimum_y, maximum_y);
+    }
+    seed
 }
 
 /// Animate the overlay cursor to `(x, y)` and suspend until the Dubins path
@@ -819,7 +846,6 @@ impl LogicalRect {
 
 #[derive(Debug, Clone, Copy)]
 struct ScreenGeometry {
-    origin_x: f64,
     origin_y: f64,
     height: f64,
     fallback_backing_scale: f64,
@@ -900,7 +926,6 @@ fn screen_geometry_for_primary_display(
         fallback_main_screen
     };
     ScreenGeometry {
-        origin_x: anchor.left,
         origin_y: anchor.top,
         height: anchor.height,
         fallback_backing_scale,
@@ -1287,8 +1312,13 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     {
         let mut guard = RENDER.lock().unwrap();
         if let Some(m) = guard.as_mut() {
-            m.win_w = win_w;
-            m.win_h = win_h;
+            let bounds = LogicalRect {
+                left: screen_frame.origin.x,
+                top: screen_frame.origin.y,
+                width: win_w,
+                height: win_h,
+            };
+            m.fallback_display_bounds = bounds.is_valid().then_some(bounds);
         }
     }
 
@@ -2060,8 +2090,12 @@ mod tests {
         RenderMap {
             cursors,
             last_active_key: None,
-            win_w: 100.0,
-            win_h: 100.0,
+            fallback_display_bounds: Some(LogicalRect {
+                left: 0.0,
+                top: 0.0,
+                width: 100.0,
+                height: 100.0,
+            }),
             template: CursorConfig::default(),
             ended: std::collections::HashSet::new(),
         }
@@ -2496,7 +2530,6 @@ mod tests {
     #[test]
     fn global_appkit_transform_does_not_reapply_the_anchor_display_origin() {
         let main = ScreenGeometry {
-            origin_x: 10.0,
             origin_y: 20.0,
             height: 900.0,
             fallback_backing_scale: 2.0,
@@ -2552,7 +2585,6 @@ mod tests {
             2.0,
         );
 
-        assert_eq!(screen.origin_x, 0.0);
         assert_eq!(screen.origin_y, 0.0);
         assert_eq!(screen.height, 982.0);
     }
@@ -2764,7 +2796,6 @@ mod tests {
             appkit_frame_for_rect(
                 rect_a,
                 ScreenGeometry {
-                    origin_x: 0.0,
                     origin_y: 0.0,
                     height: 200.0,
                     fallback_backing_scale: 2.0,
@@ -2774,7 +2805,6 @@ mod tests {
             appkit_frame_for_rect(
                 rect_b,
                 ScreenGeometry {
-                    origin_x: 0.0,
                     origin_y: 0.0,
                     height: 200.0,
                     fallback_backing_scale: 2.0,
