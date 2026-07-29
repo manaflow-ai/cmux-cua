@@ -876,11 +876,25 @@ fn host_request_is_authorized(
     }
 }
 
-fn application_surface_session_to_reap_after_delivery<'a>(
-    started_session_id: Option<&'a str>,
-    response_delivered: bool,
-) -> Option<&'a str> {
-    (!response_delivered).then_some(started_session_id).flatten()
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct ApplicationSurfaceConnectionSessions {
+    session_ids: std::collections::BTreeSet<String>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl ApplicationSurfaceConnectionSessions {
+    fn register(&mut self, session_id: &str) {
+        self.session_ids.insert(session_id.to_owned());
+    }
+
+    fn release(&mut self, session_id: &str) {
+        self.session_ids.remove(session_id);
+    }
+
+    fn drain(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.session_ids).into_iter().collect()
+    }
 }
 
 fn state_authentication_key(args: Option<&serde_json::Value>) -> Option<Vec<u8>> {
@@ -1710,6 +1724,9 @@ pub async fn run_serve(
                     // kernel-guaranteed), the post-loop block reaps the session.
                     let mut control_session_id: Option<String> = None;
                     let mut control_approval_token: Option<(String, String)> = None;
+                    #[cfg(target_os = "macos")]
+                    let mut application_surface_sessions =
+                        ApplicationSurfaceConnectionSessions::default();
 
                     while let Ok(Some(line)) = lines.next_line().await {
                         #[cfg(target_os = "macos")]
@@ -1720,7 +1737,7 @@ pub async fn run_serve(
                                         identity.is_same_generation_as(root_process_identity)
                                     });
                             if !root_is_still_live {
-                                return;
+                                break;
                             }
                         }
                         let parsed = match parse_request(&line) {
@@ -1759,7 +1776,7 @@ pub async fn run_serve(
                                 if let Some(tx) = guard.take() {
                                     let _ = tx.send(());
                                 }
-                                return;
+                                break;
                             }
                             "permissions_status" => {
                                 #[cfg(target_os = "macos")]
@@ -1973,34 +1990,28 @@ pub async fn run_serve(
                                     "application_surface_start is available only on macOS",
                                     64,
                                 );
+                                #[cfg(target_os = "macos")]
+                                if let Some(session_id) = started_session_id.as_deref() {
+                                    application_surface_sessions.register(session_id);
+                                }
                                 let delivery = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
-                                #[cfg(target_os = "macos")]
-                                if let Some(session_id) =
-                                    application_surface_session_to_reap_after_delivery(
-                                        started_session_id.as_deref(),
-                                        delivery.is_ok(),
-                                    )
-                                {
-                                    let session_id = session_id.to_owned();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        platform_macos::application_surface::stop(&session_id)
-                                    })
-                                    .await;
-                                }
                                 if delivery.is_err() {
-                                    return;
+                                    break;
                                 }
                             }
                             "application_surface_stop" => {
                                 #[cfg(target_os = "macos")]
-                                let resp = if !host_request_authorized
+                                let (resp, stopped_session_id) = if !host_request_authorized
                                     || profile != DaemonProfile::Native
                                 {
-                                    DaemonResponse::err(
-                                        "Unauthorized host-only application-surface request",
-                                        77,
+                                    (
+                                        DaemonResponse::err(
+                                            "Unauthorized host-only application-surface request",
+                                            77,
+                                        ),
+                                        None,
                                     )
                                 } else {
                                     let session = req.args.as_ref()
@@ -2013,20 +2024,27 @@ pub async fn run_serve(
                                         .map(str::to_owned);
                                     match session {
                                         Some(session) => {
+                                            let session_to_stop = session.clone();
                                             let stopped = tokio::task::spawn_blocking(
                                                 move || {
                                                     platform_macos::application_surface::stop(
-                                                        &session,
+                                                        &session_to_stop,
                                                     )
                                                 },
                                             ).await.unwrap_or(false);
-                                            DaemonResponse::ok(
-                                                serde_json::json!({"stopped": stopped}),
+                                            (
+                                                DaemonResponse::ok(
+                                                    serde_json::json!({"stopped": stopped}),
+                                                ),
+                                                Some(session),
                                             )
                                         }
-                                        None => DaemonResponse::err(
-                                            "application_surface_stop requires a session",
-                                            64,
+                                        None => (
+                                            DaemonResponse::err(
+                                                "application_surface_stop requires a session",
+                                                64,
+                                            ),
+                                            None,
                                         ),
                                     }
                                 };
@@ -2035,9 +2053,16 @@ pub async fn run_serve(
                                     "application_surface_stop is available only on macOS",
                                     64,
                                 );
-                                let _ = writer.write_all(
+                                #[cfg(target_os = "macos")]
+                                if let Some(session_id) = stopped_session_id {
+                                    application_surface_sessions.release(&session_id);
+                                }
+                                let delivery = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
+                                if delivery.is_err() {
+                                    break;
+                                }
                             }
                             "application_surface_attach" => {
                                 #[cfg(target_os = "macos")]
@@ -2687,6 +2712,19 @@ pub async fn run_serve(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
                             }
+                        }
+                    }
+
+                    #[cfg(target_os = "macos")]
+                    {
+                        let session_ids = application_surface_sessions.drain();
+                        if !session_ids.is_empty() {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                for session_id in session_ids {
+                                    platform_macos::application_surface::stop(&session_id);
+                                }
+                            })
+                            .await;
                         }
                     }
 

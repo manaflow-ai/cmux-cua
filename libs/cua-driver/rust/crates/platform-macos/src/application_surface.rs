@@ -42,6 +42,12 @@ const MAXIMUM_FRAME_RING_BYTE_COUNT: usize = 256 * 1_024 * 1_024;
 pub const MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT: usize = 64;
 const BGRA_PIXEL_FORMAT: u32 = u32::from_be_bytes(*b"BGRA");
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplicationSurfacePermissionUse {
+    WindowListing,
+    CaptureAndInput,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ApplicationWindow {
     pub window_id: u32,
@@ -945,7 +951,7 @@ fn manager() -> &'static Mutex<ApplicationSurfaceManager> {
 }
 
 pub fn list_windows() -> anyhow::Result<Vec<ApplicationWindow>> {
-    require_application_surface_permissions()?;
+    require_application_surface_permissions(ApplicationSurfacePermissionUse::WindowListing)?;
     let content = SCShareableContent::create()
         .with_on_screen_windows_only(false)
         .with_exclude_desktop_windows(true)
@@ -994,7 +1000,7 @@ pub fn list_windows() -> anyhow::Result<Vec<ApplicationWindow>> {
 pub fn start(
     request: ApplicationSurfaceStartRequest,
 ) -> anyhow::Result<ApplicationSurfaceStartResult> {
-    require_application_surface_permissions()?;
+    require_application_surface_permissions(ApplicationSurfacePermissionUse::CaptureAndInput)?;
     if !(1..=120).contains(&request.frame_rate) || request.window_id == 0 || request.process_id <= 0
     {
         bail!("invalid application-surface target or frame rate");
@@ -1080,15 +1086,29 @@ pub fn start(
     Ok(result)
 }
 
-fn require_application_surface_permissions() -> anyhow::Result<()> {
+fn require_application_surface_permissions(
+    permission_use: ApplicationSurfacePermissionUse,
+) -> anyhow::Result<()> {
     let status = permissions::current_status();
-    if !status.accessibility {
-        bail!("accessibility_permission_required");
-    }
-    if !status.screen_recording {
-        bail!("screen_recording_permission_required");
+    if let Some(error) = missing_application_surface_permission(
+        status.accessibility,
+        status.screen_recording,
+        permission_use,
+    ) {
+        bail!("{error}");
     }
     Ok(())
+}
+
+fn missing_application_surface_permission(
+    accessibility: bool,
+    screen_recording: bool,
+    permission_use: ApplicationSurfacePermissionUse,
+) -> Option<&'static str> {
+    if permission_use == ApplicationSurfacePermissionUse::CaptureAndInput && !accessibility {
+        return Some("accessibility_permission_required");
+    }
+    (!screen_recording).then_some("screen_recording_permission_required")
 }
 
 fn capture_pixel_size(width: f64, height: f64) -> anyhow::Result<(usize, usize)> {
