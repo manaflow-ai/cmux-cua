@@ -1530,6 +1530,34 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn window_listing_does_not_require_accessibility() {
+        assert_eq!(
+            missing_application_surface_permission(
+                false,
+                true,
+                ApplicationSurfacePermissionUse::WindowListing,
+            ),
+            None
+        );
+        assert_eq!(
+            missing_application_surface_permission(
+                true,
+                false,
+                ApplicationSurfacePermissionUse::WindowListing,
+            ),
+            Some("screen_recording_permission_required")
+        );
+        assert_eq!(
+            missing_application_surface_permission(
+                false,
+                true,
+                ApplicationSurfacePermissionUse::CaptureAndInput,
+            ),
+            Some("accessibility_permission_required")
+        );
+    }
+
+    #[test]
     fn frame_layout_matches_cmux_triple_ring_protocol() {
         let layout = FrameLayout::new(100, 50).unwrap();
         assert_eq!(layout.bytes_per_row, 400);

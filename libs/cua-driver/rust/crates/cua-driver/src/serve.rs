@@ -3487,9 +3487,8 @@ pub fn run_status_cmd(socket_path: &str, pid_file_path: &str) {
 #[cfg(test)]
 mod external_permission_flow_tests {
     use super::{
-        application_surface_session_to_reap_after_delivery,
-        clamp_external_permission_prompt, screen_capture_verification_response,
-        validate_system_permission_request,
+        ApplicationSurfaceConnectionSessions, clamp_external_permission_prompt,
+        screen_capture_verification_response, validate_system_permission_request,
     };
 
     #[test]
@@ -3542,25 +3541,14 @@ mod external_permission_flow_tests {
     }
 
     #[test]
-    fn undelivered_application_surface_start_is_reaped() {
-        assert_eq!(
-            application_surface_session_to_reap_after_delivery(
-                Some("surface-session"),
-                false
-            ),
-            Some("surface-session")
-        );
-        assert_eq!(
-            application_surface_session_to_reap_after_delivery(
-                Some("surface-session"),
-                true
-            ),
-            None
-        );
-        assert_eq!(
-            application_surface_session_to_reap_after_delivery(None, false),
-            None
-        );
+    fn connection_close_reaps_every_owned_application_surface() {
+        let mut sessions = ApplicationSurfaceConnectionSessions::default();
+        sessions.register("surface-a");
+        sessions.register("surface-b");
+        sessions.release("surface-a");
+
+        assert_eq!(sessions.drain(), vec!["surface-b".to_owned()]);
+        assert!(sessions.drain().is_empty());
     }
 }
 
