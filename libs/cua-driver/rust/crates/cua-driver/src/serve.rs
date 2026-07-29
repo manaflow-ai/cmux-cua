@@ -3588,6 +3588,43 @@ mod external_permission_flow_tests {
         assert_eq!(sessions.drain(), vec!["surface-b".to_owned()]);
         assert!(sessions.drain().is_empty());
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn application_surface_errors_have_stable_protocol_codes() {
+        use super::application_surface_failure_response;
+        use platform_macos::application_surface::ApplicationSurfaceError;
+
+        let cases = [
+            (
+                ApplicationSurfaceError::AccessibilityPermissionRequired,
+                "permission_required",
+            ),
+            (
+                ApplicationSurfaceError::ScreenRecordingPermissionRequired,
+                "permission_required",
+            ),
+            (
+                ApplicationSurfaceError::WindowUnavailable,
+                "window_unavailable",
+            ),
+            (
+                ApplicationSurfaceError::PointOutsideContent,
+                "point_outside_content",
+            ),
+            (
+                ApplicationSurfaceError::SessionUnavailable,
+                "session_unavailable",
+            ),
+        ];
+        for (error, expected_code) in cases {
+            let response =
+                application_surface_failure_response(anyhow::Error::new(error));
+            assert!(!response.ok);
+            assert_eq!(response.error_code.as_deref(), Some(expected_code));
+            assert!(response.error.is_some());
+        }
+    }
 }
 
 #[cfg(test)]
