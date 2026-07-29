@@ -1228,13 +1228,18 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
     }
     let target = live_target(target_window_id, target_process_id)
         .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
+    let content = *frame_state
+        .content_rect
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    validate_event_deliveries(&events, content, &input_state)?;
     for event in events {
         dispatch_event(
             event,
             target_window_id,
             target_process_id,
             &target,
-            &frame_state,
+            content,
             &input_state,
         )?;
     }
@@ -1252,7 +1257,90 @@ fn validate_event_batch(events: &[ApplicationSurfaceEvent]) -> anyhow::Result<&s
     {
         bail!("application-surface event batch must target one valid session");
     }
+    for event in events {
+        validate_event_shape(event)?;
+    }
     Ok(session)
+}
+
+fn validate_event_shape(event: &ApplicationSurfaceEvent) -> anyhow::Result<()> {
+    match event.kind.as_str() {
+        "mouse_moved"
+        | "left_mouse_down"
+        | "left_mouse_up"
+        | "left_mouse_dragged"
+        | "right_mouse_down"
+        | "right_mouse_up"
+        | "right_mouse_dragged" => {
+            if !event.x.is_finite() || !event.y.is_finite() {
+                bail!("application-surface pointer coordinates must be finite");
+            }
+        }
+        "scroll" => {
+            if !event.x.is_finite()
+                || !event.y.is_finite()
+                || !event.delta_x.is_finite()
+                || !event.delta_y.is_finite()
+            {
+                bail!("application-surface scroll values must be finite");
+            }
+        }
+        "key" | "health" => {}
+        _ => bail!("unsupported application-surface event"),
+    }
+    Ok(())
+}
+
+fn validate_event_deliveries(
+    events: &[ApplicationSurfaceEvent],
+    content: NormalizedContentRect,
+    input_state: &ApplicationSurfaceInputState,
+) -> anyhow::Result<()> {
+    let pointer = input_state
+        .pointer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut left_pressed = pointer.left.pressed_delivery.is_some();
+    let mut right_pressed = pointer.right.pressed_delivery.is_some();
+    drop(pointer);
+
+    for event in events {
+        let kind = event.kind.as_str();
+        match kind {
+            "mouse_moved"
+            | "left_mouse_down"
+            | "left_mouse_up"
+            | "left_mouse_dragged"
+            | "right_mouse_down"
+            | "right_mouse_up"
+            | "right_mouse_dragged" => {
+                let is_inside_content = content.source_point(event.x, event.y).is_some();
+                let can_continue_outside = match kind {
+                    "left_mouse_dragged" | "left_mouse_up" => left_pressed,
+                    "right_mouse_dragged" | "right_mouse_up" => right_pressed,
+                    _ => false,
+                };
+                if !is_inside_content && !can_continue_outside {
+                    return Err(ApplicationSurfaceError::PointOutsideContent.into());
+                }
+                match kind {
+                    "left_mouse_down" | "left_mouse_dragged" => left_pressed = true,
+                    "left_mouse_up" => left_pressed = false,
+                    "right_mouse_down" | "right_mouse_dragged" => right_pressed = true,
+                    "right_mouse_up" => right_pressed = false,
+                    _ => {}
+                }
+            }
+            "scroll" => {
+                content
+                    .source_point(event.x, event.y)
+                    .ok_or(ApplicationSurfaceError::PointOutsideContent)?;
+            }
+            "key" | "health" => {}
+            _ => bail!("unsupported application-surface event"),
+        }
+    }
+    Ok(())
 }
 
 fn dispatch_event(
@@ -1260,7 +1348,7 @@ fn dispatch_event(
     target_window_id: u32,
     target_process_id: i32,
     target: &windows::WindowInfo,
-    frame_state: &CaptureFrameState,
+    content: NormalizedContentRect,
     input_state: &ApplicationSurfaceInputState,
 ) -> anyhow::Result<()> {
     match event.kind.as_str() {
@@ -1271,10 +1359,6 @@ fn dispatch_event(
         | "right_mouse_down"
         | "right_mouse_up"
         | "right_mouse_dragged" => {
-            let content = *frame_state
-                .content_rect
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some((source_x, source_y)) = content.source_point(event.x, event.y) else {
                 if matches!(
                     event.kind.as_str(),
@@ -1310,10 +1394,6 @@ fn dispatch_event(
             )
         }
         "scroll" => {
-            let content = *frame_state
-                .content_rect
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let (source_x, source_y) = content
                 .source_point(event.x, event.y)
                 .ok_or(ApplicationSurfaceError::PointOutsideContent)?;
@@ -1937,6 +2017,65 @@ mod tests {
                     .collect::<Vec<_>>()
             )
             .is_err()
+        );
+
+        let mut key_down = event("one");
+        key_down.kind = "key".to_owned();
+        key_down.key_down = true;
+        let mut unsupported = event("one");
+        unsupported.kind = "unsupported".to_owned();
+        assert!(validate_event_batch(&[key_down.clone(), unsupported]).is_err());
+
+        let mut invalid_scroll = event("one");
+        invalid_scroll.kind = "scroll".to_owned();
+        invalid_scroll.delta_y = f64::NAN;
+        assert!(validate_event_batch(&[key_down, invalid_scroll]).is_err());
+    }
+
+    #[test]
+    fn event_batch_delivery_validation_rejects_an_invalid_suffix() {
+        let event = |kind: &str, x: f64, y: f64| ApplicationSurfaceEvent {
+            session: "one".to_owned(),
+            kind: kind.to_owned(),
+            x,
+            y,
+            button: String::new(),
+            key_code: 0,
+            key_down: false,
+            modifiers: 0,
+            click_count: 1,
+            delta_x: 0.0,
+            delta_y: 0.0,
+        };
+        let content = NormalizedContentRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        let input = ApplicationSurfaceInputState::new();
+
+        assert!(validate_event_deliveries(
+            &[
+                event("key", 0.0, 0.0),
+                event("mouse_moved", 2.0, 0.5),
+            ],
+            content,
+            &input,
+        )
+        .is_err());
+        assert!(validate_event_deliveries(
+            &[
+                event("left_mouse_down", 0.5, 0.5),
+                event("left_mouse_up", 2.0, 0.5),
+            ],
+            content,
+            &input,
+        )
+        .is_ok());
+        assert!(
+            validate_event_deliveries(&[event("left_mouse_up", 2.0, 0.5)], content, &input)
+                .is_err()
         );
     }
 
