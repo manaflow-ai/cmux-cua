@@ -1469,6 +1469,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_frame_ring_notifies_reader_and_blocks_later_publication() {
+        let ring = SharedFrameRing::create(2, 2).unwrap();
+        let frame = [0x5A; 16];
+
+        ring.publish(&frame, 8).unwrap();
+        ring.mark_failed().unwrap();
+
+        let published_word = unsafe {
+            ring.atomic_word(FRAME_PUBLISHED_WORD_OFFSET)
+                .load(Ordering::Acquire)
+        };
+        assert_eq!(published_word, FRAME_FAILURE_WORD);
+        assert!(ring.publish(&frame, 8).is_err());
+        let published_word_after_rejected_frame = unsafe {
+            ring.atomic_word(FRAME_PUBLISHED_WORD_OFFSET)
+                .load(Ordering::Acquire)
+        };
+        assert_eq!(published_word_after_rejected_frame, FRAME_FAILURE_WORD);
+    }
+
+    #[test]
     fn mmap_failure_unlinks_shared_memory() {
         let layout = FrameLayout::new(2, 2).unwrap();
         let (name, descriptor_handle) = create_shared_memory().unwrap();
