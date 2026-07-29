@@ -30,6 +30,7 @@ use crate::{permissions, windows};
 
 const FRAME_HEADER_BYTE_COUNT: usize = 64;
 const FRAME_PUBLISHED_WORD_OFFSET: usize = 32;
+const FRAME_FAILURE_WORD: u64 = 1 << 63;
 const FRAME_SLOT_VERSION_OFFSET: usize = 40;
 const FRAME_SLOT_VERSION_STRIDE: usize = 8;
 const FRAME_MAGIC: u32 = 0x434D_5846;
@@ -313,6 +314,11 @@ impl SharedFrameRing {
         if self.is_closed.load(Ordering::Acquire) {
             bail!("frame ring is closed");
         }
+        let publication = unsafe { self.atomic_word(FRAME_PUBLISHED_WORD_OFFSET) };
+        let previous_published_word = publication.load(Ordering::Acquire);
+        if previous_published_word == FRAME_FAILURE_WORD {
+            bail!("frame ring producer has failed");
+        }
         if source_bytes_per_row < self.layout.bytes_per_row
             || source.len() < source_bytes_per_row.saturating_mul(self.layout.height)
         {
@@ -360,12 +366,30 @@ impl SharedFrameRing {
             }
             self.atomic_word(FRAME_SLOT_VERSION_OFFSET + slot * FRAME_SLOT_VERSION_STRIDE)
                 .store(completed_version, Ordering::Release);
-            self.atomic_word(FRAME_PUBLISHED_WORD_OFFSET)
-                .store(published_word, Ordering::Release);
+        }
+        if publication
+            .compare_exchange(
+                previous_published_word,
+                published_word,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            bail!("frame ring publication changed concurrently");
         }
         fence(Ordering::SeqCst);
         post_frame_notification(&self.name)?;
         Ok(())
+    }
+
+    fn mark_failed(&self) -> anyhow::Result<()> {
+        let publication = unsafe { self.atomic_word(FRAME_PUBLISHED_WORD_OFFSET) };
+        if publication.swap(FRAME_FAILURE_WORD, Ordering::AcqRel) == FRAME_FAILURE_WORD {
+            return Ok(());
+        }
+        fence(Ordering::SeqCst);
+        post_frame_notification(&self.name)
     }
 }
 
@@ -531,7 +555,17 @@ fn capture_frame_status_is_publishable(status: Option<SCFrameStatus>) -> bool {
 }
 
 impl CaptureFrameState {
+    fn mark_failed(&self) {
+        if self.failed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.ring.mark_failed();
+    }
+
     fn receive(&self, sample: screencapturekit::cm::CMSampleBuffer) {
+        if self.failed.load(Ordering::Acquire) {
+            return;
+        }
         if !capture_frame_status_is_publishable(sample.frame_status()) {
             return;
         }
@@ -542,7 +576,7 @@ impl CaptureFrameState {
             || pixel_buffer.width() != self.ring.layout.width
             || pixel_buffer.height() != self.ring.layout.height
         {
-            self.failed.store(true, Ordering::Release);
+            self.mark_failed();
             return;
         }
         if let Some(info) = sample.frame_info() {
@@ -561,7 +595,7 @@ impl CaptureFrameState {
             }
         }
         let Ok(guard) = pixel_buffer.lock_read_only() else {
-            self.failed.store(true, Ordering::Release);
+            self.mark_failed();
             return;
         };
         if self
@@ -569,7 +603,7 @@ impl CaptureFrameState {
             .publish(guard.as_slice(), guard.bytes_per_row())
             .is_err()
         {
-            self.failed.store(true, Ordering::Release);
+            self.mark_failed();
         }
     }
 }
@@ -962,7 +996,7 @@ pub fn start(
     let callback_state = frame_state.clone();
     let error_state = frame_state.clone();
     let delegate = StreamCallbacks::new().on_error(move |_| {
-        error_state.failed.store(true, Ordering::Release);
+        error_state.mark_failed();
     });
     let mut stream = SCStream::new_with_delegate(&filter, &configuration, delegate);
     stream
