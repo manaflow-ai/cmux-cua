@@ -614,6 +614,11 @@ struct ApplicationSurfacePointerRelease {
     delivery: ApplicationSurfacePointerDelivery,
 }
 
+#[derive(Default)]
+struct ApplicationSurfaceKeyboardState {
+    pressed_key_codes: Vec<u16>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ApplicationSurfacePointerTransition {
     group_id: i64,
@@ -637,6 +642,7 @@ struct ApplicationSurfacePointerState {
 struct ApplicationSurfaceInputState {
     dispatch: Mutex<()>,
     pointer: Mutex<ApplicationSurfacePointerState>,
+    keyboard: Mutex<ApplicationSurfaceKeyboardState>,
     active: AtomicBool,
 }
 
@@ -655,26 +661,42 @@ impl ApplicationSurfaceInputState {
     }
 
     fn deactivate(&self, process_id: i32, window_id: u32) {
-        self.deactivate_with(|release| {
-            if let Err(error) = post_mouse_delivery(
-                process_id,
-                window_id,
-                release.kind,
-                release.delivery,
-                false,
-            ) {
-                tracing::warn!(
-                    %error,
-                    kind = release.kind,
-                    "application surface pointer release did not post cleanly"
-                );
-            }
-        });
+        self.deactivate_with(
+            |release| {
+                if let Err(error) = post_mouse_delivery(
+                    process_id,
+                    window_id,
+                    release.kind,
+                    release.delivery,
+                    false,
+                ) {
+                    tracing::warn!(
+                        %error,
+                        kind = release.kind,
+                        "application surface pointer release did not post cleanly"
+                    );
+                }
+            },
+            |key_code| {
+                let Some(target) = ApplicationSurfaceKeyboardTarget::new(window_id, process_id)
+                else {
+                    return;
+                };
+                if let Err(error) = post_key(target, key_code, false, 0) {
+                    tracing::warn!(
+                        %error,
+                        key_code,
+                        "application surface key release did not post cleanly"
+                    );
+                }
+            },
+        );
     }
 
     fn deactivate_with(
         &self,
-        mut release: impl FnMut(ApplicationSurfacePointerRelease),
+        mut release_pointer: impl FnMut(ApplicationSurfacePointerRelease),
+        mut release_key: impl FnMut(u16),
     ) {
         let _dispatch = self.lock_dispatch();
         if !self.active.load(Ordering::Acquire) {
@@ -686,9 +708,36 @@ impl ApplicationSurfaceInputState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take_pressed_releases();
         for pending in releases {
-            release(pending);
+            release_pointer(pending);
+        }
+        let key_releases = self
+            .keyboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_pressed_releases();
+        for key_code in key_releases {
+            release_key(key_code);
         }
         self.active.store(false, Ordering::Release);
+    }
+}
+
+impl ApplicationSurfaceKeyboardState {
+    fn record_delivery(&mut self, key_code: u16, key_down: bool) {
+        if key_down {
+            if !self.pressed_key_codes.contains(&key_code) {
+                self.pressed_key_codes.push(key_code);
+            }
+        } else {
+            self.pressed_key_codes
+                .retain(|pressed| *pressed != key_code);
+        }
+    }
+
+    fn take_pressed_releases(&mut self) -> Vec<u16> {
+        let mut releases = std::mem::take(&mut self.pressed_key_codes);
+        releases.reverse();
+        releases
     }
 }
 
@@ -961,8 +1010,9 @@ pub fn stop(session_id: &str) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .sessions
         .remove(session_id);
+    let stopped = session.is_some();
     drop(session);
-    true
+    stopped
 }
 
 pub fn stop_all() {
@@ -1097,7 +1147,13 @@ fn dispatch_event(
         "key" => {
             let target = ApplicationSurfaceKeyboardTarget::new(target_window_id, target_process_id)
                 .ok_or_else(|| anyhow!("application_window_unavailable"))?;
-            post_key(target, event.key_code, event.key_down, event.modifiers)
+            post_key(target, event.key_code, event.key_down, event.modifiers)?;
+            input_state
+                .keyboard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record_delivery(event.key_code, event.key_down);
+            Ok(())
         }
         "health" => Ok(()),
         _ => bail!("unsupported application-surface event"),

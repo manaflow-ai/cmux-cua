@@ -12,6 +12,20 @@ use crate::permissions::status::{
 
 pub struct CheckPermissionsTool;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenCaptureProbeBackend {
+    Stream,
+    ScreenshotManager,
+}
+
+fn screen_capture_probe_backend(macos_major_version: isize) -> ScreenCaptureProbeBackend {
+    if macos_major_version >= 14 {
+        ScreenCaptureProbeBackend::ScreenshotManager
+    } else {
+        ScreenCaptureProbeBackend::Stream
+    }
+}
+
 /// (A) Real ScreenCaptureKit capability probe — what THIS process can
 /// actually capture right now, independent of the CGPreflight cache.
 ///
@@ -21,7 +35,9 @@ pub struct CheckPermissionsTool;
 /// documents. Display enumeration alone is not sufficient on macOS Tahoe:
 /// `SCShareableContent::get()` can return displays while the separate
 /// direct-capture consent alert is still waiting for a decision. Readiness
-/// therefore requires one real frame from `SCScreenshotManager`.
+/// therefore requires one real frame. macOS 14 and newer use
+/// `SCScreenshotManager`; macOS 13 uses its supported one-frame `SCStream`
+/// equivalent.
 pub(super) fn screen_recording_capturable() -> bool {
     use screencapturekit::{
         prelude::{SCContentFilter, SCShareableContent, SCStreamConfiguration},
@@ -42,10 +58,59 @@ pub(super) fn screen_recording_capturable() -> bool {
                 .with_excluding_windows(&[])
                 .build();
             let configuration = SCStreamConfiguration::new().with_width(1).with_height(1);
-            SCScreenshotManager::capture_image(&filter, &configuration)
-                .is_ok_and(|image| image.width() > 0 && image.height() > 0)
+            let major_version = objc2_foundation::NSProcessInfo::processInfo()
+                .operatingSystemVersion()
+                .majorVersion;
+            match screen_capture_probe_backend(major_version) {
+                ScreenCaptureProbeBackend::Stream => {
+                    capture_one_frame_with_stream(&filter, configuration)
+                }
+                ScreenCaptureProbeBackend::ScreenshotManager => {
+                    SCScreenshotManager::capture_image(&filter, &configuration)
+                        .is_ok_and(|image| image.width() > 0 && image.height() > 0)
+                }
+            }
         },
     )
+}
+
+fn capture_one_frame_with_stream(
+    filter: &screencapturekit::prelude::SCContentFilter,
+    configuration: screencapturekit::prelude::SCStreamConfiguration,
+) -> bool {
+    use screencapturekit::{
+        cm::{CMSampleBufferExt, CMSampleBufferSCExt, SCFrameStatus},
+        prelude::{SCStream, SCStreamOutputType},
+    };
+
+    let (frame_sender, frame_receiver) = std::sync::mpsc::sync_channel(1);
+    let mut stream = SCStream::new(filter, &configuration);
+    if stream
+        .add_output_handler(
+            move |sample: screencapturekit::cm::CMSampleBuffer, output_type: SCStreamOutputType| {
+                if output_type == SCStreamOutputType::Screen
+                    && sample.frame_status() == Some(SCFrameStatus::Complete)
+                    && sample.image_buffer().is_some_and(|pixel_buffer| {
+                        pixel_buffer.width() > 0 && pixel_buffer.height() > 0
+                    })
+                {
+                    let _ = frame_sender.try_send(());
+                }
+            },
+            SCStreamOutputType::Screen,
+        )
+        .is_none()
+    {
+        return false;
+    }
+    if stream.start_capture().is_err() {
+        return false;
+    }
+    let received = frame_receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .is_ok();
+    let _ = stream.stop_capture();
+    received
 }
 
 fn verify_screen_capture_with<Display>(
