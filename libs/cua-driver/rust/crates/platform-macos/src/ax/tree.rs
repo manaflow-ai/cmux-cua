@@ -282,18 +282,23 @@ fn walk_tree_bounded_with_mode(
             }
         }
 
-        // Filter: keep non-window children (menu bar) + the target window.
+        // Native snapshots preserve the established app-root extras (menu bar,
+        // status children). Codex app-state snapshots are screenshot-scoped:
+        // walking a menu bar or another top-level child adds hundreds of
+        // irrelevant AX calls, destabilizes numeric indices, and can consume
+        // the entire response budget before the target window's controls.
         let walk_these: Vec<AXUIElementRef> = if let Some(wid) = window_id {
             top_level
                 .iter()
                 .copied()
                 .filter(|&child| {
                     let role = copy_string_attr(child, "AXRole").unwrap_or_default();
-                    if role != "AXWindow" {
-                        return true; // always keep menu bar and other non-window items
-                    }
-                    // Match AX window element → CGWindowID via private SPI.
-                    ax_get_window_id(child) == Some(wid)
+                    should_walk_top_level(
+                        &role,
+                        ax_get_window_id(child),
+                        Some(wid),
+                        mode,
+                    )
                 })
                 .collect()
         } else {
@@ -337,7 +342,7 @@ fn walk_tree_bounded_with_mode(
         let detail = if mode == WalkMode::CodexFull {
             format!(
                 "{max_elements} returned nodes or {} scanned nodes",
-                max_elements.saturating_mul(8)
+                scan_limit_for_mode(max_elements, mode)
             )
         } else {
             format!("{max_elements} nodes")
@@ -359,6 +364,51 @@ fn walk_tree_bounded_with_mode(
 
 fn should_collapse_layout_container(role: &str, mode: WalkMode) -> bool {
     role == "AXGroup" || (mode == WalkMode::Native && role == "AXScrollArea")
+}
+
+fn should_walk_top_level(
+    role: &str,
+    child_window_id: Option<u32>,
+    target_window_id: Option<u32>,
+    mode: WalkMode,
+) -> bool {
+    let Some(target_window_id) = target_window_id else {
+        return true;
+    };
+    if role == "AXWindow" {
+        return child_window_id == Some(target_window_id);
+    }
+    mode == WalkMode::Native
+}
+
+fn child_attribute_for_role(role: &str, mode: WalkMode) -> &'static str {
+    if mode == WalkMode::CodexFull {
+        match role {
+            "AXOutline" | "AXTable" => return "AXVisibleRows",
+            "AXCollection" => return "AXVisibleChildren",
+            _ => {}
+        }
+    }
+    "AXChildren"
+}
+
+unsafe fn copy_children_for_walk(
+    element: AXUIElementRef,
+    role: &str,
+    mode: WalkMode,
+) -> Vec<AXUIElementRef> {
+    copy_element_array_attr(element, child_attribute_for_role(role, mode))
+}
+
+fn scan_limit_for_mode(max_elements: usize, mode: WalkMode) -> usize {
+    if mode == WalkMode::CodexFull {
+        // A small allowance still lets layout wrappers lead to useful
+        // descendants without turning an 800-element response into 6,400 AX
+        // round trips. Visible-row traversal handles large virtualized lists.
+        max_elements.saturating_mul(2)
+    } else {
+        max_elements
+    }
 }
 
 fn should_index_node(role: &str, is_actionable: bool, has_content: bool, mode: WalkMode) -> bool {
@@ -404,11 +454,7 @@ unsafe fn walk_element(
     // larger bounded scan budget. This lets empty Electron layout wrappers be
     // traversed without crowding useful controls out of the addressable map,
     // while retaining a hard stop for pathological trees.
-    let scan_limit = if mode == WalkMode::CodexFull {
-        max_elements.saturating_mul(8)
-    } else {
-        max_elements
-    };
+    let scan_limit = scan_limit_for_mode(max_elements, mode);
     if *visited_count >= scan_limit {
         *truncated = true;
         return;
@@ -422,7 +468,7 @@ unsafe fn walk_element(
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
-        let children = copy_children(element);
+        let children = copy_children_for_walk(element, &role, mode);
         for child in children {
             walk_element(
                 child,
@@ -469,7 +515,7 @@ unsafe fn walk_element(
     let is_indexed = should_index_node(&role, is_actionable, has_content, mode);
 
     if !is_indexed && !has_content && role != "AXWindow" && role != "AXSheet" {
-        let children = copy_children(element);
+        let children = copy_children_for_walk(element, &role, mode);
         for child in children {
             walk_element(
                 child,
@@ -535,7 +581,7 @@ unsafe fn walk_element(
     lines.push((depth, line));
     nodes.push(node);
 
-    let children = copy_children(element);
+    let children = copy_children_for_walk(element, &role, mode);
     for child in children {
         walk_element(
             child,

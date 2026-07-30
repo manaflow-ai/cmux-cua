@@ -366,7 +366,19 @@ pub unsafe fn focused_element_of_pid(pid: i32) -> Option<AXUIElementRef> {
 
 /// Get the children of an AX element.
 pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
-    let attr = CFStr::new("AXChildren");
+    copy_element_array_attr(element, "AXChildren")
+}
+
+/// Copy an AX attribute whose value is an array of accessibility elements.
+///
+/// This is also used for bounded collection traversal (`AXVisibleRows` /
+/// `AXVisibleChildren`) so a window snapshot does not enumerate thousands of
+/// offscreen rows before reaching the controls visible in the screenshot.
+pub unsafe fn copy_element_array_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Vec<AXUIElementRef> {
+    let attr = CFStr::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err != kAXErrorSuccess || value.is_null() {

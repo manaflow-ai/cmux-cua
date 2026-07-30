@@ -787,8 +787,8 @@ impl CompatState {
                 "pid": app.pid,
                 "window_id": window_id,
                 "include_screenshot": true,
-                "max_elements": 800,
-                "max_depth": 20,
+                "max_elements": 400,
+                "max_depth": 16,
                 "_codex_compat_full_ax_map": true,
             }),
             compat_args,
@@ -879,21 +879,25 @@ impl CompatState {
                 native: native.clone(),
             },
         );
-        let revived_cursor = self.revive_cursor_after_fresh_state(session);
+        let cursor_key = compat_cursor_key(compat_args);
+        let revived_cursor = self.revive_cursor_after_fresh_state(&cursor_key);
         if let Err(error) = self.validate_lock_epoch(lock_epoch) {
             return error.into_result();
         }
         if revived_cursor {
-            self.lock_removed_cursors.lock().unwrap().remove(session);
+            self.lock_removed_cursors
+                .lock()
+                .unwrap()
+                .remove(&cursor_key);
         }
         if let Some((x, y)) = crate::cursor::overlay::present_cursor_for_snapshot_target(
-            session.to_owned(),
+            cursor_key.clone(),
             window_id as u64,
             &cursor_target_bounds,
         )
         .await
         {
-            native.cursor_registry.update_position(session, x, y);
+            native.cursor_registry.update_position(&cursor_key, x, y);
         }
         if let Err(error) = self.validate_lock_epoch(lock_epoch) {
             return error.into_result();
@@ -1728,6 +1732,10 @@ fn session_key(args: &Value) -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or(ANONYMOUS_SESSION)
         .to_owned()
+}
+
+fn compat_cursor_key(args: &Value) -> String {
+    super::cursor_tools::resolve_cursor_key(args)
 }
 
 fn native_action_arguments(
