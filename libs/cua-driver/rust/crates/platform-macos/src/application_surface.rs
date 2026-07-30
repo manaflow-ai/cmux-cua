@@ -40,6 +40,7 @@ const FRAME_SLOT_COUNT: usize = 3;
 // Retain more than eight seconds at the maximum 120 fps so bounded input
 // transport stalls cannot detach a queued event from its displayed frame.
 const FRAME_GEOMETRY_HISTORY_COUNT: usize = 1_024;
+const SOURCE_SIZE_MATCH_TOLERANCE_POINTS: f64 = 1.0;
 const MAXIMUM_FRAME_DIMENSION: usize = 16_384;
 const MAXIMUM_FRAME_RING_BYTE_COUNT: usize = 256 * 1_024 * 1_024;
 pub const MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT: usize = 64;
@@ -399,7 +400,7 @@ impl SharedFrameRing {
         &self,
         source: &[u8],
         source_bytes_per_row: usize,
-        content_rect: NormalizedContentRect,
+        geometry: CapturedFrameGeometry,
     ) -> anyhow::Result<u64> {
         if self.is_closed.load(Ordering::Acquire) {
             bail!("frame ring is closed");
@@ -463,10 +464,7 @@ impl SharedFrameRing {
             .frame_geometries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        frame_geometries[geometry_slot] = Some(PublishedFrameGeometry {
-            sequence,
-            content_rect,
-        });
+        frame_geometries[geometry_slot] = Some(PublishedFrameGeometry { sequence, geometry });
         if publication
             .compare_exchange(
                 previous_published_word,
@@ -485,7 +483,7 @@ impl SharedFrameRing {
         Ok(sequence)
     }
 
-    fn content_rect_for_published_sequence(&self, sequence: u64) -> Option<NormalizedContentRect> {
+    fn geometry_for_published_sequence(&self, sequence: u64) -> Option<CapturedFrameGeometry> {
         if sequence == 0 {
             return None;
         }
@@ -502,7 +500,7 @@ impl SharedFrameRing {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)[geometry_slot]
             .filter(|geometry| geometry.sequence == sequence)
-            .map(|geometry| geometry.content_rect)
+            .map(|geometry| geometry.geometry)
     }
 
     fn mark_failed(&self) -> anyhow::Result<()> {
@@ -612,7 +610,14 @@ struct NormalizedContentRect {
 #[derive(Debug, Clone, Copy)]
 struct PublishedFrameGeometry {
     sequence: u64,
+    geometry: CapturedFrameGeometry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CapturedFrameGeometry {
     content_rect: NormalizedContentRect,
+    source_width: f64,
+    source_height: f64,
 }
 
 impl Default for NormalizedContentRect {
@@ -627,13 +632,13 @@ impl Default for NormalizedContentRect {
 }
 
 impl NormalizedContentRect {
-    fn from_frame_info(
-        info: &FrameInfo,
-        frame_width: usize,
-        frame_height: usize,
-    ) -> Option<Self> {
+    fn from_frame_info(info: &FrameInfo, frame_width: usize, frame_height: usize) -> Option<Self> {
         let rect = info.content_rect?;
         let scale_factor = info.scale_factor.unwrap_or(1.0);
+        // Apple's SCStreamFrameInfoContentRect contract defines both the size
+        // and location as points in the output surface. The separate
+        // SCStreamFrameInfoScaleFactor is the pixel-to-point scale, so both the
+        // origin and size must be converted to output pixels here.
         Self::from_frame_rect(
             rect.origin.x * scale_factor,
             rect.origin.y * scale_factor,
@@ -685,9 +690,65 @@ impl NormalizedContentRect {
     }
 }
 
+impl CapturedFrameGeometry {
+    fn from_frame_info(
+        info: Option<&FrameInfo>,
+        frame_width: usize,
+        frame_height: usize,
+        fallback_source_width: f64,
+        fallback_source_height: f64,
+    ) -> Self {
+        let content_rect = info
+            .and_then(|info| {
+                NormalizedContentRect::from_frame_info(info, frame_width, frame_height)
+            })
+            .unwrap_or_default();
+        let source_size = info
+            .and_then(Self::source_size_from_frame_info)
+            .unwrap_or((fallback_source_width, fallback_source_height));
+        Self {
+            content_rect,
+            source_width: source_size.0,
+            source_height: source_size.1,
+        }
+    }
+
+    fn source_size_from_frame_info(info: &FrameInfo) -> Option<(f64, f64)> {
+        let rect = info.content_rect?;
+        let content_scale = info.content_scale?;
+        if !content_scale.is_finite() || content_scale <= 0.0 {
+            return None;
+        }
+        // SCStreamFrameInfoContentScale maps original content points into the
+        // content rectangle's surface points. Inverting it recovers the source
+        // window size that produced this exact frame.
+        let width = rect.size.width / content_scale;
+        let height = rect.size.height / content_scale;
+        (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+            .then_some((width, height))
+    }
+
+    fn content_rect_for_target(
+        self,
+        target_width: f64,
+        target_height: f64,
+    ) -> Option<NormalizedContentRect> {
+        if !target_width.is_finite() || !target_height.is_finite() {
+            return None;
+        }
+        let width_matches =
+            (target_width - self.source_width).abs() <= SOURCE_SIZE_MATCH_TOLERANCE_POINTS;
+        let height_matches =
+            (target_height - self.source_height).abs() <= SOURCE_SIZE_MATCH_TOLERANCE_POINTS;
+        (width_matches && height_matches).then_some(self.content_rect)
+    }
+}
+
 struct CaptureFrameState {
     ring: Arc<SharedFrameRing>,
     failed: AtomicBool,
+    fallback_source_width: f64,
+    fallback_source_height: f64,
 }
 
 pub(crate) fn capture_frame_status_is_publishable(status: Option<SCFrameStatus>) -> bool {
@@ -722,27 +783,21 @@ impl CaptureFrameState {
             self.mark_failed();
             return;
         }
-        let content_rect = sample
-            .frame_info()
-            .and_then(|info| {
-                // ScreenCaptureKit reports the entire contentRect in points in the
-                // output surface. scaleFactor converts both its origin and size to
-                // output pixels; contentScale independently reports source resizing
-                // and must not be applied to the rectangle again.
-                NormalizedContentRect::from_frame_info(
-                    &info,
-                    pixel_buffer.width(),
-                    pixel_buffer.height(),
-                )
-            })
-            .unwrap_or_default();
+        let frame_info = sample.frame_info();
+        let geometry = CapturedFrameGeometry::from_frame_info(
+            frame_info.as_ref(),
+            pixel_buffer.width(),
+            pixel_buffer.height(),
+            self.fallback_source_width,
+            self.fallback_source_height,
+        );
         let Ok(guard) = pixel_buffer.lock_read_only() else {
             self.mark_failed();
             return;
         };
         if self
             .ring
-            .publish(guard.as_slice(), guard.bytes_per_row(), content_rect)
+            .publish(guard.as_slice(), guard.bytes_per_row(), geometry)
             .is_err()
         {
             self.mark_failed();
@@ -1148,6 +1203,8 @@ pub fn start(
     let frame_state = Arc::new(CaptureFrameState {
         ring: ring.clone(),
         failed: AtomicBool::new(false),
+        fallback_source_width: source_frame.size.width,
+        fallback_source_height: source_frame.size.height,
     });
 
     let filter = SCContentFilter::create()
@@ -1313,7 +1370,10 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
         |sequence| {
             frame_state
                 .ring
-                .content_rect_for_published_sequence(sequence)
+                .geometry_for_published_sequence(sequence)
+                .and_then(|geometry| {
+                    geometry.content_rect_for_target(target.bounds.width, target.bounds.height)
+                })
         },
         &input_state,
     )?;
@@ -1761,6 +1821,14 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    fn frame_geometry(content_rect: NormalizedContentRect) -> CapturedFrameGeometry {
+        CapturedFrameGeometry {
+            content_rect,
+            source_width: 2.0,
+            source_height: 2.0,
+        }
+    }
+
     #[test]
     fn window_listing_does_not_require_accessibility() {
         assert_eq!(
@@ -1828,7 +1896,7 @@ mod tests {
         let ring = SharedFrameRing::create(2, 2).unwrap();
         let frame = [0x5A; 16];
 
-        ring.publish(&frame, 8, NormalizedContentRect::default())
+        ring.publish(&frame, 8, frame_geometry(NormalizedContentRect::default()))
             .unwrap();
         ring.mark_failed().unwrap();
 
@@ -1838,7 +1906,7 @@ mod tests {
         };
         assert_eq!(published_word, FRAME_FAILURE_WORD);
         assert!(ring
-            .publish(&frame, 8, NormalizedContentRect::default())
+            .publish(&frame, 8, frame_geometry(NormalizedContentRect::default()))
             .is_err());
         let published_word_after_rejected_frame = unsafe {
             ring.atomic_word(FRAME_PUBLISHED_WORD_OFFSET)
@@ -1865,7 +1933,7 @@ mod tests {
             unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
         assert_eq!(handle_after_attach, -1);
         assert!(ring
-            .publish(&frame, 8, NormalizedContentRect::default())
+            .publish(&frame, 8, frame_geometry(NormalizedContentRect::default()))
             .is_ok());
     }
 
@@ -1947,13 +2015,8 @@ mod tests {
             ..FrameInfo::default()
         };
 
-        let geometry = CapturedFrameGeometry::from_frame_info(
-            Some(&info),
-            1000,
-            1000,
-            800.0,
-            600.0,
-        );
+        let geometry =
+            CapturedFrameGeometry::from_frame_info(Some(&info), 1000, 1000, 800.0, 600.0);
         assert_eq!(geometry.source_width, 500.0);
         assert_eq!(geometry.source_height, 400.0);
     }
@@ -1985,19 +2048,21 @@ mod tests {
             height: 0.5,
         };
 
-        let first_sequence = ring.publish(&frame, 8, first).unwrap();
-        let second_sequence = ring.publish(&frame, 8, second).unwrap();
+        let first_geometry = frame_geometry(first);
+        let second_geometry = frame_geometry(second);
+        let first_sequence = ring.publish(&frame, 8, first_geometry).unwrap();
+        let second_sequence = ring.publish(&frame, 8, second_geometry).unwrap();
 
         assert_eq!(
-            ring.content_rect_for_published_sequence(first_sequence),
-            Some(first)
+            ring.geometry_for_published_sequence(first_sequence),
+            Some(first_geometry)
         );
         assert_eq!(
-            ring.content_rect_for_published_sequence(second_sequence),
-            Some(second)
+            ring.geometry_for_published_sequence(second_sequence),
+            Some(second_geometry)
         );
         assert_eq!(
-            ring.content_rect_for_published_sequence(second_sequence + 1),
+            ring.geometry_for_published_sequence(second_sequence + 1),
             None
         );
     }
