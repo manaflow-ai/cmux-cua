@@ -722,7 +722,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_probe_timeout_includes_shutdown() {
+    async fn stream_probe_cleanup_cannot_negate_a_valid_frame() {
         let result = capture_stream_lifecycle_with_timeout(
             std::time::Duration::from_millis(10),
             tokio::spawn(async { true }),
@@ -731,7 +731,7 @@ mod tests {
         )
         .await;
 
-        assert!(!result);
+        assert!(result);
     }
 
     #[tokio::test]

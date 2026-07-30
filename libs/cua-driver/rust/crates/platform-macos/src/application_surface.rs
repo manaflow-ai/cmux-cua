@@ -2075,6 +2075,12 @@ mod tests {
             }),
             serde_json::json!({
                 "session": "one",
+                "kind": "mouse_moved",
+                "x": 0.5,
+                "y": 0.5,
+            }),
+            serde_json::json!({
+                "session": "one",
                 "kind": "scroll",
                 "x": 0.5,
                 "y": 0.5,
