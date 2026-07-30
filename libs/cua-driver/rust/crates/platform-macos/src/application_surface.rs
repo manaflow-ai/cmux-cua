@@ -1937,6 +1937,43 @@ mod tests {
     }
 
     #[test]
+    fn captured_frame_geometry_recovers_source_size_from_content_scale() {
+        let info = FrameInfo {
+            scale_factor: Some(2.0),
+            content_scale: Some(0.5),
+            content_rect: Some(screencapturekit::cg::CGRect::new(
+                125.0, 125.0, 250.0, 200.0,
+            )),
+            ..FrameInfo::default()
+        };
+
+        let geometry = CapturedFrameGeometry::from_frame_info(
+            Some(&info),
+            1000,
+            1000,
+            800.0,
+            600.0,
+        );
+        assert_eq!(geometry.source_width, 500.0);
+        assert_eq!(geometry.source_height, 400.0);
+    }
+
+    #[test]
+    fn captured_frame_geometry_rejects_input_after_source_resize() {
+        let geometry = CapturedFrameGeometry {
+            content_rect: NormalizedContentRect::default(),
+            source_width: 800.0,
+            source_height: 600.0,
+        };
+
+        assert_eq!(
+            geometry.content_rect_for_target(800.0, 600.0),
+            Some(NormalizedContentRect::default())
+        );
+        assert_eq!(geometry.content_rect_for_target(1200.0, 600.0), None);
+    }
+
+    #[test]
     fn published_frame_sequences_keep_their_own_input_geometry() {
         let ring = SharedFrameRing::create(2, 2).unwrap();
         let frame = vec![0_u8; 16];
