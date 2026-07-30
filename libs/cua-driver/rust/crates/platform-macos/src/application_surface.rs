@@ -10,7 +10,7 @@ use std::ffi::{c_char, c_void, CString};
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
 use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context};
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton, ScrollEventUnit};
@@ -37,6 +37,9 @@ const FRAME_MAGIC: u32 = 0x434D_5846;
 const FRAME_VERSION: u32 = 2;
 const FRAME_PIXEL_BYTE_COUNT: usize = 4;
 const FRAME_SLOT_COUNT: usize = 3;
+// Retain more than eight seconds at the maximum 120 fps so bounded input
+// transport stalls cannot detach a queued event from its displayed frame.
+const FRAME_GEOMETRY_HISTORY_COUNT: usize = 1_024;
 const MAXIMUM_FRAME_DIMENSION: usize = 16_384;
 const MAXIMUM_FRAME_RING_BYTE_COUNT: usize = 256 * 1_024 * 1_024;
 pub const MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT: usize = 64;
@@ -129,6 +132,8 @@ fn default_frame_rate() -> u32 {
 pub struct ApplicationSurfaceEvent {
     pub session: String,
     pub kind: String,
+    #[serde(default)]
+    pub frame_sequence: Option<u64>,
     pub x: Option<f64>,
     pub y: Option<f64>,
     #[serde(default)]
@@ -144,6 +149,12 @@ pub struct ApplicationSurfaceEvent {
 }
 
 impl ApplicationSurfaceEvent {
+    fn required_frame_sequence(&self) -> anyhow::Result<u64> {
+        self.frame_sequence
+            .filter(|sequence| *sequence > 0 && *sequence <= (i64::MAX as u64 >> 2))
+            .ok_or_else(|| anyhow!("application-surface frame sequence is required"))
+    }
+
     fn pointer_coordinates(&self) -> anyhow::Result<(f64, f64)> {
         let (Some(x), Some(y)) = (self.x, self.y) else {
             bail!("application-surface pointer coordinates are required");
@@ -266,6 +277,9 @@ struct SharedFrameRing {
     mapping: NonNull<u8>,
     layout: FrameLayout,
     next_sequence: AtomicU64,
+    // The host echoes the sequence of its displayed frame with pointer input.
+    // Each geometry is recorded before that sequence becomes publishable.
+    frame_geometries: Mutex<[Option<PublishedFrameGeometry>; FRAME_GEOMETRY_HISTORY_COUNT]>,
     is_closed: AtomicBool,
     is_unlinked: AtomicBool,
 }
@@ -329,6 +343,7 @@ impl SharedFrameRing {
             mapping,
             layout,
             next_sequence: AtomicU64::new(0),
+            frame_geometries: Mutex::new([None; FRAME_GEOMETRY_HISTORY_COUNT]),
             is_closed: AtomicBool::new(false),
             is_unlinked: AtomicBool::new(false),
         };
@@ -380,7 +395,12 @@ impl SharedFrameRing {
         unsafe { &*self.mapping.as_ptr().add(offset).cast::<AtomicU64>() }
     }
 
-    fn publish(&self, source: &[u8], source_bytes_per_row: usize) -> anyhow::Result<()> {
+    fn publish(
+        &self,
+        source: &[u8],
+        source_bytes_per_row: usize,
+        content_rect: NormalizedContentRect,
+    ) -> anyhow::Result<u64> {
         if self.is_closed.load(Ordering::Acquire) {
             bail!("frame ring is closed");
         }
@@ -437,6 +457,16 @@ impl SharedFrameRing {
             self.atomic_word(FRAME_SLOT_VERSION_OFFSET + slot * FRAME_SLOT_VERSION_STRIDE)
                 .store(completed_version, Ordering::Release);
         }
+        let geometry_slot = usize::try_from((sequence - 1) % FRAME_GEOMETRY_HISTORY_COUNT as u64)
+            .expect("bounded geometry history slot always fits usize");
+        let mut frame_geometries = self
+            .frame_geometries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        frame_geometries[geometry_slot] = Some(PublishedFrameGeometry {
+            sequence,
+            content_rect,
+        });
         if publication
             .compare_exchange(
                 previous_published_word,
@@ -446,11 +476,33 @@ impl SharedFrameRing {
             )
             .is_err()
         {
+            frame_geometries[geometry_slot] = None;
             bail!("frame ring publication changed concurrently");
         }
+        drop(frame_geometries);
         fence(Ordering::SeqCst);
         post_frame_notification(&self.name)?;
-        Ok(())
+        Ok(sequence)
+    }
+
+    fn content_rect_for_published_sequence(&self, sequence: u64) -> Option<NormalizedContentRect> {
+        if sequence == 0 {
+            return None;
+        }
+        let published_word = unsafe {
+            self.atomic_word(FRAME_PUBLISHED_WORD_OFFSET)
+                .load(Ordering::Acquire)
+        };
+        if published_word == FRAME_FAILURE_WORD || (published_word >> 2) < sequence {
+            return None;
+        }
+        let geometry_slot =
+            usize::try_from((sequence - 1) % FRAME_GEOMETRY_HISTORY_COUNT as u64).ok()?;
+        self.frame_geometries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[geometry_slot]
+            .filter(|geometry| geometry.sequence == sequence)
+            .map(|geometry| geometry.content_rect)
     }
 
     fn mark_failed(&self) -> anyhow::Result<()> {
@@ -549,12 +601,18 @@ extern "C" {
     fn notify_post(name: *const c_char) -> u32;
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct NormalizedContentRect {
     x: f64,
     y: f64,
     width: f64,
     height: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PublishedFrameGeometry {
+    sequence: u64,
+    content_rect: NormalizedContentRect,
 }
 
 impl Default for NormalizedContentRect {
@@ -629,7 +687,6 @@ impl NormalizedContentRect {
 
 struct CaptureFrameState {
     ring: Arc<SharedFrameRing>,
-    content_rect: RwLock<NormalizedContentRect>,
     failed: AtomicBool,
 }
 
@@ -665,29 +722,27 @@ impl CaptureFrameState {
             self.mark_failed();
             return;
         }
-        if let Some(info) = sample.frame_info() {
-            // ScreenCaptureKit reports the entire contentRect in points in the
-            // output surface. scaleFactor converts both its origin and size to
-            // output pixels; contentScale independently reports source resizing
-            // and must not be applied to the rectangle again.
-            if let Some(normalized) = NormalizedContentRect::from_frame_info(
-                &info,
-                pixel_buffer.width(),
-                pixel_buffer.height(),
-            ) {
-                *self
-                    .content_rect
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = normalized;
-            }
-        }
+        let content_rect = sample
+            .frame_info()
+            .and_then(|info| {
+                // ScreenCaptureKit reports the entire contentRect in points in the
+                // output surface. scaleFactor converts both its origin and size to
+                // output pixels; contentScale independently reports source resizing
+                // and must not be applied to the rectangle again.
+                NormalizedContentRect::from_frame_info(
+                    &info,
+                    pixel_buffer.width(),
+                    pixel_buffer.height(),
+                )
+            })
+            .unwrap_or_default();
         let Ok(guard) = pixel_buffer.lock_read_only() else {
             self.mark_failed();
             return;
         };
         if self
             .ring
-            .publish(guard.as_slice(), guard.bytes_per_row())
+            .publish(guard.as_slice(), guard.bytes_per_row(), content_rect)
             .is_err()
         {
             self.mark_failed();
@@ -1092,7 +1147,6 @@ pub fn start(
     let ring = SharedFrameRing::create(width, height)?;
     let frame_state = Arc::new(CaptureFrameState {
         ring: ring.clone(),
-        content_rect: RwLock::new(NormalizedContentRect::default()),
         failed: AtomicBool::new(false),
     });
 
@@ -1254,12 +1308,16 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
     }
     let target = live_target(target_window_id, target_process_id)
         .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
-    let content = *frame_state
-        .content_rect
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    validate_event_deliveries(&events, content, &input_state)?;
-    for event in events {
+    let resolved_content = validate_event_deliveries(
+        &events,
+        |sequence| {
+            frame_state
+                .ring
+                .content_rect_for_published_sequence(sequence)
+        },
+        &input_state,
+    )?;
+    for (event, content) in events.into_iter().zip(resolved_content) {
         dispatch_event(
             event,
             target_window_id,
@@ -1298,9 +1356,11 @@ fn validate_event_shape(event: &ApplicationSurfaceEvent) -> anyhow::Result<()> {
         | "right_mouse_down"
         | "right_mouse_up"
         | "right_mouse_dragged" => {
+            event.required_frame_sequence()?;
             event.pointer_coordinates()?;
         }
         "scroll" => {
+            event.required_frame_sequence()?;
             event.scroll_values()?;
         }
         "key" => {
@@ -1314,9 +1374,9 @@ fn validate_event_shape(event: &ApplicationSurfaceEvent) -> anyhow::Result<()> {
 
 fn validate_event_deliveries(
     events: &[ApplicationSurfaceEvent],
-    content: NormalizedContentRect,
+    content_for_sequence: impl Fn(u64) -> Option<NormalizedContentRect>,
     input_state: &ApplicationSurfaceInputState,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<Option<NormalizedContentRect>>> {
     let pointer = input_state
         .pointer
         .lock()
@@ -1324,9 +1384,11 @@ fn validate_event_deliveries(
     let mut left_pressed = pointer.left.pressed_delivery.is_some();
     let mut right_pressed = pointer.right.pressed_delivery.is_some();
     drop(pointer);
+    let mut resolved_content = Vec::with_capacity(events.len());
 
     for event in events {
         let kind = event.kind.as_str();
+        let content = event.frame_sequence.and_then(&content_for_sequence);
         match kind {
             "mouse_moved"
             | "left_mouse_down"
@@ -1336,7 +1398,9 @@ fn validate_event_deliveries(
             | "right_mouse_up"
             | "right_mouse_dragged" => {
                 let (x, y) = event.pointer_coordinates()?;
-                let is_inside_content = content.source_point(x, y).is_some();
+                let is_inside_content = content
+                    .and_then(|content| content.source_point(x, y))
+                    .is_some();
                 let can_continue_outside = match kind {
                     "left_mouse_dragged" | "left_mouse_up" => left_pressed,
                     "right_mouse_dragged" | "right_mouse_up" => right_pressed,
@@ -1356,14 +1420,15 @@ fn validate_event_deliveries(
             "scroll" => {
                 let (x, y, _, _) = event.scroll_values()?;
                 content
-                    .source_point(x, y)
+                    .and_then(|content| content.source_point(x, y))
                     .ok_or(ApplicationSurfaceError::PointOutsideContent)?;
             }
             "key" | "health" => {}
             _ => bail!("unsupported application-surface event"),
         }
+        resolved_content.push(content);
     }
-    Ok(())
+    Ok(resolved_content)
 }
 
 fn dispatch_event(
@@ -1371,7 +1436,7 @@ fn dispatch_event(
     target_window_id: u32,
     target_process_id: i32,
     target: &windows::WindowInfo,
-    content: NormalizedContentRect,
+    content: Option<NormalizedContentRect>,
     input_state: &ApplicationSurfaceInputState,
 ) -> anyhow::Result<()> {
     match event.kind.as_str() {
@@ -1383,7 +1448,8 @@ fn dispatch_event(
         | "right_mouse_up"
         | "right_mouse_dragged" => {
             let (x, y) = event.pointer_coordinates()?;
-            let Some((source_x, source_y)) = content.source_point(x, y) else {
+            let Some((source_x, source_y)) = content.and_then(|content| content.source_point(x, y))
+            else {
                 if matches!(
                     event.kind.as_str(),
                     "left_mouse_dragged"
@@ -1420,7 +1486,7 @@ fn dispatch_event(
         "scroll" => {
             let (x, y, delta_x, delta_y) = event.scroll_values()?;
             let (source_x, source_y) = content
-                .source_point(x, y)
+                .and_then(|content| content.source_point(x, y))
                 .ok_or(ApplicationSurfaceError::PointOutsideContent)?;
             post_scroll(
                 target_process_id,
@@ -1762,7 +1828,8 @@ mod tests {
         let ring = SharedFrameRing::create(2, 2).unwrap();
         let frame = [0x5A; 16];
 
-        ring.publish(&frame, 8).unwrap();
+        ring.publish(&frame, 8, NormalizedContentRect::default())
+            .unwrap();
         ring.mark_failed().unwrap();
 
         let published_word = unsafe {
@@ -1770,7 +1837,9 @@ mod tests {
                 .load(Ordering::Acquire)
         };
         assert_eq!(published_word, FRAME_FAILURE_WORD);
-        assert!(ring.publish(&frame, 8).is_err());
+        assert!(ring
+            .publish(&frame, 8, NormalizedContentRect::default())
+            .is_err());
         let published_word_after_rejected_frame = unsafe {
             ring.atomic_word(FRAME_PUBLISHED_WORD_OFFSET)
                 .load(Ordering::Acquire)
@@ -1795,7 +1864,9 @@ mod tests {
         let handle_after_attach =
             unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
         assert_eq!(handle_after_attach, -1);
-        assert!(ring.publish(&frame, 8).is_ok());
+        assert!(ring
+            .publish(&frame, 8, NormalizedContentRect::default())
+            .is_ok());
     }
 
     #[test]
@@ -1863,6 +1934,35 @@ mod tests {
         assert_eq!(rect.source_point(0.5, 0.5), Some((0.5, 0.5)));
         assert_eq!(rect.source_point(0.2, 0.5), None);
         assert_eq!(rect.source_point(0.5, 0.2), None);
+    }
+
+    #[test]
+    fn published_frame_sequences_keep_their_own_input_geometry() {
+        let ring = SharedFrameRing::create(2, 2).unwrap();
+        let frame = vec![0_u8; 16];
+        let first = NormalizedContentRect::default();
+        let second = NormalizedContentRect {
+            x: 0.25,
+            y: 0.25,
+            width: 0.5,
+            height: 0.5,
+        };
+
+        let first_sequence = ring.publish(&frame, 8, first).unwrap();
+        let second_sequence = ring.publish(&frame, 8, second).unwrap();
+
+        assert_eq!(
+            ring.content_rect_for_published_sequence(first_sequence),
+            Some(first)
+        );
+        assert_eq!(
+            ring.content_rect_for_published_sequence(second_sequence),
+            Some(second)
+        );
+        assert_eq!(
+            ring.content_rect_for_published_sequence(second_sequence + 1),
+            None
+        );
     }
 
     #[test]
@@ -2025,6 +2125,7 @@ mod tests {
         let event = |session: &str| ApplicationSurfaceEvent {
             session: session.to_owned(),
             kind: "health".to_owned(),
+            frame_sequence: None,
             x: Some(0.0),
             y: Some(0.0),
             button: String::new(),
@@ -2123,6 +2224,7 @@ mod tests {
         let event = |kind: &str, x: f64, y: f64| ApplicationSurfaceEvent {
             session: "one".to_owned(),
             kind: kind.to_owned(),
+            frame_sequence: Some(1),
             x: Some(x),
             y: Some(y),
             button: String::new(),
@@ -2146,7 +2248,7 @@ mod tests {
                 event("key", 0.0, 0.0),
                 event("mouse_moved", 2.0, 0.5),
             ],
-            content,
+            |_| Some(content),
             &input,
         )
         .is_err());
@@ -2155,14 +2257,60 @@ mod tests {
                 event("left_mouse_down", 0.5, 0.5),
                 event("left_mouse_up", 2.0, 0.5),
             ],
-            content,
+            |_| Some(content),
             &input,
         )
         .is_ok());
-        assert!(
-            validate_event_deliveries(&[event("left_mouse_up", 2.0, 0.5)], content, &input)
-                .is_err()
-        );
+        assert!(validate_event_deliveries(
+            &[event("left_mouse_up", 2.0, 0.5)],
+            |_| Some(content),
+            &input,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn event_delivery_resolves_geometry_from_each_displayed_frame_sequence() {
+        let event = |frame_sequence: u64, x: f64, y: f64| ApplicationSurfaceEvent {
+            session: "one".to_owned(),
+            kind: "mouse_moved".to_owned(),
+            frame_sequence: Some(frame_sequence),
+            x: Some(x),
+            y: Some(y),
+            button: String::new(),
+            key_code: Some(0),
+            key_down: Some(false),
+            modifiers: 0,
+            click_count: 1,
+            delta_x: Some(0.0),
+            delta_y: Some(0.0),
+        };
+        let full_frame = NormalizedContentRect::default();
+        let inset_frame = NormalizedContentRect {
+            x: 0.25,
+            y: 0.25,
+            width: 0.5,
+            height: 0.5,
+        };
+        let content_for_sequence = |sequence| match sequence {
+            1 => Some(full_frame),
+            2 => Some(inset_frame),
+            _ => None,
+        };
+        let input = ApplicationSurfaceInputState::new();
+
+        assert!(validate_event_deliveries(
+            &[event(1, 0.1, 0.1), event(2, 0.1, 0.1)],
+            content_for_sequence,
+            &input,
+        )
+        .is_err());
+        assert!(validate_event_deliveries(
+            &[event(1, 0.1, 0.1), event(2, 0.5, 0.5)],
+            content_for_sequence,
+            &input,
+        )
+        .is_ok());
     }
 
     #[test]

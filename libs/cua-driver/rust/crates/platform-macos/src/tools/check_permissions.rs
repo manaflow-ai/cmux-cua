@@ -164,12 +164,15 @@ where
         false
     };
 
-    // Schedule shutdown even after the deadline. The lifecycle mutex keeps it
-    // behind an in-flight start, while spawn_blocking keeps both synchronous
-    // ScreenCaptureKit completion waits off Tokio's async worker threads.
+    // Schedule shutdown even after the readiness deadline. The lifecycle mutex
+    // keeps it behind an in-flight start, while spawn_blocking keeps both
+    // synchronous ScreenCaptureKit completion waits off Tokio's async workers.
+    // Cleanup gets its own bound and cannot negate a frame that proved capture.
     let stop_task = stop();
-    let stopped = capture_probe_task_before(deadline, stop_task).await;
-    started && received && stopped
+    let _cleanup_task = tokio::spawn(async move {
+        let _ = tokio::time::timeout(timeout, stop_task).await;
+    });
+    started && received
 }
 
 async fn capture_probe_task_before(
