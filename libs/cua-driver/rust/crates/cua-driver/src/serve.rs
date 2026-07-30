@@ -1290,7 +1290,10 @@ fn daemon_permission_attribution() -> &'static str {
 }
 
 #[cfg(target_os = "macos")]
-fn daemon_permission_status(profile: DaemonProfile) -> serde_json::Value {
+fn daemon_permission_status(
+    profile: DaemonProfile,
+    external_permission_ready: bool,
+) -> serde_json::Value {
     let status = platform_macos::permissions::current_status();
     let panel = platform_macos::permissions::panel::lifecycle();
     let recovery = platform_macos::permissions::gate::recovery_lifecycle();
@@ -1298,6 +1301,7 @@ fn daemon_permission_status(profile: DaemonProfile) -> serde_json::Value {
         "accessibility": status.accessibility,
         "screen_recording": status.screen_recording,
         "all_granted": status.all_granted(),
+        "external_permission_ready": external_permission_ready,
         "profile": profile,
         "panel": {
             "visible": panel.visible,
@@ -1648,6 +1652,8 @@ pub async fn run_serve(
     let approval_brokers = std::sync::Arc::new(std::sync::Mutex::new(
         std::collections::HashMap::<String, String>::new(),
     ));
+    let external_permission_ready =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
         tokio::select! {
@@ -1688,6 +1694,7 @@ pub async fn run_serve(
                 let last_activity = last_activity.clone();
                 let approval_peer_pid = approval_broker_peer_pid(&stream);
                 let approval_brokers = approval_brokers.clone();
+                let external_permission_ready = external_permission_ready.clone();
 
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.into_split();
@@ -1754,7 +1761,12 @@ pub async fn run_serve(
                             }
                             "permissions_status" => {
                                 #[cfg(target_os = "macos")]
-                                let resp = DaemonResponse::ok(daemon_permission_status(profile));
+                                let resp = DaemonResponse::ok(daemon_permission_status(
+                                    profile,
+                                    external_permission_ready.load(
+                                        std::sync::atomic::Ordering::Acquire
+                                    ),
+                                ));
                                 #[cfg(not(target_os = "macos"))]
                                 let resp = DaemonResponse::err(
                                     "permissions_status is available only on macOS",
@@ -1762,6 +1774,36 @@ pub async fn run_serve(
                                 );
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "set_external_permission_ready" => {
+                                let response = if !host_request_authorized {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    )
+                                } else if let Some(ready) = req
+                                    .args
+                                    .as_ref()
+                                    .and_then(|args| args.get("ready"))
+                                    .and_then(serde_json::Value::as_bool)
+                                {
+                                    external_permission_ready.store(
+                                        ready,
+                                        std::sync::atomic::Ordering::Release,
+                                    );
+                                    DaemonResponse::ok(serde_json::json!({
+                                        "external_permission_ready": ready,
+                                    }))
+                                } else {
+                                    DaemonResponse::err(
+                                        "External permission readiness requires a boolean `ready`"
+                                            .to_owned(),
+                                        64,
+                                    )
+                                };
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&response).unwrap() + "\n").as_bytes()
                                 ).await;
                             }
                             "permissions_present" => {
