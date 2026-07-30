@@ -796,6 +796,64 @@ mod tests {
     }
 
     #[test]
+    fn codex_window_capture_excludes_menu_bar_and_other_top_level_children() {
+        assert!(should_walk_top_level(
+            "AXWindow",
+            Some(7),
+            Some(7),
+            WalkMode::CodexFull,
+        ));
+        assert!(!should_walk_top_level(
+            "AXWindow",
+            Some(8),
+            Some(7),
+            WalkMode::CodexFull,
+        ));
+        assert!(!should_walk_top_level(
+            "AXMenuBar",
+            None,
+            Some(7),
+            WalkMode::CodexFull,
+        ));
+        assert!(
+            should_walk_top_level(
+                "AXMenuBar",
+                None,
+                Some(7),
+                WalkMode::Native,
+            ),
+            "native get_window_state keeps its established menu-bar behavior"
+        );
+    }
+
+    #[test]
+    fn codex_large_collections_walk_only_visible_rows() {
+        assert_eq!(
+            child_attribute_for_role("AXOutline", WalkMode::CodexFull),
+            "AXVisibleRows"
+        );
+        assert_eq!(
+            child_attribute_for_role("AXTable", WalkMode::CodexFull),
+            "AXVisibleRows"
+        );
+        assert_eq!(
+            child_attribute_for_role("AXCollection", WalkMode::CodexFull),
+            "AXVisibleChildren"
+        );
+        assert_eq!(
+            child_attribute_for_role("AXOutline", WalkMode::Native),
+            "AXChildren",
+            "native tree completeness is unchanged"
+        );
+    }
+
+    #[test]
+    fn codex_scan_budget_stays_close_to_the_response_budget() {
+        assert_eq!(scan_limit_for_mode(800, WalkMode::CodexFull), 1_600);
+        assert_eq!(scan_limit_for_mode(800, WalkMode::Native), 800);
+    }
+
+    #[test]
     fn truncate_ax_value_keeps_unicode_boundaries() {
         let value = "é".repeat(MAX_AX_VALUE_CHARS + 1);
         let truncated = truncate_ax_value(value);

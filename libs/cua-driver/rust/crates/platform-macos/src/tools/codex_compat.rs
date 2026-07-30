@@ -3277,6 +3277,22 @@ mod tests {
         assert_eq!(native["_host_session"], "cmux-surface-A1B2C3");
     }
 
+    #[test]
+    fn compat_cursor_uses_the_stable_host_session_across_proxy_generations() {
+        let first = json!({
+            "_session_id":"cmux-surface-A1B2C3-mcp-42-1000",
+            "_host_session":"cmux-surface-A1B2C3",
+        });
+        let second = json!({
+            "_session_id":"cmux-surface-A1B2C3-mcp-84-2000",
+            "_host_session":"cmux-surface-A1B2C3",
+        });
+
+        assert_eq!(compat_cursor_key(&first), "cmux-surface-A1B2C3");
+        assert_eq!(compat_cursor_key(&second), "cmux-surface-A1B2C3");
+        assert_ne!(session_key(&first), compat_cursor_key(&first));
+    }
+
     #[tokio::test]
     async fn action_without_app_snapshot_fails_closed() {
         let state = CompatState::new();
