@@ -577,8 +577,8 @@ impl NormalizedContentRect {
         let rect = info.content_rect?;
         let scale_factor = info.scale_factor.unwrap_or(1.0);
         Self::from_frame_rect(
-            rect.origin.x,
-            rect.origin.y,
+            rect.origin.x * scale_factor,
+            rect.origin.y * scale_factor,
             rect.size.width * scale_factor,
             rect.size.height * scale_factor,
             frame_width,
@@ -666,10 +666,10 @@ impl CaptureFrameState {
             return;
         }
         if let Some(info) = sample.frame_info() {
-            // ScreenCaptureKit reports contentRect's origin as an offset in the
-            // output surface, while scaleFactor converts its source-point size
-            // to output pixels. contentScale independently reports source
-            // resizing and must not be applied to the rectangle again.
+            // ScreenCaptureKit reports the entire contentRect in points in the
+            // output surface. scaleFactor converts both its origin and size to
+            // output pixels; contentScale independently reports source resizing
+            // and must not be applied to the rectangle again.
             if let Some(normalized) = NormalizedContentRect::from_frame_info(
                 &info,
                 pixel_buffer.width(),
@@ -1849,20 +1849,20 @@ mod tests {
     }
 
     #[test]
-    fn content_rect_scales_size_but_preserves_output_offset() {
+    fn content_rect_scales_origin_and_size_without_applying_content_scale() {
         let info = FrameInfo {
             scale_factor: Some(2.0),
             content_scale: Some(0.5),
             content_rect: Some(screencapturekit::cg::CGRect::new(
-                125.0, 125.0, 500.0, 250.0,
+                125.0, 125.0, 250.0, 250.0,
             )),
             ..FrameInfo::default()
         };
 
         let rect = NormalizedContentRect::from_frame_info(&info, 1000, 1000).unwrap();
-        assert_eq!(rect.source_point(0.625, 0.375), Some((0.5, 0.5)));
-        assert_eq!(rect.source_point(0.1, 0.375), None);
-        assert_eq!(rect.source_point(0.5, 0.1), None);
+        assert_eq!(rect.source_point(0.5, 0.5), Some((0.5, 0.5)));
+        assert_eq!(rect.source_point(0.2, 0.5), None);
+        assert_eq!(rect.source_point(0.5, 0.2), None);
     }
 
     #[test]
