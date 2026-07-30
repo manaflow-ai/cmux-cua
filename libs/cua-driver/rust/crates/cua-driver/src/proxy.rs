@@ -3060,6 +3060,21 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn external_permission_flow_waits_for_host_readiness() {
+        let state = DaemonStartState {
+            reaper_started: true,
+            grant_wait_completed: false,
+            ..DaemonStartState::default()
+        };
+
+        assert!(
+            state.needs_grant_wait(true, true),
+            "host-owned onboarding must gate driving calls until the host publishes readiness"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn tool_list_cache_tracks_observed_daemon_generations() {
         let bootstrap = Arc::new(serde_json::json!({ "source": "bootstrap" }));
         let daemon_v1 = Arc::new(serde_json::json!({ "source": "daemon-v1" }));
