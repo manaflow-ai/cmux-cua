@@ -2521,6 +2521,64 @@ mod tests {
         assert_eq!(key_releases, vec![56]);
     }
 
+    #[test]
+    fn permanent_capture_failure_releases_delivered_input_once() {
+        let ring = SharedFrameRing::create(2, 2).unwrap();
+        let input = Arc::new(ApplicationSurfaceInputState::new());
+        let mut pointer = input
+            .pointer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transition = pointer.transition_for("left_mouse_down", 1);
+        pointer.record_delivery(
+            "left_mouse_down",
+            ApplicationSurfacePointerDelivery {
+                screen_x: 10.0,
+                screen_y: 20.0,
+                local_x: 3.0,
+                local_y: 4.0,
+                modifiers: 0,
+                click_count: 1,
+                group_id: transition.group_id,
+            },
+        );
+        drop(pointer);
+        input
+            .keyboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_delivery(56, true);
+        let frame_state = CaptureFrameState {
+            ring: Arc::clone(&ring),
+            failed: AtomicBool::new(false),
+            input_state: input,
+            target_window_id: 42,
+            target_process_id: 43,
+            fallback_source_width: 2.0,
+            fallback_source_height: 2.0,
+        };
+        let mut pointer_releases = Vec::new();
+        let mut key_releases = Vec::new();
+
+        frame_state.mark_failed_with(
+            |release| pointer_releases.push(release),
+            |key_code| key_releases.push(key_code),
+        );
+        frame_state.mark_failed_with(
+            |release| pointer_releases.push(release),
+            |key_code| key_releases.push(key_code),
+        );
+
+        assert_eq!(pointer_releases.len(), 1);
+        assert_eq!(pointer_releases[0].kind, "left_mouse_up");
+        assert_eq!(key_releases, vec![56]);
+        let published_word = unsafe {
+            ring.atomic_word(FRAME_PUBLISHED_WORD_OFFSET)
+                .load(Ordering::Acquire)
+        };
+        assert_eq!(published_word, FRAME_FAILURE_WORD);
+    }
+
     #[tokio::test]
     async fn timed_out_application_start_owns_cleanup_and_blocks_retry() {
         use std::sync::atomic::{AtomicBool, AtomicUsize};
