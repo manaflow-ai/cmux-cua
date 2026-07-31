@@ -829,10 +829,52 @@ pub(crate) fn capture_frame_status_is_publishable(status: Option<SCFrameStatus>)
 
 impl CaptureFrameState {
     fn mark_failed(&self) {
+        self.mark_failed_with(
+            |release| {
+                if let Err(error) = post_mouse_delivery(
+                    self.target_process_id,
+                    self.target_window_id,
+                    release.kind,
+                    release.delivery,
+                    false,
+                ) {
+                    tracing::warn!(
+                        %error,
+                        kind = release.kind,
+                        "application surface pointer release did not post cleanly"
+                    );
+                }
+            },
+            |key_code| {
+                let Some(target) = ApplicationSurfaceKeyboardTarget::new(
+                    self.target_window_id,
+                    self.target_process_id,
+                ) else {
+                    return;
+                };
+                if let Err(error) = post_key(target, key_code, false, 0) {
+                    tracing::warn!(
+                        %error,
+                        key_code,
+                        "application surface key release did not post cleanly"
+                    );
+                }
+            },
+        );
+    }
+
+    fn mark_failed_with(
+        &self,
+        release_pointer: impl FnMut(ApplicationSurfacePointerRelease),
+        release_key: impl FnMut(u16),
+    ) {
+        let _dispatch = self.input_state.lock_dispatch();
         if self.failed.swap(true, Ordering::AcqRel) {
             return;
         }
         let _ = self.ring.mark_failed();
+        self.input_state
+            .release_pressed_locked_with(release_pointer, release_key);
     }
 
     fn mark_unavailable(&self) {
