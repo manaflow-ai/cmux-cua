@@ -43,6 +43,10 @@ use crate::{
     PathState, PlannedPath, Spring,
 };
 
+fn fixed_duration_landing_speed() -> f64 {
+    MotionConfig::default().min_end_speed
+}
+
 /// Platform-agnostic render state shared by macOS / Windows / Linux overlays.
 ///
 /// Each platform wraps this in its own struct that adds OS-specific fields
@@ -184,7 +188,7 @@ impl RenderStateCore {
                 // stays as crisp as a speed-based glide instead of overshooting
                 // proportionally to a short duration.
                 let impulse = if self.motion.glide_duration_ms > 0.0 {
-                    self.motion.min_end_speed
+                    fixed_duration_landing_speed()
                 } else {
                     speed
                 };
@@ -294,7 +298,7 @@ impl RenderStateCore {
                 // stays as crisp as a speed-based glide instead of overshooting
                 // proportionally to a short duration.
                 let impulse = if self.motion.glide_duration_ms > 0.0 {
-                    self.motion.min_end_speed
+                    fixed_duration_landing_speed()
                 } else {
                     current_speed
                 };

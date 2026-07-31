@@ -808,6 +808,7 @@ impl CaptureFrameState {
 struct ApplicationSurfaceSession {
     target_window_id: u32,
     target_process_id: i32,
+    target_uses_chromium_background_preparation: bool,
     stream: SCStream,
     frame_state: Arc<CaptureFrameState>,
     input_state: Arc<ApplicationSurfaceInputState>,
@@ -1255,6 +1256,8 @@ pub fn start(
         ApplicationSurfaceSession {
             target_window_id: request.window_id,
             target_process_id: request.process_id,
+            target_uses_chromium_background_preparation:
+                application_surface_target_uses_chromium_background_preparation(request.process_id),
             stream,
             frame_state,
             input_state: Arc::new(ApplicationSurfaceInputState::new()),
@@ -1338,7 +1341,13 @@ pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
 
 pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
     let session_id = validate_event_batch(&events)?.to_owned();
-    let (target_window_id, target_process_id, frame_state, input_state) = {
+    let (
+        target_window_id,
+        target_process_id,
+        target_uses_chromium_background_preparation,
+        frame_state,
+        input_state,
+    ) = {
         let manager = manager()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1349,6 +1358,7 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
         (
             session.target_window_id,
             session.target_process_id,
+            session.target_uses_chromium_background_preparation,
             session.frame_state.clone(),
             session.input_state.clone(),
         )
@@ -1382,6 +1392,7 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
             event,
             target_window_id,
             target_process_id,
+            target_uses_chromium_background_preparation,
             &target,
             content,
             &input_state,
@@ -1495,6 +1506,7 @@ fn dispatch_event(
     event: ApplicationSurfaceEvent,
     target_window_id: u32,
     target_process_id: i32,
+    target_uses_chromium_background_preparation: bool,
     target: &windows::WindowInfo,
     content: Option<NormalizedContentRect>,
     input_state: &ApplicationSurfaceInputState,
@@ -1540,6 +1552,7 @@ fn dispatch_event(
                 source_y * target.bounds.height,
                 event.modifiers,
                 event.click_count,
+                target_uses_chromium_background_preparation,
                 &input_state.pointer,
             )
         }
@@ -1558,6 +1571,7 @@ fn dispatch_event(
                 delta_x,
                 delta_y,
                 event.modifiers,
+                target_uses_chromium_background_preparation,
                 &input_state.pointer,
                 &input_state.scroll,
             )
@@ -1588,8 +1602,22 @@ fn live_target(window_id: u32, process_id: i32) -> Option<windows::WindowInfo> {
     })
 }
 
-fn mouse_event_requires_background_preparation(kind: &str) -> bool {
-    matches!(kind, "left_mouse_down" | "right_mouse_down")
+fn chromium_browser_bundle_id(bundle_id: &str) -> bool {
+    matches!(
+        bundle_id,
+        "com.google.Chrome" | "com.brave.Browser" | "com.microsoft.edgemac"
+    ) || bundle_id.starts_with("com.google.Chrome.")
+}
+
+fn application_surface_target_uses_chromium_background_preparation(process_id: i32) -> bool {
+    crate::apps::bundle_id_for_pid(process_id)
+        .as_deref()
+        .is_some_and(chromium_browser_bundle_id)
+        || crate::browser::ElectronJs::is_electron(process_id)
+}
+
+fn mouse_event_requires_background_preparation(kind: &str, target_uses_chromium: bool) -> bool {
+    target_uses_chromium && matches!(kind, "left_mouse_down" | "right_mouse_down")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1603,6 +1631,7 @@ fn post_mouse(
     local_y: f64,
     modifiers: u64,
     click_count: i64,
+    target_uses_chromium_background_preparation: bool,
     pointer_state: &Mutex<ApplicationSurfacePointerState>,
 ) -> anyhow::Result<()> {
     let transition = pointer_state
@@ -1623,7 +1652,11 @@ fn post_mouse(
         window_id,
         kind,
         delivery,
-        transition.should_prepare_background,
+        transition.should_prepare_background
+            && mouse_event_requires_background_preparation(
+                kind,
+                target_uses_chromium_background_preparation,
+            ),
     )?;
     pointer_state
         .lock()
@@ -1672,9 +1705,7 @@ fn post_mouse_delivery(
     };
     let point = CGPoint::new(delivery.screen_x, delivery.screen_y);
     let flags = CGEventFlags::from_bits_truncate(delivery.modifiers);
-    let source = if should_prepare_background
-        && mouse_event_requires_background_preparation(kind)
-    {
+    let source = if should_prepare_background {
         crate::input::mouse::prepare_chromium_background_gesture(
             process_id,
             delivery.screen_x,
@@ -1739,6 +1770,7 @@ fn post_scroll(
     delta_x: f64,
     delta_y: f64,
     modifiers: u64,
+    target_uses_chromium_background_preparation: bool,
     pointer_state: &Mutex<ApplicationSurfacePointerState>,
     scroll_state: &Mutex<ApplicationSurfaceScrollState>,
 ) -> anyhow::Result<()> {
@@ -1761,6 +1793,7 @@ fn post_scroll(
         local_y,
         modifiers,
         1,
+        target_uses_chromium_background_preparation,
         pointer_state,
     )?;
 
