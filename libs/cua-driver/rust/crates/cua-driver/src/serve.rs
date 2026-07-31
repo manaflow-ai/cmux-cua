@@ -1980,12 +1980,11 @@ pub async fn run_serve(
                                             })
                                         });
                                     match request {
-                                        Ok(request) => match tokio::task::spawn_blocking(
-                                            move || {
-                                                platform_macos::application_surface::start(request)
-                                            },
-                                        ).await {
-                                            Ok(Ok(result)) => {
+                                        Ok(request) => match
+                                            platform_macos::application_surface::start(request)
+                                                .await
+                                        {
+                                            Ok(result) => {
                                                 let session_id = result.session_id.clone();
                                                 (
                                                     DaemonResponse::ok(
@@ -1996,17 +1995,8 @@ pub async fn run_serve(
                                                     Some(session_id),
                                                 )
                                             }
-                                            Ok(Err(error)) => (
-                                                application_surface_failure_response(error),
-                                                None,
-                                            ),
                                             Err(error) => (
-                                                DaemonResponse::err(
-                                                    format!(
-                                                        "Application-capture task failed: {error}"
-                                                    ),
-                                                    1,
-                                                ),
+                                                application_surface_failure_response(error),
                                                 None,
                                             ),
                                         },
@@ -3643,6 +3633,11 @@ mod external_permission_flow_tests {
             (
                 ApplicationSurfaceError::SessionUnavailable,
                 "session_unavailable",
+            ),
+            (ApplicationSurfaceError::CaptureFailed, "capture_failed"),
+            (
+                ApplicationSurfaceError::CaptureUnavailable,
+                "capture_unavailable",
             ),
         ];
         for (error, expected_code) in cases {

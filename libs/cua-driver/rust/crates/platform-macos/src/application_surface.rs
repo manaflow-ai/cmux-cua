@@ -37,6 +37,7 @@ const FRAME_MAGIC: u32 = 0x434D_5846;
 const FRAME_VERSION: u32 = 2;
 const FRAME_PIXEL_BYTE_COUNT: usize = 4;
 const FRAME_SLOT_COUNT: usize = 3;
+const FRAME_UNAVAILABLE_SLOT: u64 = FRAME_SLOT_COUNT as u64;
 // Retain more than eight seconds at the maximum 120 fps so bounded input
 // transport stalls cannot detach a queued event from its displayed frame.
 const FRAME_GEOMETRY_HISTORY_COUNT: usize = 1_024;
@@ -45,6 +46,7 @@ const MAXIMUM_FRAME_DIMENSION: usize = 16_384;
 const MAXIMUM_FRAME_RING_BYTE_COUNT: usize = 256 * 1_024 * 1_024;
 pub const MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT: usize = 64;
 const BGRA_PIXEL_FORMAT: u32 = u32::from_be_bytes(*b"BGRA");
+const APPLICATION_SURFACE_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplicationSurfacePermissionUse {
@@ -66,6 +68,8 @@ pub enum ApplicationSurfaceError {
     SessionUnavailable,
     #[error("application_surface_capture_failed")]
     CaptureFailed,
+    #[error("application_surface_capture_unavailable")]
+    CaptureUnavailable,
 }
 
 impl ApplicationSurfaceError {
@@ -78,6 +82,7 @@ impl ApplicationSurfaceError {
             Self::PointOutsideContent => "point_outside_content",
             Self::SessionUnavailable => "session_unavailable",
             Self::CaptureFailed => "capture_failed",
+            Self::CaptureUnavailable => "capture_unavailable",
         }
     }
 }
@@ -291,6 +296,10 @@ struct SharedFrameRing {
 unsafe impl Send for SharedFrameRing {}
 unsafe impl Sync for SharedFrameRing {}
 
+fn frame_publication_is_unavailable(word: u64) -> bool {
+    word != FRAME_FAILURE_WORD && word & 0b11 == FRAME_UNAVAILABLE_SLOT
+}
+
 impl SharedFrameRing {
     fn create(width: usize, height: usize) -> anyhow::Result<Arc<Self>> {
         let layout = FrameLayout::new(width, height)?;
@@ -491,7 +500,10 @@ impl SharedFrameRing {
             self.atomic_word(FRAME_PUBLISHED_WORD_OFFSET)
                 .load(Ordering::Acquire)
         };
-        if published_word == FRAME_FAILURE_WORD || (published_word >> 2) < sequence {
+        if published_word == FRAME_FAILURE_WORD
+            || frame_publication_is_unavailable(published_word)
+            || (published_word >> 2) < sequence
+        {
             return None;
         }
         let geometry_slot =
@@ -501,6 +513,44 @@ impl SharedFrameRing {
             .unwrap_or_else(std::sync::PoisonError::into_inner)[geometry_slot]
             .filter(|geometry| geometry.sequence == sequence)
             .map(|geometry| geometry.geometry)
+    }
+
+    fn is_available(&self) -> bool {
+        let published_word = unsafe {
+            self.atomic_word(FRAME_PUBLISHED_WORD_OFFSET)
+                .load(Ordering::Acquire)
+        };
+        published_word != FRAME_FAILURE_WORD
+            && !frame_publication_is_unavailable(published_word)
+            && published_word >> 2 > 0
+    }
+
+    fn mark_unavailable(&self) -> anyhow::Result<()> {
+        let publication = unsafe { self.atomic_word(FRAME_PUBLISHED_WORD_OFFSET) };
+        let mut frame_geometries = self
+            .frame_geometries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut current = publication.load(Ordering::Acquire);
+        loop {
+            if current == FRAME_FAILURE_WORD || frame_publication_is_unavailable(current) {
+                return Ok(());
+            }
+            frame_geometries.fill(None);
+            let unavailable_word = (current & !0b11) | FRAME_UNAVAILABLE_SLOT;
+            match publication.compare_exchange(
+                current,
+                unavailable_word,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(updated) => current = updated,
+            }
+        }
+        drop(frame_geometries);
+        fence(Ordering::SeqCst);
+        post_frame_notification(&self.name)
     }
 
     fn mark_failed(&self) -> anyhow::Result<()> {
@@ -747,15 +797,34 @@ impl CapturedFrameGeometry {
 struct CaptureFrameState {
     ring: Arc<SharedFrameRing>,
     failed: AtomicBool,
+    input_state: Arc<ApplicationSurfaceInputState>,
+    target_window_id: u32,
+    target_process_id: i32,
     fallback_source_width: f64,
     fallback_source_height: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureFrameDisposition {
+    Publish,
+    Preserve,
+    Invalidate,
+}
+
+fn capture_frame_disposition(status: Option<SCFrameStatus>) -> CaptureFrameDisposition {
+    match status {
+        None | Some(SCFrameStatus::Complete | SCFrameStatus::Started) => {
+            CaptureFrameDisposition::Publish
+        }
+        Some(SCFrameStatus::Idle) => CaptureFrameDisposition::Preserve,
+        Some(SCFrameStatus::Blank | SCFrameStatus::Suspended | SCFrameStatus::Stopped) => {
+            CaptureFrameDisposition::Invalidate
+        }
+    }
+}
+
 pub(crate) fn capture_frame_status_is_publishable(status: Option<SCFrameStatus>) -> bool {
-    matches!(
-        status,
-        None | Some(SCFrameStatus::Complete | SCFrameStatus::Started)
-    )
+    capture_frame_disposition(status) == CaptureFrameDisposition::Publish
 }
 
 impl CaptureFrameState {
@@ -766,12 +835,28 @@ impl CaptureFrameState {
         let _ = self.ring.mark_failed();
     }
 
+    fn mark_unavailable(&self) {
+        let _dispatch = self.input_state.lock_dispatch();
+        if self.ring.mark_unavailable().is_err() {
+            drop(_dispatch);
+            self.mark_failed();
+            return;
+        }
+        self.input_state
+            .release_pressed_locked(self.target_process_id, self.target_window_id);
+    }
+
     fn receive(&self, sample: screencapturekit::cm::CMSampleBuffer) {
         if self.failed.load(Ordering::Acquire) {
             return;
         }
-        if !capture_frame_status_is_publishable(sample.frame_status()) {
-            return;
+        match capture_frame_disposition(sample.frame_status()) {
+            CaptureFrameDisposition::Publish => {}
+            CaptureFrameDisposition::Preserve => return,
+            CaptureFrameDisposition::Invalidate => {
+                self.mark_unavailable();
+                return;
+            }
         }
         let Some(pixel_buffer) = sample.image_buffer() else {
             return;
@@ -924,7 +1009,16 @@ impl ApplicationSurfaceInputState {
     }
 
     fn deactivate(&self, process_id: i32, window_id: u32) {
-        self.deactivate_with(
+        let _dispatch = self.lock_dispatch();
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        self.release_pressed_locked(process_id, window_id);
+        self.active.store(false, Ordering::Release);
+    }
+
+    fn release_pressed_locked(&self, process_id: i32, window_id: u32) {
+        self.release_pressed_locked_with(
             |release| {
                 if let Err(error) = post_mouse_delivery(
                     process_id,
@@ -956,15 +1050,38 @@ impl ApplicationSurfaceInputState {
         );
     }
 
-    fn deactivate_with(
+    #[cfg(test)]
+    fn release_pressed_with(
         &self,
-        mut release_pointer: impl FnMut(ApplicationSurfacePointerRelease),
-        mut release_key: impl FnMut(u16),
+        release_pointer: impl FnMut(ApplicationSurfacePointerRelease),
+        release_key: impl FnMut(u16),
     ) {
         let _dispatch = self.lock_dispatch();
         if !self.active.load(Ordering::Acquire) {
             return;
         }
+        self.release_pressed_locked_with(release_pointer, release_key);
+    }
+
+    #[cfg(test)]
+    fn deactivate_with(
+        &self,
+        release_pointer: impl FnMut(ApplicationSurfacePointerRelease),
+        release_key: impl FnMut(u16),
+    ) {
+        let _dispatch = self.lock_dispatch();
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        self.release_pressed_locked_with(release_pointer, release_key);
+        self.active.store(false, Ordering::Release);
+    }
+
+    fn release_pressed_locked_with(
+        &self,
+        mut release_pointer: impl FnMut(ApplicationSurfacePointerRelease),
+        mut release_key: impl FnMut(u16),
+    ) {
         let releases = self
             .pointer
             .lock()
@@ -981,7 +1098,6 @@ impl ApplicationSurfaceInputState {
         for key_code in key_releases {
             release_key(key_code);
         }
-        self.active.store(false, Ordering::Release);
     }
 }
 
@@ -1174,7 +1290,100 @@ pub fn list_windows() -> anyhow::Result<Vec<ApplicationWindow>> {
     Ok(windows)
 }
 
-pub fn start(
+#[derive(Debug)]
+enum BoundedApplicationSurfaceStartError<StartError> {
+    Start(StartError),
+    TimedOut,
+    TaskFailed(tokio::task::JoinError),
+    OwnerStopped,
+}
+
+fn application_surface_start_gate() -> Arc<tokio::sync::Mutex<()>> {
+    static GATE: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    Arc::clone(GATE.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
+}
+
+async fn bounded_application_surface_start_with<
+    Value,
+    StartError,
+    SpawnStart,
+    Cleanup,
+    CleanupFuture,
+>(
+    timeout: std::time::Duration,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    spawn_start: SpawnStart,
+    cleanup: Cleanup,
+) -> Result<Value, BoundedApplicationSurfaceStartError<StartError>>
+where
+    Value: Send + 'static,
+    StartError: Send + 'static,
+    SpawnStart: FnOnce() -> tokio::task::JoinHandle<Result<Value, StartError>> + Send + 'static,
+    Cleanup: FnOnce(Value) -> CleanupFuture + Send + 'static,
+    CleanupFuture: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let Ok(lifecycle_guard) = tokio::time::timeout_at(deadline, gate.lock_owned()).await else {
+            let _ = response_sender.send(Err(BoundedApplicationSurfaceStartError::TimedOut));
+            return;
+        };
+        let mut start_task = spawn_start();
+        let outcome = match tokio::time::timeout_at(deadline, &mut start_task).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(error))) => Err(BoundedApplicationSurfaceStartError::Start(error)),
+            Ok(Err(error)) => Err(BoundedApplicationSurfaceStartError::TaskFailed(error)),
+            Err(_) => {
+                let _ = response_sender.send(Err(BoundedApplicationSurfaceStartError::TimedOut));
+                if let Ok(Ok(value)) = start_task.await {
+                    cleanup(value).await;
+                }
+                drop(lifecycle_guard);
+                return;
+            }
+        };
+        match response_sender.send(outcome) {
+            Ok(()) => {}
+            Err(Ok(value)) => cleanup(value).await,
+            Err(Err(_)) => {}
+        }
+        drop(lifecycle_guard);
+    });
+    response_receiver
+        .await
+        .unwrap_or(Err(BoundedApplicationSurfaceStartError::OwnerStopped))
+}
+
+pub async fn start(
+    request: ApplicationSurfaceStartRequest,
+) -> anyhow::Result<ApplicationSurfaceStartResult> {
+    match bounded_application_surface_start_with(
+        APPLICATION_SURFACE_START_TIMEOUT,
+        application_surface_start_gate(),
+        move || tokio::task::spawn_blocking(move || start_blocking(request)),
+        |result: ApplicationSurfaceStartResult| async move {
+            let session_id = result.session_id;
+            let _ = tokio::task::spawn_blocking(move || stop(&session_id)).await;
+        },
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(BoundedApplicationSurfaceStartError::Start(error)) => Err(error),
+        Err(BoundedApplicationSurfaceStartError::TimedOut) => {
+            Err(ApplicationSurfaceError::CaptureFailed.into())
+        }
+        Err(BoundedApplicationSurfaceStartError::TaskFailed(error)) => {
+            Err(anyhow!("application-capture task failed: {error}"))
+        }
+        Err(BoundedApplicationSurfaceStartError::OwnerStopped) => {
+            Err(anyhow!("application-capture lifecycle owner stopped"))
+        }
+    }
+}
+
+fn start_blocking(
     request: ApplicationSurfaceStartRequest,
 ) -> anyhow::Result<ApplicationSurfaceStartResult> {
     require_application_surface_permissions(ApplicationSurfacePermissionUse::CaptureAndInput)?;
@@ -1201,9 +1410,13 @@ pub fn start(
     let source_frame = source_window.frame();
     let (width, height) = capture_pixel_size(source_frame.size.width, source_frame.size.height)?;
     let ring = SharedFrameRing::create(width, height)?;
+    let input_state = Arc::new(ApplicationSurfaceInputState::new());
     let frame_state = Arc::new(CaptureFrameState {
         ring: ring.clone(),
         failed: AtomicBool::new(false),
+        input_state: Arc::clone(&input_state),
+        target_window_id: request.window_id,
+        target_process_id: request.process_id,
         fallback_source_width: source_frame.size.width,
         fallback_source_height: source_frame.size.height,
     });
@@ -1260,7 +1473,7 @@ pub fn start(
                 application_surface_target_uses_chromium_background_preparation(request.process_id),
             stream,
             frame_state,
-            input_state: Arc::new(ApplicationSurfaceInputState::new()),
+            input_state,
         },
     );
     Ok(result)
@@ -1372,6 +1585,9 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
     }
     if frame_state.failed.load(Ordering::Acquire) {
         return Err(ApplicationSurfaceError::CaptureFailed.into());
+    }
+    if !frame_state.ring.is_available() {
+        return Err(ApplicationSurfaceError::CaptureUnavailable.into());
     }
     let target = live_target(target_window_id, target_process_id)
         .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
@@ -2592,13 +2808,20 @@ mod tests {
         assert!(capture_frame_status_is_publishable(Some(
             SCFrameStatus::Started
         )));
+        assert_eq!(
+            capture_frame_disposition(Some(SCFrameStatus::Idle)),
+            CaptureFrameDisposition::Preserve,
+        );
         for status in [
-            Some(SCFrameStatus::Idle),
             Some(SCFrameStatus::Blank),
             Some(SCFrameStatus::Suspended),
             Some(SCFrameStatus::Stopped),
         ] {
             assert!(!capture_frame_status_is_publishable(status));
+            assert_eq!(
+                capture_frame_disposition(status),
+                CaptureFrameDisposition::Invalidate,
+            );
         }
     }
 

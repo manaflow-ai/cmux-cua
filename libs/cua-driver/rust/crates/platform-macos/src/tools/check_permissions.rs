@@ -41,21 +41,41 @@ fn screen_capture_probe_backend(macos_major_version: isize) -> ScreenCaptureProb
 /// `SCScreenshotManager`; macOS 13 uses its supported one-frame `SCStream`
 /// equivalent.
 pub(super) async fn screen_recording_capturable() -> bool {
+    let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        run_owned_screen_recording_probe(response_sender).await;
+    });
+    response_receiver.await.unwrap_or(false)
+}
+
+async fn run_owned_screen_recording_probe(response_sender: tokio::sync::oneshot::Sender<bool>) {
     use screencapturekit::{
         async_api::{AsyncSCScreenshotManager, AsyncSCShareableContent},
         prelude::{SCContentFilter, SCStreamConfiguration},
     };
 
-    let Ok(Ok(content)) = tokio::time::timeout(
-        SCREEN_CAPTURE_PROBE_TIMEOUT,
-        AsyncSCShareableContent::get(),
-    )
-    .await
-    else {
-        return false;
+    let deadline = tokio::time::Instant::now() + SCREEN_CAPTURE_PROBE_TIMEOUT;
+    let gate = screen_capture_probe_gate();
+    let Ok(probe_guard) = tokio::time::timeout_at(deadline, gate.lock_owned()).await else {
+        let _ = response_sender.send(false);
+        return;
+    };
+    let mut content_probe = Box::pin(AsyncSCShareableContent::get());
+    let content = match tokio::time::timeout_at(deadline, content_probe.as_mut()).await {
+        Ok(Ok(content)) => content,
+        Ok(Err(_)) => {
+            let _ = response_sender.send(false);
+            return;
+        }
+        Err(_) => {
+            let _ = response_sender.send(false);
+            let _ = content_probe.await;
+            return;
+        }
     };
     let Some(display) = content.displays().into_iter().next() else {
-        return false;
+        let _ = response_sender.send(false);
+        return;
     };
     let filter = SCContentFilter::create()
         .with_display(&display)
@@ -65,28 +85,36 @@ pub(super) async fn screen_recording_capturable() -> bool {
     let major_version = objc2_foundation::NSProcessInfo::processInfo()
         .operatingSystemVersion()
         .majorVersion;
-    match screen_capture_probe_backend(major_version) {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        let _ = response_sender.send(false);
+        return;
+    }
+    let capturable = match screen_capture_probe_backend(major_version) {
         ScreenCaptureProbeBackend::Stream => {
-            capture_one_frame_with_stream(&filter, &configuration).await
+            capture_one_frame_with_stream(filter, configuration, remaining, probe_guard).await
         }
         ScreenCaptureProbeBackend::ScreenshotManager => {
-            capture_probe_with_timeout(
-                SCREEN_CAPTURE_PROBE_TIMEOUT,
-                async {
-                    AsyncSCScreenshotManager::capture_image(&filter, &configuration)
-                        .await
-                        .is_ok_and(|image| image.width() > 0 && image.height() > 0)
-                },
-            )
-            .await
+            let screenshot_task = tokio::spawn(async move {
+                AsyncSCScreenshotManager::capture_image(&filter, &configuration)
+                    .await
+                    .is_ok_and(|image| image.width() > 0 && image.height() > 0)
+            });
+            capture_probe_task_with_owned_guard(remaining, screenshot_task, probe_guard).await
         }
-    }
+    };
+    let _ = response_sender.send(capturable);
 }
 
-async fn capture_one_frame_with_stream(
-    filter: &screencapturekit::prelude::SCContentFilter,
-    configuration: &screencapturekit::prelude::SCStreamConfiguration,
-) -> bool {
+async fn capture_one_frame_with_stream<LifecycleGuard>(
+    filter: screencapturekit::prelude::SCContentFilter,
+    configuration: screencapturekit::prelude::SCStreamConfiguration,
+    timeout: std::time::Duration,
+    lifecycle_guard: LifecycleGuard,
+) -> bool
+where
+    LifecycleGuard: Send + 'static,
+{
     use screencapturekit::{
         async_api::AsyncSCStream,
         cm::{CMSampleBufferExt, CMSampleBufferSCExt},
@@ -94,16 +122,9 @@ async fn capture_one_frame_with_stream(
     };
     use std::sync::Arc;
 
-    let probe_gate = screen_capture_stream_probe_gate();
-    let Ok(probe_guard) =
-        tokio::time::timeout(SCREEN_CAPTURE_PROBE_TIMEOUT, probe_gate.lock_owned()).await
-    else {
-        return false;
-    };
-
     let stream = Arc::new(AsyncSCStream::new(
-        filter,
-        configuration,
+        &filter,
+        &configuration,
         1,
         SCStreamOutputType::Screen,
     ));
@@ -114,7 +135,7 @@ async fn capture_one_frame_with_stream(
     let receive_stream = Arc::clone(&stream);
     let stop_stream = Arc::clone(&stream);
     capture_stream_lifecycle_with_timeout(
-        SCREEN_CAPTURE_PROBE_TIMEOUT,
+        timeout,
         start_task,
         move || async move {
             while let Some(sample) = receive_stream.next().await {
@@ -129,15 +150,53 @@ async fn capture_one_frame_with_stream(
             false
         },
         move || tokio::task::spawn_blocking(move || stop_stream.stop_capture().is_ok()),
-        probe_guard,
+        lifecycle_guard,
     )
     .await
 }
 
-fn screen_capture_stream_probe_gate() -> std::sync::Arc<tokio::sync::Mutex<()>> {
+fn screen_capture_probe_gate() -> std::sync::Arc<tokio::sync::Mutex<()>> {
     static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
         std::sync::OnceLock::new();
     std::sync::Arc::clone(GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))))
+}
+
+async fn capture_probe_task_with_owned_guard<LifecycleGuard>(
+    timeout: std::time::Duration,
+    mut probe_task: tokio::task::JoinHandle<bool>,
+    lifecycle_guard: LifecycleGuard,
+) -> bool
+where
+    LifecycleGuard: Send + 'static,
+{
+    let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let result = capture_probe_task_before(deadline, &mut probe_task).await;
+        let _ = response_sender.send(result.unwrap_or(false));
+        if result.is_none() {
+            let _ = probe_task.await;
+        }
+        drop(lifecycle_guard);
+    });
+    response_receiver.await.unwrap_or(false)
+}
+
+#[cfg(test)]
+async fn capture_probe_with_owned_task<SpawnProbe>(
+    timeout: std::time::Duration,
+    gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+    spawn_probe: SpawnProbe,
+) -> bool
+where
+    SpawnProbe: FnOnce() -> tokio::task::JoinHandle<bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let Ok(lifecycle_guard) = tokio::time::timeout_at(deadline, gate.lock_owned()).await else {
+        return false;
+    };
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    capture_probe_task_with_owned_guard(remaining, spawn_probe(), lifecycle_guard).await
 }
 
 async fn capture_stream_lifecycle_with_timeout<Receive, ReceiveFuture, Stop, LifecycleGuard>(
@@ -148,34 +207,31 @@ async fn capture_stream_lifecycle_with_timeout<Receive, ReceiveFuture, Stop, Lif
     lifecycle_guard: LifecycleGuard,
 ) -> bool
 where
-    Receive: FnOnce() -> ReceiveFuture,
-    ReceiveFuture: std::future::Future<Output = bool>,
+    Receive: FnOnce() -> ReceiveFuture + Send + 'static,
+    ReceiveFuture: std::future::Future<Output = bool> + Send + 'static,
     Stop: FnOnce() -> tokio::task::JoinHandle<bool> + Send + 'static,
     LifecycleGuard: Send + 'static,
 {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let start_result = capture_probe_task_before(deadline, &mut start_task).await;
-    let started = start_result.unwrap_or(false);
-    let received = if started {
-        tokio::time::timeout_at(deadline, receive())
-            .await
-            .unwrap_or(false)
-    } else {
-        false
-    };
-
-    // Keep ownership of a timed-out, uncancellable spawn_blocking start. The
-    // global guard prevents polling from creating another stream while this
-    // one is still waiting on consent. Once start returns, stop runs on the
-    // same owned lifecycle and the guard is released only after cleanup.
-    let _cleanup_task = tokio::spawn(async move {
-        let _lifecycle_guard = lifecycle_guard;
+    let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let start_result = capture_probe_task_before(deadline, &mut start_task).await;
+        let started = start_result.unwrap_or(false);
+        let received = if started {
+            tokio::time::timeout_at(deadline, receive())
+                .await
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let _ = response_sender.send(started && received);
         if start_result.is_none() {
             let _ = start_task.await;
         }
         let _ = stop().await;
+        drop(lifecycle_guard);
     });
-    started && received
+    response_receiver.await.unwrap_or(false)
 }
 
 async fn capture_probe_task_before(
@@ -188,6 +244,7 @@ async fn capture_probe_task_before(
         .map(|result| result.unwrap_or(false))
 }
 
+#[cfg(test)]
 async fn capture_probe_with_timeout(
     timeout: std::time::Duration,
     probe: impl std::future::Future<Output = bool>,
@@ -730,10 +787,9 @@ mod tests {
         );
 
         release_probe_tx.send(()).unwrap();
-        let _released_guard =
-            tokio::time::timeout(std::time::Duration::from_secs(1), gate.lock())
-                .await
-                .unwrap();
+        let _released_guard = tokio::time::timeout(std::time::Duration::from_secs(1), gate.lock())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -770,12 +826,9 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(!stop_scheduled.load(Ordering::Acquire));
         assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                lifecycle_gate.lock()
-            )
-            .await
-            .is_err()
+            tokio::time::timeout(std::time::Duration::from_millis(10), lifecycle_gate.lock())
+                .await
+                .is_err()
         );
 
         release_start_tx.send(()).unwrap();
@@ -788,8 +841,8 @@ mod tests {
         .unwrap();
         let _released_guard =
             tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_gate.lock())
-            .await
-            .unwrap();
+                .await
+                .unwrap();
     }
 
     #[tokio::test]
