@@ -699,6 +699,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn screenshot_probe_timeout_owns_gate_until_native_completion() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let probe_started = Arc::new(AtomicBool::new(false));
+        let probe_started_marker = Arc::clone(&probe_started);
+        let (release_probe_tx, release_probe_rx) = tokio::sync::oneshot::channel();
+        let result = capture_probe_with_owned_task(
+            std::time::Duration::from_millis(10),
+            Arc::clone(&gate),
+            move || {
+                tokio::spawn(async move {
+                    probe_started_marker.store(true, Ordering::Release);
+                    release_probe_rx.await.is_ok()
+                })
+            },
+        )
+        .await;
+
+        assert!(!result);
+        assert!(probe_started.load(Ordering::Acquire));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), gate.lock())
+                .await
+                .is_err()
+        );
+
+        release_probe_tx.send(()).unwrap();
+        let _released_guard =
+            tokio::time::timeout(std::time::Duration::from_secs(1), gate.lock())
+                .await
+                .unwrap();
+    }
+
+    #[tokio::test]
     async fn stream_probe_timeout_defers_shutdown_until_start_finishes() {
         use std::sync::{
             atomic::{AtomicBool, Ordering},

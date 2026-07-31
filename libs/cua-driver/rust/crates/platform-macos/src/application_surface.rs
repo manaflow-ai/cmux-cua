@@ -1949,6 +1949,36 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_frame_ring_rejects_old_geometry_until_fresh_content() {
+        let ring = SharedFrameRing::create(2, 2).unwrap();
+        let frame = [0x5A; 16];
+        let first_sequence = ring
+            .publish(&frame, 8, frame_geometry(NormalizedContentRect::default()))
+            .unwrap();
+
+        assert!(ring.is_available());
+        assert!(ring
+            .geometry_for_published_sequence(first_sequence)
+            .is_some());
+        ring.mark_unavailable().unwrap();
+        assert!(!ring.is_available());
+        assert!(ring
+            .geometry_for_published_sequence(first_sequence)
+            .is_none());
+
+        let second_sequence = ring
+            .publish(&frame, 8, frame_geometry(NormalizedContentRect::default()))
+            .unwrap();
+        assert!(ring.is_available());
+        assert!(ring
+            .geometry_for_published_sequence(first_sequence)
+            .is_none());
+        assert!(ring
+            .geometry_for_published_sequence(second_sequence)
+            .is_some());
+    }
+
+    #[test]
     fn attached_frame_ring_unlinks_its_persistent_name() {
         let ring = SharedFrameRing::create(2, 2).unwrap();
         let name = ring.name.clone();
@@ -2233,6 +2263,108 @@ mod tests {
 
         assert!(!input.active.load(Ordering::Acquire));
         assert_eq!(releases, vec![1, 56]);
+    }
+
+    #[test]
+    fn temporary_capture_unavailability_releases_input_without_deactivation() {
+        let input = ApplicationSurfaceInputState::new();
+        let mut pointer = input
+            .pointer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transition = pointer.transition_for("left_mouse_down", 1);
+        pointer.record_delivery(
+            "left_mouse_down",
+            ApplicationSurfacePointerDelivery {
+                screen_x: 10.0,
+                screen_y: 20.0,
+                local_x: 3.0,
+                local_y: 4.0,
+                modifiers: 0,
+                click_count: 1,
+                group_id: transition.group_id,
+            },
+        );
+        drop(pointer);
+        input
+            .keyboard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_delivery(56, true);
+
+        let mut pointer_releases = Vec::new();
+        let mut key_releases = Vec::new();
+        input.release_pressed_with(
+            |release| pointer_releases.push(release),
+            |key_code| key_releases.push(key_code),
+        );
+
+        assert!(input.active.load(Ordering::Acquire));
+        assert_eq!(pointer_releases.len(), 1);
+        assert_eq!(pointer_releases[0].kind, "left_mouse_up");
+        assert_eq!(key_releases, vec![56]);
+    }
+
+    #[tokio::test]
+    async fn timed_out_application_start_owns_cleanup_and_blocks_retry() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleaned_marker = Arc::clone(&cleaned);
+        let (release_start_tx, release_start_rx) = tokio::sync::oneshot::channel();
+        let first = bounded_application_surface_start_with(
+            Duration::from_millis(10),
+            Arc::clone(&gate),
+            move || {
+                tokio::spawn(async move {
+                    release_start_rx.await.unwrap();
+                    Ok::<String, ()>("late-session".to_owned())
+                })
+            },
+            move |session| {
+                let cleaned_marker = Arc::clone(&cleaned_marker);
+                async move {
+                    assert_eq!(session, "late-session");
+                    cleaned_marker.store(true, Ordering::Release);
+                }
+            },
+        )
+        .await;
+        assert!(matches!(
+            first,
+            Err(BoundedApplicationSurfaceStartError::TimedOut)
+        ));
+
+        let retry_starts = Arc::new(AtomicUsize::new(0));
+        let retry_start_marker = Arc::clone(&retry_starts);
+        let retry = bounded_application_surface_start_with(
+            Duration::from_millis(10),
+            Arc::clone(&gate),
+            move || {
+                retry_start_marker.fetch_add(1, Ordering::AcqRel);
+                tokio::spawn(async { Ok::<String, ()>("retry".to_owned()) })
+            },
+            |_| async {},
+        )
+        .await;
+        assert!(matches!(
+            retry,
+            Err(BoundedApplicationSurfaceStartError::TimedOut)
+        ));
+        assert_eq!(retry_starts.load(Ordering::Acquire), 0);
+
+        release_start_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cleaned.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let _released_guard = tokio::time::timeout(Duration::from_secs(1), gate.lock())
+            .await
+            .unwrap();
     }
 
     #[test]
