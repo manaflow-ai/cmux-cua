@@ -695,7 +695,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_probe_bounds_start_and_still_schedules_shutdown() {
+    async fn stream_probe_timeout_defers_shutdown_until_start_finishes() {
         use std::sync::{
             atomic::{AtomicBool, Ordering},
             Arc,
@@ -703,11 +703,12 @@ mod tests {
 
         let receive_called = Arc::new(AtomicBool::new(false));
         let stop_scheduled = Arc::new(AtomicBool::new(false));
+        let (release_start_tx, release_start_rx) = tokio::sync::oneshot::channel();
         let receive_marker = Arc::clone(&receive_called);
         let stop_marker = Arc::clone(&stop_scheduled);
         let result = capture_stream_lifecycle_with_timeout(
             std::time::Duration::from_millis(10),
-            tokio::spawn(std::future::pending::<bool>()),
+            tokio::spawn(async move { release_start_rx.await.is_ok() }),
             move || {
                 receive_marker.store(true, Ordering::Release);
                 std::future::ready(true)
@@ -721,7 +722,17 @@ mod tests {
 
         assert!(!result);
         assert!(!receive_called.load(Ordering::Acquire));
-        assert!(stop_scheduled.load(Ordering::Acquire));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!stop_scheduled.load(Ordering::Acquire));
+
+        release_start_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !stop_scheduled.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

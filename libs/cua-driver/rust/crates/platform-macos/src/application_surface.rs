@@ -2455,12 +2455,22 @@ mod tests {
     }
 
     #[test]
-    fn mouse_down_events_require_chromium_background_preparation() {
+    fn mouse_down_events_prepare_only_chromium_backgrounds() {
         assert!(mouse_event_requires_background_preparation(
-            "left_mouse_down"
+            "left_mouse_down",
+            true,
         ));
         assert!(mouse_event_requires_background_preparation(
-            "right_mouse_down"
+            "right_mouse_down",
+            true,
+        ));
+        assert!(!mouse_event_requires_background_preparation(
+            "left_mouse_down",
+            false,
+        ));
+        assert!(!mouse_event_requires_background_preparation(
+            "right_mouse_down",
+            false,
         ));
         for kind in [
             "mouse_moved",
@@ -2469,7 +2479,22 @@ mod tests {
             "right_mouse_dragged",
             "right_mouse_up",
         ] {
-            assert!(!mouse_event_requires_background_preparation(kind));
+            assert!(!mouse_event_requires_background_preparation(kind, true));
+        }
+    }
+
+    #[test]
+    fn chromium_background_preparation_uses_explicit_bundle_identity() {
+        for bundle_id in [
+            "com.google.Chrome",
+            "com.google.Chrome.app.example",
+            "com.brave.Browser",
+            "com.microsoft.edgemac",
+        ] {
+            assert!(chromium_browser_bundle_id(bundle_id), "{bundle_id}");
+        }
+        for bundle_id in ["com.apple.Safari", "com.apple.calculator"] {
+            assert!(!chromium_browser_bundle_id(bundle_id), "{bundle_id}");
         }
     }
 

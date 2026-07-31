@@ -1097,6 +1097,30 @@ mod glide_duration_tests {
         arrival_secs_with_speed(glide_ms, dist_pts, swift, 1.0)
     }
 
+    fn fixed_duration_landing_impulse(swift: bool, speed_multiplier: f64) -> f64 {
+        let mut config = CursorConfig::default();
+        config.motion = config.motion.scaled_by(speed_multiplier);
+        let mut core = RenderStateCore::new(config);
+        core.motion.glide_duration_ms = 300.0;
+        core.place_at(0.0, 0.0);
+        core.path = Some(PathPlanner::plan(
+            0.0, 0.0, 0.0, 600.0, 0.0, 0.0, 0.0, 80.0,
+        ));
+        let dt = 1.0 / 240.0;
+        for _ in 0..1_000 {
+            let arrived = if swift {
+                core.tick_swift_constants(dt)
+            } else {
+                core.tick_motion(dt)
+            };
+            if arrived {
+                let spring = core.spring.expect("arrival installs a landing spring");
+                return spring.vx.hypot(spring.vy);
+            }
+        }
+        panic!("fixed-duration glide did not arrive");
+    }
+
     #[test]
     fn fixed_duration_is_distance_independent_on_both_paths() {
         for swift in [false, true] {
@@ -1129,6 +1153,18 @@ mod glide_duration_tests {
             let fast = arrival_secs_with_speed(0.0, 1400.0, swift, 2.0);
             assert!(
                 fast < baseline * 0.7,
+                "swift={swift} baseline={baseline} fast={fast}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_duration_landing_impulse_ignores_speed_multiplier_on_both_paths() {
+        for swift in [false, true] {
+            let baseline = fixed_duration_landing_impulse(swift, 1.0);
+            let fast = fixed_duration_landing_impulse(swift, 8.0);
+            assert!(
+                (fast - baseline).abs() < 0.001,
                 "swift={swift} baseline={baseline} fast={fast}"
             );
         }
