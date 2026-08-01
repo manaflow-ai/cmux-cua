@@ -1153,25 +1153,21 @@ impl Drop for ApplicationSurfaceSession {
         if self.stream.is_none() {
             return;
         }
+
+        // Managed sessions always transition into a tracked cleanup owner
+        // before they are dropped. Keep the destructor as a synchronous
+        // critical-cleanup backstop so an unexpected path cannot strand
+        // pressed input or a linked frame ring. Only native capture stop is
+        // allowed to outlive this fallback.
         let deactivation = self.close_admission();
+        self.finish_deactivation(deactivation);
         let stream = self
             .stream
             .take()
             .expect("application surface stream was checked above");
-        let input_state = Arc::clone(&self.input_state);
-        let frame_state = Arc::clone(&self.frame_state);
-        let target_process_id = self.target_process_id;
-        let target_window_id = self.target_window_id;
         if let Err(error) = spawn_application_surface_shutdown_with(
             application_surface_lifecycle_gate(),
-            move || {
-                input_state.finish_deactivation(
-                    deactivation.input_was_active,
-                    target_process_id,
-                    target_window_id,
-                );
-                frame_state.finish_deactivate_publication(deactivation.notify_frame_reader);
-            },
+            || {},
             move || {
                 if let Err(error) = stream.stop_capture() {
                     tracing::warn!(%error, "application surface capture did not stop cleanly");
@@ -1201,35 +1197,116 @@ impl ApplicationSurfaceSession {
             .finish_deactivate_publication(deactivation.notify_frame_reader);
     }
 
-    fn into_closed_stream(
-        mut self,
-        deactivation: ApplicationSurfaceDeactivation,
-    ) -> Option<SCStream> {
-        self.finish_deactivation(deactivation);
-        self.stream.take()
+    fn into_cleanup_owner(mut self) -> std::io::Result<ApplicationSurfaceCleanupOwner> {
+        let deactivation = self.close_admission();
+        let stream = self
+            .stream
+            .take()
+            .expect("managed application surface session has a capture stream");
+        let input_state = Arc::clone(&self.input_state);
+        let frame_state = Arc::clone(&self.frame_state);
+        let target_process_id = self.target_process_id;
+        let target_window_id = self.target_window_id;
+        spawn_application_surface_shutdown_with(
+            application_surface_lifecycle_gate(),
+            move || {
+                input_state.finish_deactivation(
+                    deactivation.input_was_active,
+                    target_process_id,
+                    target_window_id,
+                );
+                frame_state.finish_deactivate_publication(deactivation.notify_frame_reader);
+            },
+            move || {
+                if let Err(error) = stream.stop_capture() {
+                    tracing::warn!(%error, "application surface capture did not stop cleanly");
+                }
+            },
+        )
     }
 
-    fn stop_blocking(&mut self) {
+    fn stop_blocking(self) {
+        let (reporter, _tracker) = application_surface_cleanup_progress();
+        self.stop_blocking_with_reporter(reporter);
+    }
+
+    fn stop_blocking_with_reporter(mut self, mut reporter: ApplicationSurfaceCleanupReporter) {
         let deactivation = self.close_admission();
         self.finish_deactivation(deactivation);
+        reporter.mark_critical_complete();
         if let Some(stream) = self.stream.take() {
             if let Err(error) = stream.stop_capture() {
                 tracing::warn!(%error, "application surface capture did not stop cleanly");
             }
         }
+        drop(self);
+        reporter.mark_complete();
     }
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum ApplicationSurfaceManagerPhase {
+    #[default]
+    Accepting,
+    Closing,
 }
 
 #[derive(Default)]
 struct ApplicationSurfaceManager {
     sessions: HashMap<String, ApplicationSurfaceSession>,
-    is_closing: bool,
+    cleanups: Vec<ApplicationSurfaceCleanupTracker>,
+    phase: ApplicationSurfaceManagerPhase,
 }
 
 impl ApplicationSurfaceManager {
-    fn begin_shutdown(&mut self) -> HashMap<String, ApplicationSurfaceSession> {
-        self.is_closing = true;
-        std::mem::take(&mut self.sessions)
+    fn accepts_sessions(&self) -> bool {
+        self.phase == ApplicationSurfaceManagerPhase::Accepting
+    }
+
+    fn track_cleanup(&mut self, owner: ApplicationSurfaceCleanupOwner) {
+        self.track_cleanup_progress(owner.into_tracker());
+    }
+
+    fn track_cleanup_progress(&mut self, tracker: ApplicationSurfaceCleanupTracker) {
+        self.cleanups.retain(|tracker| !tracker.can_reap());
+        self.cleanups.push(tracker);
+    }
+
+    fn transition_session_to_cleanup(&mut self, session_id: &str) -> bool {
+        let Some(session) = self.sessions.remove(session_id) else {
+            return false;
+        };
+        match session.into_cleanup_owner() {
+            Ok(owner) => self.track_cleanup(owner),
+            Err(error) => {
+                tracing::error!(%error, "could not start application surface cleanup owner");
+            }
+        }
+        true
+    }
+
+    fn take_session_for_blocking_cleanup(
+        &mut self,
+        session_id: &str,
+    ) -> Option<(ApplicationSurfaceSession, ApplicationSurfaceCleanupReporter)> {
+        let session = self.sessions.remove(session_id)?;
+        let (reporter, tracker) = application_surface_cleanup_progress();
+        self.track_cleanup_progress(tracker);
+        Some((session, reporter))
+    }
+
+    fn begin_shutdown(&mut self) -> Vec<ApplicationSurfaceCleanupTracker> {
+        self.phase = ApplicationSurfaceManagerPhase::Closing;
+        self.cleanups.retain(|tracker| !tracker.can_reap());
+        for session in std::mem::take(&mut self.sessions).into_values() {
+            match session.into_cleanup_owner() {
+                Ok(owner) => self.cleanups.push(owner.into_tracker()),
+                Err(error) => {
+                    tracing::error!(%error, "could not start application surface cleanup owner");
+                }
+            }
+        }
+        std::mem::take(&mut self.cleanups)
     }
 }
 
@@ -1742,10 +1819,146 @@ where
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApplicationSurfaceCleanupPhase {
+    Pending,
+    CriticalComplete,
+    Complete,
+    FailedBeforeCritical,
+    FailedAfterCritical,
+}
+
+impl ApplicationSurfaceCleanupPhase {
+    fn critical_result(self) -> Option<bool> {
+        match self {
+            Self::Pending => None,
+            Self::CriticalComplete | Self::Complete | Self::FailedAfterCritical => Some(true),
+            Self::FailedBeforeCritical => Some(false),
+        }
+    }
+
+    fn completion_result(self) -> Option<bool> {
+        match self {
+            Self::Pending | Self::CriticalComplete => None,
+            Self::Complete => Some(true),
+            Self::FailedBeforeCritical | Self::FailedAfterCritical => Some(false),
+        }
+    }
+}
+
+struct ApplicationSurfaceCleanupReporter {
+    phase: tokio::sync::watch::Sender<ApplicationSurfaceCleanupPhase>,
+    critical_completed: bool,
+    completed: bool,
+}
+
+impl ApplicationSurfaceCleanupReporter {
+    fn mark_critical_complete(&mut self) {
+        self.critical_completed = true;
+        self.phase
+            .send_replace(ApplicationSurfaceCleanupPhase::CriticalComplete);
+    }
+
+    fn mark_complete(mut self) {
+        if !self.critical_completed {
+            self.mark_critical_complete();
+        }
+        self.phase
+            .send_replace(ApplicationSurfaceCleanupPhase::Complete);
+        self.completed = true;
+    }
+}
+
+impl Drop for ApplicationSurfaceCleanupReporter {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.phase.send_replace(if self.critical_completed {
+            ApplicationSurfaceCleanupPhase::FailedAfterCritical
+        } else {
+            ApplicationSurfaceCleanupPhase::FailedBeforeCritical
+        });
+    }
+}
+
+#[derive(Clone)]
+struct ApplicationSurfaceCleanupTracker {
+    phase: tokio::sync::watch::Receiver<ApplicationSurfaceCleanupPhase>,
+}
+
+impl ApplicationSurfaceCleanupTracker {
+    fn can_reap(&self) -> bool {
+        *self.phase.borrow() == ApplicationSurfaceCleanupPhase::Complete
+    }
+
+    async fn wait_for_critical(&mut self) -> bool {
+        loop {
+            if let Some(result) = self.phase.borrow().critical_result() {
+                return result;
+            }
+            if self.phase.changed().await.is_err() {
+                return false;
+            }
+        }
+    }
+
+    async fn wait_for_completion_until(&mut self, deadline: tokio::time::Instant) -> bool {
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                if let Some(result) = self.phase.borrow().completion_result() {
+                    return result;
+                }
+                if self.phase.changed().await.is_err() {
+                    return false;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+}
+
+fn application_surface_cleanup_progress() -> (
+    ApplicationSurfaceCleanupReporter,
+    ApplicationSurfaceCleanupTracker,
+) {
+    let (sender, receiver) = tokio::sync::watch::channel(ApplicationSurfaceCleanupPhase::Pending);
+    (
+        ApplicationSurfaceCleanupReporter {
+            phase: sender,
+            critical_completed: false,
+            completed: false,
+        },
+        ApplicationSurfaceCleanupTracker { phase: receiver },
+    )
+}
+
+struct ApplicationSurfaceCleanupOwner {
+    tracker: ApplicationSurfaceCleanupTracker,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ApplicationSurfaceCleanupOwner {
+    fn into_tracker(mut self) -> ApplicationSurfaceCleanupTracker {
+        drop(self.thread.take());
+        self.tracker
+    }
+
+    #[cfg(test)]
+    fn join(mut self) -> std::thread::Result<()> {
+        match self.thread.take() {
+            Some(thread) => thread.join(),
+            None => Ok(()),
+        }
+    }
+}
+
 struct ApplicationSurfaceShutdownJob<Deactivate, Stop> {
     gate: Arc<tokio::sync::Mutex<()>>,
     deactivate: Deactivate,
     stop: Stop,
+    reporter: ApplicationSurfaceCleanupReporter,
 }
 
 impl<Deactivate, Stop> ApplicationSurfaceShutdownJob<Deactivate, Stop>
@@ -1754,19 +1967,34 @@ where
     Stop: FnOnce(),
 {
     fn run(self) {
-        (self.deactivate)();
-        let _lifecycle_guard = self.gate.blocking_lock_owned();
-        (self.stop)();
+        let Self {
+            gate,
+            deactivate,
+            stop,
+            mut reporter,
+        } = self;
+        deactivate();
+        reporter.mark_critical_complete();
+        let _lifecycle_guard = gate.blocking_lock_owned();
+        stop();
+        reporter.mark_complete();
     }
 
     fn run_after_spawn_failure(self) {
-        (self.deactivate)();
+        let Self {
+            gate,
+            deactivate,
+            stop,
+            mut reporter,
+        } = self;
+        deactivate();
+        reporter.mark_critical_complete();
         // No worker owns this job. Give the lifecycle owner one normal
         // shutdown budget, then prioritize release and native stop over
         // abandoning cleanup under thread exhaustion.
         let deadline = std::time::Instant::now() + APPLICATION_SURFACE_SHUTDOWN_TIMEOUT;
         let lifecycle_guard = loop {
-            match Arc::clone(&self.gate).try_lock_owned() {
+            match Arc::clone(&gate).try_lock_owned() {
                 Ok(guard) => break Some(guard),
                 Err(_) if std::time::Instant::now() >= deadline => {
                     tracing::error!(
@@ -1778,7 +2006,8 @@ where
                 Err(_) => std::thread::park_timeout(std::time::Duration::from_millis(1)),
             }
         };
-        (self.stop)();
+        stop();
+        reporter.mark_complete();
         drop(lifecycle_guard);
     }
 }
@@ -1788,7 +2017,7 @@ fn spawn_application_surface_shutdown_with_spawner<Deactivate, Stop, Spawn>(
     deactivate: Deactivate,
     stop: Stop,
     spawn: Spawn,
-) -> std::io::Result<std::thread::JoinHandle<()>>
+) -> std::io::Result<ApplicationSurfaceCleanupOwner>
 where
     Deactivate: FnOnce() + Send + 'static,
     Stop: FnOnce() + Send + 'static,
@@ -1796,13 +2025,18 @@ where
         Arc<Mutex<Option<ApplicationSurfaceShutdownJob<Deactivate, Stop>>>>,
     ) -> std::io::Result<std::thread::JoinHandle<()>>,
 {
+    let (reporter, tracker) = application_surface_cleanup_progress();
     let job = Arc::new(Mutex::new(Some(ApplicationSurfaceShutdownJob {
         gate,
         deactivate,
         stop,
+        reporter,
     })));
     match spawn(Arc::clone(&job)) {
-        Ok(owner) => Ok(owner),
+        Ok(thread) => Ok(ApplicationSurfaceCleanupOwner {
+            tracker,
+            thread: Some(thread),
+        }),
         Err(error) => {
             let fallback = job
                 .lock()
@@ -1822,7 +2056,7 @@ fn spawn_application_surface_shutdown_with<Deactivate, Stop>(
     gate: Arc<tokio::sync::Mutex<()>>,
     deactivate: Deactivate,
     stop: Stop,
-) -> std::io::Result<std::thread::JoinHandle<()>>
+) -> std::io::Result<ApplicationSurfaceCleanupOwner>
 where
     Deactivate: FnOnce() + Send + 'static,
     Stop: FnOnce() + Send + 'static,
@@ -1842,35 +2076,30 @@ where
     })
 }
 
-async fn bounded_application_surface_shutdown_with<Value, Deactivate, Stop>(
-    timeout: std::time::Duration,
-    gate: Arc<tokio::sync::Mutex<()>>,
-    deactivate: Deactivate,
-    stop: Stop,
-) -> bool
-where
-    Value: Send + 'static,
-    Deactivate: FnOnce() -> Value + Send + 'static,
-    Stop: FnOnce(Value) + Send + 'static,
-{
-    let deadline = tokio::time::Instant::now() + timeout;
-    let (completion_sender, completion_receiver) = tokio::sync::oneshot::channel();
-    let owner = std::thread::Builder::new()
-        .name("application-surface-bounded-stop".to_owned())
-        .spawn(move || {
-            let value = deactivate();
-            let _lifecycle_guard = gate.blocking_lock_owned();
-            stop(value);
-            let _ = completion_sender.send(());
-        });
-    if let Err(error) = owner {
-        tracing::error!(%error, "could not start bounded application surface shutdown owner");
-        return false;
+async fn drain_application_surface_cleanup_owners_with(
+    mut owners: Vec<ApplicationSurfaceCleanupTracker>,
+    native_stop_timeout: std::time::Duration,
+    lifecycle_gate: Arc<tokio::sync::Mutex<()>>,
+) -> bool {
+    let mut critical_completed = true;
+    for owner in &mut owners {
+        if !owner.wait_for_critical().await {
+            critical_completed = false;
+            tracing::error!("application surface critical cleanup owner stopped early");
+        }
     }
-    matches!(
-        tokio::time::timeout_at(deadline, completion_receiver).await,
-        Ok(Ok(()))
-    )
+
+    let deadline = tokio::time::Instant::now() + native_stop_timeout;
+    let mut native_completed = true;
+    for owner in &mut owners {
+        if !owner.wait_for_completion_until(deadline).await {
+            native_completed = false;
+        }
+    }
+    let lifecycle_completed = tokio::time::timeout_at(deadline, lifecycle_gate.lock_owned())
+        .await
+        .is_ok();
+    critical_completed && native_completed && lifecycle_completed
 }
 
 async fn finish_application_surface_cleanup_with<Stop>(stop: Stop)
@@ -1984,10 +2213,15 @@ pub async fn start(
             })
         },
         |result: ApplicationSurfaceStartResult| async move {
-            let session_id = result.session_id;
-            let session = take_application_surface_session(&session_id);
-            if let Some(mut session) = session {
-                finish_application_surface_cleanup_with(move || session.stop_blocking()).await;
+            let cleanup = manager()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take_session_for_blocking_cleanup(&result.session_id);
+            if let Some((session, reporter)) = cleanup {
+                finish_application_surface_cleanup_with(move || {
+                    session.stop_blocking_with_reporter(reporter);
+                })
+                .await;
             }
         },
     )
@@ -2010,10 +2244,10 @@ pub async fn start(
 fn start_blocking(
     request: ApplicationSurfaceStartRequest,
 ) -> anyhow::Result<ApplicationSurfaceStartResult> {
-    if manager()
+    if !manager()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_closing
+        .accepts_sessions()
     {
         return Err(ApplicationSurfaceError::SessionUnavailable.into());
     }
@@ -2108,7 +2342,7 @@ fn start_blocking(
         session_id: session_id.clone(),
         frame_transport: ring.descriptor(),
     };
-    let mut session = ApplicationSurfaceSession {
+    let session = ApplicationSurfaceSession {
         target_window_id: request.window_id,
         target_process_id: request.process_id,
         target_uses_chromium_background_preparation:
@@ -2120,7 +2354,7 @@ fn start_blocking(
     let mut manager = manager()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if manager.is_closing {
+    if !manager.accepts_sessions() {
         drop(manager);
         session.stop_blocking();
         return Err(ApplicationSurfaceError::SessionUnavailable.into());
@@ -2207,19 +2441,11 @@ fn capture_pixel_size(width: f64, height: f64) -> anyhow::Result<(usize, usize)>
     Ok((pixel_width, pixel_height))
 }
 
-fn take_application_surface_session(session_id: &str) -> Option<ApplicationSurfaceSession> {
+pub fn stop(session_id: &str) -> bool {
     manager()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .sessions
-        .remove(session_id)
-}
-
-pub fn stop(session_id: &str) -> bool {
-    let session = take_application_surface_session(session_id);
-    let stopped = session.is_some();
-    drop(session);
-    stopped
+        .transition_session_to_cleanup(session_id)
 }
 
 pub fn acknowledge_attachment(session_id: &str) -> bool {
@@ -2233,44 +2459,22 @@ pub fn acknowledge_attachment(session_id: &str) -> bool {
 }
 
 pub async fn stop_all() {
-    let sessions = {
+    let owners = {
         let mut manager = manager()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         manager.begin_shutdown()
     };
-    if sessions.is_empty() {
-        return;
-    }
-    let sessions = sessions
-        .into_values()
-        .map(|session| {
-            let deactivation = session.close_admission();
-            (session, deactivation)
-        })
-        .collect::<Vec<_>>();
-    let completed = bounded_application_surface_shutdown_with(
+    let completed = drain_application_surface_cleanup_owners_with(
+        owners,
         APPLICATION_SURFACE_SHUTDOWN_TIMEOUT,
         application_surface_lifecycle_gate(),
-        move || {
-            sessions
-                .into_iter()
-                .filter_map(|(session, deactivation)| session.into_closed_stream(deactivation))
-                .collect::<Vec<_>>()
-        },
-        |streams| {
-            for stream in streams {
-                if let Err(error) = stream.stop_capture() {
-                    tracing::warn!(%error, "application surface capture did not stop cleanly");
-                }
-            }
-        },
     )
     .await;
     if !completed {
         tracing::warn!(
             timeout_ms = APPLICATION_SURFACE_SHUTDOWN_TIMEOUT.as_millis(),
-            "application surface shutdown exceeded its deadline"
+            "application surface native stop or lifecycle barrier exceeded its deadline, or a cleanup owner failed"
         );
     }
 }
@@ -2887,10 +3091,10 @@ mod tests {
     fn application_surface_shutdown_closes_future_start_admission() {
         let mut manager = ApplicationSurfaceManager::default();
 
-        let sessions = manager.begin_shutdown();
+        let owners = manager.begin_shutdown();
 
-        assert!(sessions.is_empty());
-        assert!(manager.is_closing);
+        assert!(owners.is_empty());
+        assert!(!manager.accepts_sessions());
     }
 
     #[test]
@@ -3829,6 +4033,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn application_surface_shutdown_barriers_inflight_lifecycle_without_sessions() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let lifecycle_owner = gate.lock().await;
+
+        assert!(
+            !drain_application_surface_cleanup_owners_with(
+                Vec::new(),
+                Duration::from_millis(20),
+                Arc::clone(&gate),
+            )
+            .await
+        );
+
+        drop(lifecycle_owner);
+        assert!(
+            drain_application_surface_cleanup_owners_with(
+                Vec::new(),
+                Duration::from_secs(1),
+                gate,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
     async fn application_surface_shutdown_is_bounded_while_lifecycle_is_owned() {
         use std::sync::atomic::AtomicBool;
 
@@ -3839,15 +4068,18 @@ mod tests {
         let stopped = Arc::new(AtomicBool::new(false));
         let stopped_for_action = Arc::clone(&stopped);
 
+        let owner = spawn_application_surface_shutdown_with(
+            Arc::clone(&gate),
+            move || deactivated_for_action.store(true, Ordering::Release),
+            move || stopped_for_action.store(true, Ordering::Release),
+        )
+        .unwrap();
         let completed = tokio::time::timeout(
             Duration::from_secs(1),
-            bounded_application_surface_shutdown_with(
+            drain_application_surface_cleanup_owners_with(
+                vec![owner.into_tracker()],
                 Duration::from_millis(50),
                 Arc::clone(&gate),
-                move || {
-                    deactivated_for_action.store(true, Ordering::Release);
-                },
-                move |()| stopped_for_action.store(true, Ordering::Release),
             ),
         )
         .await
@@ -3857,41 +4089,13 @@ mod tests {
         assert!(deactivated.load(Ordering::Acquire));
         assert!(!stopped.load(Ordering::Acquire));
         drop(lifecycle_owner);
-    }
-
-    #[tokio::test]
-    async fn application_surface_shutdown_deadline_includes_deactivation() {
-        use std::sync::atomic::AtomicBool;
-
-        let gate = Arc::new(tokio::sync::Mutex::new(()));
-        let deactivated = Arc::new(AtomicBool::new(false));
-        let deactivated_for_action = Arc::clone(&deactivated);
-        let stopped = Arc::new(AtomicBool::new(false));
-        let stopped_for_action = Arc::clone(&stopped);
-
-        let completed = bounded_application_surface_shutdown_with(
-            Duration::from_millis(20),
-            gate,
-            move || {
-                std::thread::sleep(Duration::from_millis(150));
-                deactivated_for_action.store(true, Ordering::Release);
-            },
-            move |()| stopped_for_action.store(true, Ordering::Release),
-        )
-        .await;
-
-        assert!(
-            !completed,
-            "lock-taking deactivation must consume the shutdown deadline"
-        );
         tokio::time::timeout(Duration::from_secs(1), async {
             while !stopped.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("timed-out shutdown owner did not finish cleanup");
-        assert!(deactivated.load(Ordering::Acquire));
+        .expect("native stop did not finish after lifecycle release");
     }
 
     #[tokio::test]
@@ -3907,7 +4111,7 @@ mod tests {
         let (release_native_tx, release_native_rx) = mpsc::channel();
 
         let owner = spawn_application_surface_shutdown_with(
-            gate,
+            Arc::clone(&gate),
             move || {
                 critical_entered_tx.send(()).unwrap();
                 release_critical_rx.recv().unwrap();
@@ -3925,6 +4129,7 @@ mod tests {
         let mut shutdown = tokio::spawn(drain_application_surface_cleanup_owners_with(
             owners,
             Duration::from_millis(40),
+            gate,
         ));
 
         critical_entered_rx
@@ -3960,18 +4165,21 @@ mod tests {
         let (stop_entered_tx, stop_entered_rx) = mpsc::channel();
         let (release_stop_tx, release_stop_rx) = mpsc::channel();
 
+        let owner = spawn_application_surface_shutdown_with(
+            Arc::clone(&gate),
+            move || deactivated_for_action.store(true, Ordering::Release),
+            move || {
+                stop_entered_tx.send(()).unwrap();
+                release_stop_rx.recv().unwrap();
+            },
+        )
+        .unwrap();
         let completed = tokio::time::timeout(
             Duration::from_secs(1),
-            bounded_application_surface_shutdown_with(
+            drain_application_surface_cleanup_owners_with(
+                vec![owner.into_tracker()],
                 Duration::from_millis(100),
                 gate,
-                move || {
-                    deactivated_for_action.store(true, Ordering::Release);
-                },
-                move |()| {
-                    stop_entered_tx.send(()).unwrap();
-                    release_stop_rx.recv().unwrap();
-                },
             ),
         )
         .await
@@ -4018,7 +4226,7 @@ mod tests {
     }
 
     #[test]
-    fn application_surface_drop_shutdown_does_not_wait_for_deactivation() {
+    fn application_surface_tracked_shutdown_returns_owner_before_deactivation() {
         let gate = Arc::new(tokio::sync::Mutex::new(()));
         let (deactivate_entered_tx, deactivate_entered_rx) = mpsc::channel();
         let (release_deactivate_tx, release_deactivate_rx) = mpsc::channel();
@@ -4053,7 +4261,7 @@ mod tests {
 
         assert!(
             returned_before_release,
-            "session drop must hand lock-taking deactivation to its cleanup owner"
+            "tracked shutdown must return its owner before lock-taking cleanup completes"
         );
     }
 
