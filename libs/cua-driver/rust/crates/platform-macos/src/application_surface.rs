@@ -50,6 +50,86 @@ pub const MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT: usize = 64;
 const BGRA_PIXEL_FORMAT: u32 = u32::from_be_bytes(*b"BGRA");
 const APPLICATION_WINDOW_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const APPLICATION_SURFACE_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const APPLICATION_WINDOW_CONTAINMENT_TOLERANCE: f64 = 0.5;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ApplicationCaptureBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl ApplicationCaptureBounds {
+    const fn new(x: f64, y: f64, width: f64, height: f64) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        self.x.is_finite()
+            && self.y.is_finite()
+            && self.width.is_finite()
+            && self.height.is_finite()
+            && self.width > 0.0
+            && self.height > 0.0
+    }
+
+    fn fully_contains(self, window: Self) -> bool {
+        self.is_valid()
+            && window.is_valid()
+            && window.x >= self.x - APPLICATION_WINDOW_CONTAINMENT_TOLERANCE
+            && window.y >= self.y - APPLICATION_WINDOW_CONTAINMENT_TOLERANCE
+            && window.x + window.width
+                <= self.x + self.width + APPLICATION_WINDOW_CONTAINMENT_TOLERANCE
+            && window.y + window.height
+                <= self.y + self.height + APPLICATION_WINDOW_CONTAINMENT_TOLERANCE
+    }
+}
+
+fn application_surface_supports_unclipped_window_capture() -> bool {
+    objc2_foundation::NSProcessInfo::processInfo()
+        .operatingSystemVersion()
+        .majorVersion
+        >= 14
+}
+
+fn active_application_display_bounds() -> Vec<ApplicationCaptureBounds> {
+    use core_graphics::display::CGDisplay;
+
+    let Ok(display_ids) = CGDisplay::active_displays() else {
+        return Vec::new();
+    };
+    display_ids
+        .into_iter()
+        .filter_map(|display_id| {
+            let bounds = CGDisplay::new(display_id).bounds();
+            let bounds = ApplicationCaptureBounds::new(
+                bounds.origin.x,
+                bounds.origin.y,
+                bounds.size.width,
+                bounds.size.height,
+            );
+            bounds.is_valid().then_some(bounds)
+        })
+        .collect()
+}
+
+fn application_window_is_capturable(
+    window: ApplicationCaptureBounds,
+    supports_unclipped_window_capture: bool,
+    displays: &[ApplicationCaptureBounds],
+) -> bool {
+    window.is_valid()
+        && (supports_unclipped_window_capture
+            || displays
+                .iter()
+                .any(|display| display.fully_contains(window)))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplicationSurfacePermissionUse {
@@ -1441,8 +1521,14 @@ fn manager() -> &'static Mutex<ApplicationSurfaceManager> {
 
 fn list_windows_blocking() -> anyhow::Result<Vec<ApplicationWindow>> {
     require_application_surface_permissions(ApplicationSurfacePermissionUse::WindowListing)?;
+    let supports_unclipped_window_capture = application_surface_supports_unclipped_window_capture();
+    let display_bounds = if supports_unclipped_window_capture {
+        Vec::new()
+    } else {
+        active_application_display_bounds()
+    };
     let content = SCShareableContent::create()
-        .with_on_screen_windows_only(false)
+        .with_on_screen_windows_only(!supports_unclipped_window_capture)
         .with_exclude_desktop_windows(true)
         .get()
         .map_err(|error| anyhow!("could not enumerate application windows: {error}"))?;
@@ -1453,11 +1539,22 @@ fn list_windows_blocking() -> anyhow::Result<Vec<ApplicationWindow>> {
         .filter_map(|window| {
             let owner = window.owning_application()?;
             let frame = window.frame();
+            let capture_bounds = ApplicationCaptureBounds::new(
+                frame.origin.x,
+                frame.origin.y,
+                frame.size.width,
+                frame.size.height,
+            );
             if window.window_id() == 0
                 || owner.process_id() == helper_pid
                 || window.window_layer() != 0
                 || frame.size.width < 64.0
                 || frame.size.height < 64.0
+                || !application_window_is_capturable(
+                    capture_bounds,
+                    supports_unclipped_window_capture,
+                    &display_bounds,
+                )
             {
                 return None;
             }
@@ -1689,8 +1786,14 @@ fn start_blocking(
         bail!("invalid application-surface target or frame rate");
     }
 
+    let supports_unclipped_window_capture = application_surface_supports_unclipped_window_capture();
+    let display_bounds = if supports_unclipped_window_capture {
+        Vec::new()
+    } else {
+        active_application_display_bounds()
+    };
     let content = SCShareableContent::create()
-        .with_on_screen_windows_only(false)
+        .with_on_screen_windows_only(!supports_unclipped_window_capture)
         .with_exclude_desktop_windows(true)
         .get()
         .map_err(|error| anyhow!("could not enumerate application windows: {error}"))?;
@@ -1702,6 +1805,19 @@ fn start_blocking(
                 && window
                     .owning_application()
                     .is_some_and(|owner| owner.process_id() == request.process_id)
+                && {
+                    let frame = window.frame();
+                    application_window_is_capturable(
+                        ApplicationCaptureBounds::new(
+                            frame.origin.x,
+                            frame.origin.y,
+                            frame.size.width,
+                            frame.size.height,
+                        ),
+                        supports_unclipped_window_capture,
+                        &display_bounds,
+                    )
+                }
         })
         .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
     let source_frame = source_window.frame();
@@ -1727,7 +1843,12 @@ fn start_blocking(
         .with_window(&source_window)
         .build();
     let interval = screencapturekit::cm::CMTime::new(1, request.frame_rate as i32);
-    let configuration = application_surface_stream_configuration(width, height, &interval);
+    let configuration = application_surface_stream_configuration(
+        width,
+        height,
+        &interval,
+        supports_unclipped_window_capture,
+    );
     let callback_state = frame_state.clone();
     let error_state = frame_state.clone();
     let delegate = StreamCallbacks::new().on_error(move |_| {
@@ -1778,8 +1899,15 @@ fn application_surface_stream_configuration(
     width: usize,
     height: usize,
     interval: &screencapturekit::cm::CMTime,
+    supports_unclipped_window_capture: bool,
 ) -> SCStreamConfiguration {
-    configure_application_surface_stream(SCStreamConfiguration::new(), width, height, interval)
+    configure_application_surface_stream(
+        SCStreamConfiguration::new(),
+        width,
+        height,
+        interval,
+        supports_unclipped_window_capture,
+    )
 }
 
 fn configure_application_surface_stream(
@@ -1787,19 +1915,24 @@ fn configure_application_surface_stream(
     width: usize,
     height: usize,
     interval: &screencapturekit::cm::CMTime,
+    supports_unclipped_window_capture: bool,
 ) -> SCStreamConfiguration {
-    configuration
+    let configuration = configuration
         .with_width(width as u32)
         .with_height(height as u32)
         .with_minimum_frame_interval(interval)
         .with_queue_depth(3)
-        .with_ignore_global_clip_single_window(true)
         // The host already presents the local pointer over the pane. Capturing
         // the target window's synthetic pointer would render a second cursor.
         .with_shows_cursor(false)
         .with_pixel_format(PixelFormat::BGRA)
         .with_scales_to_fit(true)
-        .with_preserves_aspect_ratio(true)
+        .with_preserves_aspect_ratio(true);
+    if supports_unclipped_window_capture {
+        configuration.with_ignore_global_clip_single_window(true)
+    } else {
+        configuration
+    }
 }
 
 fn require_application_surface_permissions(
@@ -2421,21 +2554,30 @@ mod tests {
     }
 
     #[test]
-    fn application_surface_configuration_preserves_cross_display_window_content() {
+    fn application_surface_configuration_uses_unclipped_capture_when_available() {
         let interval = screencapturekit::cm::CMTime::new(1, 30);
         let base = SCStreamConfiguration::new().with_ignore_global_clip_single_window(false);
-        let configuration =
-            configure_application_surface_stream(base, 320, 200, &interval, true);
+        let supports_unclipped_window_capture =
+            application_surface_supports_unclipped_window_capture();
+        let configuration = configure_application_surface_stream(
+            base,
+            320,
+            200,
+            &interval,
+            supports_unclipped_window_capture,
+        );
 
-        assert!(configuration.ignore_global_clip_single_window());
+        assert_eq!(
+            configuration.ignore_global_clip_single_window(),
+            supports_unclipped_window_capture
+        );
     }
 
     #[test]
     fn macos13_configuration_avoids_the_unavailable_unclipped_window_option() {
         let interval = screencapturekit::cm::CMTime::new(1, 30);
         let base = SCStreamConfiguration::new().with_ignore_global_clip_single_window(false);
-        let configuration =
-            configure_application_surface_stream(base, 320, 200, &interval, false);
+        let configuration = configure_application_surface_stream(base, 320, 200, &interval, false);
 
         assert!(!configuration.ignore_global_clip_single_window());
     }
@@ -2448,9 +2590,7 @@ mod tests {
         let crossing_display_edge = ApplicationCaptureBounds::new(1_200.0, 100.0, 800.0, 600.0);
 
         assert!(application_window_is_capturable(
-            contained,
-            false,
-            &displays
+            contained, false, &displays
         ));
         assert!(!application_window_is_capturable(
             partially_offscreen,

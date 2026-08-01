@@ -36,10 +36,30 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use cursor_overlay::{
-    CursorConfig, CursorKey, FocusRect, KeyedOverlayCommand, MotionConfig, OverlayCommand,
-    OverlayMsg, Palette, RenderStateCore, ZOrderEnforcer,
+    CursorConfig, CursorKey, FocusRect, KeyedOverlayCommand, MotionConfig, OverlayCommand, Palette,
+    RenderStateCore, ZOrderEnforcer,
 };
 use indexmap::IndexMap;
+
+/// macOS extends the shared keyed command protocol with generation-tagged
+/// moves and timeout recovery. The render side must decide whether recovery
+/// still owns the path after another task has queued a newer move.
+#[derive(Debug, Clone)]
+enum OverlayMsg {
+    Cmd(KeyedOverlayCommand),
+    RegisteredMove {
+        key: CursorKey,
+        cmd: OverlayCommand,
+        generation: u64,
+    },
+    TimeoutRecovery {
+        key: CursorKey,
+        cmd: OverlayCommand,
+        generation: u64,
+    },
+    Remove(CursorKey),
+    Revive(CursorKey),
+}
 
 // ── Arrival-signal channels (one waiter slot per cursor key) ──────────────
 //
@@ -98,11 +118,16 @@ fn arrival_register(key: CursorKey, tx: tokio::sync::oneshot::Sender<()>) -> u64
     generation
 }
 
-fn arrival_fire(key: &CursorKey) {
+fn arrival_fire(key: &CursorKey, generation: u64) {
     if let Ok(mut guard) = ARRIVAL_TX.lock() {
         if let Some(map) = guard.as_mut() {
-            if let Some(waiter) = map.remove(key) {
-                let _ = waiter.tx.send(());
+            if map
+                .get(key)
+                .is_some_and(|waiter| waiter.generation == generation)
+            {
+                if let Some(waiter) = map.remove(key) {
+                    let _ = waiter.tx.send(());
+                }
             }
         }
     }
@@ -186,6 +211,9 @@ static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
 /// CoreGraphics cannot enumerate the active global display layout.
 struct RenderMap {
     cursors: IndexMap<CursorKey, RenderState>,
+    /// Generation of the move currently rendered for each cursor. Arrival and
+    /// timeout recovery may only resolve or replace this exact generation.
+    active_move_generations: HashMap<CursorKey, u64>,
     /// Most recent cursor key touched by an inbound command. Idle-dwell
     /// timeout selection prefers this cursor so a stale visible cursor cannot
     /// shorten the dwell of the cursor the user just moved.
@@ -229,6 +257,7 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
                 if map.last_active_key.as_deref() == Some(key.as_str()) {
                     map.last_active_key = None;
                 }
+                map.active_move_generations.remove(&key);
                 if let Ok(mut guard) = ARRIVAL_TX.lock() {
                     if let Some(m) = guard.as_mut() {
                         m.remove(&key);
@@ -244,27 +273,67 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
         OverlayMsg::Revive(key) => {
             if key != "default" {
                 map.ended.remove(&key);
+                map.active_move_generations.remove(&key);
             }
             None
         }
         OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }) => {
-            // Drop a command for an already-ended session WITHOUT get-or-create
-            // — this is the resurrection guard. Without it, a ClickPulse/MoveTo
-            // landing after Remove would re-insert (and re-leak) the cursor.
-            if map.ended.contains(&key) {
+            if matches!(
+                &cmd,
+                OverlayCommand::MoveTo { .. } | OverlayCommand::SnapTo { .. }
+            ) {
+                map.active_move_generations.remove(&key);
+            }
+            apply_render_command(map, key, cmd)
+        }
+        OverlayMsg::RegisteredMove {
+            key,
+            cmd,
+            generation,
+        } => {
+            let applied = apply_render_command(map, key.clone(), cmd);
+            if applied.is_some() {
+                map.active_move_generations.insert(key, generation);
+            }
+            applied
+        }
+        OverlayMsg::TimeoutRecovery {
+            key,
+            cmd,
+            generation,
+        } => {
+            if map.active_move_generations.get(&key) != Some(&generation) {
                 return None;
             }
-            let template = map.template.clone();
-            let k = key.clone();
-            let rs = map
-                .cursors
-                .entry(key)
-                .or_insert_with(|| render_state_for_key(&template, &k));
-            rs.apply_command(cmd);
-            map.last_active_key = Some(k.clone());
-            Some(k)
+            let applied = apply_render_command(map, key.clone(), cmd);
+            if applied.is_some() {
+                map.active_move_generations.remove(&key);
+            }
+            applied
         }
     }
+}
+
+fn apply_render_command(
+    map: &mut RenderMap,
+    key: CursorKey,
+    cmd: OverlayCommand,
+) -> Option<CursorKey> {
+    // Drop a command for an already-ended session WITHOUT get-or-create —
+    // this is the resurrection guard. Without it, a late click or move would
+    // re-insert and leak the cursor after Remove.
+    if map.ended.contains(&key) {
+        return None;
+    }
+    let template = map.template.clone();
+    let k = key.clone();
+    let rs = map
+        .cursors
+        .entry(key)
+        .or_insert_with(|| render_state_for_key(&template, &k));
+    rs.apply_command(cmd);
+    map.last_active_key = Some(k.clone());
+    Some(k)
 }
 
 /// Initialise global overlay state (call once, before run_on_main_thread).
@@ -287,6 +356,7 @@ pub fn init(cfg: CursorConfig) {
     cursors.insert("default".to_owned(), RenderState::new(cfg.clone()));
     *RENDER.lock().unwrap() = Some(RenderMap {
         cursors,
+        active_move_generations: HashMap::new(),
         last_active_key: None,
         fallback_display_bounds: None,
         template: cfg,
@@ -319,6 +389,18 @@ fn try_send_command_with_depth(
     cmd: OverlayCommand,
     pending: &std::sync::atomic::AtomicUsize,
 ) -> bool {
+    try_send_render_msg_with_depth(
+        sender,
+        OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }),
+        pending,
+    )
+}
+
+fn try_send_render_msg_with_depth(
+    sender: Option<&std::sync::mpsc::Sender<OverlayMsg>>,
+    msg: OverlayMsg,
+    pending: &std::sync::atomic::AtomicUsize,
+) -> bool {
     let reserved = pending
         .fetch_update(
             std::sync::atomic::Ordering::AcqRel,
@@ -329,10 +411,7 @@ fn try_send_command_with_depth(
     if !reserved {
         return false;
     }
-    let sent = sender.is_some_and(|tx| {
-        tx.send(OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }))
-            .is_ok()
-    });
+    let sent = sender.is_some_and(|tx| tx.send(msg).is_ok());
     if !sent {
         pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -340,7 +419,10 @@ fn try_send_command_with_depth(
 }
 
 fn note_command_dequeued(msg: &OverlayMsg) {
-    if matches!(msg, OverlayMsg::Cmd(_)) {
+    if matches!(
+        msg,
+        OverlayMsg::Cmd(_) | OverlayMsg::RegisteredMove { .. } | OverlayMsg::TimeoutRecovery { .. }
+    ) {
         PENDING_COMMANDS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
@@ -351,12 +433,29 @@ fn send_registered_move(
     cmd: OverlayCommand,
     generation: u64,
 ) -> bool {
-    if try_send_command(sender, key.clone(), cmd) {
+    let msg = OverlayMsg::RegisteredMove {
+        key: key.clone(),
+        cmd,
+        generation,
+    };
+    if try_send_render_msg_with_depth(sender, msg, &PENDING_COMMANDS) {
         true
     } else {
         arrival_cancel(&key, generation);
         false
     }
+}
+
+fn send_timeout_recovery(key: CursorKey, cmd: OverlayCommand, generation: u64) -> bool {
+    try_send_render_msg_with_depth(
+        CMD_TX.get(),
+        OverlayMsg::TimeoutRecovery {
+            key,
+            cmd,
+            generation,
+        },
+        &PENDING_COMMANDS,
+    )
 }
 
 /// Convenience for callsites not yet threaded with a session key: drives the
@@ -608,13 +707,14 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
         // Queue the recovery behind the original move. Subsequent click and
         // scroll render commands use the same FIFO channel, so the visible
         // cursor cannot continue its stale path after the tool call resumes.
-        let recovery_sent = send_command(
+        let recovery_sent = send_timeout_recovery(
             key.clone(),
             OverlayCommand::SnapTo {
                 x: end_x,
                 y: end_y,
                 heading_radians: Some(end_heading),
             },
+            generation,
         );
         if recovery_sent
             && !wait_for_rendered_snap(&key, end_x, end_y, ARRIVAL_RECOVERY_TIMEOUT).await
@@ -1568,14 +1668,22 @@ fn render_loop(
                     // or immediately after a command changed render state. The
                     // latter lets a just-created path/click/focus rect start on
                     // this frame without waiting for the next 16ms tick.
-                    let mut arrived: Vec<CursorKey> = Vec::new();
+                    let mut arrived_keys: Vec<CursorKey> = Vec::new();
                     if frame_tick_needed || had_msg || woke_for_idle_maintenance {
                         for (k, rs) in map.cursors.iter_mut() {
                             if rs.tick(dt) {
-                                arrived.push(k.clone());
+                                arrived_keys.push(k.clone());
                             }
                         }
                     }
+                    let arrived = arrived_keys
+                        .into_iter()
+                        .filter_map(|key| {
+                            map.active_move_generations
+                                .remove(&key)
+                                .map(|generation| (key, generation))
+                        })
+                        .collect::<Vec<_>>();
                     let next_frame_tick_needed = render_map_needs_frame_tick(map);
                     let next_idle_maintenance_due_in = if next_frame_tick_needed {
                         None
@@ -1644,8 +1752,8 @@ fn render_loop(
         };
 
         // Fire arrival signals so each session's animate_cursor_to() unblocks.
-        for k in &arrived {
-            arrival_fire(k);
+        for (key, generation) in &arrived {
+            arrival_fire(key, *generation);
         }
 
         // ── Phase 2: move per-cursor windows and update contents only when needed.
@@ -2179,6 +2287,7 @@ mod tests {
         );
         RenderMap {
             cursors,
+            active_move_generations: HashMap::new(),
             last_active_key: None,
             fallback_display_bounds: Some(LogicalRect {
                 left: 0.0,
