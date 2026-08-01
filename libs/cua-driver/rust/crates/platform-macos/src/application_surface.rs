@@ -2683,6 +2683,83 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn timed_out_application_window_listing_owns_lifecycle_and_blocks_retry() {
+        use std::sync::atomic::AtomicUsize;
+
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let (release_listing_tx, release_listing_rx) = tokio::sync::oneshot::channel();
+        let first = bounded_application_window_listing_with(
+            Duration::from_millis(10),
+            Arc::clone(&gate),
+            move || {
+                tokio::spawn(async move {
+                    release_listing_rx.await.unwrap();
+                    Ok::<Vec<ApplicationWindow>, ()>(Vec::new())
+                })
+            },
+        )
+        .await;
+        assert!(matches!(
+            first,
+            Err(BoundedApplicationSurfaceStartError::TimedOut)
+        ));
+
+        let retry_starts = Arc::new(AtomicUsize::new(0));
+        let retry_start_marker = Arc::clone(&retry_starts);
+        let retry = bounded_application_window_listing_with(
+            Duration::from_millis(10),
+            Arc::clone(&gate),
+            move || {
+                retry_start_marker.fetch_add(1, Ordering::AcqRel);
+                tokio::spawn(async { Ok::<Vec<ApplicationWindow>, ()>(Vec::new()) })
+            },
+        )
+        .await;
+        assert!(matches!(
+            retry,
+            Err(BoundedApplicationSurfaceStartError::TimedOut)
+        ));
+        assert_eq!(retry_starts.load(Ordering::Acquire), 0);
+
+        release_listing_tx.send(()).unwrap();
+        let _released_guard = tokio::time::timeout(Duration::from_secs(1), gate.lock())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn application_surface_shutdown_deactivates_before_async_native_stop() {
+        use std::sync::atomic::AtomicBool;
+
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let deactivated = Arc::new(AtomicBool::new(false));
+        let deactivated_for_action = Arc::clone(&deactivated);
+        let deactivated_for_stop = Arc::clone(&deactivated);
+        let (stop_entered_tx, stop_entered_rx) = mpsc::channel();
+        let (release_stop_tx, release_stop_rx) = mpsc::channel();
+
+        let shutdown = spawn_application_surface_shutdown_with(
+            Arc::clone(&gate),
+            move || deactivated_for_action.store(true, Ordering::Release),
+            move || {
+                assert!(deactivated_for_stop.load(Ordering::Acquire));
+                stop_entered_tx.send(()).unwrap();
+                release_stop_rx.recv().unwrap();
+            },
+        )
+        .unwrap();
+
+        assert!(deactivated.load(Ordering::Acquire));
+        stop_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(gate.try_lock().is_err());
+        release_stop_tx.send(()).unwrap();
+        shutdown.join().unwrap();
+        assert!(gate.try_lock().is_ok());
+    }
+
     #[test]
     fn stopping_an_unknown_application_surface_reports_false() {
         assert!(!stop(&Uuid::new_v4().to_string()));
