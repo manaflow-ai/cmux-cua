@@ -3215,6 +3215,63 @@ mod tests {
     }
 
     #[test]
+    fn batch_dispatch_failure_releases_every_delivered_press() {
+        let input = ApplicationSurfaceInputState::new();
+        let _dispatch = input.lock_dispatch();
+        let mut pointer_releases = Vec::new();
+        let mut key_releases = Vec::new();
+
+        let result = dispatch_application_surface_batch_with(
+            [0, 1],
+            |step| {
+                if step == 1 {
+                    return Err(anyhow!("injected delivery failure"));
+                }
+                let mut pointer = input
+                    .pointer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let transition = pointer.transition_for("left_mouse_down", 1);
+                pointer.record_delivery(
+                    "left_mouse_down",
+                    ApplicationSurfacePointerDelivery {
+                        screen_x: 10.0,
+                        screen_y: 20.0,
+                        local_x: 3.0,
+                        local_y: 4.0,
+                        modifiers: 0,
+                        click_count: 1,
+                        group_id: transition.group_id,
+                    },
+                );
+                drop(pointer);
+                input
+                    .keyboard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .record_delivery(56, true);
+                Ok(())
+            },
+            || {
+                input.release_pressed_locked_with(
+                    |release| pointer_releases.push(release),
+                    |key_code| key_releases.push(key_code),
+                );
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(input.active.load(Ordering::Acquire));
+        assert_eq!(pointer_releases.len(), 1);
+        assert_eq!(pointer_releases[0].kind, "left_mouse_up");
+        assert_eq!(key_releases, vec![56]);
+        input.release_pressed_locked_with(
+            |_| panic!("pointer release remained recorded"),
+            |_| panic!("key release remained recorded"),
+        );
+    }
+
+    #[test]
     fn permanent_capture_failure_releases_delivered_input_once() {
         let ring = SharedFrameRing::create(2, 2).unwrap();
         let input = Arc::new(ApplicationSurfaceInputState::new());
