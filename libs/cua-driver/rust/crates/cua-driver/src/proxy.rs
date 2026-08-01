@@ -1437,9 +1437,12 @@ impl DaemonStartState {
     fn needs_grant_wait(
         &self,
         request_requires_wait: bool,
-        _external_permission_flow: bool,
+        external_permission_flow: bool,
     ) -> bool {
-        request_requires_wait && !self.grant_wait_completed
+        // A host can revoke external readiness without restarting the daemon,
+        // so protected calls must observe that mutable milestone every time.
+        request_requires_wait
+            && (external_permission_flow || !self.grant_wait_completed)
     }
 
     fn complete_grant_wait(&mut self) {
