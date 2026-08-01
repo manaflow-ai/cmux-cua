@@ -2748,6 +2748,43 @@ mod tests {
         assert_eq!(published_word, FRAME_FAILURE_WORD);
     }
 
+    #[test]
+    fn publication_owned_capture_failure_does_not_relock_publication() {
+        let ring = SharedFrameRing::create(2, 2).unwrap();
+        let frame_state = Arc::new(CaptureFrameState {
+            ring: Arc::clone(&ring),
+            publication: Mutex::new(()),
+            failed: AtomicBool::new(false),
+            input_state: Arc::new(ApplicationSurfaceInputState::new()),
+            target_window_id: 42,
+            target_process_id: 43,
+            fallback_source_width: 2.0,
+            fallback_source_height: 2.0,
+        });
+        let state_for_failure = Arc::clone(&frame_state);
+        let (completed_tx, completed_rx) = mpsc::channel();
+
+        let failure = std::thread::spawn(move || {
+            let _publication = state_for_failure
+                .publication
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state_for_failure.mark_failed_while_publishing();
+            completed_tx.send(()).unwrap();
+        });
+
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("capture failure recursively locked publication");
+        failure.join().unwrap();
+        assert!(frame_state.failed.load(Ordering::Acquire));
+        let published_word = unsafe {
+            ring.atomic_word(FRAME_PUBLISHED_WORD_OFFSET)
+                .load(Ordering::Acquire)
+        };
+        assert_eq!(published_word, FRAME_FAILURE_WORD);
+    }
+
     #[tokio::test]
     async fn timed_out_application_start_owns_cleanup_and_blocks_retry() {
         use std::sync::atomic::{AtomicBool, AtomicUsize};
