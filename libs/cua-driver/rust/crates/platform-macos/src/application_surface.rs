@@ -46,6 +46,7 @@ const MAXIMUM_FRAME_DIMENSION: usize = 16_384;
 const MAXIMUM_FRAME_RING_BYTE_COUNT: usize = 256 * 1_024 * 1_024;
 pub const MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT: usize = 64;
 const BGRA_PIXEL_FORMAT: u32 = u32::from_be_bytes(*b"BGRA");
+const APPLICATION_WINDOW_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const APPLICATION_SURFACE_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -796,6 +797,7 @@ impl CapturedFrameGeometry {
 
 struct CaptureFrameState {
     ring: Arc<SharedFrameRing>,
+    publication: Mutex<()>,
     failed: AtomicBool,
     input_state: Arc<ApplicationSurfaceInputState>,
     target_window_id: u32,
@@ -829,6 +831,14 @@ pub(crate) fn capture_frame_status_is_publishable(status: Option<SCFrameStatus>)
 
 impl CaptureFrameState {
     fn mark_failed(&self) {
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.mark_failed_locked();
+    }
+
+    fn mark_failed_locked(&self) {
         self.mark_failed_with(
             |release| {
                 if let Err(error) = post_mouse_delivery(
@@ -877,18 +887,35 @@ impl CaptureFrameState {
             .release_pressed_locked_with(release_pointer, release_key);
     }
 
-    fn mark_unavailable(&self) {
+    fn mark_unavailable_locked(&self) {
         let _dispatch = self.input_state.lock_dispatch();
         if self.ring.mark_unavailable().is_err() {
             drop(_dispatch);
-            self.mark_failed();
+            self.mark_failed_locked();
             return;
         }
         self.input_state
             .release_pressed_locked(self.target_process_id, self.target_window_id);
     }
 
+    fn deactivate_publication(&self) {
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.failed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if self.ring.mark_unavailable().is_err() {
+            let _ = self.ring.mark_failed();
+        }
+    }
+
     fn receive(&self, sample: screencapturekit::cm::CMSampleBuffer) {
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.failed.load(Ordering::Acquire) {
             return;
         }
@@ -896,7 +923,7 @@ impl CaptureFrameState {
             CaptureFrameDisposition::Publish => {}
             CaptureFrameDisposition::Preserve => return,
             CaptureFrameDisposition::Invalidate => {
-                self.mark_unavailable();
+                self.mark_unavailable_locked();
                 return;
             }
         }
@@ -907,7 +934,7 @@ impl CaptureFrameState {
             || pixel_buffer.width() != self.ring.layout.width
             || pixel_buffer.height() != self.ring.layout.height
         {
-            self.mark_failed();
+            self.mark_failed_locked();
             return;
         }
         let frame_info = sample.frame_info();
@@ -927,7 +954,7 @@ impl CaptureFrameState {
             .publish(guard.as_slice(), guard.bytes_per_row(), geometry)
             .is_err()
         {
-            self.mark_failed();
+            self.mark_failed_locked();
         }
     }
 }
@@ -936,17 +963,33 @@ struct ApplicationSurfaceSession {
     target_window_id: u32,
     target_process_id: i32,
     target_uses_chromium_background_preparation: bool,
-    stream: SCStream,
+    stream: Option<SCStream>,
     frame_state: Arc<CaptureFrameState>,
     input_state: Arc<ApplicationSurfaceInputState>,
 }
 
 impl Drop for ApplicationSurfaceSession {
     fn drop(&mut self) {
-        self.input_state
-            .deactivate(self.target_process_id, self.target_window_id);
-        if let Err(error) = self.stream.stop_capture() {
-            tracing::warn!(%error, "application surface capture did not stop cleanly");
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        let input_state = Arc::clone(&self.input_state);
+        let frame_state = Arc::clone(&self.frame_state);
+        let target_process_id = self.target_process_id;
+        let target_window_id = self.target_window_id;
+        if let Err(error) = spawn_application_surface_shutdown_with(
+            application_surface_lifecycle_gate(),
+            move || {
+                input_state.deactivate(target_process_id, target_window_id);
+                frame_state.deactivate_publication();
+            },
+            move || {
+                if let Err(error) = stream.stop_capture() {
+                    tracing::warn!(%error, "application surface capture did not stop cleanly");
+                }
+            },
+        ) {
+            tracing::error!(%error, "could not start application surface cleanup owner");
         }
     }
 }
@@ -1285,7 +1328,7 @@ fn manager() -> &'static Mutex<ApplicationSurfaceManager> {
     MANAGER.get_or_init(|| Mutex::new(ApplicationSurfaceManager::default()))
 }
 
-pub fn list_windows() -> anyhow::Result<Vec<ApplicationWindow>> {
+fn list_windows_blocking() -> anyhow::Result<Vec<ApplicationWindow>> {
     require_application_surface_permissions(ApplicationSurfacePermissionUse::WindowListing)?;
     let content = SCShareableContent::create()
         .with_on_screen_windows_only(false)
@@ -1333,34 +1376,75 @@ pub fn list_windows() -> anyhow::Result<Vec<ApplicationWindow>> {
 }
 
 #[derive(Debug)]
-enum BoundedApplicationSurfaceStartError<StartError> {
-    Start(StartError),
+enum BoundedApplicationSurfaceOperationError<OperationError> {
+    Operation(OperationError),
     TimedOut,
     TaskFailed(tokio::task::JoinError),
     OwnerStopped,
 }
 
-fn application_surface_start_gate() -> Arc<tokio::sync::Mutex<()>> {
+fn application_surface_lifecycle_gate() -> Arc<tokio::sync::Mutex<()>> {
     static GATE: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
     Arc::clone(GATE.get_or_init(|| Arc::new(tokio::sync::Mutex::new(()))))
 }
 
-async fn bounded_application_surface_start_with<
+fn spawn_application_surface_native_task<Value, Operation>(
+    thread_name: &'static str,
+    operation: Operation,
+) -> tokio::task::JoinHandle<anyhow::Result<Value>>
+where
+    Value: Send + 'static,
+    Operation: FnOnce() -> anyhow::Result<Value> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name(thread_name.to_owned())
+            .spawn(move || {
+                let _ = sender.send(operation());
+            })
+            .with_context(|| format!("could not start {thread_name} owner"))?;
+        receiver
+            .await
+            .map_err(|_| anyhow!("{thread_name} owner stopped"))?
+    })
+}
+
+fn spawn_application_surface_shutdown_with<Deactivate, Stop>(
+    gate: Arc<tokio::sync::Mutex<()>>,
+    deactivate: Deactivate,
+    stop: Stop,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    Deactivate: FnOnce(),
+    Stop: FnOnce() + Send + 'static,
+{
+    deactivate();
+    std::thread::Builder::new()
+        .name("application-surface-stop".to_owned())
+        .spawn(move || {
+            let _lifecycle_guard = gate.blocking_lock_owned();
+            stop();
+        })
+}
+
+async fn bounded_application_surface_operation_with<
     Value,
-    StartError,
-    SpawnStart,
+    OperationError,
+    SpawnOperation,
     Cleanup,
     CleanupFuture,
 >(
     timeout: std::time::Duration,
     gate: Arc<tokio::sync::Mutex<()>>,
-    spawn_start: SpawnStart,
+    spawn_operation: SpawnOperation,
     cleanup: Cleanup,
-) -> Result<Value, BoundedApplicationSurfaceStartError<StartError>>
+) -> Result<Value, BoundedApplicationSurfaceOperationError<OperationError>>
 where
     Value: Send + 'static,
-    StartError: Send + 'static,
-    SpawnStart: FnOnce() -> tokio::task::JoinHandle<Result<Value, StartError>> + Send + 'static,
+    OperationError: Send + 'static,
+    SpawnOperation:
+        FnOnce() -> tokio::task::JoinHandle<Result<Value, OperationError>> + Send + 'static,
     Cleanup: FnOnce(Value) -> CleanupFuture + Send + 'static,
     CleanupFuture: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -1368,17 +1452,18 @@ where
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + timeout;
         let Ok(lifecycle_guard) = tokio::time::timeout_at(deadline, gate.lock_owned()).await else {
-            let _ = response_sender.send(Err(BoundedApplicationSurfaceStartError::TimedOut));
+            let _ = response_sender.send(Err(BoundedApplicationSurfaceOperationError::TimedOut));
             return;
         };
-        let mut start_task = spawn_start();
-        let outcome = match tokio::time::timeout_at(deadline, &mut start_task).await {
+        let mut operation_task = spawn_operation();
+        let outcome = match tokio::time::timeout_at(deadline, &mut operation_task).await {
             Ok(Ok(Ok(value))) => Ok(value),
-            Ok(Ok(Err(error))) => Err(BoundedApplicationSurfaceStartError::Start(error)),
-            Ok(Err(error)) => Err(BoundedApplicationSurfaceStartError::TaskFailed(error)),
+            Ok(Ok(Err(error))) => Err(BoundedApplicationSurfaceOperationError::Operation(error)),
+            Ok(Err(error)) => Err(BoundedApplicationSurfaceOperationError::TaskFailed(error)),
             Err(_) => {
-                let _ = response_sender.send(Err(BoundedApplicationSurfaceStartError::TimedOut));
-                if let Ok(Ok(value)) = start_task.await {
+                let _ =
+                    response_sender.send(Err(BoundedApplicationSurfaceOperationError::TimedOut));
+                if let Ok(Ok(value)) = operation_task.await {
                     cleanup(value).await;
                 }
                 drop(lifecycle_guard);
@@ -1394,32 +1479,72 @@ where
     });
     response_receiver
         .await
-        .unwrap_or(Err(BoundedApplicationSurfaceStartError::OwnerStopped))
+        .unwrap_or(Err(BoundedApplicationSurfaceOperationError::OwnerStopped))
+}
+
+async fn bounded_application_window_listing_with<ListError, SpawnList>(
+    timeout: std::time::Duration,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    spawn_list: SpawnList,
+) -> Result<Vec<ApplicationWindow>, BoundedApplicationSurfaceOperationError<ListError>>
+where
+    ListError: Send + 'static,
+    SpawnList: FnOnce() -> tokio::task::JoinHandle<Result<Vec<ApplicationWindow>, ListError>>
+        + Send
+        + 'static,
+{
+    bounded_application_surface_operation_with(timeout, gate, spawn_list, |_| async {}).await
+}
+
+pub async fn list_windows() -> anyhow::Result<Vec<ApplicationWindow>> {
+    match bounded_application_window_listing_with(
+        APPLICATION_WINDOW_LIST_TIMEOUT,
+        application_surface_lifecycle_gate(),
+        || spawn_application_surface_native_task("application-window-list", list_windows_blocking),
+    )
+    .await
+    {
+        Ok(windows) => Ok(windows),
+        Err(BoundedApplicationSurfaceOperationError::Operation(error)) => Err(error),
+        Err(BoundedApplicationSurfaceOperationError::TimedOut) => {
+            Err(ApplicationSurfaceError::CaptureUnavailable.into())
+        }
+        Err(BoundedApplicationSurfaceOperationError::TaskFailed(error)) => {
+            Err(anyhow!("application-window task failed: {error}"))
+        }
+        Err(BoundedApplicationSurfaceOperationError::OwnerStopped) => {
+            Err(anyhow!("application-window lifecycle owner stopped"))
+        }
+    }
 }
 
 pub async fn start(
     request: ApplicationSurfaceStartRequest,
 ) -> anyhow::Result<ApplicationSurfaceStartResult> {
-    match bounded_application_surface_start_with(
+    match bounded_application_surface_operation_with(
         APPLICATION_SURFACE_START_TIMEOUT,
-        application_surface_start_gate(),
-        move || tokio::task::spawn_blocking(move || start_blocking(request)),
+        application_surface_lifecycle_gate(),
+        move || {
+            spawn_application_surface_native_task("application-surface-start", move || {
+                start_blocking(request)
+            })
+        },
         |result: ApplicationSurfaceStartResult| async move {
             let session_id = result.session_id;
-            let _ = tokio::task::spawn_blocking(move || stop(&session_id)).await;
+            let _ = stop(&session_id);
         },
     )
     .await
     {
         Ok(result) => Ok(result),
-        Err(BoundedApplicationSurfaceStartError::Start(error)) => Err(error),
-        Err(BoundedApplicationSurfaceStartError::TimedOut) => {
+        Err(BoundedApplicationSurfaceOperationError::Operation(error)) => Err(error),
+        Err(BoundedApplicationSurfaceOperationError::TimedOut) => {
             Err(ApplicationSurfaceError::CaptureFailed.into())
         }
-        Err(BoundedApplicationSurfaceStartError::TaskFailed(error)) => {
+        Err(BoundedApplicationSurfaceOperationError::TaskFailed(error)) => {
             Err(anyhow!("application-capture task failed: {error}"))
         }
-        Err(BoundedApplicationSurfaceStartError::OwnerStopped) => {
+        Err(BoundedApplicationSurfaceOperationError::OwnerStopped) => {
             Err(anyhow!("application-capture lifecycle owner stopped"))
         }
     }
@@ -1455,6 +1580,7 @@ fn start_blocking(
     let input_state = Arc::new(ApplicationSurfaceInputState::new());
     let frame_state = Arc::new(CaptureFrameState {
         ring: ring.clone(),
+        publication: Mutex::new(()),
         failed: AtomicBool::new(false),
         input_state: Arc::clone(&input_state),
         target_window_id: request.window_id,
@@ -1513,7 +1639,7 @@ fn start_blocking(
             target_process_id: request.process_id,
             target_uses_chromium_background_preparation:
                 application_surface_target_uses_chromium_background_preparation(request.process_id),
-            stream,
+            stream: Some(stream),
             frame_state,
             input_state,
         },
@@ -2592,6 +2718,7 @@ mod tests {
             .record_delivery(56, true);
         let frame_state = CaptureFrameState {
             ring: Arc::clone(&ring),
+            publication: Mutex::new(()),
             failed: AtomicBool::new(false),
             input_state: input,
             target_window_id: 42,
@@ -2629,7 +2756,7 @@ mod tests {
         let cleaned = Arc::new(AtomicBool::new(false));
         let cleaned_marker = Arc::clone(&cleaned);
         let (release_start_tx, release_start_rx) = tokio::sync::oneshot::channel();
-        let first = bounded_application_surface_start_with(
+        let first = bounded_application_surface_operation_with(
             Duration::from_millis(10),
             Arc::clone(&gate),
             move || {
@@ -2649,12 +2776,12 @@ mod tests {
         .await;
         assert!(matches!(
             first,
-            Err(BoundedApplicationSurfaceStartError::TimedOut)
+            Err(BoundedApplicationSurfaceOperationError::TimedOut)
         ));
 
         let retry_starts = Arc::new(AtomicUsize::new(0));
         let retry_start_marker = Arc::clone(&retry_starts);
-        let retry = bounded_application_surface_start_with(
+        let retry = bounded_application_surface_operation_with(
             Duration::from_millis(10),
             Arc::clone(&gate),
             move || {
@@ -2666,7 +2793,7 @@ mod tests {
         .await;
         assert!(matches!(
             retry,
-            Err(BoundedApplicationSurfaceStartError::TimedOut)
+            Err(BoundedApplicationSurfaceOperationError::TimedOut)
         ));
         assert_eq!(retry_starts.load(Ordering::Acquire), 0);
 
@@ -2702,7 +2829,7 @@ mod tests {
         .await;
         assert!(matches!(
             first,
-            Err(BoundedApplicationSurfaceStartError::TimedOut)
+            Err(BoundedApplicationSurfaceOperationError::TimedOut)
         ));
 
         let retry_starts = Arc::new(AtomicUsize::new(0));
@@ -2718,7 +2845,7 @@ mod tests {
         .await;
         assert!(matches!(
             retry,
-            Err(BoundedApplicationSurfaceStartError::TimedOut)
+            Err(BoundedApplicationSurfaceOperationError::TimedOut)
         ));
         assert_eq!(retry_starts.load(Ordering::Acquire), 0);
 

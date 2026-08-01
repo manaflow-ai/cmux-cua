@@ -1931,19 +1931,13 @@ pub async fn run_serve(
                                         77,
                                     )
                                 } else {
-                                    match tokio::task::spawn_blocking(
-                                        platform_macos::application_surface::list_windows,
-                                    ).await {
-                                        Ok(Ok(windows)) => DaemonResponse::ok(
+                                    match platform_macos::application_surface::list_windows().await {
+                                        Ok(windows) => DaemonResponse::ok(
                                             serde_json::json!({"windows": windows}),
                                         ),
-                                        Ok(Err(error)) => {
+                                        Err(error) => {
                                             application_surface_failure_response(error)
                                         }
-                                        Err(error) => DaemonResponse::err(
-                                            format!("Application-window task failed: {error}"),
-                                            1,
-                                        ),
                                     }
                                 };
                                 #[cfg(not(target_os = "macos"))]
@@ -2045,14 +2039,8 @@ pub async fn run_serve(
                                         .map(str::to_owned);
                                     match session {
                                         Some(session) => {
-                                            let session_to_stop = session.clone();
-                                            let stopped = tokio::task::spawn_blocking(
-                                                move || {
-                                                    platform_macos::application_surface::stop(
-                                                        &session_to_stop,
-                                                    )
-                                                },
-                                            ).await.unwrap_or(false);
+                                            let stopped =
+                                                platform_macos::application_surface::stop(&session);
                                             (
                                                 DaemonResponse::ok(
                                                     serde_json::json!({"stopped": stopped}),
@@ -2736,13 +2724,8 @@ pub async fn run_serve(
                     #[cfg(target_os = "macos")]
                     {
                         let session_ids = application_surface_sessions.drain();
-                        if !session_ids.is_empty() {
-                            let _ = tokio::task::spawn_blocking(move || {
-                                for session_id in session_ids {
-                                    platform_macos::application_surface::stop(&session_id);
-                                }
-                            })
-                            .await;
+                        for session_id in session_ids {
+                            platform_macos::application_surface::stop(&session_id);
                         }
                     }
 
