@@ -298,6 +298,8 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
             let applied = apply_render_command(map, key.clone(), cmd);
             if applied.is_some() {
                 map.active_move_generations.insert(key, generation);
+            } else {
+                arrival_cancel(&key, generation);
             }
             applied
         }

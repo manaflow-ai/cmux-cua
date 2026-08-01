@@ -1742,6 +1742,82 @@ where
     })
 }
 
+struct ApplicationSurfaceShutdownJob<Deactivate, Stop> {
+    gate: Arc<tokio::sync::Mutex<()>>,
+    deactivate: Deactivate,
+    stop: Stop,
+}
+
+impl<Deactivate, Stop> ApplicationSurfaceShutdownJob<Deactivate, Stop>
+where
+    Deactivate: FnOnce(),
+    Stop: FnOnce(),
+{
+    fn run(self) {
+        (self.deactivate)();
+        let _lifecycle_guard = self.gate.blocking_lock_owned();
+        (self.stop)();
+    }
+
+    fn run_after_spawn_failure(self) {
+        (self.deactivate)();
+        // No worker owns this job. Give the lifecycle owner one normal
+        // shutdown budget, then prioritize release and native stop over
+        // abandoning cleanup under thread exhaustion.
+        let deadline = std::time::Instant::now() + APPLICATION_SURFACE_SHUTDOWN_TIMEOUT;
+        let lifecycle_guard = loop {
+            match Arc::clone(&self.gate).try_lock_owned() {
+                Ok(guard) => break Some(guard),
+                Err(_) if std::time::Instant::now() >= deadline => {
+                    tracing::error!(
+                        timeout_ms = APPLICATION_SURFACE_SHUTDOWN_TIMEOUT.as_millis(),
+                        "application surface emergency shutdown bypassed its busy lifecycle gate"
+                    );
+                    break None;
+                }
+                Err(_) => std::thread::park_timeout(std::time::Duration::from_millis(1)),
+            }
+        };
+        (self.stop)();
+        drop(lifecycle_guard);
+    }
+}
+
+fn spawn_application_surface_shutdown_with_spawner<Deactivate, Stop, Spawn>(
+    gate: Arc<tokio::sync::Mutex<()>>,
+    deactivate: Deactivate,
+    stop: Stop,
+    spawn: Spawn,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    Deactivate: FnOnce() + Send + 'static,
+    Stop: FnOnce() + Send + 'static,
+    Spawn: FnOnce(
+        Arc<Mutex<Option<ApplicationSurfaceShutdownJob<Deactivate, Stop>>>>,
+    ) -> std::io::Result<std::thread::JoinHandle<()>>,
+{
+    let job = Arc::new(Mutex::new(Some(ApplicationSurfaceShutdownJob {
+        gate,
+        deactivate,
+        stop,
+    })));
+    match spawn(Arc::clone(&job)) {
+        Ok(owner) => Ok(owner),
+        Err(error) => {
+            let fallback = job
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(fallback) = fallback {
+                fallback.run_after_spawn_failure();
+            } else {
+                tracing::error!("failed shutdown owner consumed its fallback cleanup");
+            }
+            Err(error)
+        }
+    }
+}
+
 fn spawn_application_surface_shutdown_with<Deactivate, Stop>(
     gate: Arc<tokio::sync::Mutex<()>>,
     deactivate: Deactivate,
@@ -1751,13 +1827,19 @@ where
     Deactivate: FnOnce() + Send + 'static,
     Stop: FnOnce() + Send + 'static,
 {
-    std::thread::Builder::new()
-        .name("application-surface-stop".to_owned())
-        .spawn(move || {
-            deactivate();
-            let _lifecycle_guard = gate.blocking_lock_owned();
-            stop();
-        })
+    spawn_application_surface_shutdown_with_spawner(gate, deactivate, stop, |job| {
+        std::thread::Builder::new()
+            .name("application-surface-stop".to_owned())
+            .spawn(move || {
+                let job = job
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(job) = job {
+                    job.run();
+                }
+            })
+    })
 }
 
 async fn bounded_application_surface_shutdown_with<Value, Deactivate, Stop>(
