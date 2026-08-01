@@ -2708,6 +2708,29 @@ mod tests {
     }
 
     #[test]
+    fn closing_input_admission_does_not_wait_for_dispatch_cleanup() {
+        let input = Arc::new(ApplicationSurfaceInputState::new());
+        let dispatch = input.lock_dispatch();
+        let input_for_close = Arc::clone(&input);
+        let (closed_tx, closed_rx) = mpsc::channel();
+
+        let closer = std::thread::spawn(move || {
+            closed_tx
+                .send(input_for_close.close_admission())
+                .unwrap();
+        });
+
+        assert!(
+            closed_rx
+                .recv_timeout(Duration::from_millis(250))
+                .expect("input admission closure waited for dispatch cleanup")
+        );
+        assert!(!input.active.load(Ordering::Acquire));
+        drop(dispatch);
+        closer.join().unwrap();
+    }
+
+    #[test]
     fn window_listing_does_not_require_accessibility() {
         assert_eq!(
             missing_application_surface_permission(
@@ -2925,6 +2948,49 @@ mod tests {
             "session deactivation must unlink the frame ring synchronously"
         );
         assert_eq!(Arc::strong_count(&ring), 2, "capture owner remains alive");
+    }
+
+    #[test]
+    fn closing_frame_admission_does_not_wait_for_capture_cleanup() {
+        let ring = SharedFrameRing::create(2, 2).unwrap();
+        let frame = [0x5A; 16];
+        ring.publish(&frame, 8, frame_geometry(NormalizedContentRect::default()))
+            .unwrap();
+        let frame_state = Arc::new(CaptureFrameState {
+            ring: Arc::clone(&ring),
+            _resource_reservation: None,
+            publication: Mutex::new(()),
+            failed: AtomicBool::new(false),
+            input_state: Arc::new(ApplicationSurfaceInputState::new()),
+            target_window_id: 42,
+            target_process_id: 43,
+            fallback_source_width: 2.0,
+            fallback_source_height: 2.0,
+        });
+        let publication = frame_state
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state_for_close = Arc::clone(&frame_state);
+        let (closed_tx, closed_rx) = mpsc::channel();
+
+        let closer = std::thread::spawn(move || {
+            closed_tx
+                .send(state_for_close.close_publication_admission())
+                .unwrap();
+        });
+
+        let closure = closed_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("frame admission closure waited for capture cleanup");
+        assert!(frame_state.failed.load(Ordering::Acquire));
+        assert!(!ring.is_available());
+        assert!(ring
+            .publish(&frame, 8, frame_geometry(NormalizedContentRect::default()))
+            .is_err());
+        drop(publication);
+        frame_state.finish_deactivate_publication(closure);
+        closer.join().unwrap();
     }
 
     #[test]
