@@ -57,6 +57,11 @@ static NEXT_ARRIVAL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic
 
 const ARRIVAL_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+fn arrival_timeout_for_path(_path_length: f64, _motion: &MotionConfig) -> Duration {
+    ARRIVAL_TIMEOUT
+}
+
 fn arrival_register(key: CursorKey, tx: tokio::sync::oneshot::Sender<()>) -> u64 {
     let generation = NEXT_ARRIVAL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut guard = ARRIVAL_TX.lock().unwrap();
@@ -2297,6 +2302,18 @@ mod tests {
             .contains_key(&key));
 
         *ARRIVAL_TX.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn slow_wide_glide_extends_arrival_timeout_past_ideal_travel_time() {
+        let motion = MotionConfig::default().scaled_by(0.25);
+        let path_length = 8_000.0;
+        let ideal_travel_time = Duration::from_secs_f64(path_length / motion.peak_speed);
+
+        assert!(
+            arrival_timeout_for_path(path_length, &motion) > ideal_travel_time,
+            "a slow cross-display glide must not time out before even peak speed could arrive"
+        );
     }
 
     #[test]

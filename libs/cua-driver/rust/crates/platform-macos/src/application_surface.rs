@@ -1539,6 +1539,17 @@ where
         })
 }
 
+#[cfg(test)]
+async fn finish_application_surface_cleanup_with<Stop>(stop: Stop)
+where
+    Stop: FnOnce() + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("application-surface-late-stop".to_owned())
+        .spawn(stop)
+        .expect("late application-surface cleanup owner must start");
+}
+
 async fn bounded_application_surface_operation_with<
     Value,
     OperationError,
@@ -3078,6 +3089,88 @@ mod tests {
         let _released_guard = tokio::time::timeout(Duration::from_secs(1), gate.lock())
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_application_start_finishes_native_stop_before_retry() {
+        use std::sync::atomic::AtomicBool;
+
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let native_stopped = Arc::new(AtomicBool::new(false));
+        let stopped_for_cleanup = Arc::clone(&native_stopped);
+        let (release_start_tx, release_start_rx) = tokio::sync::oneshot::channel();
+        let (stop_entered_tx, stop_entered_rx) = tokio::sync::oneshot::channel();
+        let (release_stop_tx, release_stop_rx) = mpsc::channel();
+
+        let first = bounded_application_surface_operation_with(
+            Duration::from_millis(10),
+            Arc::clone(&gate),
+            move || {
+                tokio::spawn(async move {
+                    release_start_rx.await.unwrap();
+                    Ok::<String, ()>("late-session".to_owned())
+                })
+            },
+            move |session| async move {
+                assert_eq!(session, "late-session");
+                finish_application_surface_cleanup_with(move || {
+                    stop_entered_tx.send(()).unwrap();
+                    release_stop_rx.recv().unwrap();
+                    stopped_for_cleanup.store(true, Ordering::Release);
+                })
+                .await;
+            },
+        )
+        .await;
+        assert!(matches!(
+            first,
+            Err(BoundedApplicationSurfaceOperationError::TimedOut)
+        ));
+
+        let stopped_for_retry = Arc::clone(&native_stopped);
+        let (retry_started_tx, mut retry_started_rx) = tokio::sync::oneshot::channel();
+        let retry = tokio::spawn(bounded_application_surface_operation_with(
+            Duration::from_secs(1),
+            Arc::clone(&gate),
+            move || {
+                retry_started_tx
+                    .send(stopped_for_retry.load(Ordering::Acquire))
+                    .unwrap();
+                tokio::spawn(async { Ok::<String, ()>("retry".to_owned()) })
+            },
+            |_| async {},
+        ));
+
+        release_start_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stop_entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let retry_before_stop =
+            tokio::time::timeout(Duration::from_millis(100), &mut retry_started_rx)
+                .await
+                .ok()
+                .and_then(Result::ok);
+
+        release_stop_tx.send(()).unwrap();
+        let retry_observed_stopped = match retry_before_stop {
+            Some(observed) => observed,
+            None => tokio::time::timeout(Duration::from_secs(1), retry_started_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        let retry_result = tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            retry_before_stop.is_none(),
+            "retry started while native capture shutdown was still blocked"
+        );
+        assert!(retry_observed_stopped);
+        assert_eq!(retry_result.unwrap(), "retry");
     }
 
     #[tokio::test]
