@@ -835,10 +835,10 @@ impl CaptureFrameState {
             .publication
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.mark_failed_locked();
+        self.mark_failed_while_publishing();
     }
 
-    fn mark_failed_locked(&self) {
+    fn mark_failed_while_publishing(&self) {
         self.mark_failed_with(
             |release| {
                 if let Err(error) = post_mouse_delivery(
@@ -891,7 +891,7 @@ impl CaptureFrameState {
         let _dispatch = self.input_state.lock_dispatch();
         if self.ring.mark_unavailable().is_err() {
             drop(_dispatch);
-            self.mark_failed_locked();
+            self.mark_failed_while_publishing();
             return;
         }
         self.input_state
@@ -934,7 +934,7 @@ impl CaptureFrameState {
             || pixel_buffer.width() != self.ring.layout.width
             || pixel_buffer.height() != self.ring.layout.height
         {
-            self.mark_failed_locked();
+            self.mark_failed_while_publishing();
             return;
         }
         let frame_info = sample.frame_info();
@@ -946,7 +946,7 @@ impl CaptureFrameState {
             self.fallback_source_height,
         );
         let Ok(guard) = pixel_buffer.lock_read_only() else {
-            self.mark_failed();
+            self.mark_failed_while_publishing();
             return;
         };
         if self
@@ -954,7 +954,7 @@ impl CaptureFrameState {
             .publish(guard.as_slice(), guard.bytes_per_row(), geometry)
             .is_err()
         {
-            self.mark_failed_locked();
+            self.mark_failed_while_publishing();
         }
     }
 }
