@@ -74,6 +74,10 @@ struct ArrivalWaiter {
 
 static ARRIVAL_TX: Mutex<Option<HashMap<CursorKey, ArrivalWaiter>>> = Mutex::new(None);
 static NEXT_ARRIVAL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+// Registration order must match the shared renderer queue order. Otherwise
+// concurrent moves for one cursor can leave the newer waiter behind an older
+// queued generation that can never signal it.
+static ARRIVAL_ENQUEUE_LOCK: Mutex<()> = Mutex::new(());
 
 const ARRIVAL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ARRIVAL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -452,12 +456,35 @@ fn register_cursor_move_if_renderer_available(
     key: CursorKey,
     cmd: OverlayCommand,
 ) -> Option<(u64, tokio::sync::oneshot::Receiver<()>)> {
+    register_cursor_move_if_renderer_available_with(
+        renderer_available,
+        sender,
+        key,
+        cmd,
+        || {},
+    )
+}
+
+fn register_cursor_move_if_renderer_available_with<AfterRegistration>(
+    renderer_available: bool,
+    sender: Option<&std::sync::mpsc::Sender<OverlayMsg>>,
+    key: CursorKey,
+    cmd: OverlayCommand,
+    after_registration: AfterRegistration,
+) -> Option<(u64, tokio::sync::oneshot::Receiver<()>)>
+where
+    AfterRegistration: FnOnce(),
+{
     if !renderer_available {
         return None;
     }
     let sender = sender?;
+    let _enqueue_guard = ARRIVAL_ENQUEUE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (arrival_tx, arrival_rx) = tokio::sync::oneshot::channel();
     let generation = arrival_register(key.clone(), arrival_tx);
+    after_registration();
     send_registered_move(Some(sender), key, cmd, generation).then_some((generation, arrival_rx))
 }
 
