@@ -2500,6 +2500,33 @@ mod tests {
     }
 
     #[test]
+    fn headless_animation_does_not_enqueue_or_create_an_arrival_waiter() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let registration = register_cursor_move_if_renderer_available(
+            false,
+            Some(&command_tx),
+            "headless".to_owned(),
+            OverlayCommand::MoveTo {
+                x: 12.0,
+                y: 34.0,
+                end_heading_radians: 0.0,
+            },
+        );
+
+        assert!(
+            registration.is_none(),
+            "headless animation must not create an arrival waiter"
+        );
+        assert!(
+            matches!(
+                command_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "headless animation must not enqueue into the undrained renderer"
+        );
+    }
+
+    #[test]
     fn slow_wide_glide_extends_arrival_timeout_past_ideal_travel_time() {
         let motion = MotionConfig::default().scaled_by(0.25);
         let path_length = 8_000.0;
