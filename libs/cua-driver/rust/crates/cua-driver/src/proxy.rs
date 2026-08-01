@@ -3099,6 +3099,25 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn external_permission_flow_rechecks_host_readiness_after_completion() {
+        let state = DaemonStartState {
+            reaper_started: true,
+            grant_wait_completed: true,
+            ..DaemonStartState::default()
+        };
+
+        assert!(
+            state.needs_grant_wait(true, true),
+            "external permission flow must observe a host readiness revocation"
+        );
+        assert!(
+            !state.needs_grant_wait(true, false),
+            "driver-owned permission flow may retain its completed grant wait"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn external_permission_readiness_requires_the_host_milestone() {
         let granted_without_host = serde_json::json!({
             "accessibility": true,
