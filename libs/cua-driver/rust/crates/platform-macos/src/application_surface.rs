@@ -3920,6 +3920,29 @@ mod tests {
     }
 
     #[test]
+    fn application_surface_spawn_failure_runs_preserved_cleanup() {
+        use std::sync::atomic::AtomicBool;
+
+        let deactivated = Arc::new(AtomicBool::new(false));
+        let deactivated_for_action = Arc::clone(&deactivated);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_for_action = Arc::clone(&stopped);
+
+        let result = spawn_application_surface_shutdown_with_spawner(
+            Arc::new(tokio::sync::Mutex::new(())),
+            move || deactivated_for_action.store(true, Ordering::Release),
+            move || stopped_for_action.store(true, Ordering::Release),
+            |_| -> std::io::Result<std::thread::JoinHandle<()>> {
+                Err(std::io::Error::other("synthetic thread creation failure"))
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(deactivated.load(Ordering::Acquire));
+        assert!(stopped.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn stopping_an_unknown_application_surface_reports_false() {
         assert!(!stop(&Uuid::new_v4().to_string()));
     }

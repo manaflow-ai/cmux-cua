@@ -2487,6 +2487,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tombstone_rejection_cancels_registered_move_waiter() {
+        let _test_guard = ARRIVAL_TEST_LOCK.lock().unwrap();
+        *ARRIVAL_TX.lock().unwrap() = Some(HashMap::new());
+        let mut map = empty_map();
+        let key = "ended-move".to_owned();
+        apply_msg(&mut map, OverlayMsg::Remove(key.clone()));
+        let (arrival_tx, arrival_rx) = tokio::sync::oneshot::channel();
+        let generation = arrival_register(key.clone(), arrival_tx);
+
+        let applied = apply_msg(
+            &mut map,
+            OverlayMsg::RegisteredMove {
+                key: key.clone(),
+                cmd: OverlayCommand::MoveTo {
+                    x: 99.0,
+                    y: 99.0,
+                    end_heading_radians: 0.0,
+                },
+                generation,
+            },
+        );
+
+        assert!(applied.is_none());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(100), arrival_rx).await,
+            Ok(Err(_))
+        ));
+        assert!(!ARRIVAL_TX
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .contains_key(&key));
+        *ARRIVAL_TX.lock().unwrap() = None;
+    }
+
+    #[tokio::test]
     async fn failed_move_send_and_timeout_both_clear_the_registered_waiter() {
         let _test_guard = ARRIVAL_TEST_LOCK.lock().unwrap();
         *ARRIVAL_TX.lock().unwrap() = Some(HashMap::new());
