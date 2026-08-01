@@ -56,10 +56,35 @@ static ARRIVAL_TX: Mutex<Option<HashMap<CursorKey, ArrivalWaiter>>> = Mutex::new
 static NEXT_ARRIVAL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 const ARRIVAL_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_ARRIVAL_TIMEOUT: Duration = Duration::from_secs(60);
+const ARRIVAL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 
-#[cfg(test)]
-fn arrival_timeout_for_path(_path_length: f64, _motion: &MotionConfig) -> Duration {
-    ARRIVAL_TIMEOUT
+fn arrival_timeout_for_path(path_length: f64, motion: &MotionConfig) -> Duration {
+    if !path_length.is_finite() || path_length < 0.0 {
+        return MAX_ARRIVAL_TIMEOUT;
+    }
+    let expected_seconds = if motion.glide_duration_ms.is_finite() && motion.glide_duration_ms > 0.0
+    {
+        motion.glide_duration_ms / 1_000.0
+    } else {
+        let minimum_speed = motion.min_start_speed.min(motion.min_end_speed);
+        if !minimum_speed.is_finite() || minimum_speed <= 0.0 {
+            return MAX_ARRIVAL_TIMEOUT;
+        }
+        path_length / minimum_speed
+    };
+    let bounded_seconds = (expected_seconds * 1.25 + 2.0).clamp(
+        ARRIVAL_TIMEOUT.as_secs_f64(),
+        MAX_ARRIVAL_TIMEOUT.as_secs_f64(),
+    );
+    Duration::from_secs_f64(bounded_seconds)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrivalWaitResult {
+    Signaled,
+    Canceled,
+    TimedOut,
 }
 
 fn arrival_register(key: CursorKey, tx: tokio::sync::oneshot::Sender<()>) -> u64 {
@@ -101,13 +126,47 @@ async fn wait_for_arrival(
     generation: u64,
     rx: tokio::sync::oneshot::Receiver<()>,
     timeout: Duration,
-) -> bool {
+) -> ArrivalWaitResult {
     match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(())) => true,
-        Ok(Err(_)) | Err(_) => {
+        Ok(Ok(())) => ArrivalWaitResult::Signaled,
+        Ok(Err(_)) => {
             arrival_cancel(key, generation);
-            false
+            ArrivalWaitResult::Canceled
         }
+        Err(_) => {
+            arrival_cancel(key, generation);
+            ArrivalWaitResult::TimedOut
+        }
+    }
+}
+
+async fn wait_for_rendered_snap(
+    key: &CursorKey,
+    x: f64,
+    y: f64,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let snapped = {
+            let guard = RENDER.lock().unwrap();
+            guard
+                .as_ref()
+                .and_then(|map| map.cursors.get(key))
+                .is_some_and(|state| {
+                    state.core.path.is_none()
+                        && (state.core.pos.0 - x).abs() <= 0.5
+                        && (state.core.pos.1 - y).abs() <= 0.5
+                })
+        };
+        if snapped {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(8))).await;
     }
 }
 
@@ -500,16 +559,24 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
 
     // Check whether animation should run for THIS cursor. A disabled cursor
     // never animates; an absent cursor (seed found nothing to prime) is skipped.
-    let should_animate = {
+    let end_heading_radians = std::f64::consts::FRAC_PI_4;
+    let animation = {
         let guard = RENDER.lock().unwrap();
         match guard.as_ref().and_then(|m| m.cursors.get(&key)) {
-            Some(rs) if rs.core.cfg.enabled && !rs.core.is_unplaced() => true,
-            _ => false,
+            Some(rs) if rs.core.cfg.enabled && !rs.core.is_unplaced() => {
+                let path = rs.core.planned_move_path(x, y, end_heading_radians);
+                let endpoint = path.sample(path.length);
+                Some((
+                    arrival_timeout_for_path(path.length, &rs.core.motion),
+                    (endpoint.x, endpoint.y, path.end_visual_heading),
+                ))
+            }
+            _ => None,
         }
     };
-    if !should_animate {
+    let Some((arrival_timeout, (end_x, end_y, end_heading))) = animation else {
         return;
-    }
+    };
 
     // Create a one-shot channel; store the sender (keyed) so the render thread
     // can fire it when this cursor's path finishes.
@@ -525,7 +592,7 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
             y,
             // Arrive pointing upper-left (45°), matching the macOS system-cursor
             // convention and Swift reference (`endAngleDegrees: 45`).
-            end_heading_radians: std::f64::consts::FRAC_PI_4,
+            end_heading_radians,
         },
         generation,
     );
@@ -536,7 +603,25 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
 
     // Await arrival signal (fired from render thread when Dubins path ends),
     // but never let a stopped/stalled renderer hang a tool call indefinitely.
-    let _ = wait_for_arrival(&key, generation, rx, ARRIVAL_TIMEOUT).await;
+    if wait_for_arrival(&key, generation, rx, arrival_timeout).await == ArrivalWaitResult::TimedOut
+    {
+        // Queue the recovery behind the original move. Subsequent click and
+        // scroll render commands use the same FIFO channel, so the visible
+        // cursor cannot continue its stale path after the tool call resumes.
+        let recovery_sent = send_command(
+            key.clone(),
+            OverlayCommand::SnapTo {
+                x: end_x,
+                y: end_y,
+                heading_radians: Some(end_heading),
+            },
+        );
+        if recovery_sent
+            && !wait_for_rendered_snap(&key, end_x, end_y, ARRIVAL_RECOVERY_TIMEOUT).await
+        {
+            tracing::warn!(cursor_key = %key, "cursor renderer did not apply timeout recovery");
+        }
+    }
 }
 
 /// Block the calling thread (must be the OS main thread) running the AppKit
@@ -2290,8 +2375,9 @@ mod tests {
         let key = "arrival-timeout".to_owned();
         let (arrival_tx, arrival_rx) = tokio::sync::oneshot::channel();
         let generation = arrival_register(key.clone(), arrival_tx);
-        assert!(
-            !wait_for_arrival(&key, generation, arrival_rx, Duration::ZERO).await,
+        assert_eq!(
+            wait_for_arrival(&key, generation, arrival_rx, Duration::ZERO).await,
+            ArrivalWaitResult::TimedOut,
             "pending arrival must time out"
         );
         assert!(!ARRIVAL_TX
@@ -2313,6 +2399,16 @@ mod tests {
         assert!(
             arrival_timeout_for_path(path_length, &motion) > ideal_travel_time,
             "a slow cross-display glide must not time out before even peak speed could arrive"
+        );
+    }
+
+    #[test]
+    fn cursor_arrival_timeout_remains_bounded_for_a_stalled_renderer() {
+        let motion = MotionConfig::default().scaled_by(0.25);
+
+        assert_eq!(
+            arrival_timeout_for_path(1_000_000.0, &motion),
+            MAX_ARRIVAL_TIMEOUT
         );
     }
 

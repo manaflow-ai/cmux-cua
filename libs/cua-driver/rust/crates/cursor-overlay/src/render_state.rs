@@ -398,6 +398,31 @@ impl RenderStateCore {
         }
     }
 
+    /// Plan the same click-targeted glide consumed by [`Self::apply_command_base`].
+    /// Callers that bound an animation can therefore recover to the exact
+    /// rendered endpoint without duplicating hotspot or path geometry.
+    pub fn planned_move_path(&self, x: f64, y: f64, end_heading_radians: f64) -> PlannedPath {
+        let click_offset = self.click_offset_points();
+        let tx = x + end_heading_radians.cos() * click_offset;
+        let ty = y + end_heading_radians.sin() * click_offset;
+        let (x0, y0) = self.pos;
+        // The resting cursor angle is visual state, not a vehicle-like
+        // constraint. Using it as the Dubins start heading can turn a short
+        // move into a full loop, so the path approaches along its direct
+        // travel heading and adopts the requested visual angle at rest.
+        let travel_heading = (ty - y0).atan2(tx - x0);
+        PathPlanner::plan(
+            x0,
+            y0,
+            travel_heading,
+            tx,
+            ty,
+            travel_heading,
+            end_heading_radians,
+            self.motion.turn_radius,
+        )
+    }
+
     /// Handle the OverlayCommand variants that are identical across all
     /// three platforms.  Returns `true` if the command was consumed; `false`
     /// for variants the platform must handle itself (e.g. macOS's
@@ -432,7 +457,6 @@ impl RenderStateCore {
                 //   tx = clickPoint.x + cos(endAngle) * clickOffset
                 //   ty = clickPoint.y + sin(endAngle) * clickOffset
                 let click_offset = self.click_offset_points();
-                let turn_radius = self.motion.turn_radius;
                 let tx = x + end_heading_radians.cos() * click_offset;
                 let ty = y + end_heading_radians.sin() * click_offset;
 
@@ -441,23 +465,7 @@ impl RenderStateCore {
                 if move_to_snap_sentinel && self.is_unplaced() {
                     self.place_at(tx, ty);
                 }
-                let (x0, y0) = self.pos;
-                // Travel directly toward the target. The resting cursor angle
-                // is visual state, not a vehicle-like turning constraint; using
-                // it as the Dubins start/end heading can turn a short move into
-                // a full loop. The path tangent drives the cursor during the
-                // glide, while `end_heading_radians` remains its resting angle.
-                let travel_heading = (ty - y0).atan2(tx - x0);
-                let plan = PathPlanner::plan(
-                    x0,
-                    y0,
-                    travel_heading,
-                    tx,
-                    ty,
-                    travel_heading,
-                    end_heading_radians,
-                    turn_radius,
-                );
+                let plan = self.planned_move_path(x, y, end_heading_radians);
                 self.path = Some(plan);
                 self.dist = 0.0;
                 self.spring = None;

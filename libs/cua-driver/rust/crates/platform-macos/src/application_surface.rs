@@ -1539,15 +1539,13 @@ where
         })
 }
 
-#[cfg(test)]
 async fn finish_application_surface_cleanup_with<Stop>(stop: Stop)
 where
     Stop: FnOnce() + Send + 'static,
 {
-    std::thread::Builder::new()
-        .name("application-surface-late-stop".to_owned())
-        .spawn(stop)
-        .expect("late application-surface cleanup owner must start");
+    if let Err(error) = tokio::task::spawn_blocking(stop).await {
+        tracing::error!(%error, "late application surface cleanup owner failed");
+    }
 }
 
 async fn bounded_application_surface_operation_with<
@@ -1653,7 +1651,10 @@ pub async fn start(
         },
         |result: ApplicationSurfaceStartResult| async move {
             let session_id = result.session_id;
-            let _ = stop(&session_id);
+            let session = take_application_surface_session(&session_id);
+            if let Some(mut session) = session {
+                finish_application_surface_cleanup_with(move || session.stop_blocking()).await;
+            }
         },
     )
     .await
@@ -1839,12 +1840,16 @@ fn capture_pixel_size(width: f64, height: f64) -> anyhow::Result<(usize, usize)>
     Ok((pixel_width, pixel_height))
 }
 
-pub fn stop(session_id: &str) -> bool {
-    let session = manager()
+fn take_application_surface_session(session_id: &str) -> Option<ApplicationSurfaceSession> {
+    manager()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .sessions
-        .remove(session_id);
+        .remove(session_id)
+}
+
+pub fn stop(session_id: &str) -> bool {
+    let session = take_application_surface_session(session_id);
     let stopped = session.is_some();
     drop(session);
     stopped
