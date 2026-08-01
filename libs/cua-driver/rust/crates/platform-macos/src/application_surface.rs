@@ -2286,6 +2286,29 @@ mod tests {
     }
 
     #[test]
+    fn application_surface_budget_bounds_sessions_and_total_frame_bytes() {
+        let budget = Arc::new(ApplicationSurfaceResourceBudget::new(2, 10));
+        let first = budget.reserve(6).unwrap();
+        let total_error = match budget.reserve(5) {
+            Ok(_) => panic!("aggregate frame budget was not enforced"),
+            Err(error) => error,
+        };
+        assert_eq!(error_protocol_code(&total_error), "resource_limit");
+        let second = budget.reserve(4).unwrap();
+        drop(first);
+        drop(second);
+        assert!(budget.reserve(10).is_ok());
+
+        let session_budget = Arc::new(ApplicationSurfaceResourceBudget::new(1, 10));
+        let _only_session = session_budget.reserve(1).unwrap();
+        let session_error = match session_budget.reserve(1) {
+            Ok(_) => panic!("application surface session limit was not enforced"),
+            Err(error) => error,
+        };
+        assert_eq!(error_protocol_code(&session_error), "resource_limit");
+    }
+
+    #[test]
     fn frame_ring_can_be_created_with_macos_shm_open() {
         let ring = SharedFrameRing::create(2, 2).unwrap();
         let descriptor = ring.descriptor();

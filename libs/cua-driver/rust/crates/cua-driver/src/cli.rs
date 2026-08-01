@@ -3642,6 +3642,13 @@ mod tests {
     }
 
     #[test]
+    fn mcp_proxy_rejects_daemon_wide_cursor_speed() {
+        assert!(validate_mcp_proxy_cursor_speed(None).is_ok());
+        let error = validate_mcp_proxy_cursor_speed(Some("1.75")).unwrap_err();
+        assert!(error.to_string().contains("cua-driver serve"));
+    }
+
+    #[test]
     fn daemon_launch_forwards_cursor_speed() {
         let args = daemon_open_arguments(
             "CuaDriver",
