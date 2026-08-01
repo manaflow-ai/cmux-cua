@@ -1651,13 +1651,13 @@ fn spawn_application_surface_shutdown_with<Deactivate, Stop>(
     stop: Stop,
 ) -> std::io::Result<std::thread::JoinHandle<()>>
 where
-    Deactivate: FnOnce(),
+    Deactivate: FnOnce() + Send + 'static,
     Stop: FnOnce() + Send + 'static,
 {
-    deactivate();
     std::thread::Builder::new()
         .name("application-surface-stop".to_owned())
         .spawn(move || {
+            deactivate();
             let _lifecycle_guard = gate.blocking_lock_owned();
             stop();
         })
@@ -1671,19 +1671,16 @@ async fn bounded_application_surface_shutdown_with<Value, Deactivate, Stop>(
 ) -> bool
 where
     Value: Send + 'static,
-    Deactivate: FnOnce() -> Value,
+    Deactivate: FnOnce() -> Value + Send + 'static,
     Stop: FnOnce(Value) + Send + 'static,
 {
-    let value = deactivate();
     let deadline = tokio::time::Instant::now() + timeout;
-    let Ok(lifecycle_guard) = tokio::time::timeout_at(deadline, gate.lock_owned()).await else {
-        return false;
-    };
     let (completion_sender, completion_receiver) = tokio::sync::oneshot::channel();
     let owner = std::thread::Builder::new()
         .name("application-surface-bounded-stop".to_owned())
         .spawn(move || {
-            let _lifecycle_guard = lifecycle_guard;
+            let value = deactivate();
+            let _lifecycle_guard = gate.blocking_lock_owned();
             stop(value);
             let _ = completion_sender.send(());
         });
@@ -3702,10 +3699,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(deactivated.load(Ordering::Acquire));
         stop_entered_rx
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
+        assert!(deactivated.load(Ordering::Acquire));
         assert!(gate.try_lock().is_err());
         release_stop_tx.send(()).unwrap();
         shutdown.join().unwrap();
