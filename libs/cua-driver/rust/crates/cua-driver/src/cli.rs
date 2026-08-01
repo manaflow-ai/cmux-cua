@@ -829,7 +829,6 @@ pub fn launch_daemon_and_wait(
     timeout_secs: u64,
     claude_code_compat: bool,
     codex_computer_use_compat: bool,
-    cursor_speed: Option<&str>,
 ) -> anyhow::Result<()> {
     use std::process::{Command as Cmd, Stdio};
     use std::time::{Duration, Instant};
@@ -853,7 +852,6 @@ pub fn launch_daemon_and_wait(
         socket_path,
         claude_code_compat,
         codex_computer_use_compat,
-        cursor_speed,
     );
     let pass_socket = socket_path != crate::serve::default_socket_path();
 
@@ -908,7 +906,6 @@ fn daemon_open_arguments(
     socket_path: &str,
     claude_code_compat: bool,
     codex_computer_use_compat: bool,
-    cursor_speed: Option<&str>,
 ) -> Vec<String> {
     let mut arguments = ["-n", "-g", "-a", daemon_app, "--args", "serve"]
         .map(str::to_owned)
@@ -923,11 +920,17 @@ fn daemon_open_arguments(
     if codex_computer_use_compat {
         arguments.push("--codex-computer-use-compat".to_owned());
     }
-    if let Some(cursor_speed) = cursor_speed {
-        arguments.push("--cursor-speed".to_owned());
-        arguments.push(cursor_speed.to_owned());
-    }
     arguments
+}
+
+fn validate_mcp_proxy_cursor_speed(cursor_speed: Option<&str>) -> anyhow::Result<()> {
+    if cursor_speed.is_some() {
+        anyhow::bail!(
+            "--cursor-speed configures a shared daemon and cannot be set by an MCP proxy; \
+             pass it to `cua-driver serve` or use --no-daemon-relaunch"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -967,6 +970,7 @@ pub fn run_mcp_via_daemon_proxy(
 ) -> anyhow::Result<()> {
     let process_arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let cursor_speed = flag_value(&process_arguments, "--cursor-speed");
+    validate_mcp_proxy_cursor_speed(cursor_speed.as_deref())?;
     // Windows: prefer the uiAccess'd worker pipe over the regular daemon pipe
     // when both are running, so MCP tool calls land in a process that can
     // bypass UIPI for UWP apps. The protocol on both pipes is identical so
@@ -1042,7 +1046,6 @@ pub fn run_mcp_via_daemon_proxy(
         crate::serve::DaemonProfile::for_codex_compat(
             codex_computer_use_compat,
         ),
-        cursor_speed,
     ))
 }
 
@@ -2545,7 +2548,7 @@ fn run_permissions_grant_macos() -> anyhow::Result<()> {
             .find(|endpoint| endpoint.profile == crate::serve::DaemonProfile::Native)
             .expect("native permission endpoint");
         println!("Launching CuaDriver permission onboarding.");
-        launch_daemon_and_wait(&native.socket, 10, false, false, None)?;
+        launch_daemon_and_wait(&native.socket, 10, false, false)?;
         let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             if let Some(state) = query_permission_daemon(&native)? {
@@ -3646,19 +3649,6 @@ mod tests {
         assert!(validate_mcp_proxy_cursor_speed(None).is_ok());
         let error = validate_mcp_proxy_cursor_speed(Some("1.75")).unwrap_err();
         assert!(error.to_string().contains("cua-driver serve"));
-    }
-
-    #[test]
-    fn daemon_launch_forwards_cursor_speed() {
-        let args = daemon_open_arguments(
-            "CuaDriver",
-            "/tmp/custom-cua.sock",
-            false,
-            false,
-            Some("1.75"),
-        );
-
-        assert!(args.windows(2).any(|pair| pair == ["--cursor-speed", "1.75"]));
     }
 
     #[test]

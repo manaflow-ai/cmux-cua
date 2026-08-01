@@ -44,6 +44,8 @@ const FRAME_GEOMETRY_HISTORY_COUNT: usize = 1_024;
 const SOURCE_SIZE_MATCH_TOLERANCE_POINTS: f64 = 1.0;
 const MAXIMUM_FRAME_DIMENSION: usize = 16_384;
 const MAXIMUM_FRAME_RING_BYTE_COUNT: usize = 256 * 1_024 * 1_024;
+const MAXIMUM_ACTIVE_APPLICATION_SURFACE_COUNT: usize = 16;
+const MAXIMUM_APPLICATION_SURFACE_FRAME_BYTE_COUNT: usize = 512 * 1_024 * 1_024;
 pub const MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT: usize = 64;
 const BGRA_PIXEL_FORMAT: u32 = u32::from_be_bytes(*b"BGRA");
 const APPLICATION_WINDOW_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -71,6 +73,8 @@ pub enum ApplicationSurfaceError {
     CaptureFailed,
     #[error("application_surface_capture_unavailable")]
     CaptureUnavailable,
+    #[error("application_surface_resource_limit")]
+    ResourceLimitExceeded,
 }
 
 impl ApplicationSurfaceError {
@@ -84,6 +88,7 @@ impl ApplicationSurfaceError {
             Self::SessionUnavailable => "session_unavailable",
             Self::CaptureFailed => "capture_failed",
             Self::CaptureUnavailable => "capture_unavailable",
+            Self::ResourceLimitExceeded => "resource_limit",
         }
     }
 }
@@ -797,6 +802,7 @@ impl CapturedFrameGeometry {
 
 struct CaptureFrameState {
     ring: Arc<SharedFrameRing>,
+    _resource_reservation: Option<ApplicationSurfaceResourceReservation>,
     publication: Mutex<()>,
     failed: AtomicBool,
     input_state: Arc<ApplicationSurfaceInputState>,
@@ -997,6 +1003,84 @@ impl Drop for ApplicationSurfaceSession {
 #[derive(Default)]
 struct ApplicationSurfaceManager {
     sessions: HashMap<String, ApplicationSurfaceSession>,
+}
+
+#[derive(Default)]
+struct ApplicationSurfaceResourceUsage {
+    session_count: usize,
+    frame_byte_count: usize,
+}
+
+struct ApplicationSurfaceResourceBudget {
+    maximum_session_count: usize,
+    maximum_frame_byte_count: usize,
+    usage: Mutex<ApplicationSurfaceResourceUsage>,
+}
+
+impl ApplicationSurfaceResourceBudget {
+    fn new(maximum_session_count: usize, maximum_frame_byte_count: usize) -> Self {
+        Self {
+            maximum_session_count,
+            maximum_frame_byte_count,
+            usage: Mutex::new(ApplicationSurfaceResourceUsage::default()),
+        }
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        frame_byte_count: usize,
+    ) -> anyhow::Result<ApplicationSurfaceResourceReservation> {
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next_session_count = usage
+            .session_count
+            .checked_add(1)
+            .ok_or(ApplicationSurfaceError::ResourceLimitExceeded)?;
+        let next_frame_byte_count = usage
+            .frame_byte_count
+            .checked_add(frame_byte_count)
+            .ok_or(ApplicationSurfaceError::ResourceLimitExceeded)?;
+        if next_session_count > self.maximum_session_count
+            || next_frame_byte_count > self.maximum_frame_byte_count
+        {
+            return Err(ApplicationSurfaceError::ResourceLimitExceeded.into());
+        }
+        usage.session_count = next_session_count;
+        usage.frame_byte_count = next_frame_byte_count;
+        Ok(ApplicationSurfaceResourceReservation {
+            budget: Arc::clone(self),
+            frame_byte_count,
+        })
+    }
+}
+
+struct ApplicationSurfaceResourceReservation {
+    budget: Arc<ApplicationSurfaceResourceBudget>,
+    frame_byte_count: usize,
+}
+
+impl Drop for ApplicationSurfaceResourceReservation {
+    fn drop(&mut self) {
+        let mut usage = self
+            .budget
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        usage.session_count = usage.session_count.saturating_sub(1);
+        usage.frame_byte_count = usage.frame_byte_count.saturating_sub(self.frame_byte_count);
+    }
+}
+
+fn application_surface_resource_budget() -> Arc<ApplicationSurfaceResourceBudget> {
+    static BUDGET: OnceLock<Arc<ApplicationSurfaceResourceBudget>> = OnceLock::new();
+    Arc::clone(BUDGET.get_or_init(|| {
+        Arc::new(ApplicationSurfaceResourceBudget::new(
+            MAXIMUM_ACTIVE_APPLICATION_SURFACE_COUNT,
+            MAXIMUM_APPLICATION_SURFACE_FRAME_BYTE_COUNT,
+        ))
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1576,10 +1660,14 @@ fn start_blocking(
         .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
     let source_frame = source_window.frame();
     let (width, height) = capture_pixel_size(source_frame.size.width, source_frame.size.height)?;
+    let frame_layout = FrameLayout::new(width, height)?;
+    let resource_reservation =
+        application_surface_resource_budget().reserve(frame_layout.total_byte_count)?;
     let ring = SharedFrameRing::create(width, height)?;
     let input_state = Arc::new(ApplicationSurfaceInputState::new());
     let frame_state = Arc::new(CaptureFrameState {
         ring: ring.clone(),
+        _resource_reservation: Some(resource_reservation),
         publication: Mutex::new(()),
         failed: AtomicBool::new(false),
         input_state: Arc::clone(&input_state),
@@ -2741,6 +2829,7 @@ mod tests {
             .record_delivery(56, true);
         let frame_state = CaptureFrameState {
             ring: Arc::clone(&ring),
+            _resource_reservation: None,
             publication: Mutex::new(()),
             failed: AtomicBool::new(false),
             input_state: input,
@@ -2776,6 +2865,7 @@ mod tests {
         let ring = SharedFrameRing::create(2, 2).unwrap();
         let frame_state = Arc::new(CaptureFrameState {
             ring: Arc::clone(&ring),
+            _resource_reservation: None,
             publication: Mutex::new(()),
             failed: AtomicBool::new(false),
             input_state: Arc::new(ApplicationSurfaceInputState::new()),

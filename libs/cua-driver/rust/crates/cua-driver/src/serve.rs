@@ -3622,6 +3622,10 @@ mod external_permission_flow_tests {
                 ApplicationSurfaceError::CaptureUnavailable,
                 "capture_unavailable",
             ),
+            (
+                ApplicationSurfaceError::ResourceLimitExceeded,
+                "resource_limit",
+            ),
         ];
         for (error, expected_code) in cases {
             let response =
