@@ -373,6 +373,10 @@ struct SharedFrameRing {
     // The host echoes the sequence of its displayed frame with pointer input.
     // Each geometry is recorded before that sequence becomes publishable.
     frame_geometries: Mutex<[Option<PublishedFrameGeometry>; FRAME_GEOMETRY_HISTORY_COUNT]>,
+    // Stop closes this before advancing the published word. A producer checks
+    // it on both sides of loading that word, so its final CAS cannot reopen a
+    // ring after synchronous admission closure.
+    accepts_publication: AtomicBool,
     is_closed: AtomicBool,
     is_unlinked: AtomicBool,
 }
@@ -441,6 +445,7 @@ impl SharedFrameRing {
             layout,
             next_sequence: AtomicU64::new(0),
             frame_geometries: Mutex::new([None; FRAME_GEOMETRY_HISTORY_COUNT]),
+            accepts_publication: AtomicBool::new(true),
             is_closed: AtomicBool::new(false),
             is_unlinked: AtomicBool::new(false),
         };
@@ -498,11 +503,16 @@ impl SharedFrameRing {
         source_bytes_per_row: usize,
         geometry: CapturedFrameGeometry,
     ) -> anyhow::Result<u64> {
-        if self.is_closed.load(Ordering::Acquire) {
+        if self.is_closed.load(Ordering::Acquire)
+            || !self.accepts_publication.load(Ordering::Acquire)
+        {
             bail!("frame ring is closed");
         }
         let publication = unsafe { self.atomic_word(FRAME_PUBLISHED_WORD_OFFSET) };
         let previous_published_word = publication.load(Ordering::Acquire);
+        if !self.accepts_publication.load(Ordering::Acquire) {
+            bail!("frame ring is closed");
+        }
         if previous_published_word == FRAME_FAILURE_WORD {
             bail!("frame ring producer has failed");
         }
@@ -642,11 +652,58 @@ impl SharedFrameRing {
 
     fn mark_failed(&self) -> anyhow::Result<()> {
         let publication = unsafe { self.atomic_word(FRAME_PUBLISHED_WORD_OFFSET) };
-        if publication.swap(FRAME_FAILURE_WORD, Ordering::AcqRel) == FRAME_FAILURE_WORD {
+        let previous = publication.swap(FRAME_FAILURE_WORD, Ordering::AcqRel);
+        self.accepts_publication.store(false, Ordering::Release);
+        if previous == FRAME_FAILURE_WORD {
             return Ok(());
         }
         fence(Ordering::SeqCst);
         post_frame_notification(&self.name)
+    }
+
+    fn close_publication_admission(&self) -> bool {
+        if !self.accepts_publication.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+
+        let publication = unsafe { self.atomic_word(FRAME_PUBLISHED_WORD_OFFSET) };
+        let mut current = publication.load(Ordering::Acquire);
+        loop {
+            if current == FRAME_FAILURE_WORD {
+                return false;
+            }
+            // Advance even when capture is temporarily unavailable. This
+            // invalidates a producer that already loaded the old word.
+            let current_sequence = current >> 2;
+            let closed_word = current_sequence
+                .checked_add(1)
+                .filter(|sequence| *sequence <= (i64::MAX as u64 >> 2))
+                .map_or(FRAME_FAILURE_WORD, |sequence| {
+                    (sequence << 2) | FRAME_UNAVAILABLE_SLOT
+                });
+            match publication.compare_exchange(
+                current,
+                closed_word,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(updated) => current = updated,
+            }
+        }
+    }
+
+    fn finish_publication_closure(&self, notify_reader: bool) {
+        self.frame_geometries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .fill(None);
+        if notify_reader {
+            fence(Ordering::SeqCst);
+            if let Err(error) = post_frame_notification(&self.name) {
+                tracing::warn!(%error, "application surface closure notification failed");
+            }
+        }
     }
 
     fn acknowledge_attachment(&self) -> bool {
@@ -999,19 +1056,26 @@ impl CaptureFrameState {
         }
     }
 
-    fn deactivate_publication(&self) {
+    fn close_publication_admission(&self) -> bool {
+        self.failed.store(true, Ordering::Release);
+        self.ring.close_publication_admission()
+    }
+
+    fn finish_deactivate_publication(&self, notify_reader: bool) {
         let _publication = self
             .publication
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !self.failed.swap(true, Ordering::AcqRel) {
-            if self.ring.mark_unavailable().is_err() {
-                let _ = self.ring.mark_failed();
-            }
-        }
+        self.ring.finish_publication_closure(notify_reader);
         if !self.ring.unlink_name() {
             tracing::warn!("application surface frame ring did not unlink during deactivation");
         }
+    }
+
+    #[cfg(test)]
+    fn deactivate_publication(&self) {
+        let notify_reader = self.close_publication_admission();
+        self.finish_deactivate_publication(notify_reader);
     }
 
     fn receive(&self, sample: screencapturekit::cm::CMSampleBuffer) {
@@ -1069,6 +1133,12 @@ fn application_surface_stream_callbacks(frame_state: Arc<CaptureFrameState>) -> 
         .on_inactive(move || frame_state.mark_unavailable())
 }
 
+#[derive(Clone, Copy)]
+struct ApplicationSurfaceDeactivation {
+    input_was_active: bool,
+    notify_frame_reader: bool,
+}
+
 struct ApplicationSurfaceSession {
     target_window_id: u32,
     target_process_id: i32,
@@ -1080,9 +1150,14 @@ struct ApplicationSurfaceSession {
 
 impl Drop for ApplicationSurfaceSession {
     fn drop(&mut self) {
-        let Some(stream) = self.stream.take() else {
+        if self.stream.is_none() {
             return;
-        };
+        }
+        let deactivation = self.close_admission();
+        let stream = self
+            .stream
+            .take()
+            .expect("application surface stream was checked above");
         let input_state = Arc::clone(&self.input_state);
         let frame_state = Arc::clone(&self.frame_state);
         let target_process_id = self.target_process_id;
@@ -1090,8 +1165,12 @@ impl Drop for ApplicationSurfaceSession {
         if let Err(error) = spawn_application_surface_shutdown_with(
             application_surface_lifecycle_gate(),
             move || {
-                input_state.deactivate(target_process_id, target_window_id);
-                frame_state.deactivate_publication();
+                input_state.finish_deactivation(
+                    deactivation.input_was_active,
+                    target_process_id,
+                    target_window_id,
+                );
+                frame_state.finish_deactivate_publication(deactivation.notify_frame_reader);
             },
             move || {
                 if let Err(error) = stream.stop_capture() {
@@ -1105,19 +1184,34 @@ impl Drop for ApplicationSurfaceSession {
 }
 
 impl ApplicationSurfaceSession {
-    fn deactivate(&self) {
-        self.input_state
-            .deactivate(self.target_process_id, self.target_window_id);
-        self.frame_state.deactivate_publication();
+    fn close_admission(&self) -> ApplicationSurfaceDeactivation {
+        ApplicationSurfaceDeactivation {
+            input_was_active: self.input_state.close_admission(),
+            notify_frame_reader: self.frame_state.close_publication_admission(),
+        }
     }
 
-    fn into_deactivated_stream(mut self) -> Option<SCStream> {
-        self.deactivate();
+    fn finish_deactivation(&self, deactivation: ApplicationSurfaceDeactivation) {
+        self.input_state.finish_deactivation(
+            deactivation.input_was_active,
+            self.target_process_id,
+            self.target_window_id,
+        );
+        self.frame_state
+            .finish_deactivate_publication(deactivation.notify_frame_reader);
+    }
+
+    fn into_closed_stream(
+        mut self,
+        deactivation: ApplicationSurfaceDeactivation,
+    ) -> Option<SCStream> {
+        self.finish_deactivation(deactivation);
         self.stream.take()
     }
 
     fn stop_blocking(&mut self) {
-        self.deactivate();
+        let deactivation = self.close_admission();
+        self.finish_deactivation(deactivation);
         if let Some(stream) = self.stream.take() {
             if let Err(error) = stream.stop_capture() {
                 tracing::warn!(%error, "application surface capture did not stop cleanly");
@@ -1311,13 +1405,16 @@ impl ApplicationSurfaceInputState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn deactivate(&self, process_id: i32, window_id: u32) {
-        let _dispatch = self.lock_dispatch();
-        if !self.active.load(Ordering::Acquire) {
+    fn close_admission(&self) -> bool {
+        self.active.swap(false, Ordering::AcqRel)
+    }
+
+    fn finish_deactivation(&self, was_active: bool, process_id: i32, window_id: u32) {
+        if !was_active {
             return;
         }
+        let _dispatch = self.lock_dispatch();
         self.release_pressed_locked(process_id, window_id);
-        self.active.store(false, Ordering::Release);
     }
 
     fn release_pressed_locked(&self, process_id: i32, window_id: u32) {
@@ -1372,12 +1469,12 @@ impl ApplicationSurfaceInputState {
         release_pointer: impl FnMut(ApplicationSurfacePointerRelease),
         release_key: impl FnMut(u16),
     ) {
-        let _dispatch = self.lock_dispatch();
-        if !self.active.load(Ordering::Acquire) {
+        let was_active = self.close_admission();
+        if !was_active {
             return;
         }
+        let _dispatch = self.lock_dispatch();
         self.release_pressed_locked_with(release_pointer, release_key);
-        self.active.store(false, Ordering::Release);
     }
 
     fn release_pressed_locked_with(
@@ -2063,13 +2160,20 @@ pub async fn stop_all() {
     if sessions.is_empty() {
         return;
     }
+    let sessions = sessions
+        .into_values()
+        .map(|session| {
+            let deactivation = session.close_admission();
+            (session, deactivation)
+        })
+        .collect::<Vec<_>>();
     let completed = bounded_application_surface_shutdown_with(
         APPLICATION_SURFACE_SHUTDOWN_TIMEOUT,
         application_surface_lifecycle_gate(),
         move || {
             sessions
-                .into_values()
-                .filter_map(ApplicationSurfaceSession::into_deactivated_stream)
+                .into_iter()
+                .filter_map(|(session, deactivation)| session.into_closed_stream(deactivation))
                 .collect::<Vec<_>>()
         },
         |streams| {
