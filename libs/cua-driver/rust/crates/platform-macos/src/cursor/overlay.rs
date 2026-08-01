@@ -446,6 +446,21 @@ fn send_registered_move(
     }
 }
 
+fn register_cursor_move_if_renderer_available(
+    renderer_available: bool,
+    sender: Option<&std::sync::mpsc::Sender<OverlayMsg>>,
+    key: CursorKey,
+    cmd: OverlayCommand,
+) -> Option<(u64, tokio::sync::oneshot::Receiver<()>)> {
+    if !renderer_available {
+        return None;
+    }
+    let sender = sender?;
+    let (arrival_tx, arrival_rx) = tokio::sync::oneshot::channel();
+    let generation = arrival_register(key.clone(), arrival_tx);
+    send_registered_move(Some(sender), key, cmd, generation).then_some((generation, arrival_rx))
+}
+
 fn send_timeout_recovery(key: CursorKey, cmd: OverlayCommand, generation: u64) -> bool {
     try_send_render_msg_with_depth(
         CMD_TX.get(),
@@ -677,13 +692,12 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
         return;
     };
 
-    // Create a one-shot channel; store the sender (keyed) so the render thread
-    // can fire it when this cursor's path finishes.
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let generation = arrival_register(key.clone(), tx);
-
-    // Send the MoveTo command (click offset applied inside apply_command).
-    let sent = send_registered_move(
+    // A headless process has no local render loop. Preserve the embedded host
+    // feed above, but never enqueue or wait on the undrained local renderer.
+    // Otherwise register the waiter and enqueue atomically from this caller's
+    // perspective so send failure cannot leave a stale arrival behind.
+    let Some((generation, rx)) = register_cursor_move_if_renderer_available(
+        crate::session::has_graphic_access(),
         CMD_TX.get(),
         key.clone(),
         OverlayCommand::MoveTo {
@@ -693,12 +707,9 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
             // convention and Swift reference (`endAngleDegrees: 45`).
             end_heading_radians,
         },
-        generation,
-    );
-
-    if !sent {
+    ) else {
         return;
-    }
+    };
 
     // Await arrival signal (fired from render thread when Dubins path ends),
     // but never let a stopped/stalled renderer hang a tool call indefinitely.
