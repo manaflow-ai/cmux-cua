@@ -1729,44 +1729,46 @@ async fn wait_for_daemon_permission_readiness_with_timeout(
     external_permission_flow: bool,
     timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
-    use std::time::{Duration, Instant};
-    let deadline = Instant::now() + timeout;
-    loop {
-        if Instant::now() >= deadline {
-            if external_permission_flow {
-                anyhow::bail!(
-                    "Computer Use onboarding is still in progress. Finish setup in cmux, then retry."
-                );
-            }
-            anyhow::bail!(
-                "Computer Use permissions are not ready. Finish granting Accessibility and Screen Recording, then retry."
-            );
-        }
-        let sp = socket_path.to_owned();
-        let sid = session_id.to_owned();
-        let probe = tokio::task::spawn_blocking(move || {
-            let req = DaemonRequest {
-                method: "permissions_status".into(),
-                name: None,
-                args: None,
-                session_id: Some(sid),
-            };
-            send_request(&sp, &req)
-        })
-        .await;
-        if let Ok(Ok(resp)) = probe {
-            if let Some(result) = resp.result.as_ref() {
-                if daemon_permission_readiness(result, external_permission_flow) {
-                    debug!(
-                        external_permission_flow = external_permission_flow,
-                        "daemon permission authority is ready"
-                    );
-                    return Ok(());
+    use std::time::Duration;
+    let wait = async {
+        loop {
+            let sp = socket_path.to_owned();
+            let sid = session_id.to_owned();
+            let probe = tokio::task::spawn_blocking(move || {
+                let req = DaemonRequest {
+                    method: "permissions_status".into(),
+                    name: None,
+                    args: None,
+                    session_id: Some(sid),
+                };
+                send_request(&sp, &req)
+            })
+            .await;
+            if let Ok(Ok(resp)) = probe {
+                if let Some(result) = resp.result.as_ref() {
+                    if daemon_permission_readiness(result, external_permission_flow) {
+                        debug!(
+                            external_permission_flow = external_permission_flow,
+                            "daemon permission authority is ready"
+                        );
+                        return;
+                    }
                 }
             }
+            tokio::time::sleep(Duration::from_millis(750)).await;
         }
-        tokio::time::sleep(Duration::from_millis(750)).await;
+    };
+    if tokio::time::timeout(timeout, wait).await.is_ok() {
+        return Ok(());
     }
+    if external_permission_flow {
+        anyhow::bail!(
+            "Computer Use onboarding is still in progress. Finish setup in cmux, then retry."
+        );
+    }
+    anyhow::bail!(
+        "Computer Use permissions are not ready. Finish granting Accessibility and Screen Recording, then retry."
+    );
 }
 
 #[cfg(target_os = "macos")]

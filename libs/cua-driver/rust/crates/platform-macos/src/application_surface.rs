@@ -569,6 +569,10 @@ impl SharedFrameRing {
     }
 
     fn acknowledge_attachment(&self) -> bool {
+        self.unlink_name()
+    }
+
+    fn unlink_name(&self) -> bool {
         if self.is_unlinked.swap(true, Ordering::AcqRel) {
             return true;
         }
@@ -909,11 +913,13 @@ impl CaptureFrameState {
             .publication
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.failed.swap(true, Ordering::AcqRel) {
-            return;
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            if self.ring.mark_unavailable().is_err() {
+                let _ = self.ring.mark_failed();
+            }
         }
-        if self.ring.mark_unavailable().is_err() {
-            let _ = self.ring.mark_failed();
+        if !self.ring.unlink_name() {
+            tracing::warn!("application surface frame ring did not unlink during deactivation");
         }
     }
 
