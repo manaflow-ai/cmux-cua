@@ -2424,9 +2424,49 @@ mod tests {
     fn application_surface_configuration_preserves_cross_display_window_content() {
         let interval = screencapturekit::cm::CMTime::new(1, 30);
         let base = SCStreamConfiguration::new().with_ignore_global_clip_single_window(false);
-        let configuration = configure_application_surface_stream(base, 320, 200, &interval);
+        let configuration =
+            configure_application_surface_stream(base, 320, 200, &interval, true);
 
         assert!(configuration.ignore_global_clip_single_window());
+    }
+
+    #[test]
+    fn macos13_configuration_avoids_the_unavailable_unclipped_window_option() {
+        let interval = screencapturekit::cm::CMTime::new(1, 30);
+        let base = SCStreamConfiguration::new().with_ignore_global_clip_single_window(false);
+        let configuration =
+            configure_application_surface_stream(base, 320, 200, &interval, false);
+
+        assert!(!configuration.ignore_global_clip_single_window());
+    }
+
+    #[test]
+    fn macos13_filters_windows_that_require_unclipped_capture() {
+        let displays = [ApplicationCaptureBounds::new(0.0, 0.0, 1_440.0, 900.0)];
+        let contained = ApplicationCaptureBounds::new(100.0, 100.0, 800.0, 600.0);
+        let partially_offscreen = ApplicationCaptureBounds::new(-20.0, 100.0, 800.0, 600.0);
+        let crossing_display_edge = ApplicationCaptureBounds::new(1_200.0, 100.0, 800.0, 600.0);
+
+        assert!(application_window_is_capturable(
+            contained,
+            false,
+            &displays
+        ));
+        assert!(!application_window_is_capturable(
+            partially_offscreen,
+            false,
+            &displays
+        ));
+        assert!(!application_window_is_capturable(
+            crossing_display_edge,
+            false,
+            &displays
+        ));
+        assert!(application_window_is_capturable(
+            crossing_display_edge,
+            true,
+            &displays
+        ));
     }
 
     #[test]

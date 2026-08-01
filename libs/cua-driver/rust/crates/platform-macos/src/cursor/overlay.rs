@@ -2413,6 +2413,57 @@ mod tests {
     }
 
     #[test]
+    fn stale_timeout_recovery_cannot_replace_a_newer_move_generation() {
+        let mut map = empty_map();
+        let key = "generation-race".to_owned();
+        assert!(seed_start_in_map(&mut map, &key, 20.0, 20.0));
+        apply_msg(
+            &mut map,
+            OverlayMsg::RegisteredMove {
+                key: key.clone(),
+                cmd: OverlayCommand::MoveTo {
+                    x: 40.0,
+                    y: 40.0,
+                    end_heading_radians: 0.0,
+                },
+                generation: 1,
+            },
+        );
+        apply_msg(
+            &mut map,
+            OverlayMsg::RegisteredMove {
+                key: key.clone(),
+                cmd: OverlayCommand::MoveTo {
+                    x: 80.0,
+                    y: 80.0,
+                    end_heading_radians: 0.0,
+                },
+                generation: 2,
+            },
+        );
+
+        let applied = apply_msg(
+            &mut map,
+            OverlayMsg::TimeoutRecovery {
+                key: key.clone(),
+                cmd: OverlayCommand::SnapTo {
+                    x: 40.0,
+                    y: 40.0,
+                    heading_radians: Some(0.0),
+                },
+                generation: 1,
+            },
+        );
+
+        assert!(applied.is_none(), "stale recovery must be discarded");
+        assert_eq!(map.active_move_generations.get(&key), Some(&2));
+        assert!(
+            map.cursors[&key].core.path.is_some(),
+            "the newer glide must remain active"
+        );
+    }
+
+    #[test]
     fn lifecycle_events_remain_ordered_behind_a_saturated_renderer_backlog() {
         let (command_tx, command_rx) = std::sync::mpsc::channel();
         let pending = std::sync::atomic::AtomicUsize::new(0);
