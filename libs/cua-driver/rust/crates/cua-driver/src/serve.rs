@@ -2851,7 +2851,7 @@ pub async fn run_serve(
 
     // Clean up.
     #[cfg(target_os = "macos")]
-    platform_macos::application_surface::stop_all();
+    platform_macos::application_surface::stop_all().await;
     let _ = std::fs::remove_file(socket_path);
     if let Some(pid_path) = pid_file_path {
         let _ = std::fs::remove_file(pid_path);

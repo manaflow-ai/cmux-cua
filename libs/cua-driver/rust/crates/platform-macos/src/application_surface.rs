@@ -1006,6 +1006,19 @@ impl Drop for ApplicationSurfaceSession {
     }
 }
 
+impl ApplicationSurfaceSession {
+    fn stop_blocking(&mut self) {
+        self.input_state
+            .deactivate(self.target_process_id, self.target_window_id);
+        self.frame_state.deactivate_publication();
+        if let Some(stream) = self.stream.take() {
+            if let Err(error) = stream.stop_capture() {
+                tracing::warn!(%error, "application surface capture did not stop cleanly");
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct ApplicationSurfaceManager {
     sessions: HashMap<String, ApplicationSurfaceSession>,
@@ -1014,6 +1027,7 @@ struct ApplicationSurfaceManager {
 
 impl ApplicationSurfaceManager {
     fn begin_shutdown(&mut self) -> HashMap<String, ApplicationSurfaceSession> {
+        self.is_closing = true;
         std::mem::take(&mut self.sessions)
     }
 }
@@ -1650,6 +1664,13 @@ pub async fn start(
 fn start_blocking(
     request: ApplicationSurfaceStartRequest,
 ) -> anyhow::Result<ApplicationSurfaceStartResult> {
+    if manager()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_closing
+    {
+        return Err(ApplicationSurfaceError::SessionUnavailable.into());
+    }
     require_application_surface_permissions(ApplicationSurfacePermissionUse::CaptureAndInput)?;
     if !(1..=120).contains(&request.frame_rate) || request.window_id == 0 || request.process_id <= 0
     {
@@ -1720,21 +1741,24 @@ fn start_blocking(
         session_id: session_id.clone(),
         frame_transport: ring.descriptor(),
     };
+    let mut session = ApplicationSurfaceSession {
+        target_window_id: request.window_id,
+        target_process_id: request.process_id,
+        target_uses_chromium_background_preparation:
+            application_surface_target_uses_chromium_background_preparation(request.process_id),
+        stream: Some(stream),
+        frame_state,
+        input_state,
+    };
     let mut manager = manager()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    manager.sessions.insert(
-        session_id,
-        ApplicationSurfaceSession {
-            target_window_id: request.window_id,
-            target_process_id: request.process_id,
-            target_uses_chromium_background_preparation:
-                application_surface_target_uses_chromium_background_preparation(request.process_id),
-            stream: Some(stream),
-            frame_state,
-            input_state,
-        },
-    );
+    if manager.is_closing {
+        drop(manager);
+        session.stop_blocking();
+        return Err(ApplicationSurfaceError::SessionUnavailable.into());
+    }
+    manager.sessions.insert(session_id, session);
     Ok(result)
 }
 
@@ -1743,12 +1767,7 @@ fn application_surface_stream_configuration(
     height: usize,
     interval: &screencapturekit::cm::CMTime,
 ) -> SCStreamConfiguration {
-    configure_application_surface_stream(
-        SCStreamConfiguration::new(),
-        width,
-        height,
-        interval,
-    )
+    configure_application_surface_stream(SCStreamConfiguration::new(), width, height, interval)
 }
 
 fn configure_application_surface_stream(
@@ -1762,6 +1781,7 @@ fn configure_application_surface_stream(
         .with_height(height as u32)
         .with_minimum_frame_interval(interval)
         .with_queue_depth(3)
+        .with_ignore_global_clip_single_window(true)
         // The host already presents the local pointer over the pane. Capturing
         // the target window's synthetic pointer would render a second cursor.
         .with_shows_cursor(false)
@@ -1829,14 +1849,29 @@ pub fn acknowledge_attachment(session_id: &str) -> bool {
     ring.is_some_and(|ring| ring.acknowledge_attachment())
 }
 
-pub fn stop_all() {
+pub async fn stop_all() {
+    {
+        let mut manager = manager()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        manager.is_closing = true;
+    }
+    let _lifecycle_guard = application_surface_lifecycle_gate().lock_owned().await;
     let sessions = {
         let mut manager = manager()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         manager.begin_shutdown()
     };
-    drop(sessions);
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        for mut session in sessions.into_values() {
+            session.stop_blocking();
+        }
+    })
+    .await
+    {
+        tracing::error!(%error, "application surface shutdown owner failed");
+    }
 }
 
 pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
