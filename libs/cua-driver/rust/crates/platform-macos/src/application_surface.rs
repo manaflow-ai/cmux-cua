@@ -2542,6 +2542,7 @@ extern "C" {
 mod tests {
     use super::*;
     use screencapturekit::cm::{FrameInfo, SCFrameStatus};
+    use screencapturekit::prelude::SCStreamDelegateTrait;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -2756,6 +2757,34 @@ mod tests {
         assert!(ring
             .geometry_for_published_sequence(second_sequence)
             .is_some());
+    }
+
+    #[test]
+    fn inactive_capture_delegate_invalidates_frames_until_fresh_content() {
+        let ring = SharedFrameRing::create(2, 2).unwrap();
+        let frame = [0x5A; 16];
+        ring.publish(&frame, 8, frame_geometry(NormalizedContentRect::default()))
+            .unwrap();
+        let frame_state = Arc::new(CaptureFrameState {
+            ring: Arc::clone(&ring),
+            _resource_reservation: None,
+            publication: Mutex::new(()),
+            failed: AtomicBool::new(false),
+            input_state: Arc::new(ApplicationSurfaceInputState::new()),
+            target_window_id: 42,
+            target_process_id: 43,
+            fallback_source_width: 2.0,
+            fallback_source_height: 2.0,
+        });
+        let delegate = application_surface_stream_callbacks(Arc::clone(&frame_state));
+
+        delegate.stream_did_become_inactive();
+
+        assert!(!ring.is_available());
+        assert!(!frame_state.failed.load(Ordering::Acquire));
+        ring.publish(&frame, 8, frame_geometry(NormalizedContentRect::default()))
+            .unwrap();
+        assert!(ring.is_available());
     }
 
     #[test]
@@ -3401,6 +3430,72 @@ mod tests {
         let _released_guard = tokio::time::timeout(Duration::from_secs(1), gate.lock())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn application_surface_shutdown_is_bounded_while_lifecycle_is_owned() {
+        use std::sync::atomic::AtomicBool;
+
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let lifecycle_owner = gate.lock().await;
+        let deactivated = Arc::new(AtomicBool::new(false));
+        let deactivated_for_action = Arc::clone(&deactivated);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_for_action = Arc::clone(&stopped);
+
+        let completed = tokio::time::timeout(
+            Duration::from_secs(1),
+            bounded_application_surface_shutdown_with(
+                Duration::from_millis(50),
+                Arc::clone(&gate),
+                move || {
+                    deactivated_for_action.store(true, Ordering::Release);
+                },
+                move |()| stopped_for_action.store(true, Ordering::Release),
+            ),
+        )
+        .await
+        .expect("shutdown waited indefinitely for the lifecycle gate");
+
+        assert!(!completed);
+        assert!(deactivated.load(Ordering::Acquire));
+        assert!(!stopped.load(Ordering::Acquire));
+        drop(lifecycle_owner);
+    }
+
+    #[tokio::test]
+    async fn application_surface_shutdown_is_bounded_while_native_stop_blocks() {
+        use std::sync::atomic::AtomicBool;
+
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let deactivated = Arc::new(AtomicBool::new(false));
+        let deactivated_for_action = Arc::clone(&deactivated);
+        let (stop_entered_tx, stop_entered_rx) = mpsc::channel();
+        let (release_stop_tx, release_stop_rx) = mpsc::channel();
+
+        let completed = tokio::time::timeout(
+            Duration::from_secs(1),
+            bounded_application_surface_shutdown_with(
+                Duration::from_millis(100),
+                gate,
+                move || {
+                    deactivated_for_action.store(true, Ordering::Release);
+                },
+                move |()| {
+                    stop_entered_tx.send(()).unwrap();
+                    release_stop_rx.recv().unwrap();
+                },
+            ),
+        )
+        .await
+        .expect("shutdown waited indefinitely for native capture stop");
+
+        assert!(!completed);
+        assert!(deactivated.load(Ordering::Acquire));
+        stop_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("native capture stop did not start");
+        release_stop_tx.send(()).unwrap();
     }
 
     #[test]
