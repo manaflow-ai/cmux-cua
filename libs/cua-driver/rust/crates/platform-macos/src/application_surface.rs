@@ -50,6 +50,7 @@ pub const MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT: usize = 64;
 const BGRA_PIXEL_FORMAT: u32 = u32::from_be_bytes(*b"BGRA");
 const APPLICATION_WINDOW_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const APPLICATION_SURFACE_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const APPLICATION_SURFACE_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const APPLICATION_WINDOW_CONTAINMENT_TOLERANCE: f64 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -988,6 +989,16 @@ impl CaptureFrameState {
             .release_pressed_locked(self.target_process_id, self.target_window_id);
     }
 
+    fn mark_unavailable(&self) {
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.failed.load(Ordering::Acquire) {
+            self.mark_unavailable_locked();
+        }
+    }
+
     fn deactivate_publication(&self) {
         let _publication = self
             .publication
@@ -1051,6 +1062,13 @@ impl CaptureFrameState {
     }
 }
 
+fn application_surface_stream_callbacks(frame_state: Arc<CaptureFrameState>) -> StreamCallbacks {
+    let error_state = Arc::clone(&frame_state);
+    StreamCallbacks::new()
+        .on_error(move |_| error_state.mark_failed())
+        .on_inactive(move || frame_state.mark_unavailable())
+}
+
 struct ApplicationSurfaceSession {
     target_window_id: u32,
     target_process_id: i32,
@@ -1087,10 +1105,19 @@ impl Drop for ApplicationSurfaceSession {
 }
 
 impl ApplicationSurfaceSession {
-    fn stop_blocking(&mut self) {
+    fn deactivate(&self) {
         self.input_state
             .deactivate(self.target_process_id, self.target_window_id);
         self.frame_state.deactivate_publication();
+    }
+
+    fn into_deactivated_stream(mut self) -> Option<SCStream> {
+        self.deactivate();
+        self.stream.take()
+    }
+
+    fn stop_blocking(&mut self) {
+        self.deactivate();
         if let Some(stream) = self.stream.take() {
             if let Err(error) = stream.stop_capture() {
                 tracing::warn!(%error, "application surface capture did not stop cleanly");
@@ -1636,6 +1663,40 @@ where
         })
 }
 
+async fn bounded_application_surface_shutdown_with<Value, Deactivate, Stop>(
+    timeout: std::time::Duration,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    deactivate: Deactivate,
+    stop: Stop,
+) -> bool
+where
+    Value: Send + 'static,
+    Deactivate: FnOnce() -> Value,
+    Stop: FnOnce(Value) + Send + 'static,
+{
+    let value = deactivate();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let Ok(lifecycle_guard) = tokio::time::timeout_at(deadline, gate.lock_owned()).await else {
+        return false;
+    };
+    let (completion_sender, completion_receiver) = tokio::sync::oneshot::channel();
+    let owner = std::thread::Builder::new()
+        .name("application-surface-bounded-stop".to_owned())
+        .spawn(move || {
+            let _lifecycle_guard = lifecycle_guard;
+            stop(value);
+            let _ = completion_sender.send(());
+        });
+    if let Err(error) = owner {
+        tracing::error!(%error, "could not start bounded application surface shutdown owner");
+        return false;
+    }
+    matches!(
+        tokio::time::timeout_at(deadline, completion_receiver).await,
+        Ok(Ok(()))
+    )
+}
+
 async fn finish_application_surface_cleanup_with<Stop>(stop: Stop)
 where
     Stop: FnOnce() + Send + 'static,
@@ -1850,10 +1911,7 @@ fn start_blocking(
         supports_unclipped_window_capture,
     );
     let callback_state = frame_state.clone();
-    let error_state = frame_state.clone();
-    let delegate = StreamCallbacks::new().on_error(move |_| {
-        error_state.mark_failed();
-    });
+    let delegate = application_surface_stream_callbacks(Arc::clone(&frame_state));
     let mut stream = SCStream::new_with_delegate(&filter, &configuration, delegate);
     stream
         .add_output_handler(
@@ -1999,27 +2057,38 @@ pub fn acknowledge_attachment(session_id: &str) -> bool {
 }
 
 pub async fn stop_all() {
-    {
-        let mut manager = manager()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        manager.is_closing = true;
-    }
-    let _lifecycle_guard = application_surface_lifecycle_gate().lock_owned().await;
     let sessions = {
         let mut manager = manager()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         manager.begin_shutdown()
     };
-    if let Err(error) = tokio::task::spawn_blocking(move || {
-        for mut session in sessions.into_values() {
-            session.stop_blocking();
-        }
-    })
-    .await
-    {
-        tracing::error!(%error, "application surface shutdown owner failed");
+    if sessions.is_empty() {
+        return;
+    }
+    let completed = bounded_application_surface_shutdown_with(
+        APPLICATION_SURFACE_SHUTDOWN_TIMEOUT,
+        application_surface_lifecycle_gate(),
+        move || {
+            sessions
+                .into_values()
+                .filter_map(ApplicationSurfaceSession::into_deactivated_stream)
+                .collect::<Vec<_>>()
+        },
+        |streams| {
+            for stream in streams {
+                if let Err(error) = stream.stop_capture() {
+                    tracing::warn!(%error, "application surface capture did not stop cleanly");
+                }
+            }
+        },
+    )
+    .await;
+    if !completed {
+        tracing::warn!(
+            timeout_ms = APPLICATION_SURFACE_SHUTDOWN_TIMEOUT.as_millis(),
+            "application surface shutdown exceeded its deadline"
+        );
     }
 }
 
