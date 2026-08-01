@@ -2496,6 +2496,37 @@ mod tests {
     }
 
     #[test]
+    fn deactivated_frame_ring_unlinks_before_capture_owner_drops() {
+        let ring = SharedFrameRing::create(2, 2).unwrap();
+        let name = ring.name.clone();
+        let frame_state = CaptureFrameState {
+            ring: Arc::clone(&ring),
+            _resource_reservation: None,
+            publication: Mutex::new(()),
+            failed: AtomicBool::new(false),
+            input_state: Arc::new(ApplicationSurfaceInputState::new()),
+            target_window_id: 42,
+            target_process_id: 43,
+            fallback_source_width: 2.0,
+            fallback_source_height: 2.0,
+        };
+
+        frame_state.deactivate_publication();
+
+        let reopened = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        if reopened >= 0 {
+            unsafe {
+                libc::close(reopened);
+            }
+        }
+        assert_eq!(
+            reopened, -1,
+            "session deactivation must unlink the frame ring synchronously"
+        );
+        assert_eq!(Arc::strong_count(&ring), 2, "capture owner remains alive");
+    }
+
+    #[test]
     fn unknown_frame_ring_attachment_is_rejected() {
         assert!(!acknowledge_attachment("missing-session"));
     }

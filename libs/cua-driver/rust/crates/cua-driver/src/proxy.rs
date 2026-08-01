@@ -1713,8 +1713,24 @@ async fn wait_for_daemon_permission_readiness(
     session_id: &str,
     external_permission_flow: bool,
 ) -> anyhow::Result<()> {
+    wait_for_daemon_permission_readiness_with_timeout(
+        socket_path,
+        session_id,
+        external_permission_flow,
+        std::time::Duration::from_secs(55),
+    )
+    .await
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_daemon_permission_readiness_with_timeout(
+    socket_path: &str,
+    session_id: &str,
+    external_permission_flow: bool,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
-    let deadline = Instant::now() + Duration::from_secs(55);
+    let deadline = Instant::now() + timeout;
     loop {
         if Instant::now() >= deadline {
             if external_permission_flow {
@@ -3117,6 +3133,32 @@ mod tests {
             !state.needs_grant_wait(true, false),
             "driver-owned permission flow may retain its completed grant wait"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn permission_probe_is_bounded_by_the_onboarding_deadline() {
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().expect("socket tempdir");
+        let socket = root.path().join("stalled-permission.sock");
+        let listener = UnixListener::bind(&socket).expect("bind stalled permission daemon");
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept permission probe");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+
+        let readiness = wait_for_daemon_permission_readiness_with_timeout(
+            socket.to_str().expect("UTF-8 socket path"),
+            "deadline-test",
+            true,
+            std::time::Duration::from_millis(20),
+        );
+        let bounded = tokio::time::timeout(std::time::Duration::from_millis(100), readiness).await;
+        server.join().expect("stalled permission daemon joins");
+
+        let result = bounded.expect("permission probe outlived its onboarding deadline");
+        assert!(result.is_err(), "deadline must fail closed");
     }
 
     #[cfg(target_os = "macos")]
