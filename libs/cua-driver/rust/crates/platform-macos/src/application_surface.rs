@@ -2096,6 +2096,24 @@ pub fn send_event(event: ApplicationSurfaceEvent) -> anyhow::Result<()> {
     send_events(vec![event])
 }
 
+fn dispatch_application_surface_batch_with<Item, Dispatch, Release>(
+    items: impl IntoIterator<Item = Item>,
+    mut dispatch: Dispatch,
+    release: Release,
+) -> anyhow::Result<()>
+where
+    Dispatch: FnMut(Item) -> anyhow::Result<()>,
+    Release: FnOnce(),
+{
+    for item in items {
+        if let Err(error) = dispatch(item) {
+            release();
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
     let session_id = validate_event_batch(&events)?.to_owned();
     let (
@@ -2147,18 +2165,21 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
         },
         &input_state,
     )?;
-    for (event, content) in events.into_iter().zip(resolved_content) {
-        dispatch_event(
-            event,
-            target_window_id,
-            target_process_id,
-            target_uses_chromium_background_preparation,
-            &target,
-            content,
-            &input_state,
-        )?;
-    }
-    Ok(())
+    dispatch_application_surface_batch_with(
+        events.into_iter().zip(resolved_content),
+        |(event, content)| {
+            dispatch_event(
+                event,
+                target_window_id,
+                target_process_id,
+                target_uses_chromium_background_preparation,
+                &target,
+                content,
+                &input_state,
+            )
+        },
+        || input_state.release_pressed_locked(target_process_id, target_window_id),
+    )
 }
 
 fn validate_event_batch(events: &[ApplicationSurfaceEvent]) -> anyhow::Result<&str> {
