@@ -3611,6 +3611,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn application_surface_shutdown_deadline_includes_deactivation() {
+        use std::sync::atomic::AtomicBool;
+
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let deactivated = Arc::new(AtomicBool::new(false));
+        let deactivated_for_action = Arc::clone(&deactivated);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_for_action = Arc::clone(&stopped);
+
+        let completed = bounded_application_surface_shutdown_with(
+            Duration::from_millis(20),
+            gate,
+            move || {
+                std::thread::sleep(Duration::from_millis(150));
+                deactivated_for_action.store(true, Ordering::Release);
+            },
+            move |()| stopped_for_action.store(true, Ordering::Release),
+        )
+        .await;
+
+        assert!(
+            !completed,
+            "lock-taking deactivation must consume the shutdown deadline"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !stopped.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed-out shutdown owner did not finish cleanup");
+        assert!(deactivated.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
     async fn application_surface_shutdown_is_bounded_while_native_stop_blocks() {
         use std::sync::atomic::AtomicBool;
 
@@ -3675,6 +3710,46 @@ mod tests {
         release_stop_tx.send(()).unwrap();
         shutdown.join().unwrap();
         assert!(gate.try_lock().is_ok());
+    }
+
+    #[test]
+    fn application_surface_drop_shutdown_does_not_wait_for_deactivation() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let (deactivate_entered_tx, deactivate_entered_rx) = mpsc::channel();
+        let (release_deactivate_tx, release_deactivate_rx) = mpsc::channel();
+        let (shutdown_owner_tx, shutdown_owner_rx) = mpsc::channel();
+
+        let caller = std::thread::spawn(move || {
+            let owner = spawn_application_surface_shutdown_with(
+                gate,
+                move || {
+                    deactivate_entered_tx.send(()).unwrap();
+                    release_deactivate_rx.recv().unwrap();
+                },
+                || {},
+            )
+            .unwrap();
+            shutdown_owner_tx.send(owner).unwrap();
+        });
+
+        deactivate_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("deactivation did not start");
+        let early_owner = shutdown_owner_rx.recv_timeout(Duration::from_millis(250));
+        let returned_before_release = early_owner.is_ok();
+        release_deactivate_tx.send(()).unwrap();
+        let owner = early_owner.unwrap_or_else(|_| {
+            shutdown_owner_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown owner was not returned after deactivation")
+        });
+        caller.join().unwrap();
+        owner.join().unwrap();
+
+        assert!(
+            returned_before_release,
+            "session drop must hand lock-taking deactivation to its cleanup owner"
+        );
     }
 
     #[test]
