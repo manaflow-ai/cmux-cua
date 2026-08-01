@@ -1009,6 +1009,13 @@ impl Drop for ApplicationSurfaceSession {
 #[derive(Default)]
 struct ApplicationSurfaceManager {
     sessions: HashMap<String, ApplicationSurfaceSession>,
+    is_closing: bool,
+}
+
+impl ApplicationSurfaceManager {
+    fn begin_shutdown(&mut self) -> HashMap<String, ApplicationSurfaceSession> {
+        std::mem::take(&mut self.sessions)
+    }
 }
 
 #[derive(Default)]
@@ -1687,17 +1694,7 @@ fn start_blocking(
         .with_window(&source_window)
         .build();
     let interval = screencapturekit::cm::CMTime::new(1, request.frame_rate as i32);
-    let configuration = SCStreamConfiguration::new()
-        .with_width(width as u32)
-        .with_height(height as u32)
-        .with_minimum_frame_interval(&interval)
-        .with_queue_depth(3)
-        // The host already presents the local pointer over the pane. Capturing
-        // the target window's synthetic pointer would render a second cursor.
-        .with_shows_cursor(false)
-        .with_pixel_format(PixelFormat::BGRA)
-        .with_scales_to_fit(true)
-        .with_preserves_aspect_ratio(true);
+    let configuration = application_surface_stream_configuration(width, height, &interval);
     let callback_state = frame_state.clone();
     let error_state = frame_state.clone();
     let delegate = StreamCallbacks::new().on_error(move |_| {
@@ -1739,6 +1736,38 @@ fn start_blocking(
         },
     );
     Ok(result)
+}
+
+fn application_surface_stream_configuration(
+    width: usize,
+    height: usize,
+    interval: &screencapturekit::cm::CMTime,
+) -> SCStreamConfiguration {
+    configure_application_surface_stream(
+        SCStreamConfiguration::new(),
+        width,
+        height,
+        interval,
+    )
+}
+
+fn configure_application_surface_stream(
+    configuration: SCStreamConfiguration,
+    width: usize,
+    height: usize,
+    interval: &screencapturekit::cm::CMTime,
+) -> SCStreamConfiguration {
+    configuration
+        .with_width(width as u32)
+        .with_height(height as u32)
+        .with_minimum_frame_interval(interval)
+        .with_queue_depth(3)
+        // The host already presents the local pointer over the pane. Capturing
+        // the target window's synthetic pointer would render a second cursor.
+        .with_shows_cursor(false)
+        .with_pixel_format(PixelFormat::BGRA)
+        .with_scales_to_fit(true)
+        .with_preserves_aspect_ratio(true)
 }
 
 fn require_application_surface_permissions(
@@ -1805,7 +1834,7 @@ pub fn stop_all() {
         let mut manager = manager()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut manager.sessions)
+        manager.begin_shutdown()
     };
     drop(sessions);
 }
@@ -2338,6 +2367,25 @@ mod tests {
             source_width: 2.0,
             source_height: 2.0,
         }
+    }
+
+    #[test]
+    fn application_surface_configuration_preserves_cross_display_window_content() {
+        let interval = screencapturekit::cm::CMTime::new(1, 30);
+        let base = SCStreamConfiguration::new().with_ignore_global_clip_single_window(false);
+        let configuration = configure_application_surface_stream(base, 320, 200, &interval);
+
+        assert!(configuration.ignore_global_clip_single_window());
+    }
+
+    #[test]
+    fn application_surface_shutdown_closes_future_start_admission() {
+        let mut manager = ApplicationSurfaceManager::default();
+
+        let sessions = manager.begin_shutdown();
+
+        assert!(sessions.is_empty());
+        assert!(manager.is_closing);
     }
 
     #[test]
