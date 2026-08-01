@@ -3895,6 +3895,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn application_surface_shutdown_drains_tracked_cleanup_before_native_deadline() {
+        use std::sync::atomic::AtomicBool;
+
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let critical_completed = Arc::new(AtomicBool::new(false));
+        let critical_completed_for_action = Arc::clone(&critical_completed);
+        let (critical_entered_tx, critical_entered_rx) = mpsc::channel();
+        let (release_critical_tx, release_critical_rx) = mpsc::channel();
+        let (native_entered_tx, native_entered_rx) = mpsc::channel();
+        let (release_native_tx, release_native_rx) = mpsc::channel();
+
+        let owner = spawn_application_surface_shutdown_with(
+            gate,
+            move || {
+                critical_entered_tx.send(()).unwrap();
+                release_critical_rx.recv().unwrap();
+                critical_completed_for_action.store(true, Ordering::Release);
+            },
+            move || {
+                native_entered_tx.send(()).unwrap();
+                release_native_rx.recv().unwrap();
+            },
+        )
+        .unwrap();
+        let mut manager = ApplicationSurfaceManager::default();
+        manager.track_cleanup(owner);
+        let owners = manager.begin_shutdown();
+        let mut shutdown = tokio::spawn(drain_application_surface_cleanup_owners_with(
+            owners,
+            Duration::from_millis(40),
+        ));
+
+        critical_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("tracked critical cleanup did not start");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown returned before tracked critical cleanup completed"
+        );
+
+        release_critical_tx.send(()).unwrap();
+        native_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("tracked native stop did not start");
+        assert!(critical_completed.load(Ordering::Acquire));
+        assert!(!tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("tracked native stop was not bounded")
+            .expect("cleanup drain task failed"));
+
+        release_native_tx.send(()).unwrap();
+    }
+
+    #[tokio::test]
     async fn application_surface_shutdown_is_bounded_while_native_stop_blocks() {
         use std::sync::atomic::AtomicBool;
 
