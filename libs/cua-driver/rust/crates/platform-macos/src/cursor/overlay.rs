@@ -2278,6 +2278,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    static ARRIVAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn negative_x_cursor_is_not_the_unplaced_sentinel() {
         let mut core = RenderStateCore::new(CursorConfig::default());
@@ -2459,7 +2461,6 @@ mod tests {
 
     #[tokio::test]
     async fn failed_move_send_and_timeout_both_clear_the_registered_waiter() {
-        static ARRIVAL_TEST_LOCK: Mutex<()> = Mutex::new(());
         let _test_guard = ARRIVAL_TEST_LOCK.lock().unwrap();
         *ARRIVAL_TX.lock().unwrap() = Some(HashMap::new());
 
@@ -2535,6 +2536,77 @@ mod tests {
             ),
             "headless animation must not enqueue into the undrained renderer"
         );
+    }
+
+    #[test]
+    fn concurrent_same_cursor_registration_preserves_enqueue_order() {
+        let _test_guard = ARRIVAL_TEST_LOCK.lock().unwrap();
+        *ARRIVAL_TX.lock().unwrap() = Some(HashMap::new());
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let first_command_tx = command_tx.clone();
+        let (first_registered_tx, first_registered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            register_cursor_move_if_renderer_available_with(
+                true,
+                Some(&first_command_tx),
+                "ordered".to_owned(),
+                OverlayCommand::MoveTo {
+                    x: 1.0,
+                    y: 1.0,
+                    end_heading_radians: 0.0,
+                },
+                move || {
+                    first_registered_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                },
+            )
+        });
+        first_registered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first waiter was not registered");
+
+        let second_command_tx = command_tx.clone();
+        let (second_registered_tx, second_registered_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            register_cursor_move_if_renderer_available_with(
+                true,
+                Some(&second_command_tx),
+                "ordered".to_owned(),
+                OverlayCommand::MoveTo {
+                    x: 2.0,
+                    y: 2.0,
+                    end_heading_radians: 0.0,
+                },
+                move || second_registered_tx.send(()).unwrap(),
+            )
+        });
+
+        assert!(matches!(
+            second_registered_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_first_tx.send(()).unwrap();
+        second_registered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second waiter did not register after the first enqueue");
+        let first_waiter = first.join().unwrap().expect("first move was not enqueued");
+        let second_waiter = second.join().unwrap().expect("second move was not enqueued");
+
+        let generations = [command_rx.recv().unwrap(), command_rx.recv().unwrap()]
+            .map(|message| match message {
+                OverlayMsg::RegisteredMove { generation, .. } => generation,
+                other => panic!("unexpected renderer message: {other:?}"),
+            });
+        assert!(
+            generations[0] < generations[1],
+            "renderer queue order must match waiter generation order"
+        );
+
+        arrival_cancel(&"ordered".to_owned(), first_waiter.0);
+        arrival_cancel(&"ordered".to_owned(), second_waiter.0);
+        drop((first_waiter, second_waiter));
+        *ARRIVAL_TX.lock().unwrap() = None;
     }
 
     #[test]
