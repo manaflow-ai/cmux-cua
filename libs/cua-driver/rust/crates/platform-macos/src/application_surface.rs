@@ -3178,6 +3178,15 @@ mod tests {
     }
 
     #[test]
+    fn application_window_filter_distinguishes_known_empty_accessibility_from_failure() {
+        assert_eq!(
+            application_accessibility_window_id_set(Some(Vec::new())),
+            Some(std::collections::HashSet::new())
+        );
+        assert_eq!(application_accessibility_window_id_set(None), None);
+    }
+
+    #[test]
     fn application_surface_shutdown_closes_future_start_admission() {
         let mut manager = ApplicationSurfaceManager::default();
 
