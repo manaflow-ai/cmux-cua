@@ -1351,11 +1351,10 @@ fn daemon_permission_status(
     let status = platform_macos::permissions::current_status();
     let panel = platform_macos::permissions::panel::lifecycle();
     let recovery = platform_macos::permissions::gate::recovery_lifecycle();
-    serde_json::json!({
+    let mut result = serde_json::json!({
         "accessibility": status.accessibility,
         "screen_recording": status.screen_recording,
         "all_granted": status.all_granted(),
-        "external_permission_ready": external_permission_ready.unwrap_or(false),
         "profile": profile,
         "panel": {
             "visible": panel.visible,
@@ -1373,7 +1372,26 @@ fn daemon_permission_status(
             "pid": std::process::id(),
             "instance": daemon_instance_id(),
         },
-    })
+    });
+    if let Some(ready) = external_permission_ready {
+        result
+            .as_object_mut()
+            .expect("permission status must be an object")
+            .insert(
+                "external_permission_ready".to_owned(),
+                serde_json::Value::Bool(ready),
+            );
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn external_permission_readiness_from_state(state: u8) -> Option<bool> {
+    match state {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
 }
 
 fn app_approval_broker_matches(
@@ -1706,8 +1724,11 @@ pub async fn run_serve(
     let approval_brokers = std::sync::Arc::new(std::sync::Mutex::new(
         std::collections::HashMap::<String, String>::new(),
     ));
-    let external_permission_ready =
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // State zero means the external host has not negotiated readiness
+    // ownership. Older hosts therefore retain the grant-only behavior. Once a
+    // capable host calls the setter, one and two preserve explicit false/true.
+    let external_permission_readiness =
+        std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
 
     loop {
         tokio::select! {
@@ -1748,7 +1769,7 @@ pub async fn run_serve(
                 let last_activity = last_activity.clone();
                 let approval_peer_pid = approval_broker_peer_pid(&stream);
                 let approval_brokers = approval_brokers.clone();
-                let external_permission_ready = external_permission_ready.clone();
+                let external_permission_readiness = external_permission_readiness.clone();
 
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.into_split();
@@ -1820,9 +1841,11 @@ pub async fn run_serve(
                                 #[cfg(target_os = "macos")]
                                 let resp = DaemonResponse::ok(daemon_permission_status(
                                     profile,
-                                    Some(external_permission_ready.load(
-                                        std::sync::atomic::Ordering::Acquire
-                                    )),
+                                    external_permission_readiness_from_state(
+                                        external_permission_readiness.load(
+                                            std::sync::atomic::Ordering::Acquire
+                                        )
+                                    ),
                                 ));
                                 #[cfg(not(target_os = "macos"))]
                                 let resp = DaemonResponse::err(
@@ -1845,8 +1868,8 @@ pub async fn run_serve(
                                     .and_then(|args| args.get("ready"))
                                     .and_then(serde_json::Value::as_bool)
                                 {
-                                    external_permission_ready.store(
-                                        ready,
+                                    external_permission_readiness.store(
+                                        if ready { 2 } else { 1 },
                                         std::sync::atomic::Ordering::Release,
                                     );
                                     DaemonResponse::ok(serde_json::json!({
@@ -3591,6 +3614,16 @@ mod external_permission_flow_tests {
         let status = daemon_permission_status(DaemonProfile::Native, None);
 
         assert!(status.get("external_permission_ready").is_none());
+        assert_eq!(
+            daemon_permission_status(DaemonProfile::Native, Some(false))
+                ["external_permission_ready"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            daemon_permission_status(DaemonProfile::Native, Some(true))
+                ["external_permission_ready"],
+            serde_json::json!(true)
+        );
     }
 
     #[cfg(target_os = "macos")]
