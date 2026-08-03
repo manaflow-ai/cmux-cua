@@ -5,7 +5,7 @@
 //! authority. Control and input use the authenticated daemon socket. Frames use
 //! a permission-restricted, versioned triple-buffer in POSIX shared memory.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void, CString};
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
@@ -13,6 +13,7 @@ use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context};
+use core_foundation::base::{CFRelease, CFTypeRef};
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton, ScrollEventUnit};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -26,6 +27,10 @@ use screencapturekit::stream::StreamCallbacks;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::ax::bindings::{
+    ax_get_window_id, copy_ax_windows, kAXErrorSuccess, AXUIElementCreateApplication,
+    AXUIElementSetMessagingTimeout,
+};
 use crate::{permissions, windows};
 
 const FRAME_HEADER_BYTE_COUNT: usize = 64;
@@ -52,6 +57,7 @@ const APPLICATION_WINDOW_LIST_TIMEOUT: std::time::Duration = std::time::Duration
 const APPLICATION_SURFACE_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const APPLICATION_SURFACE_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const APPLICATION_WINDOW_CONTAINMENT_TOLERANCE: f64 = 0.5;
+const APPLICATION_ACCESSIBILITY_WINDOW_TIMEOUT_SECONDS: f32 = 0.1;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ApplicationCaptureBounds {
@@ -132,8 +138,41 @@ fn application_window_is_capturable(
                 .any(|display| display.fully_contains(window)))
 }
 
-fn application_window_has_presentable_identity(is_on_screen: bool, title: Option<&str>) -> bool {
-    is_on_screen || title.is_some_and(|value| !value.trim().is_empty())
+fn application_accessibility_window_ids(process_id: i32) -> Option<HashSet<u32>> {
+    unsafe {
+        let application = AXUIElementCreateApplication(process_id);
+        if application.is_null() {
+            return None;
+        }
+        if AXUIElementSetMessagingTimeout(
+            application,
+            APPLICATION_ACCESSIBILITY_WINDOW_TIMEOUT_SECONDS,
+        ) != kAXErrorSuccess
+        {
+            CFRelease(application as CFTypeRef);
+            return None;
+        }
+
+        let windows = copy_ax_windows(application);
+        CFRelease(application as CFTypeRef);
+        let window_ids = windows
+            .iter()
+            .filter_map(|window| ax_get_window_id(*window))
+            .collect::<HashSet<_>>();
+        for window in windows {
+            CFRelease(window as CFTypeRef);
+        }
+        (!window_ids.is_empty()).then_some(window_ids)
+    }
+}
+
+fn application_window_has_user_facing_identity(
+    is_on_screen: bool,
+    window_id: u32,
+    accessibility_window_ids: Option<&HashSet<u32>>,
+) -> bool {
+    is_on_screen
+        || accessibility_window_ids.is_none_or(|window_ids| window_ids.contains(&window_id))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1738,28 +1777,26 @@ fn list_windows_blocking() -> anyhow::Result<Vec<ApplicationWindow>> {
         .get()
         .map_err(|error| anyhow!("could not enumerate application windows: {error}"))?;
     let helper_pid = std::process::id() as i32;
+    let mut accessibility_window_ids_by_process = HashMap::new();
     let mut windows = content
         .windows()
         .into_iter()
         .filter_map(|window| {
             let owner = window.owning_application()?;
             let frame = window.frame();
-            let window_title = window.title();
+            let window_id = window.window_id();
+            let process_id = owner.process_id();
             let capture_bounds = ApplicationCaptureBounds::new(
                 frame.origin.x,
                 frame.origin.y,
                 frame.size.width,
                 frame.size.height,
             );
-            if window.window_id() == 0
-                || owner.process_id() == helper_pid
+            if window_id == 0
+                || process_id == helper_pid
                 || window.window_layer() != 0
                 || frame.size.width < 64.0
                 || frame.size.height < 64.0
-                || !application_window_has_presentable_identity(
-                    window.is_on_screen(),
-                    window_title.as_deref(),
-                )
                 || !application_window_is_capturable(
                     capture_bounds,
                     supports_unclipped_window_capture,
@@ -1768,13 +1805,30 @@ fn list_windows_blocking() -> anyhow::Result<Vec<ApplicationWindow>> {
             {
                 return None;
             }
+            let is_on_screen = window.is_on_screen();
+            let has_user_facing_identity = if is_on_screen {
+                true
+            } else {
+                let accessibility_window_ids = accessibility_window_ids_by_process
+                    .entry(process_id)
+                    .or_insert_with(|| application_accessibility_window_ids(process_id));
+                application_window_has_user_facing_identity(
+                    false,
+                    window_id,
+                    accessibility_window_ids.as_ref(),
+                )
+            };
+            if !has_user_facing_identity {
+                return None;
+            }
             let owner_name = owner.application_name();
+            let window_title = window.title();
             let title = window_title
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| owner_name.clone());
             Some(ApplicationWindow {
-                window_id: window.window_id(),
-                process_id: owner.process_id(),
+                window_id,
+                process_id,
                 owner: owner_name,
                 title,
                 width: frame.size.width,
@@ -2276,6 +2330,7 @@ fn start_blocking(
         .with_exclude_desktop_windows(true)
         .get()
         .map_err(|error| anyhow!("could not enumerate application windows: {error}"))?;
+    let accessibility_window_ids = application_accessibility_window_ids(request.process_id);
     let source_window = content
         .windows()
         .into_iter()
@@ -2284,9 +2339,10 @@ fn start_blocking(
                 && window
                     .owning_application()
                     .is_some_and(|owner| owner.process_id() == request.process_id)
-                && application_window_has_presentable_identity(
+                && application_window_has_user_facing_identity(
                     window.is_on_screen(),
-                    window.title().as_deref(),
+                    window.window_id(),
+                    accessibility_window_ids.as_ref(),
                 )
                 && {
                     let frame = window.frame();
