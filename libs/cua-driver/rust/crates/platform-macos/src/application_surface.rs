@@ -50,7 +50,9 @@ const SOURCE_SIZE_MATCH_TOLERANCE_POINTS: f64 = 1.0;
 const MAXIMUM_FRAME_DIMENSION: usize = 16_384;
 const MAXIMUM_FRAME_RING_BYTE_COUNT: usize = 256 * 1_024 * 1_024;
 const MAXIMUM_ACTIVE_APPLICATION_SURFACE_COUNT: usize = 16;
-const MAXIMUM_APPLICATION_SURFACE_FRAME_BYTE_COUNT: usize = 512 * 1_024 * 1_024;
+const MAXIMUM_APPLICATION_SURFACE_FRAME_SLOT_BYTE_COUNT: usize = 16 * 1_024 * 1_024;
+const MAXIMUM_APPLICATION_SURFACE_COPY_BYTE_COUNT_PER_SECOND: usize = 512 * 1_024 * 1_024;
+const MAXIMUM_APPLICATION_SURFACE_TOTAL_RING_BYTE_COUNT: usize = 512 * 1_024 * 1_024;
 pub const MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT: usize = 64;
 const BGRA_PIXEL_FORMAT: u32 = u32::from_be_bytes(*b"BGRA");
 const APPLICATION_WINDOW_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1433,7 +1435,7 @@ fn application_surface_resource_budget() -> Arc<ApplicationSurfaceResourceBudget
     Arc::clone(BUDGET.get_or_init(|| {
         Arc::new(ApplicationSurfaceResourceBudget::new(
             MAXIMUM_ACTIVE_APPLICATION_SURFACE_COUNT,
-            MAXIMUM_APPLICATION_SURFACE_FRAME_BYTE_COUNT,
+            MAXIMUM_APPLICATION_SURFACE_TOTAL_RING_BYTE_COUNT,
         ))
     }))
 }
@@ -2369,6 +2371,10 @@ fn start_blocking(
     let source_frame = source_window.frame();
     let (width, height) = capture_pixel_size(source_frame.size.width, source_frame.size.height)?;
     let frame_layout = FrameLayout::new(width, height)?;
+    let effective_frame_rate = application_surface_frame_rate(
+        request.frame_rate,
+        frame_layout.slot_byte_count,
+    );
     let resource_reservation =
         application_surface_resource_budget().reserve(frame_layout.total_byte_count)?;
     let ring = SharedFrameRing::create(width, height)?;
@@ -2388,7 +2394,7 @@ fn start_blocking(
     let filter = SCContentFilter::create()
         .with_window(&source_window)
         .build();
-    let interval = screencapturekit::cm::CMTime::new(1, request.frame_rate as i32);
+    let interval = screencapturekit::cm::CMTime::new(1, effective_frame_rate as i32);
     let configuration = application_surface_stream_configuration(
         width,
         height,
@@ -2507,13 +2513,32 @@ fn capture_pixel_size(width: f64, height: f64) -> anyhow::Result<(usize, usize)>
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         bail!("application window has invalid dimensions");
     }
+    let maximum_pixel_count =
+        MAXIMUM_APPLICATION_SURFACE_FRAME_SLOT_BYTE_COUNT / FRAME_PIXEL_BYTE_COUNT;
+    let source_pixel_count = width * height;
+    if !source_pixel_count.is_finite() {
+        bail!("application window dimensions exceed supported bounds");
+    }
+    let pixel_budget_scale = (maximum_pixel_count as f64 / source_pixel_count).sqrt();
     let scale = 2.0_f64
         .min(4096.0 / width.max(1.0))
-        .min(2304.0 / height.max(1.0));
-    let pixel_width = (width * scale).round().max(1.0) as usize;
-    let pixel_height = (height * scale).round().max(1.0) as usize;
-    FrameLayout::new(pixel_width, pixel_height)?;
+        .min(2304.0 / height.max(1.0))
+        .min(pixel_budget_scale);
+    let pixel_width = (width * scale).floor().max(1.0) as usize;
+    let pixel_height = (height * scale).floor().max(1.0) as usize;
+    let layout = FrameLayout::new(pixel_width, pixel_height)?;
+    if layout.slot_byte_count > MAXIMUM_APPLICATION_SURFACE_FRAME_SLOT_BYTE_COUNT {
+        bail!("application frame exceeds the supported copy budget");
+    }
     Ok((pixel_width, pixel_height))
+}
+
+fn application_surface_frame_rate(requested_frame_rate: u32, frame_byte_count: usize) -> u32 {
+    let bandwidth_frame_rate = MAXIMUM_APPLICATION_SURFACE_COPY_BYTE_COUNT_PER_SECOND
+        .checked_div(frame_byte_count)
+        .unwrap_or(0)
+        .clamp(1, 120) as u32;
+    requested_frame_rate.min(bandwidth_frame_rate)
 }
 
 pub fn stop(session_id: &str) -> bool {
@@ -3640,6 +3665,22 @@ mod tests {
         );
         assert!((width as f64 / height as f64 - 2.0).abs() < 0.01);
         assert!(capture_pixel_size(0.0, 600.0).is_err());
+    }
+
+    #[test]
+    fn application_surface_frame_rate_respects_copy_bandwidth() {
+        assert_eq!(
+            application_surface_frame_rate(120, 16 * 1_024 * 1_024),
+            32
+        );
+        assert_eq!(
+            application_surface_frame_rate(30, 16 * 1_024 * 1_024),
+            30
+        );
+        assert_eq!(
+            application_surface_frame_rate(120, 1280 * 720 * FRAME_PIXEL_BYTE_COUNT),
+            120
+        );
     }
 
     #[test]
