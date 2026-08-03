@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::ax::bindings::{
-    ax_get_window_id, copy_ax_windows, kAXErrorSuccess, AXUIElementCreateApplication,
+    ax_get_window_id, copy_ax_windows_if_available, kAXErrorSuccess, AXUIElementCreateApplication,
     AXUIElementSetMessagingTimeout,
 };
 use crate::{permissions, windows};
@@ -153,17 +153,24 @@ fn application_accessibility_window_ids(process_id: i32) -> Option<HashSet<u32>>
             return None;
         }
 
-        let windows = copy_ax_windows(application);
+        let windows = copy_ax_windows_if_available(application);
         CFRelease(application as CFTypeRef);
-        let window_ids = windows
-            .iter()
-            .filter_map(|window| ax_get_window_id(*window))
-            .collect::<HashSet<_>>();
-        for window in windows {
-            CFRelease(window as CFTypeRef);
-        }
-        (!window_ids.is_empty()).then_some(window_ids)
+        let window_ids = windows.map(|windows| {
+            windows
+                .into_iter()
+                .filter_map(|window| {
+                    let window_id = ax_get_window_id(window);
+                    CFRelease(window as CFTypeRef);
+                    window_id
+                })
+                .collect()
+        });
+        application_accessibility_window_id_set(window_ids)
     }
+}
+
+fn application_accessibility_window_id_set(window_ids: Option<Vec<u32>>) -> Option<HashSet<u32>> {
+    window_ids.map(|window_ids| window_ids.into_iter().collect())
 }
 
 fn application_window_has_user_facing_identity(
