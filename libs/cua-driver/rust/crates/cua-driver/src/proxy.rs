@@ -3179,6 +3179,16 @@ mod tests {
             "a daemon from before the host-readiness field must retain its granted behavior"
         );
 
+        let capable_but_unnegotiated = serde_json::json!({
+            "accessibility": true,
+            "screen_recording": true,
+            "external_permission_readiness_protocol": 1,
+        });
+        assert!(
+            !daemon_permission_readiness(&capable_but_unnegotiated, true),
+            "a capable daemon must wait for its host's explicit readiness milestone"
+        );
+
         let granted_without_host = serde_json::json!({
             "accessibility": true,
             "screen_recording": true,
