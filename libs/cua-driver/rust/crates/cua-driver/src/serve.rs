@@ -1346,7 +1346,7 @@ fn daemon_permission_attribution() -> &'static str {
 #[cfg(target_os = "macos")]
 fn daemon_permission_status(
     profile: DaemonProfile,
-    external_permission_ready: bool,
+    external_permission_ready: Option<bool>,
 ) -> serde_json::Value {
     let status = platform_macos::permissions::current_status();
     let panel = platform_macos::permissions::panel::lifecycle();
@@ -1355,7 +1355,7 @@ fn daemon_permission_status(
         "accessibility": status.accessibility,
         "screen_recording": status.screen_recording,
         "all_granted": status.all_granted(),
-        "external_permission_ready": external_permission_ready,
+        "external_permission_ready": external_permission_ready.unwrap_or(false),
         "profile": profile,
         "panel": {
             "visible": panel.visible,
@@ -1820,9 +1820,9 @@ pub async fn run_serve(
                                 #[cfg(target_os = "macos")]
                                 let resp = DaemonResponse::ok(daemon_permission_status(
                                     profile,
-                                    external_permission_ready.load(
+                                    Some(external_permission_ready.load(
                                         std::sync::atomic::Ordering::Acquire
-                                    ),
+                                    )),
                                 ));
                                 #[cfg(not(target_os = "macos"))]
                                 let resp = DaemonResponse::err(
@@ -3571,6 +3571,8 @@ mod external_permission_flow_tests {
         ApplicationSurfaceConnectionSessions, clamp_external_permission_prompt,
         screen_capture_verification_response, validate_system_permission_request,
     };
+    #[cfg(target_os = "macos")]
+    use super::{DaemonProfile, daemon_permission_status};
 
     #[test]
     fn external_permission_flow_clamps_agent_prompt_requests() {
@@ -3581,6 +3583,14 @@ mod external_permission_flow_tests {
         let mut ordinary_tool_args = serde_json::json!({ "prompt": true });
         clamp_external_permission_prompt(true, "click", &mut ordinary_tool_args);
         assert_eq!(ordinary_tool_args["prompt"], serde_json::json!(true));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unnegotiated_external_permission_readiness_is_omitted() {
+        let status = daemon_permission_status(DaemonProfile::Native, None);
+
+        assert!(status.get("external_permission_ready").is_none());
     }
 
     #[cfg(target_os = "macos")]
