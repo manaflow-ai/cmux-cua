@@ -3087,10 +3087,10 @@ fn post_key(
 
 fn deliver_application_keyboard_event(
     private_delivery: impl FnOnce() -> bool,
-    _public_delivery: impl FnOnce(),
+    public_delivery: impl FnOnce(),
 ) -> anyhow::Result<()> {
     if !private_delivery() {
-        return Err(ApplicationSurfaceError::WindowUnavailable.into());
+        public_delivery();
     }
     Ok(())
 }
