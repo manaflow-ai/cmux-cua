@@ -3100,17 +3100,25 @@ mod tests {
     }
 
     #[test]
-    fn application_window_filter_rejects_offscreen_untitled_placeholders() {
-        assert!(!application_window_has_presentable_identity(false, None));
-        assert!(!application_window_has_presentable_identity(
-            false,
-            Some("   ")
+    fn application_window_filter_uses_accessibility_identity_for_offscreen_windows() {
+        let accessibility_window_ids = std::collections::HashSet::from([42]);
+
+        assert!(application_window_has_user_facing_identity(
+            true,
+            7,
+            Some(&accessibility_window_ids)
         ));
-        assert!(application_window_has_presentable_identity(true, None));
-        assert!(application_window_has_presentable_identity(
+        assert!(application_window_has_user_facing_identity(
             false,
-            Some("All iCloud")
+            42,
+            Some(&accessibility_window_ids)
         ));
+        assert!(!application_window_has_user_facing_identity(
+            false,
+            7,
+            Some(&accessibility_window_ids)
+        ));
+        assert!(application_window_has_user_facing_identity(false, 7, None));
     }
 
     #[test]
