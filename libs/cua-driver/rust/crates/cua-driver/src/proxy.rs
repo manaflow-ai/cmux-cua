@@ -1780,7 +1780,11 @@ fn daemon_permission_readiness(
         |(accessibility, screen_recording, host_ready)| {
             accessibility
                 && screen_recording
-                && (!external_permission_flow || host_ready == Some(true))
+                && (!external_permission_flow
+                    // Daemons predating host-owned onboarding expose only the
+                    // two grant booleans. Explicit false from a capable daemon
+                    // still blocks protected calls until cmux verifies capture.
+                    || host_ready.unwrap_or(true))
         },
     )
 }
