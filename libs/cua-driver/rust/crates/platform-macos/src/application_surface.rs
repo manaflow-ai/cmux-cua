@@ -3079,7 +3079,17 @@ fn post_key(
     for field in [51, 91, 92] {
         crate::input::skylight::set_integer_field(pointer, field, target.window_id as i64);
     }
-    if !crate::input::skylight::post_to_pid(target.process_id as libc::pid_t, pointer, true) {
+    deliver_application_keyboard_event(
+        || crate::input::skylight::post_to_pid(target.process_id as libc::pid_t, pointer, true),
+        || event.post_to_pid(target.process_id as libc::pid_t),
+    )
+}
+
+fn deliver_application_keyboard_event(
+    private_delivery: impl FnOnce() -> bool,
+    _public_delivery: impl FnOnce(),
+) -> anyhow::Result<()> {
+    if !private_delivery() {
         return Err(ApplicationSurfaceError::WindowUnavailable.into());
     }
     Ok(())
@@ -3095,6 +3105,7 @@ mod tests {
     use super::*;
     use screencapturekit::cm::{FrameInfo, SCFrameStatus};
     use screencapturekit::prelude::SCStreamDelegateTrait;
+    use std::cell::Cell;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -3752,6 +3763,19 @@ mod tests {
 
         assert!(!input.active.load(Ordering::Acquire));
         assert_eq!(releases, vec![1, 56]);
+    }
+
+    #[test]
+    fn application_keyboard_delivery_falls_back_to_public_core_graphics() {
+        let public_delivery_called = Cell::new(false);
+
+        let result = deliver_application_keyboard_event(
+            || false,
+            || public_delivery_called.set(true),
+        );
+
+        assert!(result.is_ok());
+        assert!(public_delivery_called.get());
     }
 
     #[test]
