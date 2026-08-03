@@ -3166,6 +3166,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn external_permission_readiness_requires_the_host_milestone() {
+        let legacy_granted = serde_json::json!({
+            "accessibility": true,
+            "screen_recording": true,
+        });
+        assert!(
+            daemon_permission_readiness(&legacy_granted, true),
+            "a daemon from before the host-readiness field must retain its granted behavior"
+        );
+
         let granted_without_host = serde_json::json!({
             "accessibility": true,
             "screen_recording": true,
