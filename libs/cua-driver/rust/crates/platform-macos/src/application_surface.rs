@@ -3633,7 +3633,12 @@ mod tests {
     #[test]
     fn capture_size_is_bounded_without_changing_aspect_ratio() {
         assert_eq!(capture_pixel_size(800.0, 600.0).unwrap(), (1600, 1200));
-        assert_eq!(capture_pixel_size(5000.0, 2500.0).unwrap(), (4096, 2048));
+        let (width, height) = capture_pixel_size(5000.0, 2500.0).unwrap();
+        assert!(
+            width * height * FRAME_PIXEL_BYTE_COUNT <= 16 * 1_024 * 1_024,
+            "application frames must stay within the host copy budget"
+        );
+        assert!((width as f64 / height as f64 - 2.0).abs() < 0.01);
         assert!(capture_pixel_size(0.0, 600.0).is_err());
     }
 
