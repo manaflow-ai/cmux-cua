@@ -132,6 +132,10 @@ fn application_window_is_capturable(
                 .any(|display| display.fully_contains(window)))
 }
 
+fn application_window_has_presentable_identity(is_on_screen: bool, title: Option<&str>) -> bool {
+    is_on_screen || title.is_some_and(|value| !value.trim().is_empty())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApplicationSurfacePermissionUse {
     WindowListing,
@@ -1740,6 +1744,7 @@ fn list_windows_blocking() -> anyhow::Result<Vec<ApplicationWindow>> {
         .filter_map(|window| {
             let owner = window.owning_application()?;
             let frame = window.frame();
+            let window_title = window.title();
             let capture_bounds = ApplicationCaptureBounds::new(
                 frame.origin.x,
                 frame.origin.y,
@@ -1751,6 +1756,10 @@ fn list_windows_blocking() -> anyhow::Result<Vec<ApplicationWindow>> {
                 || window.window_layer() != 0
                 || frame.size.width < 64.0
                 || frame.size.height < 64.0
+                || !application_window_has_presentable_identity(
+                    window.is_on_screen(),
+                    window_title.as_deref(),
+                )
                 || !application_window_is_capturable(
                     capture_bounds,
                     supports_unclipped_window_capture,
@@ -1760,8 +1769,7 @@ fn list_windows_blocking() -> anyhow::Result<Vec<ApplicationWindow>> {
                 return None;
             }
             let owner_name = owner.application_name();
-            let title = window
-                .title()
+            let title = window_title
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| owner_name.clone());
             Some(ApplicationWindow {
@@ -2276,6 +2284,10 @@ fn start_blocking(
                 && window
                     .owning_application()
                     .is_some_and(|owner| owner.process_id() == request.process_id)
+                && application_window_has_presentable_identity(
+                    window.is_on_screen(),
+                    window.title().as_deref(),
+                )
                 && {
                     let frame = window.frame();
                     application_window_is_capturable(
