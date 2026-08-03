@@ -1355,6 +1355,7 @@ fn daemon_permission_status(
         "accessibility": status.accessibility,
         "screen_recording": status.screen_recording,
         "all_granted": status.all_granted(),
+        "external_permission_readiness_protocol": 1,
         "profile": profile,
         "panel": {
             "visible": panel.visible,
@@ -3614,6 +3615,10 @@ mod external_permission_flow_tests {
         let status = daemon_permission_status(DaemonProfile::Native, None);
 
         assert!(status.get("external_permission_ready").is_none());
+        assert_eq!(
+            status["external_permission_readiness_protocol"],
+            serde_json::json!(1)
+        );
         assert_eq!(
             daemon_permission_status(DaemonProfile::Native, Some(false))
                 ["external_permission_ready"],

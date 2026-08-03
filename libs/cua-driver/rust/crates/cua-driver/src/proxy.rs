@@ -1692,11 +1692,16 @@ async fn ensure_daemon_started(
     // host's explicit post-verification readiness milestone.
     let external_permission_flow =
         crate::bundle::is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW");
-    if state.needs_grant_wait(wait_for_grants, external_permission_flow) {
+    let external_permission_readiness_required = external_permission_flow
+        && crate::bundle::is_env_truthy(
+            "CUA_DRIVER_RS_EXTERNAL_PERMISSION_READINESS_PROTOCOL",
+        );
+    if state.needs_grant_wait(wait_for_grants, external_permission_readiness_required) {
         wait_for_daemon_permission_readiness(
             socket_path,
             session_id,
             external_permission_flow,
+            external_permission_readiness_required,
         )
         .await?;
         state.complete_grant_wait();
@@ -1712,11 +1717,13 @@ async fn wait_for_daemon_permission_readiness(
     socket_path: &str,
     session_id: &str,
     external_permission_flow: bool,
+    external_permission_readiness_required: bool,
 ) -> anyhow::Result<()> {
     wait_for_daemon_permission_readiness_with_timeout(
         socket_path,
         session_id,
         external_permission_flow,
+        external_permission_readiness_required,
         std::time::Duration::from_secs(55),
     )
     .await
@@ -1727,6 +1734,7 @@ async fn wait_for_daemon_permission_readiness_with_timeout(
     socket_path: &str,
     session_id: &str,
     external_permission_flow: bool,
+    external_permission_readiness_required: bool,
     timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
@@ -1746,9 +1754,14 @@ async fn wait_for_daemon_permission_readiness_with_timeout(
             .await;
             if let Ok(Ok(resp)) = probe {
                 if let Some(result) = resp.result.as_ref() {
-                    if daemon_permission_readiness(result, external_permission_flow) {
+                    if daemon_permission_readiness(
+                        result,
+                        external_permission_readiness_required,
+                    ) {
                         debug!(
                             external_permission_flow = external_permission_flow,
+                            external_permission_readiness_required =
+                                external_permission_readiness_required,
                             "daemon permission authority is ready"
                         );
                         return;
@@ -1774,17 +1787,18 @@ async fn wait_for_daemon_permission_readiness_with_timeout(
 #[cfg(target_os = "macos")]
 fn daemon_permission_readiness(
     value: &serde_json::Value,
-    external_permission_flow: bool,
+    external_permission_readiness_required: bool,
 ) -> bool {
     extract_permission_readiness(value).is_some_and(
-        |(accessibility, screen_recording, host_ready)| {
+        |(accessibility, screen_recording, host_ready, readiness_capable)| {
             accessibility
                 && screen_recording
-                && (!external_permission_flow
-                    // Daemons predating host-owned onboarding expose only the
-                    // two grant booleans. Explicit false from a capable daemon
-                    // still blocks protected calls until cmux verifies capture.
-                    || host_ready.unwrap_or(true))
+                && (!external_permission_readiness_required
+                    // Hosts predating readiness negotiation do not request the
+                    // milestone. Daemons predating the capability field retain
+                    // their grant-only behavior for current hosts as well.
+                    || !readiness_capable
+                    || host_ready == Some(true))
         },
     )
 }
@@ -1794,7 +1808,7 @@ fn daemon_permission_readiness(
 #[cfg(target_os = "macos")]
 fn extract_permission_readiness(
     v: &serde_json::Value,
-) -> Option<(bool, bool, Option<bool>)> {
+) -> Option<(bool, bool, Option<bool>, bool)> {
     match v {
         serde_json::Value::Object(obj) => {
             if let (Some(a), Some(s)) = (
@@ -1806,6 +1820,7 @@ fn extract_permission_readiness(
                     s,
                     obj.get("external_permission_ready")
                         .and_then(serde_json::Value::as_bool),
+                    obj.contains_key("external_permission_readiness_protocol"),
                 ));
             }
             obj.values().find_map(extract_permission_readiness)
@@ -3158,6 +3173,7 @@ mod tests {
             socket.to_str().expect("UTF-8 socket path"),
             "deadline-test",
             true,
+            true,
             std::time::Duration::from_millis(20),
         );
         let bounded = tokio::time::timeout(std::time::Duration::from_millis(100), readiness).await;
@@ -3192,6 +3208,7 @@ mod tests {
         let granted_without_host = serde_json::json!({
             "accessibility": true,
             "screen_recording": true,
+            "external_permission_readiness_protocol": 1,
             "external_permission_ready": false,
         });
         assert!(daemon_permission_readiness(&granted_without_host, false));
@@ -3201,6 +3218,7 @@ mod tests {
             "result": {
                 "accessibility": true,
                 "screen_recording": true,
+                "external_permission_readiness_protocol": 1,
                 "external_permission_ready": true,
             }
         });
