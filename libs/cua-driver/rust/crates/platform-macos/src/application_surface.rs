@@ -3088,6 +3088,20 @@ mod tests {
     }
 
     #[test]
+    fn application_window_filter_rejects_offscreen_untitled_placeholders() {
+        assert!(!application_window_has_presentable_identity(false, None));
+        assert!(!application_window_has_presentable_identity(
+            false,
+            Some("   ")
+        ));
+        assert!(application_window_has_presentable_identity(true, None));
+        assert!(application_window_has_presentable_identity(
+            false,
+            Some("All iCloud")
+        ));
+    }
+
+    #[test]
     fn application_surface_shutdown_closes_future_start_admission() {
         let mut manager = ApplicationSurfaceManager::default();
 
