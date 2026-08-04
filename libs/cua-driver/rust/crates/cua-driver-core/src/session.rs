@@ -19,7 +19,7 @@
 //! reverse coupling from core into the platform crates.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 type SessionEndHook = Box<dyn Fn(&str) + Send + Sync>;
@@ -54,6 +54,8 @@ fn is_trackable(id: &str) -> bool {
 /// once. Growth is bounded (one short string per ended session over the
 /// daemon's lifetime); eviction is a deliberate non-blocking follow-up.
 static ENDED_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static SESSION_LIFECYCLE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    OnceLock::new();
 
 fn hooks() -> &'static Mutex<Vec<SessionEndHook>> {
     SESSION_END_HOOKS.get_or_init(|| Mutex::new(Vec::new()))
@@ -65,6 +67,16 @@ fn revive_hooks() -> &'static Mutex<Vec<SessionReviveHook>> {
 
 fn ended_sessions() -> &'static Mutex<HashSet<String>> {
     ENDED_SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn session_lifecycle_lock(session_id: &str) -> Arc<Mutex<()>> {
+    SESSION_LIFECYCLE_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .entry(session_id.to_owned())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 /// Register a callback invoked with the disconnecting `session_id` whenever a
@@ -92,6 +104,8 @@ pub fn register_session_revive_hook(hook: impl Fn(&str) + Send + Sync + 'static)
 /// stray legacy `session_end` (mixed-version rollout) so cursor-remove +
 /// recording-stop run exactly once. No-op when no hooks are registered.
 pub fn fire_session_end(session_id: &str) {
+    let lifecycle = session_lifecycle_lock(session_id);
+    let _lifecycle_guard = lifecycle.lock().unwrap();
     // Mark-then-fan-out under a short critical section, releasing the lock
     // before running hooks (hooks may be slow / re-entrant and must not hold
     // the dedupe lock).
@@ -144,6 +158,8 @@ pub fn revive_session(session_id: &str) -> bool {
     if !is_trackable(session_id) {
         return false;
     }
+    let lifecycle = session_lifecycle_lock(session_id);
+    let _lifecycle_guard = lifecycle.lock().unwrap();
     // Serialize revivals through the hook lock, but do not hold the ended-set
     // lock while invoking callbacks. The tombstone remains present while hooks
     // enqueue their ordered lifecycle events, so concurrent actions still see
