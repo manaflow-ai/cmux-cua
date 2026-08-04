@@ -4724,7 +4724,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_down_events_prepare_only_chromium_backgrounds() {
+    fn mouse_down_events_prepare_target_focus_for_every_application() {
         assert!(mouse_event_requires_background_preparation(
             "left_mouse_down",
             true,
@@ -4733,11 +4733,11 @@ mod tests {
             "right_mouse_down",
             true,
         ));
-        assert!(!mouse_event_requires_background_preparation(
+        assert!(mouse_event_requires_background_preparation(
             "left_mouse_down",
             false,
         ));
-        assert!(!mouse_event_requires_background_preparation(
+        assert!(mouse_event_requires_background_preparation(
             "right_mouse_down",
             false,
         ));
