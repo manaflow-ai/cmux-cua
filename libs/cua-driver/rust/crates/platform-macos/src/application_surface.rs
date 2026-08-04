@@ -98,6 +98,83 @@ impl ApplicationCaptureBounds {
             && window.y + window.height
                 <= self.y + self.height + APPLICATION_WINDOW_CONTAINMENT_TOLERANCE
     }
+
+    fn relative_to(self, container: Self) -> Option<Self> {
+        container.fully_contains(self).then_some(Self::new(
+            self.x - container.x,
+            self.y - container.y,
+            self.width,
+            self.height,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ApplicationCapturePlacement {
+    display_index: usize,
+    source_rect: ApplicationCaptureBounds,
+}
+
+fn application_capture_placement(
+    window: ApplicationCaptureBounds,
+    displays: &[ApplicationCaptureBounds],
+) -> Option<ApplicationCapturePlacement> {
+    displays
+        .iter()
+        .copied()
+        .enumerate()
+        .find_map(|(index, display)| {
+            window
+                .relative_to(display)
+                .map(|source_rect| ApplicationCapturePlacement {
+                    display_index: index,
+                    source_rect,
+                })
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApplicationSurfaceProcessIdentity {
+    process_id: u32,
+    start_seconds: i64,
+    start_microseconds: i64,
+}
+
+fn application_surface_process_identity(
+    process_id: i32,
+) -> Option<ApplicationSurfaceProcessIdentity> {
+    let process_id = u32::try_from(process_id).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let expected_size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let result = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(process_id).ok()?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(expected_size).ok()?,
+        )
+    };
+    if usize::try_from(result).ok()? != expected_size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != process_id {
+        return None;
+    }
+    Some(ApplicationSurfaceProcessIdentity {
+        process_id,
+        start_seconds: i64::try_from(info.pbi_start_tvsec).ok()?,
+        start_microseconds: i64::try_from(info.pbi_start_tvusec).ok()?,
+    })
+}
+
+fn application_surface_process_fallback_is_authorized(
+    application_scoped_capture: bool,
+    original: ApplicationSurfaceProcessIdentity,
+    current: Option<ApplicationSurfaceProcessIdentity>,
+) -> bool {
+    application_scoped_capture && current == Some(original)
 }
 
 fn application_surface_supports_unclipped_window_capture() -> bool {
@@ -353,6 +430,13 @@ impl ApplicationSurfaceKeyboardTarget {
     fn new(window_id: u32, process_id: i32) -> Option<Self> {
         (window_id > 0 && process_id > 0).then_some(Self {
             window_id,
+            process_id,
+        })
+    }
+
+    fn process_key_window(process_id: i32) -> Option<Self> {
+        (process_id > 0).then_some(Self {
+            window_id: 0,
             process_id,
         })
     }
@@ -1195,6 +1279,9 @@ struct ApplicationSurfaceDeactivation {
 struct ApplicationSurfaceSession {
     target_window_id: u32,
     target_process_id: i32,
+    target_process_identity: Option<ApplicationSurfaceProcessIdentity>,
+    application_scoped_capture: bool,
+    fallback_target_bounds: ApplicationCaptureBounds,
     target_uses_chromium_background_preparation: bool,
     stream: Option<SCStream>,
     frame_state: Arc<CaptureFrameState>,
@@ -2342,9 +2429,9 @@ fn start_blocking(
         .get()
         .map_err(|error| anyhow!("could not enumerate application windows: {error}"))?;
     let accessibility_window_ids = application_accessibility_window_ids(request.process_id);
-    let source_window = content
-        .windows()
-        .into_iter()
+    let windows = content.windows();
+    let source_window = windows
+        .iter()
         .find(|window| {
             window.window_id() == request.window_id
                 && window
@@ -2371,6 +2458,33 @@ fn start_blocking(
         })
         .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
     let source_frame = source_window.frame();
+    let source_bounds = ApplicationCaptureBounds::new(
+        source_frame.origin.x,
+        source_frame.origin.y,
+        source_frame.size.width,
+        source_frame.size.height,
+    );
+    let source_application = source_window
+        .owning_application()
+        .filter(|application| application.process_id() == request.process_id);
+    let displays = content.displays();
+    let shareable_display_bounds = displays
+        .iter()
+        .map(|display| {
+            let frame = display.frame();
+            ApplicationCaptureBounds::new(
+                frame.origin.x,
+                frame.origin.y,
+                frame.size.width,
+                frame.size.height,
+            )
+        })
+        .collect::<Vec<_>>();
+    let capture_placement = application_capture_placement(source_bounds, &shareable_display_bounds);
+    let target_process_identity = application_surface_process_identity(request.process_id);
+    let application_scoped_capture = capture_placement.is_some()
+        && source_application.is_some()
+        && target_process_identity.is_some();
     let (width, height) = capture_pixel_size(source_frame.size.width, source_frame.size.height)?;
     let frame_layout = FrameLayout::new(width, height)?;
     let effective_frame_rate = application_surface_frame_rate(
@@ -2393,15 +2507,54 @@ fn start_blocking(
         fallback_source_height: source_frame.size.height,
     });
 
-    let filter = SCContentFilter::create()
-        .with_window(&source_window)
-        .build();
+    // A desktop-independent SCWindow stream terminates when some applications
+    // replace that WindowServer object during an exclusive-fullscreen
+    // transition. A display filter scoped to the exact owning process survives
+    // the replacement. Crop it to the selected window and exclude the process's
+    // other existing windows so the pane does not become a display capture or a
+    // cross-application privacy boundary. Input fallback is separately pinned
+    // to this process generation below.
+    let capture_plan = if application_scoped_capture {
+        let placement = capture_placement.expect("application-scoped capture has a placement");
+        let source_application = source_application
+            .as_ref()
+            .expect("application-scoped capture has an application");
+        let excepting_windows = windows
+            .iter()
+            .filter(|window| {
+                window.window_id() != request.window_id
+                    && window
+                        .owning_application()
+                        .is_some_and(|owner| owner.process_id() == request.process_id)
+            })
+            .collect::<Vec<_>>();
+        let filter = SCContentFilter::create()
+            .with_display(&displays[placement.display_index])
+            .with_including_applications(&[source_application], &excepting_windows)
+            .build();
+        (
+            filter,
+            Some(screencapturekit::cg::CGRect::new(
+                placement.source_rect.x,
+                placement.source_rect.y,
+                placement.source_rect.width,
+                placement.source_rect.height,
+            )),
+        )
+    } else {
+        (
+            SCContentFilter::create().with_window(source_window).build(),
+            None,
+        )
+    };
+    let (filter, source_rect) = capture_plan;
     let interval = screencapturekit::cm::CMTime::new(1, effective_frame_rate as i32);
     let configuration = application_surface_stream_configuration(
         width,
         height,
         &interval,
         supports_unclipped_window_capture,
+        source_rect,
     );
     let callback_state = frame_state.clone();
     let delegate = application_surface_stream_callbacks(Arc::clone(&frame_state));
@@ -2428,6 +2581,9 @@ fn start_blocking(
     let session = ApplicationSurfaceSession {
         target_window_id: request.window_id,
         target_process_id: request.process_id,
+        target_process_identity,
+        application_scoped_capture,
+        fallback_target_bounds: source_bounds,
         target_uses_chromium_background_preparation:
             application_surface_target_uses_chromium_background_preparation(request.process_id),
         stream: Some(stream),
@@ -2451,6 +2607,7 @@ fn application_surface_stream_configuration(
     height: usize,
     interval: &screencapturekit::cm::CMTime,
     supports_unclipped_window_capture: bool,
+    source_rect: Option<screencapturekit::cg::CGRect>,
 ) -> SCStreamConfiguration {
     configure_application_surface_stream(
         SCStreamConfiguration::new(),
@@ -2458,6 +2615,7 @@ fn application_surface_stream_configuration(
         height,
         interval,
         supports_unclipped_window_capture,
+        source_rect,
     )
 }
 
@@ -2467,6 +2625,7 @@ fn configure_application_surface_stream(
     height: usize,
     interval: &screencapturekit::cm::CMTime,
     supports_unclipped_window_capture: bool,
+    source_rect: Option<screencapturekit::cg::CGRect>,
 ) -> SCStreamConfiguration {
     let configuration = configuration
         .with_width(width as u32)
@@ -2479,8 +2638,13 @@ fn configure_application_surface_stream(
         .with_pixel_format(PixelFormat::BGRA)
         .with_scales_to_fit(true)
         .with_preserves_aspect_ratio(true);
-    if supports_unclipped_window_capture {
+    let configuration = if supports_unclipped_window_capture {
         configuration.with_ignore_global_clip_single_window(true)
+    } else {
+        configuration
+    };
+    if let Some(source_rect) = source_rect {
+        configuration.with_source_rect(source_rect)
     } else {
         configuration
     }
@@ -2608,6 +2772,9 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
     let (
         target_window_id,
         target_process_id,
+        target_process_identity,
+        application_scoped_capture,
+        fallback_target_bounds,
         target_uses_chromium_background_preparation,
         frame_state,
         input_state,
@@ -2622,6 +2789,9 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
         (
             session.target_window_id,
             session.target_process_id,
+            session.target_process_identity,
+            session.application_scoped_capture,
+            session.fallback_target_bounds,
             session.target_uses_chromium_background_preparation,
             session.frame_state.clone(),
             session.input_state.clone(),
@@ -2640,8 +2810,14 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
     if !frame_state.ring.is_available() {
         return Err(ApplicationSurfaceError::CaptureUnavailable.into());
     }
-    let target = live_target(target_window_id, target_process_id)
-        .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
+    let target = application_surface_input_target(
+        target_window_id,
+        target_process_id,
+        target_process_identity,
+        application_scoped_capture,
+        fallback_target_bounds,
+    )
+    .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
     let resolved_content = validate_event_deliveries(
         &events,
         |sequence| {
@@ -2659,7 +2835,7 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
         |(event, content)| {
             dispatch_event(
                 event,
-                target_window_id,
+                target.window_id,
                 target_process_id,
                 target_uses_chromium_background_preparation,
                 &target,
@@ -2667,7 +2843,7 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
                 &input_state,
             )
         },
-        || input_state.release_pressed_locked(target_process_id, target_window_id),
+        || input_state.release_pressed_locked(target_process_id, target.window_id),
     )
 }
 
@@ -2848,8 +3024,12 @@ fn dispatch_event(
         }
         "key" => {
             let (key_code, key_down) = event.key_values()?;
-            let target = ApplicationSurfaceKeyboardTarget::new(target_window_id, target_process_id)
-                .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
+            let target = if target_window_id == 0 {
+                ApplicationSurfaceKeyboardTarget::process_key_window(target_process_id)
+            } else {
+                ApplicationSurfaceKeyboardTarget::new(target_window_id, target_process_id)
+            }
+            .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
             post_key(target, key_code, key_down, event.modifiers)?;
             input_state
                 .keyboard
@@ -2869,6 +3049,45 @@ fn live_target(window_id: u32, process_id: i32) -> Option<windows::WindowInfo> {
             && window.pid == process_id
             && window.bounds.width > 0.0
             && window.bounds.height > 0.0
+    })
+}
+
+fn application_surface_input_target(
+    window_id: u32,
+    process_id: i32,
+    original_process_identity: Option<ApplicationSurfaceProcessIdentity>,
+    application_scoped_capture: bool,
+    fallback_bounds: ApplicationCaptureBounds,
+) -> Option<windows::WindowInfo> {
+    if let Some(target) = live_target(window_id, process_id) {
+        return Some(target);
+    }
+    let original_process_identity = original_process_identity?;
+    application_surface_process_fallback_is_authorized(
+        application_scoped_capture,
+        original_process_identity,
+        application_surface_process_identity(process_id),
+    )
+    .then(|| windows::WindowInfo {
+        // A zero window id tells WindowServer to deliver to the process's
+        // current key window. Exclusive fullscreen transitions retire the
+        // original window id while preserving the process generation.
+        window_id: 0,
+        pid: process_id,
+        app_name: String::new(),
+        title: String::new(),
+        bounds: windows::WindowBounds {
+            x: fallback_bounds.x,
+            y: fallback_bounds.y,
+            width: fallback_bounds.width,
+            height: fallback_bounds.height,
+        },
+        layer: 0,
+        alpha: 1.0,
+        z_index: 0,
+        is_on_screen: false,
+        on_current_space: None,
+        space_ids: None,
     })
 }
 
@@ -3172,6 +3391,7 @@ mod tests {
             200,
             &interval,
             supports_unclipped_window_capture,
+            None,
         );
 
         assert_eq!(
@@ -3184,7 +3404,8 @@ mod tests {
     fn macos13_configuration_avoids_the_unavailable_unclipped_window_option() {
         let interval = screencapturekit::cm::CMTime::new(1, 30);
         let base = SCStreamConfiguration::new().with_ignore_global_clip_single_window(false);
-        let configuration = configure_application_surface_stream(base, 320, 200, &interval, false);
+        let configuration =
+            configure_application_surface_stream(base, 320, 200, &interval, false, None);
 
         assert!(!configuration.ignore_global_clip_single_window());
     }
@@ -3212,6 +3433,23 @@ mod tests {
             None,
             "cross-display windows must keep exact-window capture semantics"
         );
+
+        let interval = screencapturekit::cm::CMTime::new(1, 60);
+        let configuration = configure_application_surface_stream(
+            SCStreamConfiguration::new(),
+            1_280,
+            720,
+            &interval,
+            true,
+            Some(screencapturekit::cg::CGRect::new(
+                320.0, 180.0, 1_280.0, 720.0,
+            )),
+        );
+        let source_rect = configuration.source_rect();
+        assert_eq!(source_rect.origin.x, 320.0);
+        assert_eq!(source_rect.origin.y, 180.0);
+        assert_eq!(source_rect.size.width, 1_280.0);
+        assert_eq!(source_rect.size.height, 720.0);
     }
 
     #[test]
