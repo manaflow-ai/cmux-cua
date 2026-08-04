@@ -3190,6 +3190,62 @@ mod tests {
     }
 
     #[test]
+    fn application_capture_uses_a_display_relative_source_rect() {
+        let displays = [
+            ApplicationCaptureBounds::new(-1_440.0, 0.0, 1_440.0, 900.0),
+            ApplicationCaptureBounds::new(0.0, 0.0, 2_560.0, 1_440.0),
+        ];
+        let window = ApplicationCaptureBounds::new(320.0, 180.0, 1_280.0, 720.0);
+
+        assert_eq!(
+            application_capture_placement(window, &displays),
+            Some(ApplicationCapturePlacement {
+                display_index: 1,
+                source_rect: ApplicationCaptureBounds::new(320.0, 180.0, 1_280.0, 720.0),
+            })
+        );
+        assert_eq!(
+            application_capture_placement(
+                ApplicationCaptureBounds::new(-320.0, 180.0, 1_280.0, 720.0),
+                &displays,
+            ),
+            None,
+            "cross-display windows must keep exact-window capture semantics"
+        );
+    }
+
+    #[test]
+    fn fullscreen_process_fallback_requires_the_original_process_generation() {
+        let original = ApplicationSurfaceProcessIdentity {
+            process_id: 44,
+            start_seconds: 1_700_000_000,
+            start_microseconds: 123,
+        };
+
+        assert!(application_surface_process_fallback_is_authorized(
+            true,
+            original,
+            Some(original),
+        ));
+        assert!(!application_surface_process_fallback_is_authorized(
+            false,
+            original,
+            Some(original),
+        ));
+        assert!(!application_surface_process_fallback_is_authorized(
+            true,
+            original,
+            Some(ApplicationSurfaceProcessIdentity {
+                start_microseconds: 124,
+                ..original
+            }),
+        ));
+        assert!(!application_surface_process_fallback_is_authorized(
+            true, original, None,
+        ));
+    }
+
+    #[test]
     fn macos13_filters_windows_that_require_unclipped_capture() {
         let displays = [ApplicationCaptureBounds::new(0.0, 0.0, 1_440.0, 900.0)];
         let contained = ApplicationCaptureBounds::new(100.0, 100.0, 800.0, 600.0);
