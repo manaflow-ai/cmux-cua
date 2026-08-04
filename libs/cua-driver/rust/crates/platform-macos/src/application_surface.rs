@@ -2971,8 +2971,8 @@ fn dispatch_event(
         | "right_mouse_up"
         | "right_mouse_dragged" => {
             let (x, y, delta_x, delta_y) = event.pointer_values()?;
-            let delta_x = application_surface_pointer_delta(delta_x, target.bounds.width);
-            let delta_y = application_surface_pointer_delta(delta_y, target.bounds.height);
+            let delta_x = application_surface_pointer_delta(delta_x);
+            let delta_y = application_surface_pointer_delta(delta_y);
             let Some((source_x, source_y)) = content.and_then(|content| content.source_point(x, y))
             else {
                 if matches!(
@@ -3283,12 +3283,8 @@ fn application_surface_target_phase(kind: &str) -> i64 {
     }
 }
 
-fn application_surface_pointer_delta(normalized_delta: f64, target_extent: f64) -> i64 {
+fn application_surface_pointer_delta(delta: f64) -> i64 {
     const MAXIMUM_POINTER_DELTA: f64 = 32_767.0;
-    if !normalized_delta.is_finite() || !target_extent.is_finite() || target_extent <= 0.0 {
-        return 0;
-    }
-    let delta = normalized_delta * target_extent;
     if !delta.is_finite() {
         return 0;
     }
@@ -4814,9 +4810,9 @@ mod tests {
 
     #[test]
     fn relative_pointer_motion_preserves_host_distance() {
-        assert_eq!(application_surface_pointer_delta(12.5, 2_560.0), 13);
-        assert_eq!(application_surface_pointer_delta(-8.25, 1_440.0), -8);
-        assert_eq!(application_surface_pointer_delta(f64::NAN, 1_440.0), 0);
+        assert_eq!(application_surface_pointer_delta(12.5), 13);
+        assert_eq!(application_surface_pointer_delta(-8.25), -8);
+        assert_eq!(application_surface_pointer_delta(f64::NAN), 0);
     }
 
     #[test]
