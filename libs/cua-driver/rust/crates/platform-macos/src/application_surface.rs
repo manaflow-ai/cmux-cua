@@ -177,6 +177,36 @@ fn application_surface_process_fallback_is_authorized(
     application_scoped_capture && current == Some(original)
 }
 
+fn application_capture_window_id(
+    requested_window_id: u32,
+    process_id: i32,
+    expected_process_identity: Option<ApplicationSurfaceProcessIdentity>,
+    current_process_identity: Option<ApplicationSurfaceProcessIdentity>,
+    eligible_windows: &[(u32, i32)],
+) -> Option<u32> {
+    if expected_process_identity.is_some() && expected_process_identity != current_process_identity
+    {
+        return None;
+    }
+
+    if eligible_windows
+        .iter()
+        .any(|(window_id, owner_process_id)| {
+            *window_id == requested_window_id && *owner_process_id == process_id
+        })
+    {
+        return Some(requested_window_id);
+    }
+    expected_process_identity?;
+
+    let mut replacements = eligible_windows
+        .iter()
+        .filter(|(_, owner_process_id)| *owner_process_id == process_id)
+        .map(|(window_id, _)| *window_id);
+    let replacement = replacements.next()?;
+    replacements.next().is_none().then_some(replacement)
+}
+
 fn application_surface_supports_unclipped_window_capture() -> bool {
     objc2_foundation::NSProcessInfo::processInfo()
         .operatingSystemVersion()
@@ -335,6 +365,9 @@ pub struct FrameTransportDescriptor {
 #[serde(rename_all = "camelCase")]
 pub struct ApplicationSurfaceStartResult {
     pub session_id: String,
+    pub target_window_id: u32,
+    pub process_start_seconds: Option<i64>,
+    pub process_start_microseconds: Option<i64>,
     pub frame_transport: FrameTransportDescriptor,
 }
 
@@ -342,8 +375,33 @@ pub struct ApplicationSurfaceStartResult {
 pub struct ApplicationSurfaceStartRequest {
     pub window_id: u32,
     pub process_id: i32,
+    #[serde(default)]
+    pub process_start_seconds: Option<i64>,
+    #[serde(default)]
+    pub process_start_microseconds: Option<i64>,
     #[serde(default = "default_frame_rate")]
     pub frame_rate: u32,
+}
+
+impl ApplicationSurfaceStartRequest {
+    fn expected_process_identity(
+        &self,
+    ) -> anyhow::Result<Option<ApplicationSurfaceProcessIdentity>> {
+        match (self.process_start_seconds, self.process_start_microseconds) {
+            (None, None) => Ok(None),
+            (Some(start_seconds), Some(start_microseconds))
+                if start_seconds >= 0 && (0..1_000_000).contains(&start_microseconds) =>
+            {
+                Ok(Some(ApplicationSurfaceProcessIdentity {
+                    process_id: u32::try_from(self.process_id)
+                        .context("invalid application process id")?,
+                    start_seconds,
+                    start_microseconds,
+                }))
+            }
+            _ => bail!("invalid application process identity"),
+        }
+    }
 }
 
 fn default_frame_rate() -> u32 {
@@ -2423,6 +2481,8 @@ fn start_blocking(
     {
         bail!("invalid application-surface target or frame rate");
     }
+    let expected_process_identity = request.expected_process_identity()?;
+    let target_process_identity = application_surface_process_identity(request.process_id);
 
     let supports_unclipped_window_capture = application_surface_supports_unclipped_window_capture();
     let display_bounds = if supports_unclipped_window_capture {
@@ -2437,13 +2497,12 @@ fn start_blocking(
         .map_err(|error| anyhow!("could not enumerate application windows: {error}"))?;
     let accessibility_window_ids = application_accessibility_window_ids(request.process_id);
     let windows = content.windows();
-    let source_window = windows
+    let eligible_windows = windows
         .iter()
-        .find(|window| {
-            window.window_id() == request.window_id
-                && window
-                    .owning_application()
-                    .is_some_and(|owner| owner.process_id() == request.process_id)
+        .filter(|window| {
+            window
+                .owning_application()
+                .is_some_and(|owner| owner.process_id() == request.process_id)
                 && application_window_has_user_facing_identity(
                     window.is_on_screen(),
                     window.window_id(),
@@ -2463,6 +2522,26 @@ fn start_blocking(
                     )
                 }
         })
+        .collect::<Vec<_>>();
+    let eligible_window_ids = eligible_windows
+        .iter()
+        .filter_map(|window| {
+            window
+                .owning_application()
+                .map(|owner| (window.window_id(), owner.process_id()))
+        })
+        .collect::<Vec<_>>();
+    let target_window_id = application_capture_window_id(
+        request.window_id,
+        request.process_id,
+        expected_process_identity,
+        target_process_identity,
+        &eligible_window_ids,
+    )
+    .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
+    let source_window = eligible_windows
+        .into_iter()
+        .find(|window| window.window_id() == target_window_id)
         .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
     let source_frame = source_window.frame();
     let source_bounds = ApplicationCaptureBounds::new(
@@ -2488,7 +2567,6 @@ fn start_blocking(
         })
         .collect::<Vec<_>>();
     let capture_placement = application_capture_placement(source_bounds, &shareable_display_bounds);
-    let target_process_identity = application_surface_process_identity(request.process_id);
     let application_scoped_capture = capture_placement.is_some()
         && source_application.is_some()
         && target_process_identity.is_some();
@@ -2506,7 +2584,7 @@ fn start_blocking(
         publication: Mutex::new(()),
         failed: AtomicBool::new(false),
         input_state: Arc::clone(&input_state),
-        target_window_id: request.window_id,
+        target_window_id,
         target_process_id: request.process_id,
         fallback_source_width: source_frame.size.width,
         fallback_source_height: source_frame.size.height,
@@ -2527,7 +2605,7 @@ fn start_blocking(
         let excepting_windows = windows
             .iter()
             .filter(|window| {
-                window.window_id() != request.window_id
+                window.window_id() != target_window_id
                     && window
                         .owning_application()
                         .is_some_and(|owner| owner.process_id() == request.process_id)
@@ -2581,10 +2659,14 @@ fn start_blocking(
     let session_id = Uuid::new_v4().to_string();
     let result = ApplicationSurfaceStartResult {
         session_id: session_id.clone(),
+        target_window_id,
+        process_start_seconds: target_process_identity.map(|identity| identity.start_seconds),
+        process_start_microseconds: target_process_identity
+            .map(|identity| identity.start_microseconds),
         frame_transport: ring.descriptor(),
     };
     let session = ApplicationSurfaceSession {
-        target_window_id: request.window_id,
+        target_window_id,
         target_process_id: request.process_id,
         target_process_identity,
         application_scoped_capture,
@@ -3528,13 +3610,7 @@ mod tests {
             "an initial request must still name an exact window"
         );
         assert_eq!(
-            application_capture_window_id(
-                42,
-                44,
-                Some(original),
-                Some(original),
-                &replacement,
-            ),
+            application_capture_window_id(42, 44, Some(original), Some(original), &replacement,),
             Some(84),
             "a restart may follow the sole replacement window"
         );
