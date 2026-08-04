@@ -4813,9 +4813,9 @@ mod tests {
     }
 
     #[test]
-    fn relative_pointer_motion_maps_to_target_pixels() {
-        assert_eq!(application_surface_pointer_delta(0.125, 2_560.0), 320);
-        assert_eq!(application_surface_pointer_delta(-0.25, 1_440.0), -360);
+    fn relative_pointer_motion_preserves_host_distance() {
+        assert_eq!(application_surface_pointer_delta(12.5, 2_560.0), 13);
+        assert_eq!(application_surface_pointer_delta(-8.25, 1_440.0), -8);
         assert_eq!(application_surface_pointer_delta(f64::NAN, 1_440.0), 0);
     }
 
