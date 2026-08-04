@@ -343,12 +343,10 @@ impl Tool for DragTool {
                             restore_prior_frontmost_after_drag(
                                 pid,
                                 prior_front,
-                                result.is_ok(),
-                                || Ok(gate.check()?),
                                 |previous_pid| {
                                     let _ = apps::activate_pid(previous_pid);
                                 },
-                            )?;
+                            );
                             result?;
                             Ok(())
                         }
@@ -408,17 +406,13 @@ impl Tool for DragTool {
 fn restore_prior_frontmost_after_drag(
     target_pid: i32,
     prior_frontmost_pid: Option<i32>,
-    drag_succeeded: bool,
-    check_dispatch_gate: impl FnOnce() -> anyhow::Result<()>,
     activate: impl FnOnce(i32),
-) -> anyhow::Result<()> {
+) {
     if let Some(previous_pid) = prior_frontmost_pid {
-        if previous_pid != target_pid && drag_succeeded {
-            check_dispatch_gate()?;
+        if previous_pid != target_pid {
             activate(previous_pid);
         }
     }
-    Ok(())
 }
 
 /// Side-effect-free validation for the exact boundary before embedded mode
@@ -560,21 +554,13 @@ mod tests {
     #[test]
     fn foreground_drag_restores_prior_app_after_dispatch_failure() {
         let restored_pid = std::cell::Cell::new(None);
-        let gate_checked = std::cell::Cell::new(false);
 
         restore_prior_frontmost_after_drag(
             42,
             Some(7),
-            false,
-            || {
-                gate_checked.set(true);
-                anyhow::bail!("stale dispatch epoch")
-            },
             |pid| restored_pid.set(Some(pid)),
-        )
-        .expect("focus cleanup must not depend on the failed dispatch");
+        );
 
         assert_eq!(restored_pid.get(), Some(7));
-        assert!(!gate_checked.get());
     }
 }

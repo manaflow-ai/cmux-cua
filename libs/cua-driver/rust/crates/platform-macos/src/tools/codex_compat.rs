@@ -1555,6 +1555,7 @@ fn compat_drag_native_arguments(
             "from_y": from_y,
             "to_x": to_x,
             "to_y": to_y,
+            "delivery_mode": "foreground",
         }),
         args,
         session,
