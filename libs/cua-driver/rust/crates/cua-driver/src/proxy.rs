@@ -963,28 +963,49 @@ const APPROVAL_BROKER_TOKEN_ARG: &str = "_cua_approval_broker_token";
 pub(crate) const COMPAT_PROXY_HOST_SESSION_ARG: &str = "_cua_proxy_host_session";
 pub(crate) const COMPAT_PROXY_STATE_OWNER_PID_ARG: &str = "_cua_proxy_state_owner_pid";
 
-fn with_approval_broker_token(
+fn compat_authenticated_arguments(
     mut args: serde_json::Value,
     broker_token: &str,
+    session_id: &str,
+    managed_session: bool,
+    state_owner_pid: Option<u32>,
 ) -> serde_json::Value {
     if !args.is_object() {
         args = serde_json::Value::Object(serde_json::Map::new());
     }
-    args.as_object_mut().unwrap().insert(
+    let object = args.as_object_mut().unwrap();
+
+    // Host authority is transport metadata owned by the embedding proxy. Never
+    // forward caller-provided copies, including values that already use the
+    // proxy-only names below.
+    object.remove(cua_driver_core::HOST_SESSION_ARG);
+    object.remove(cua_driver_core::session_state::STATE_OWNER_PID_ARG);
+    object.remove(COMPAT_PROXY_HOST_SESSION_ARG);
+    object.remove(COMPAT_PROXY_STATE_OWNER_PID_ARG);
+
+    if managed_session {
+        let lifecycle_session = serde_json::Value::String(session_id.to_owned());
+        object.insert("session".to_owned(), lifecycle_session.clone());
+        object.insert("_session_id".to_owned(), lifecycle_session);
+        if let Some(host_session) = managed_host_session(session_id) {
+            object.insert(
+                COMPAT_PROXY_HOST_SESSION_ARG.to_owned(),
+                serde_json::Value::String(host_session.to_owned()),
+            );
+        }
+        if let Some(owner_pid) = state_owner_pid.filter(|value| *value > 1) {
+            object.insert(
+                COMPAT_PROXY_STATE_OWNER_PID_ARG.to_owned(),
+                serde_json::json!(owner_pid),
+            );
+        }
+    }
+
+    object.insert(
         APPROVAL_BROKER_TOKEN_ARG.to_owned(),
         serde_json::Value::String(broker_token.to_owned()),
     );
     args
-}
-
-fn compat_authenticated_arguments(
-    args: serde_json::Value,
-    broker_token: &str,
-    _session_id: &str,
-    _managed_session: bool,
-    _state_owner_pid: Option<u32>,
-) -> serde_json::Value {
-    with_approval_broker_token(args, broker_token)
 }
 
 impl AppApprovalChallenge {
@@ -2354,12 +2375,15 @@ mod tests {
 
     #[test]
     fn compat_calls_overwrite_caller_broker_fields_with_the_daemon_token() {
-        let args = with_approval_broker_token(
+        let args = compat_authenticated_arguments(
             serde_json::json!({
                 "app": "Calculator",
                 (APPROVAL_BROKER_TOKEN_ARG): "caller-forged",
             }),
             "daemon-minted",
+            "mcp-4242-99",
+            false,
+            None,
         );
         assert_eq!(args["app"], "Calculator");
         assert_eq!(args[APPROVAL_BROKER_TOKEN_ARG], "daemon-minted");

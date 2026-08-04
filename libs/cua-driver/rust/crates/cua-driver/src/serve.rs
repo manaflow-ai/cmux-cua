@@ -1430,14 +1430,28 @@ fn authenticate_compat_call(
         return Ok(());
     }
 
-    let supplied_token = args
-        .as_object_mut()
-        .and_then(|object| object.remove(APPROVAL_BROKER_TOKEN_ARG))
+    let object = args.as_object_mut().ok_or_else(|| {
+        "Codex Computer Use tool arguments must be an object.".to_owned()
+    })?;
+    let supplied_token = object
+        .remove(APPROVAL_BROKER_TOKEN_ARG)
         .and_then(|value| value.as_str().map(str::to_owned))
         .ok_or_else(|| {
             "Codex Computer Use tool calls require the authenticated MCP control session."
                 .to_owned()
         })?;
+    let proxy_host_session = object
+        .remove(crate::proxy::COMPAT_PROXY_HOST_SESSION_ARG)
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|value| !value.is_empty());
+    let proxy_state_owner_pid = object
+        .remove(crate::proxy::COMPAT_PROXY_STATE_OWNER_PID_ARG)
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 1);
+    object.remove(cua_driver_core::HOST_SESSION_ARG);
+    object.remove(cua_driver_core::session_state::STATE_OWNER_PID_ARG);
+
     let session_id = session_id.filter(|value| !value.is_empty()).ok_or_else(|| {
         "Codex Computer Use tool calls require the authenticated MCP session id.".to_owned()
     })?;
@@ -1453,6 +1467,22 @@ fn authenticate_compat_call(
         "_session_id".to_owned(),
         serde_json::Value::String(session_id.to_owned()),
     );
+    if let Some(host_session) = proxy_host_session.filter(|host_session| {
+        session_id
+            .strip_prefix(host_session.as_str())
+            .is_some_and(|suffix| suffix.starts_with("-mcp-"))
+    }) {
+        object.insert(
+            cua_driver_core::HOST_SESSION_ARG.to_owned(),
+            serde_json::Value::String(host_session),
+        );
+    }
+    if let Some(owner_pid) = proxy_state_owner_pid {
+        object.insert(
+            cua_driver_core::session_state::STATE_OWNER_PID_ARG.to_owned(),
+            serde_json::json!(owner_pid),
+        );
+    }
     Ok(())
 }
 
@@ -4482,6 +4512,46 @@ mod session_boundary_tests {
             .get(cua_driver_core::session_state::STATE_OWNER_PID_ARG)
             .is_none());
         assert!(args.get(APPROVAL_BROKER_TOKEN_ARG).is_none());
+    }
+
+    #[test]
+    fn compat_broker_restores_authenticated_proxy_host_identity() {
+        let session_id = "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF-mcp-4242-99";
+        let brokers = Mutex::new(HashMap::from([(
+            session_id.to_owned(),
+            "daemon-minted".to_owned(),
+        )]));
+        let mut args = json!({
+            "app": "Calculator",
+            (crate::proxy::COMPAT_PROXY_HOST_SESSION_ARG):
+                "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF",
+            (crate::proxy::COMPAT_PROXY_STATE_OWNER_PID_ARG): 4242,
+            (APPROVAL_BROKER_TOKEN_ARG): "daemon-minted",
+        });
+
+        authenticate_compat_call(
+            &mut args,
+            DaemonProfile::CodexComputerUseCompat,
+            Some(session_id),
+            &brokers,
+        )
+        .unwrap();
+
+        assert_eq!(args["_session_id"], session_id);
+        assert_eq!(
+            args[cua_driver_core::HOST_SESSION_ARG],
+            "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF"
+        );
+        assert_eq!(
+            args[cua_driver_core::session_state::STATE_OWNER_PID_ARG],
+            4242
+        );
+        assert!(args
+            .get(crate::proxy::COMPAT_PROXY_HOST_SESSION_ARG)
+            .is_none());
+        assert!(args
+            .get(crate::proxy::COMPAT_PROXY_STATE_OWNER_PID_ARG)
+            .is_none());
     }
 
     #[test]
