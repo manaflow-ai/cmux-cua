@@ -878,6 +878,11 @@ fn host_request_is_authorized(
     }
 }
 
+fn host_permission_control_is_authorized(method: &str, host_request_authorized: bool) -> bool {
+    !matches!(method, "permissions_present" | "permissions_refresh")
+        || host_request_authorized
+}
+
 #[cfg(any(target_os = "macos", test))]
 #[derive(Default)]
 struct ApplicationSurfaceConnectionSessions {
@@ -1888,6 +1893,19 @@ pub async fn run_serve(
                                 ).await;
                             }
                             "permissions_present" => {
+                                if !host_permission_control_is_authorized(
+                                    req.method.as_str(),
+                                    host_request_authorized,
+                                ) {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
                                 #[cfg(target_os = "macos")]
                                 {
                                     let prepared =
@@ -1927,6 +1945,19 @@ pub async fn run_serve(
                                 }
                             }
                             "permissions_refresh" => {
+                                if !host_permission_control_is_authorized(
+                                    req.method.as_str(),
+                                    host_request_authorized,
+                                ) {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
                                 #[cfg(target_os = "macos")]
                                 {
                                     let available =
