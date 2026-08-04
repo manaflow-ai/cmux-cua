@@ -387,6 +387,17 @@ impl ApplicationSurfaceEvent {
         Ok((x, y))
     }
 
+    fn pointer_values(&self) -> anyhow::Result<(f64, f64, f64, f64)> {
+        let (x, y) = self.pointer_coordinates()?;
+        let (Some(delta_x), Some(delta_y)) = (self.delta_x, self.delta_y) else {
+            bail!("application-surface pointer deltas are required");
+        };
+        if !delta_x.is_finite() || !delta_y.is_finite() {
+            bail!("application-surface pointer deltas must be finite");
+        }
+        Ok((x, y, delta_x, delta_y))
+    }
+
     fn scroll_values(&self) -> anyhow::Result<(f64, f64, f64, f64)> {
         let (Some(x), Some(y), Some(delta_x), Some(delta_y)) =
             (self.x, self.y, self.delta_x, self.delta_y)
@@ -1130,6 +1141,8 @@ impl CaptureFrameState {
                     self.target_window_id,
                     release.kind,
                     release.delivery,
+                    0,
+                    0,
                     false,
                     false,
                 ) {
@@ -1642,6 +1655,8 @@ impl ApplicationSurfaceInputState {
                     window_id,
                     release.kind,
                     release.delivery,
+                    0,
+                    0,
                     false,
                     false,
                 ) {
@@ -2874,7 +2889,7 @@ fn validate_event_shape(event: &ApplicationSurfaceEvent) -> anyhow::Result<()> {
         | "right_mouse_up"
         | "right_mouse_dragged" => {
             event.required_frame_sequence()?;
-            event.pointer_coordinates()?;
+            event.pointer_values()?;
         }
         "scroll" => {
             event.required_frame_sequence()?;
@@ -2914,7 +2929,7 @@ fn validate_event_deliveries(
             | "right_mouse_down"
             | "right_mouse_up"
             | "right_mouse_dragged" => {
-                let (x, y) = event.pointer_coordinates()?;
+                let (x, y, _, _) = event.pointer_values()?;
                 let is_inside_content = content
                     .and_then(|content| content.source_point(x, y))
                     .is_some();
@@ -2965,7 +2980,9 @@ fn dispatch_event(
         | "right_mouse_down"
         | "right_mouse_up"
         | "right_mouse_dragged" => {
-            let (x, y) = event.pointer_coordinates()?;
+            let (x, y, delta_x, delta_y) = event.pointer_values()?;
+            let delta_x = application_surface_pointer_delta(delta_x, target.bounds.width);
+            let delta_y = application_surface_pointer_delta(delta_y, target.bounds.height);
             let Some((source_x, source_y)) = content.and_then(|content| content.source_point(x, y))
             else {
                 if matches!(
@@ -2981,6 +2998,8 @@ fn dispatch_event(
                         event.kind.as_str(),
                         event.modifiers,
                         event.click_count,
+                        delta_x,
+                        delta_y,
                         &input_state.pointer,
                     );
                 }
@@ -2998,6 +3017,8 @@ fn dispatch_event(
                 source_y * target.bounds.height,
                 event.modifiers,
                 event.click_count,
+                delta_x,
+                delta_y,
                 target_uses_chromium_background_preparation,
                 &input_state.pointer,
             )
@@ -3127,6 +3148,8 @@ fn post_mouse(
     local_y: f64,
     modifiers: u64,
     click_count: i64,
+    delta_x: i64,
+    delta_y: i64,
     target_uses_chromium_background_preparation: bool,
     pointer_state: &Mutex<ApplicationSurfacePointerState>,
 ) -> anyhow::Result<()> {
@@ -3150,6 +3173,8 @@ fn post_mouse(
         window_id,
         kind,
         delivery,
+        delta_x,
+        delta_y,
         should_focus_target,
         should_focus_target
             && mouse_event_requires_chromium_background_preparation(
@@ -3170,6 +3195,8 @@ fn post_mouse_continuation(
     kind: &str,
     modifiers: u64,
     click_count: i64,
+    delta_x: i64,
+    delta_y: i64,
     pointer_state: &Mutex<ApplicationSurfacePointerState>,
 ) -> anyhow::Result<()> {
     let delivery = pointer_state
@@ -3177,7 +3204,9 @@ fn post_mouse_continuation(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .continued_delivery(kind, modifiers, click_count)
         .ok_or(ApplicationSurfaceError::PointOutsideContent)?;
-    post_mouse_delivery(process_id, window_id, kind, delivery, false, false)?;
+    post_mouse_delivery(
+        process_id, window_id, kind, delivery, delta_x, delta_y, false, false,
+    )?;
     pointer_state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3190,6 +3219,8 @@ fn post_mouse_delivery(
     window_id: u32,
     kind: &str,
     delivery: ApplicationSurfacePointerDelivery,
+    delta_x: i64,
+    delta_y: i64,
     should_focus_target: bool,
     should_prepare_chromium_background: bool,
 ) -> anyhow::Result<()> {
@@ -3233,6 +3264,8 @@ fn post_mouse_delivery(
         0,
         application_surface_target_phase(kind),
     );
+    crate::input::skylight::set_integer_field(event.as_ptr() as *mut c_void, 4, delta_x);
+    crate::input::skylight::set_integer_field(event.as_ptr() as *mut c_void, 5, delta_y);
     let click_state = if kind == "mouse_moved" {
         0
     } else {
@@ -3262,6 +3295,20 @@ fn application_surface_target_phase(kind: &str) -> i64 {
     } else {
         3
     }
+}
+
+fn application_surface_pointer_delta(normalized_delta: f64, target_extent: f64) -> i64 {
+    const MAXIMUM_POINTER_DELTA: f64 = 32_767.0;
+    if !normalized_delta.is_finite() || !target_extent.is_finite() || target_extent <= 0.0 {
+        return 0;
+    }
+    let delta = normalized_delta * target_extent;
+    if !delta.is_finite() {
+        return 0;
+    }
+    delta
+        .round()
+        .clamp(-MAXIMUM_POINTER_DELTA, MAXIMUM_POINTER_DELTA) as i64
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3298,6 +3345,8 @@ fn post_scroll(
         local_y,
         modifiers,
         1,
+        0,
+        0,
         target_uses_chromium_background_preparation,
         pointer_state,
     )?;
