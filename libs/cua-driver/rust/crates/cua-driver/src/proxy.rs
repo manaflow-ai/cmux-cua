@@ -960,6 +960,8 @@ struct AppApprovalChallenge {
 }
 
 const APPROVAL_BROKER_TOKEN_ARG: &str = "_cua_approval_broker_token";
+pub(crate) const COMPAT_PROXY_HOST_SESSION_ARG: &str = "_cua_proxy_host_session";
+pub(crate) const COMPAT_PROXY_STATE_OWNER_PID_ARG: &str = "_cua_proxy_state_owner_pid";
 
 fn with_approval_broker_token(
     mut args: serde_json::Value,
@@ -973,6 +975,16 @@ fn with_approval_broker_token(
         serde_json::Value::String(broker_token.to_owned()),
     );
     args
+}
+
+fn compat_authenticated_arguments(
+    args: serde_json::Value,
+    broker_token: &str,
+    _session_id: &str,
+    _managed_session: bool,
+    _state_owner_pid: Option<u32>,
+) -> serde_json::Value {
+    with_approval_broker_token(args, broker_token)
 }
 
 impl AppApprovalChallenge {
@@ -1238,7 +1250,15 @@ where
         }
     };
 
-    let authenticated_args = with_approval_broker_token(args, &broker_token);
+    let managed_session = configured_default_session()
+        .is_some_and(|base| session_id.starts_with(&format!("{base}-mcp-")));
+    let authenticated_args = compat_authenticated_arguments(
+        args,
+        &broker_token,
+        session_id,
+        managed_session,
+        configured_state_owner_pid(),
+    );
 
     let first = match call_daemon_tool(
         socket_path,
@@ -2342,6 +2362,37 @@ mod tests {
             "daemon-minted",
         );
         assert_eq!(args["app"], "Calculator");
+        assert_eq!(args[APPROVAL_BROKER_TOKEN_ARG], "daemon-minted");
+    }
+
+    #[test]
+    fn compat_calls_forward_only_trusted_host_identity() {
+        let managed = "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF-mcp-4242-99";
+        let args = compat_authenticated_arguments(
+            serde_json::json!({
+                "app": "Calculator",
+                "session": "caller-session",
+                "_session_id": "caller-session",
+                (cua_driver_core::HOST_SESSION_ARG): "caller-forged-host",
+                (cua_driver_core::session_state::STATE_OWNER_PID_ARG): 7,
+                (COMPAT_PROXY_HOST_SESSION_ARG): "caller-forged-proxy-host",
+                (COMPAT_PROXY_STATE_OWNER_PID_ARG): 8,
+            }),
+            "daemon-minted",
+            managed,
+            true,
+            Some(4242),
+        );
+
+        assert!(args.get(cua_driver_core::HOST_SESSION_ARG).is_none());
+        assert!(args
+            .get(cua_driver_core::session_state::STATE_OWNER_PID_ARG)
+            .is_none());
+        assert_eq!(
+            args[COMPAT_PROXY_HOST_SESSION_ARG],
+            "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF"
+        );
+        assert_eq!(args[COMPAT_PROXY_STATE_OWNER_PID_ARG], 4242);
         assert_eq!(args[APPROVAL_BROKER_TOKEN_ARG], "daemon-minted");
     }
 

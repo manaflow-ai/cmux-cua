@@ -4461,6 +4461,8 @@ mod session_boundary_tests {
             "app": "Calculator",
             "session": "victim-session",
             "_session_id": "victim-session",
+            (cua_driver_core::HOST_SESSION_ARG): "caller-forged-host",
+            (cua_driver_core::session_state::STATE_OWNER_PID_ARG): 7,
             (APPROVAL_BROKER_TOKEN_ARG): "daemon-minted",
         });
 
@@ -4475,6 +4477,10 @@ mod session_boundary_tests {
         assert_eq!(args["app"], "Calculator");
         assert_eq!(args["_session_id"], "authenticated-session");
         assert!(args.get("session").is_none());
+        assert!(args.get(cua_driver_core::HOST_SESSION_ARG).is_none());
+        assert!(args
+            .get(cua_driver_core::session_state::STATE_OWNER_PID_ARG)
+            .is_none());
         assert!(args.get(APPROVAL_BROKER_TOKEN_ARG).is_none());
     }
 

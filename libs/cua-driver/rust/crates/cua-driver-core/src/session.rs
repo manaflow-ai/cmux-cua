@@ -365,6 +365,48 @@ mod tests {
     }
 
     #[test]
+    fn revive_waits_for_in_flight_end_cleanup() {
+        let sid = "test-end-revive-order-session-F6A7B8";
+        let end_entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release_end = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (revive_entered_tx, revive_entered_rx) = std::sync::mpsc::channel();
+        let expected_end = sid.to_owned();
+        let hook_end_entered = end_entered.clone();
+        let hook_release_end = release_end.clone();
+        register_session_end_hook(move |got| {
+            if got == expected_end {
+                hook_end_entered.wait();
+                hook_release_end.wait();
+            }
+        });
+        let expected_revive = sid.to_owned();
+        register_session_revive_hook(move |got| {
+            if got == expected_revive {
+                revive_entered_tx.send(()).unwrap();
+            }
+        });
+
+        let end_sid = sid.to_owned();
+        let ender = std::thread::spawn(move || fire_session_end(&end_sid));
+        end_entered.wait();
+
+        let revive_sid = sid.to_owned();
+        let reviver = std::thread::spawn(move || revive_session(&revive_sid));
+        let revived_before_cleanup_finished = revive_entered_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_ok();
+        release_end.wait();
+        ender.join().unwrap();
+        assert!(reviver.join().unwrap());
+
+        assert!(
+            !revived_before_cleanup_finished,
+            "revival hooks must wait until the older end cleanup completes"
+        );
+        assert!(!is_session_ended(sid));
+    }
+
+    #[test]
     fn revive_is_noop_for_anonymous_ids() {
         // The anonymous fallback is never tracked, so there is nothing to revive.
         assert!(!revive_session("default"));
