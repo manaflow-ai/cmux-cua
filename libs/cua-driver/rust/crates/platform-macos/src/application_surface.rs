@@ -1761,12 +1761,8 @@ impl ApplicationSurfacePointerState {
     ) -> ApplicationSurfacePointerTransition {
         let click_count = click_count.clamp(1, 3);
         let button = match kind {
-            "left_mouse_down" | "left_mouse_dragged" | "left_mouse_up" => {
-                Some(&mut self.left)
-            }
-            "right_mouse_down" | "right_mouse_dragged" | "right_mouse_up" => {
-                Some(&mut self.right)
-            }
+            "left_mouse_down" | "left_mouse_dragged" | "left_mouse_up" => Some(&mut self.left),
+            "right_mouse_down" | "right_mouse_dragged" | "right_mouse_up" => Some(&mut self.right),
             _ => None,
         };
         let Some(button) = button else {
@@ -1802,11 +1798,7 @@ impl ApplicationSurfacePointerState {
         }
     }
 
-    fn record_delivery(
-        &mut self,
-        kind: &str,
-        delivery: ApplicationSurfacePointerDelivery,
-    ) {
+    fn record_delivery(&mut self, kind: &str, delivery: ApplicationSurfacePointerDelivery) {
         match kind {
             "left_mouse_down" | "left_mouse_dragged" => {
                 self.left.pressed_delivery = Some(delivery);
@@ -2502,10 +2494,8 @@ fn start_blocking(
         && target_process_identity.is_some();
     let (width, height) = capture_pixel_size(source_frame.size.width, source_frame.size.height)?;
     let frame_layout = FrameLayout::new(width, height)?;
-    let effective_frame_rate = application_surface_frame_rate(
-        request.frame_rate,
-        frame_layout.slot_byte_count,
-    );
+    let effective_frame_rate =
+        application_surface_frame_rate(request.frame_rate, frame_layout.slot_byte_count);
     let resource_reservation =
         application_surface_resource_budget().reserve(frame_layout.total_byte_count)?;
     let ring = SharedFrameRing::create(width, height)?;
@@ -3259,13 +3249,9 @@ fn post_mouse_delivery(
     let event = CGEvent::new_mouse_event(source, event_type, point, button)
         .map_err(|_| anyhow!("could not create mouse event"))?;
     event.set_flags(flags);
-    crate::input::skylight::set_integer_field(
-        event.as_ptr() as *mut c_void,
-        0,
-        application_surface_target_phase(kind),
-    );
-    crate::input::skylight::set_integer_field(event.as_ptr() as *mut c_void, 4, delta_x);
-    crate::input::skylight::set_integer_field(event.as_ptr() as *mut c_void, 5, delta_y);
+    crate::input::skylight::set_integer_field(&event, 0, application_surface_target_phase(kind));
+    crate::input::skylight::set_integer_field(&event, 4, delta_x);
+    crate::input::skylight::set_integer_field(&event, 5, delta_y);
     let click_state = if kind == "mouse_moved" {
         0
     } else {
@@ -3358,12 +3344,12 @@ fn post_scroll(
     event.set_flags(CGEventFlags::from_bits_truncate(modifiers));
     let pointer = event.as_ptr() as *mut c_void;
     unsafe { CGEventSetLocation(pointer, screen_x, screen_y) };
-    crate::input::skylight::set_window_location(pointer, local_x, local_y);
-    crate::input::skylight::set_integer_field(pointer, 40, process_id as i64);
-    crate::input::skylight::set_integer_field(pointer, 51, window_id as i64);
-    crate::input::skylight::set_integer_field(pointer, 91, window_id as i64);
-    crate::input::skylight::set_integer_field(pointer, 92, window_id as i64);
-    crate::input::skylight::post_to_pid(process_id as libc::pid_t, pointer, false);
+    crate::input::skylight::set_window_location(&event, local_x, local_y);
+    crate::input::skylight::set_integer_field(&event, 40, process_id as i64);
+    crate::input::skylight::set_integer_field(&event, 51, window_id as i64);
+    crate::input::skylight::set_integer_field(&event, 91, window_id as i64);
+    crate::input::skylight::set_integer_field(&event, 92, window_id as i64);
+    crate::input::skylight::post_to_pid(process_id as libc::pid_t, &event, false);
     event.post_to_pid(process_id as libc::pid_t);
     Ok(())
 }
@@ -3386,12 +3372,11 @@ fn post_key(
     let event = CGEvent::new_keyboard_event(source, key_code, key_down)
         .map_err(|_| anyhow!("could not create keyboard event"))?;
     event.set_flags(CGEventFlags::from_bits_truncate(modifiers));
-    let pointer = event.as_ptr() as *mut c_void;
     for field in [51, 91, 92] {
-        crate::input::skylight::set_integer_field(pointer, field, target.window_id as i64);
+        crate::input::skylight::set_integer_field(&event, field, target.window_id as i64);
     }
     deliver_application_keyboard_event(
-        || crate::input::skylight::post_to_pid(target.process_id as libc::pid_t, pointer, true),
+        || crate::input::skylight::post_to_pid(target.process_id as libc::pid_t, &event, true),
         || event.post_to_pid(target.process_id as libc::pid_t),
     )
 }
@@ -3608,16 +3593,12 @@ mod tests {
         let (closed_tx, closed_rx) = mpsc::channel();
 
         let closer = std::thread::spawn(move || {
-            closed_tx
-                .send(input_for_close.close_admission())
-                .unwrap();
+            closed_tx.send(input_for_close.close_admission()).unwrap();
         });
 
-        assert!(
-            closed_rx
-                .recv_timeout(Duration::from_millis(250))
-                .expect("input admission closure waited for dispatch cleanup")
-        );
+        assert!(closed_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("input admission closure waited for dispatch cleanup"));
         assert!(!input.active.load(Ordering::Acquire));
         drop(dispatch);
         closer.join().unwrap();
@@ -3796,16 +3777,14 @@ mod tests {
         let name = ring.name.clone();
         let frame = [0x5A; 16];
 
-        let handle_before_attach =
-            unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        let handle_before_attach = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
         assert!(handle_before_attach >= 0);
         unsafe {
             libc::close(handle_before_attach);
         }
 
         assert!(ring.acknowledge_attachment());
-        let handle_after_attach =
-            unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+        let handle_after_attach = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
         assert_eq!(handle_after_attach, -1);
         assert!(ring
             .publish(&frame, 8, frame_geometry(NormalizedContentRect::default()))
@@ -3895,12 +3874,8 @@ mod tests {
     fn mmap_failure_unlinks_shared_memory() {
         let layout = FrameLayout::new(2, 2).unwrap();
         let (name, descriptor_handle) = create_shared_memory().unwrap();
-        let result = SharedFrameRing::map_with(
-            name.clone(),
-            descriptor_handle,
-            layout,
-            || libc::MAP_FAILED,
-        );
+        let result =
+            SharedFrameRing::map_with(name.clone(), descriptor_handle, layout, || libc::MAP_FAILED);
         unsafe {
             libc::close(descriptor_handle);
         }
@@ -4030,14 +4005,8 @@ mod tests {
 
     #[test]
     fn application_surface_frame_rate_respects_copy_bandwidth() {
-        assert_eq!(
-            application_surface_frame_rate(120, 16 * 1_024 * 1_024),
-            32
-        );
-        assert_eq!(
-            application_surface_frame_rate(30, 16 * 1_024 * 1_024),
-            30
-        );
+        assert_eq!(application_surface_frame_rate(120, 16 * 1_024 * 1_024), 32);
+        assert_eq!(application_surface_frame_rate(30, 16 * 1_024 * 1_024), 30);
         assert_eq!(
             application_surface_frame_rate(120, 1280 * 720 * FRAME_PIXEL_BYTE_COUNT),
             120
@@ -4176,10 +4145,8 @@ mod tests {
     fn application_keyboard_delivery_falls_back_to_public_core_graphics() {
         let public_delivery_called = Cell::new(false);
 
-        let result = deliver_application_keyboard_event(
-            || false,
-            || public_delivery_called.set(true),
-        );
+        let result =
+            deliver_application_keyboard_event(|| false, || public_delivery_called.set(true));
 
         assert!(result.is_ok());
         assert!(public_delivery_called.get());
@@ -4872,14 +4839,12 @@ mod tests {
         assert!(validate_event_batch(&[event("one")]).is_ok());
         assert!(validate_event_batch(&[]).is_err());
         assert!(validate_event_batch(&[event("one"), event("two")]).is_err());
-        assert!(
-            validate_event_batch(
-                &(0..=MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT)
-                    .map(|_| event("one"))
-                    .collect::<Vec<_>>()
-            )
-            .is_err()
-        );
+        assert!(validate_event_batch(
+            &(0..=MAXIMUM_APPLICATION_SURFACE_EVENT_BATCH_COUNT)
+                .map(|_| event("one"))
+                .collect::<Vec<_>>()
+        )
+        .is_err());
 
         let mut key_down = event("one");
         key_down.kind = "key".to_owned();
@@ -4983,10 +4948,7 @@ mod tests {
         let input = ApplicationSurfaceInputState::new();
 
         assert!(validate_event_deliveries(
-            &[
-                event("key", 0.0, 0.0),
-                event("mouse_moved", 2.0, 0.5),
-            ],
+            &[event("key", 0.0, 0.0), event("mouse_moved", 2.0, 0.5),],
             |_| Some(content),
             &input,
         )

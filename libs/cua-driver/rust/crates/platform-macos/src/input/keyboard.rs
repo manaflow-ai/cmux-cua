@@ -9,7 +9,6 @@ use core_graphics::{
     event::{CGEvent, CGEventFlags},
     event_source::{CGEventSource, CGEventSourceStateID},
 };
-use foreign_types::ForeignType;
 
 use crate::dispatch_gate::NativeDispatchGate;
 
@@ -79,12 +78,8 @@ pub(crate) fn type_text_guarded(
         up.set_flags(CGEventFlags::CGEventFlagNull);
         guarded_key_pair(
             gate,
-            || {
-                post_keyboard_event_guarded(pid, &down, gate)
-            },
-            || {
-                post_keyboard_event_guarded(pid, &up, gate)
-            },
+            || post_keyboard_event_guarded(pid, &down, gate),
+            || post_keyboard_event_guarded(pid, &up, gate),
             || {
                 post_keyboard_event(pid, &up);
                 Ok(())
@@ -127,12 +122,8 @@ pub(crate) fn type_text_with_delay_guarded(
         up.set_flags(CGEventFlags::CGEventFlagNull);
         guarded_key_pair(
             gate,
-            || {
-                post_keyboard_event_guarded(pid, &down, gate)
-            },
-            || {
-                post_keyboard_event_guarded(pid, &up, gate)
-            },
+            || post_keyboard_event_guarded(pid, &down, gate),
+            || post_keyboard_event_guarded(pid, &up, gate),
             || {
                 post_keyboard_event(pid, &up);
                 Ok(())
@@ -230,9 +221,8 @@ fn guarded_key_pair(
 /// Post a keyboard event to `pid` via SLEventPostToPid (with auth message for
 /// Chromium/Electron support) or fall back to CGEvent::post_to_pid.
 fn post_keyboard_event(pid: i32, event: &CGEvent) {
-    let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
     // attachAuthMessage = true: required for Chromium keyboard on macOS 14+.
-    if !crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, true) {
+    if !crate::input::skylight::post_to_pid(pid as libc::pid_t, event, true) {
         event.post_to_pid(pid as libc::pid_t);
     }
 }
@@ -242,9 +232,8 @@ fn post_keyboard_event_guarded(
     event: &CGEvent,
     gate: &NativeDispatchGate,
 ) -> anyhow::Result<()> {
-    let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
     gate.check()?;
-    if !crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, true) {
+    if !crate::input::skylight::post_to_pid(pid as libc::pid_t, event, true) {
         gate.check()?;
         event.post_to_pid(pid as libc::pid_t);
     }
@@ -280,7 +269,12 @@ fn post_key_guarded(
     post_keyboard_event_guarded(pid, &event, gate)
 }
 
-fn post_key_no_auth(pid: i32, key_code: u16, key_down: bool, flags: CGEventFlags) -> anyhow::Result<()> {
+fn post_key_no_auth(
+    pid: i32,
+    key_code: u16,
+    key_down: bool,
+    flags: CGEventFlags,
+) -> anyhow::Result<()> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let event = CGEvent::new_keyboard_event(source, key_code, key_down)
@@ -288,9 +282,8 @@ fn post_key_no_auth(pid: i32, key_code: u16, key_down: bool, flags: CGEventFlags
     if flags != CGEventFlags::CGEventFlagNull {
         event.set_flags(flags);
     }
-    let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
     // attach_auth_message = false → IOHIDPostEvent path → NSMenu fires
-    if !crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false) {
+    if !crate::input::skylight::post_to_pid(pid as libc::pid_t, &event, false) {
         event.post_to_pid(pid as libc::pid_t);
     }
     Ok(())
@@ -310,9 +303,8 @@ fn post_key_no_auth_guarded(
     if flags != CGEventFlags::CGEventFlagNull {
         event.set_flags(flags);
     }
-    let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
     gate.check()?;
-    if !crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false) {
+    if !crate::input::skylight::post_to_pid(pid as libc::pid_t, &event, false) {
         gate.check()?;
         event.post_to_pid(pid as libc::pid_t);
     }
@@ -357,15 +349,65 @@ fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
         "down" | "down_arrow" => 125,
         "up" | "up_arrow" => 126,
         "kp_0" => 82,
-        "f1" => 122, "f2" => 120, "f3" => 99, "f4" => 118, "f5" => 96,
-        "f6" => 97, "f7" => 98, "f8" => 100, "f9" => 101, "f10" => 109,
-        "f11" => 103, "f12" => 111,
-        "a" => 0, "s" => 1, "d" => 2, "f" => 3, "h" => 4, "g" => 5, "z" => 6, "x" => 7,
-        "c" => 8, "v" => 9, "b" => 11, "q" => 12, "w" => 13, "e" => 14, "r" => 15, "y" => 16,
-        "t" => 17, "1" => 18, "2" => 19, "3" => 20, "4" => 21, "6" => 22, "5" => 23, "=" => 24,
-        "9" => 25, "7" => 26, "-" => 27, "8" => 28, "0" => 29, "]" => 30, "o" => 31, "u" => 32,
-        "[" => 33, "i" => 34, "p" => 35, "l" => 37, "j" => 38, "'" => 39, "k" => 40, ";" => 41,
-        "\\" => 42, "," => 43, "/" => 44, "n" => 45, "m" => 46, "." => 47, "`" => 50,
+        "f1" => 122,
+        "f2" => 120,
+        "f3" => 99,
+        "f4" => 118,
+        "f5" => 96,
+        "f6" => 97,
+        "f7" => 98,
+        "f8" => 100,
+        "f9" => 101,
+        "f10" => 109,
+        "f11" => 103,
+        "f12" => 111,
+        "a" => 0,
+        "s" => 1,
+        "d" => 2,
+        "f" => 3,
+        "h" => 4,
+        "g" => 5,
+        "z" => 6,
+        "x" => 7,
+        "c" => 8,
+        "v" => 9,
+        "b" => 11,
+        "q" => 12,
+        "w" => 13,
+        "e" => 14,
+        "r" => 15,
+        "y" => 16,
+        "t" => 17,
+        "1" => 18,
+        "2" => 19,
+        "3" => 20,
+        "4" => 21,
+        "6" => 22,
+        "5" => 23,
+        "=" => 24,
+        "9" => 25,
+        "7" => 26,
+        "-" => 27,
+        "8" => 28,
+        "0" => 29,
+        "]" => 30,
+        "o" => 31,
+        "u" => 32,
+        "[" => 33,
+        "i" => 34,
+        "p" => 35,
+        "l" => 37,
+        "j" => 38,
+        "'" => 39,
+        "k" => 40,
+        ";" => 41,
+        "\\" => 42,
+        "," => 43,
+        "/" => 44,
+        "n" => 45,
+        "m" => 46,
+        "." => 47,
+        "`" => 50,
         _ => anyhow::bail!("Unknown key name: {key}"),
     };
     Ok(code)
@@ -374,11 +416,11 @@ fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::{guarded_key_pair, key_name_to_code};
-    use crate::dispatch_gate::{NativeDispatchGate, install_for_test};
+    use crate::dispatch_gate::{install_for_test, NativeDispatchGate};
     use crate::session::SessionLockGuardian;
     use std::sync::{
-        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
     };
 
     #[test]
