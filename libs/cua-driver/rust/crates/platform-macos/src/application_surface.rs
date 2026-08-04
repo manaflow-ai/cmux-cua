@@ -3514,6 +3514,58 @@ mod tests {
     }
 
     #[test]
+    fn capture_restart_rebinds_only_with_the_original_process_generation() {
+        let original = ApplicationSurfaceProcessIdentity {
+            process_id: 44,
+            start_seconds: 1_700_000_000,
+            start_microseconds: 123,
+        };
+        let replacement = [(84, 44), (99, 50)];
+
+        assert_eq!(
+            application_capture_window_id(42, 44, None, Some(original), &replacement),
+            None,
+            "an initial request must still name an exact window"
+        );
+        assert_eq!(
+            application_capture_window_id(
+                42,
+                44,
+                Some(original),
+                Some(original),
+                &replacement,
+            ),
+            Some(84),
+            "a restart may follow the sole replacement window"
+        );
+        assert_eq!(
+            application_capture_window_id(
+                42,
+                44,
+                Some(original),
+                Some(ApplicationSurfaceProcessIdentity {
+                    start_microseconds: 124,
+                    ..original
+                }),
+                &replacement,
+            ),
+            None,
+            "a reused PID must not authorize capture"
+        );
+        assert_eq!(
+            application_capture_window_id(
+                42,
+                44,
+                Some(original),
+                Some(original),
+                &[(84, 44), (85, 44)],
+            ),
+            None,
+            "an ambiguous replacement must require a new user selection"
+        );
+    }
+
+    #[test]
     fn macos13_filters_windows_that_require_unclipped_capture() {
         let displays = [ApplicationCaptureBounds::new(0.0, 0.0, 1_440.0, 900.0)];
         let contained = ApplicationCaptureBounds::new(100.0, 100.0, 800.0, 600.0);
