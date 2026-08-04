@@ -3730,10 +3730,20 @@ mod external_permission_flow_tests {
 #[cfg(test)]
 mod socket_authentication_tests {
     use super::{
-        attach_state_writer_identity, host_request_is_authorized, parse_request_with_token,
+        attach_state_writer_identity, host_permission_control_is_authorized,
+        host_request_is_authorized, parse_request_with_token,
         parse_request_with_tokens, process_descends_from, socket_peer_requires_authorized_root,
         state_authentication_key, DaemonRequest, ProcessIdentity,
     };
+
+    #[test]
+    fn permission_presentation_and_refresh_require_host_authority() {
+        for method in ["permissions_present", "permissions_refresh"] {
+            assert!(host_permission_control_is_authorized(method, true));
+            assert!(!host_permission_control_is_authorized(method, false));
+        }
+        assert!(host_permission_control_is_authorized("permissions_status", false));
+    }
     use std::collections::HashMap;
 
     fn list_request() -> DaemonRequest {
