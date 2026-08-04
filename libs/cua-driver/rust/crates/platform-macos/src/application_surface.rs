@@ -511,6 +511,23 @@ impl ApplicationSurfaceKeyboardTarget {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplicationSurfaceInputDeliveryMode {
+    Standard,
+    ChromiumBackground,
+}
+
+fn deliver_application_surface_event(
+    mode: ApplicationSurfaceInputDeliveryMode,
+    public_delivery: impl FnOnce() -> anyhow::Result<()>,
+    specialized_delivery: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    match mode {
+        ApplicationSurfaceInputDeliveryMode::Standard => public_delivery(),
+        ApplicationSurfaceInputDeliveryMode::ChromiumBackground => specialized_delivery(),
+    }
+}
+
 fn default_click_count() -> i64 {
     1
 }
@@ -1155,6 +1172,7 @@ struct CaptureFrameState {
     input_state: Arc<ApplicationSurfaceInputState>,
     target_window_id: u32,
     target_process_id: i32,
+    input_delivery_mode: ApplicationSurfaceInputDeliveryMode,
     fallback_source_width: f64,
     fallback_source_height: f64,
 }
@@ -1203,6 +1221,7 @@ impl CaptureFrameState {
                     0,
                     false,
                     false,
+                    self.input_delivery_mode,
                 ) {
                     tracing::warn!(
                         %error,
@@ -1218,7 +1237,7 @@ impl CaptureFrameState {
                 ) else {
                     return;
                 };
-                if let Err(error) = post_key(target, key_code, false, 0) {
+                if let Err(error) = post_key(target, key_code, false, 0, self.input_delivery_mode) {
                     tracing::warn!(
                         %error,
                         key_code,
@@ -1250,8 +1269,11 @@ impl CaptureFrameState {
             self.mark_failed_while_publishing();
             return;
         }
-        self.input_state
-            .release_pressed_locked(self.target_process_id, self.target_window_id);
+        self.input_state.release_pressed_locked(
+            self.target_process_id,
+            self.target_window_id,
+            self.input_delivery_mode,
+        );
     }
 
     fn mark_unavailable(&self) {
@@ -1353,7 +1375,7 @@ struct ApplicationSurfaceSession {
     target_process_identity: Option<ApplicationSurfaceProcessIdentity>,
     application_scoped_capture: bool,
     fallback_target_bounds: ApplicationCaptureBounds,
-    target_uses_chromium_background_preparation: bool,
+    input_delivery_mode: ApplicationSurfaceInputDeliveryMode,
     stream: Option<SCStream>,
     frame_state: Arc<CaptureFrameState>,
     input_state: Arc<ApplicationSurfaceInputState>,
@@ -1403,6 +1425,7 @@ impl ApplicationSurfaceSession {
             deactivation.input_was_active,
             self.target_process_id,
             self.target_window_id,
+            self.input_delivery_mode,
         );
         self.frame_state
             .finish_deactivate_publication(deactivation.notify_frame_reader);
@@ -1418,6 +1441,7 @@ impl ApplicationSurfaceSession {
         let frame_state = Arc::clone(&self.frame_state);
         let target_process_id = self.target_process_id;
         let target_window_id = self.target_window_id;
+        let input_delivery_mode = self.input_delivery_mode;
         spawn_application_surface_shutdown_with(
             application_surface_lifecycle_gate(),
             move || {
@@ -1425,6 +1449,7 @@ impl ApplicationSurfaceSession {
                     deactivation.input_was_active,
                     target_process_id,
                     target_window_id,
+                    input_delivery_mode,
                 );
                 frame_state.finish_deactivate_publication(deactivation.notify_frame_reader);
             },
@@ -1697,15 +1722,26 @@ impl ApplicationSurfaceInputState {
         self.active.swap(false, Ordering::AcqRel)
     }
 
-    fn finish_deactivation(&self, was_active: bool, process_id: i32, window_id: u32) {
+    fn finish_deactivation(
+        &self,
+        was_active: bool,
+        process_id: i32,
+        window_id: u32,
+        input_delivery_mode: ApplicationSurfaceInputDeliveryMode,
+    ) {
         if !was_active {
             return;
         }
         let _dispatch = self.lock_dispatch();
-        self.release_pressed_locked(process_id, window_id);
+        self.release_pressed_locked(process_id, window_id, input_delivery_mode);
     }
 
-    fn release_pressed_locked(&self, process_id: i32, window_id: u32) {
+    fn release_pressed_locked(
+        &self,
+        process_id: i32,
+        window_id: u32,
+        input_delivery_mode: ApplicationSurfaceInputDeliveryMode,
+    ) {
         self.release_pressed_locked_with(
             |release| {
                 if let Err(error) = post_mouse_delivery(
@@ -1717,6 +1753,7 @@ impl ApplicationSurfaceInputState {
                     0,
                     false,
                     false,
+                    input_delivery_mode,
                 ) {
                     tracing::warn!(
                         %error,
@@ -1730,7 +1767,7 @@ impl ApplicationSurfaceInputState {
                 else {
                     return;
                 };
-                if let Err(error) = post_key(target, key_code, false, 0) {
+                if let Err(error) = post_key(target, key_code, false, 0, input_delivery_mode) {
                     tracing::warn!(
                         %error,
                         key_code,
@@ -2578,6 +2615,7 @@ fn start_blocking(
         application_surface_resource_budget().reserve(frame_layout.total_byte_count)?;
     let ring = SharedFrameRing::create(width, height)?;
     let input_state = Arc::new(ApplicationSurfaceInputState::new());
+    let input_delivery_mode = application_surface_input_delivery_mode(request.process_id);
     let frame_state = Arc::new(CaptureFrameState {
         ring: ring.clone(),
         _resource_reservation: Some(resource_reservation),
@@ -2586,6 +2624,7 @@ fn start_blocking(
         input_state: Arc::clone(&input_state),
         target_window_id,
         target_process_id: request.process_id,
+        input_delivery_mode,
         fallback_source_width: source_frame.size.width,
         fallback_source_height: source_frame.size.height,
     });
@@ -2671,8 +2710,7 @@ fn start_blocking(
         target_process_identity,
         application_scoped_capture,
         fallback_target_bounds: source_bounds,
-        target_uses_chromium_background_preparation:
-            application_surface_target_uses_chromium_background_preparation(request.process_id),
+        input_delivery_mode,
         stream: Some(stream),
         frame_state,
         input_state,
@@ -2862,7 +2900,7 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
         target_process_identity,
         application_scoped_capture,
         fallback_target_bounds,
-        target_uses_chromium_background_preparation,
+        input_delivery_mode,
         frame_state,
         input_state,
     ) = {
@@ -2879,7 +2917,7 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
             session.target_process_identity,
             session.application_scoped_capture,
             session.fallback_target_bounds,
-            session.target_uses_chromium_background_preparation,
+            session.input_delivery_mode,
             session.frame_state.clone(),
             session.input_state.clone(),
         )
@@ -2924,13 +2962,19 @@ pub fn send_events(events: Vec<ApplicationSurfaceEvent>) -> anyhow::Result<()> {
                 event,
                 target.window_id,
                 target_process_id,
-                target_uses_chromium_background_preparation,
+                input_delivery_mode,
                 &target,
                 content,
                 &input_state,
             )
         },
-        || input_state.release_pressed_locked(target_process_id, target.window_id),
+        || {
+            input_state.release_pressed_locked(
+                target_process_id,
+                target.window_id,
+                input_delivery_mode,
+            )
+        },
     )
 }
 
@@ -3039,7 +3083,7 @@ fn dispatch_event(
     event: ApplicationSurfaceEvent,
     target_window_id: u32,
     target_process_id: i32,
-    target_uses_chromium_background_preparation: bool,
+    input_delivery_mode: ApplicationSurfaceInputDeliveryMode,
     target: &windows::WindowInfo,
     content: Option<NormalizedContentRect>,
     input_state: &ApplicationSurfaceInputState,
@@ -3072,6 +3116,7 @@ fn dispatch_event(
                         event.click_count,
                         delta_x,
                         delta_y,
+                        input_delivery_mode,
                         &input_state.pointer,
                     );
                 }
@@ -3091,7 +3136,7 @@ fn dispatch_event(
                 event.click_count,
                 delta_x,
                 delta_y,
-                target_uses_chromium_background_preparation,
+                input_delivery_mode,
                 &input_state.pointer,
             )
         }
@@ -3110,7 +3155,7 @@ fn dispatch_event(
                 delta_x,
                 delta_y,
                 event.modifiers,
-                target_uses_chromium_background_preparation,
+                input_delivery_mode,
                 &input_state.pointer,
                 &input_state.scroll,
             )
@@ -3123,7 +3168,13 @@ fn dispatch_event(
                 ApplicationSurfaceKeyboardTarget::new(target_window_id, target_process_id)
             }
             .ok_or(ApplicationSurfaceError::WindowUnavailable)?;
-            post_key(target, key_code, key_down, event.modifiers)?;
+            post_key(
+                target,
+                key_code,
+                key_down,
+                event.modifiers,
+                input_delivery_mode,
+            )?;
             input_state
                 .keyboard
                 .lock()
@@ -3191,11 +3242,16 @@ fn chromium_browser_bundle_id(bundle_id: &str) -> bool {
     ) || bundle_id.starts_with("com.google.Chrome.")
 }
 
-fn application_surface_target_uses_chromium_background_preparation(process_id: i32) -> bool {
-    crate::apps::bundle_id_for_pid(process_id)
+fn application_surface_input_delivery_mode(process_id: i32) -> ApplicationSurfaceInputDeliveryMode {
+    let uses_chromium_background_delivery = crate::apps::bundle_id_for_pid(process_id)
         .as_deref()
         .is_some_and(chromium_browser_bundle_id)
-        || crate::browser::ElectronJs::is_electron(process_id)
+        || crate::browser::ElectronJs::is_electron(process_id);
+    if uses_chromium_background_delivery {
+        ApplicationSurfaceInputDeliveryMode::ChromiumBackground
+    } else {
+        ApplicationSurfaceInputDeliveryMode::Standard
+    }
 }
 
 fn mouse_event_requires_target_focus(kind: &str) -> bool {
@@ -3204,9 +3260,10 @@ fn mouse_event_requires_target_focus(kind: &str) -> bool {
 
 fn mouse_event_requires_chromium_background_preparation(
     kind: &str,
-    target_uses_chromium: bool,
+    input_delivery_mode: ApplicationSurfaceInputDeliveryMode,
 ) -> bool {
-    target_uses_chromium && mouse_event_requires_target_focus(kind)
+    input_delivery_mode == ApplicationSurfaceInputDeliveryMode::ChromiumBackground
+        && mouse_event_requires_target_focus(kind)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3222,7 +3279,7 @@ fn post_mouse(
     click_count: i64,
     delta_x: i64,
     delta_y: i64,
-    target_uses_chromium_background_preparation: bool,
+    input_delivery_mode: ApplicationSurfaceInputDeliveryMode,
     pointer_state: &Mutex<ApplicationSurfacePointerState>,
 ) -> anyhow::Result<()> {
     let transition = pointer_state
@@ -3249,10 +3306,8 @@ fn post_mouse(
         delta_y,
         should_focus_target,
         should_focus_target
-            && mouse_event_requires_chromium_background_preparation(
-                kind,
-                target_uses_chromium_background_preparation,
-            ),
+            && mouse_event_requires_chromium_background_preparation(kind, input_delivery_mode),
+        input_delivery_mode,
     )?;
     pointer_state
         .lock()
@@ -3261,6 +3316,7 @@ fn post_mouse(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn post_mouse_continuation(
     process_id: i32,
     window_id: u32,
@@ -3269,6 +3325,7 @@ fn post_mouse_continuation(
     click_count: i64,
     delta_x: i64,
     delta_y: i64,
+    input_delivery_mode: ApplicationSurfaceInputDeliveryMode,
     pointer_state: &Mutex<ApplicationSurfacePointerState>,
 ) -> anyhow::Result<()> {
     let delivery = pointer_state
@@ -3277,7 +3334,15 @@ fn post_mouse_continuation(
         .continued_delivery(kind, modifiers, click_count)
         .ok_or(ApplicationSurfaceError::PointOutsideContent)?;
     post_mouse_delivery(
-        process_id, window_id, kind, delivery, delta_x, delta_y, false, false,
+        process_id,
+        window_id,
+        kind,
+        delivery,
+        delta_x,
+        delta_y,
+        false,
+        false,
+        input_delivery_mode,
     )?;
     pointer_state
         .lock()
@@ -3286,6 +3351,7 @@ fn post_mouse_continuation(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn post_mouse_delivery(
     process_id: i32,
     window_id: u32,
@@ -3295,6 +3361,7 @@ fn post_mouse_delivery(
     delta_y: i64,
     should_focus_target: bool,
     should_prepare_chromium_background: bool,
+    input_delivery_mode: ApplicationSurfaceInputDeliveryMode,
 ) -> anyhow::Result<()> {
     let (event_type, button, button_number) = match kind {
         "mouse_moved" => (CGEventType::MouseMoved, CGMouseButton::Left, 0),
@@ -3344,17 +3411,26 @@ fn post_mouse_delivery(
     } else {
         3
     };
-    crate::input::mouse::post_mouse_event(
-        process_id,
-        &event,
-        Some((delivery.local_x, delivery.local_y)),
-        Some(window_id),
-        Some(delivery.group_id),
-        click_state,
-        button_number,
-        subtype,
-    );
-    Ok(())
+    deliver_application_surface_event(
+        input_delivery_mode,
+        || {
+            event.post_to_pid(process_id as libc::pid_t);
+            Ok(())
+        },
+        || {
+            crate::input::mouse::post_mouse_event(
+                process_id,
+                &event,
+                Some((delivery.local_x, delivery.local_y)),
+                Some(window_id),
+                Some(delivery.group_id),
+                click_state,
+                button_number,
+                subtype,
+            );
+            Ok(())
+        },
+    )
 }
 
 fn application_surface_target_phase(kind: &str) -> i64 {
@@ -3386,7 +3462,7 @@ fn post_scroll(
     delta_x: f64,
     delta_y: f64,
     modifiers: u64,
-    target_uses_chromium_background_preparation: bool,
+    input_delivery_mode: ApplicationSurfaceInputDeliveryMode,
     pointer_state: &Mutex<ApplicationSurfacePointerState>,
     scroll_state: &Mutex<ApplicationSurfaceScrollState>,
 ) -> anyhow::Result<()> {
@@ -3411,7 +3487,7 @@ fn post_scroll(
         1,
         0,
         0,
-        target_uses_chromium_background_preparation,
+        input_delivery_mode,
         pointer_state,
     )?;
 
@@ -3422,14 +3498,23 @@ fn post_scroll(
     event.set_flags(CGEventFlags::from_bits_truncate(modifiers));
     let pointer = event.as_ptr() as *mut c_void;
     unsafe { CGEventSetLocation(pointer, screen_x, screen_y) };
-    crate::input::skylight::set_window_location(&event, local_x, local_y);
-    crate::input::skylight::set_integer_field(&event, 40, process_id as i64);
-    crate::input::skylight::set_integer_field(&event, 51, window_id as i64);
-    crate::input::skylight::set_integer_field(&event, 91, window_id as i64);
-    crate::input::skylight::set_integer_field(&event, 92, window_id as i64);
-    crate::input::skylight::post_to_pid(process_id as libc::pid_t, &event, false);
-    event.post_to_pid(process_id as libc::pid_t);
-    Ok(())
+    deliver_application_surface_event(
+        input_delivery_mode,
+        || {
+            event.post_to_pid(process_id as libc::pid_t);
+            Ok(())
+        },
+        || {
+            crate::input::skylight::set_window_location(&event, local_x, local_y);
+            crate::input::skylight::set_integer_field(&event, 40, process_id as i64);
+            crate::input::skylight::set_integer_field(&event, 51, window_id as i64);
+            crate::input::skylight::set_integer_field(&event, 91, window_id as i64);
+            crate::input::skylight::set_integer_field(&event, 92, window_id as i64);
+            crate::input::skylight::post_to_pid(process_id as libc::pid_t, &event, false);
+            event.post_to_pid(process_id as libc::pid_t);
+            Ok(())
+        },
+    )
 }
 
 fn post_key(
@@ -3437,25 +3522,41 @@ fn post_key(
     key_code: u16,
     key_down: bool,
     modifiers: u64,
+    input_delivery_mode: ApplicationSurfaceInputDeliveryMode,
 ) -> anyhow::Result<()> {
-    if !crate::input::skylight::activate_without_raise(
-        target.process_id as libc::pid_t,
-        target.window_id,
-    ) {
-        return Err(ApplicationSurfaceError::WindowUnavailable.into());
-    }
-    std::thread::sleep(std::time::Duration::from_millis(8));
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow!("could not create keyboard event source"))?;
     let event = CGEvent::new_keyboard_event(source, key_code, key_down)
         .map_err(|_| anyhow!("could not create keyboard event"))?;
     event.set_flags(CGEventFlags::from_bits_truncate(modifiers));
-    for field in [51, 91, 92] {
-        crate::input::skylight::set_integer_field(&event, field, target.window_id as i64);
-    }
-    deliver_application_keyboard_event(
-        || crate::input::skylight::post_to_pid(target.process_id as libc::pid_t, &event, true),
-        || event.post_to_pid(target.process_id as libc::pid_t),
+    deliver_application_surface_event(
+        input_delivery_mode,
+        || {
+            event.post_to_pid(target.process_id as libc::pid_t);
+            Ok(())
+        },
+        || {
+            if !crate::input::skylight::activate_without_raise(
+                target.process_id as libc::pid_t,
+                target.window_id,
+            ) {
+                return Err(ApplicationSurfaceError::WindowUnavailable.into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(8));
+            for field in [51, 91, 92] {
+                crate::input::skylight::set_integer_field(&event, field, target.window_id as i64);
+            }
+            deliver_application_keyboard_event(
+                || {
+                    crate::input::skylight::post_to_pid(
+                        target.process_id as libc::pid_t,
+                        &event,
+                        true,
+                    )
+                },
+                || event.post_to_pid(target.process_id as libc::pid_t),
+            )
+        },
     )
 }
 
@@ -3881,6 +3982,7 @@ mod tests {
             input_state: Arc::new(ApplicationSurfaceInputState::new()),
             target_window_id: 42,
             target_process_id: 43,
+            input_delivery_mode: ApplicationSurfaceInputDeliveryMode::Standard,
             fallback_source_width: 2.0,
             fallback_source_height: 2.0,
         });
@@ -3927,6 +4029,7 @@ mod tests {
             input_state: Arc::new(ApplicationSurfaceInputState::new()),
             target_window_id: 42,
             target_process_id: 43,
+            input_delivery_mode: ApplicationSurfaceInputDeliveryMode::Standard,
             fallback_source_width: 2.0,
             fallback_source_height: 2.0,
         };
@@ -3960,6 +4063,7 @@ mod tests {
             input_state: Arc::new(ApplicationSurfaceInputState::new()),
             target_window_id: 42,
             target_process_id: 43,
+            input_delivery_mode: ApplicationSurfaceInputDeliveryMode::Standard,
             fallback_source_width: 2.0,
             fallback_source_height: 2.0,
         });
@@ -4408,6 +4512,7 @@ mod tests {
             input_state: input,
             target_window_id: 42,
             target_process_id: 43,
+            input_delivery_mode: ApplicationSurfaceInputDeliveryMode::Standard,
             fallback_source_width: 2.0,
             fallback_source_height: 2.0,
         };
@@ -4444,6 +4549,7 @@ mod tests {
             input_state: Arc::new(ApplicationSurfaceInputState::new()),
             target_window_id: 42,
             target_process_id: 43,
+            input_delivery_mode: ApplicationSurfaceInputDeliveryMode::Standard,
             fallback_source_width: 2.0,
             fallback_source_height: 2.0,
         });
@@ -5189,10 +5295,12 @@ mod tests {
         for kind in ["left_mouse_down", "right_mouse_down"] {
             assert!(mouse_event_requires_target_focus(kind));
             assert!(mouse_event_requires_chromium_background_preparation(
-                kind, true,
+                kind,
+                ApplicationSurfaceInputDeliveryMode::ChromiumBackground,
             ));
             assert!(!mouse_event_requires_chromium_background_preparation(
-                kind, false,
+                kind,
+                ApplicationSurfaceInputDeliveryMode::Standard,
             ));
         }
         for kind in [
@@ -5204,7 +5312,8 @@ mod tests {
         ] {
             assert!(!mouse_event_requires_target_focus(kind));
             assert!(!mouse_event_requires_chromium_background_preparation(
-                kind, true,
+                kind,
+                ApplicationSurfaceInputDeliveryMode::ChromiumBackground,
             ));
         }
     }
