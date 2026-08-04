@@ -1047,6 +1047,7 @@ impl CaptureFrameState {
                     release.kind,
                     release.delivery,
                     false,
+                    false,
                 ) {
                     tracing::warn!(
                         %error,
@@ -1554,6 +1555,7 @@ impl ApplicationSurfaceInputState {
                     window_id,
                     release.kind,
                     release.delivery,
+                    false,
                     false,
                 ) {
                     tracing::warn!(
@@ -2884,8 +2886,15 @@ fn application_surface_target_uses_chromium_background_preparation(process_id: i
         || crate::browser::ElectronJs::is_electron(process_id)
 }
 
-fn mouse_event_requires_background_preparation(kind: &str, target_uses_chromium: bool) -> bool {
-    target_uses_chromium && matches!(kind, "left_mouse_down" | "right_mouse_down")
+fn mouse_event_requires_target_focus(kind: &str) -> bool {
+    matches!(kind, "left_mouse_down" | "right_mouse_down")
+}
+
+fn mouse_event_requires_chromium_background_preparation(
+    kind: &str,
+    target_uses_chromium: bool,
+) -> bool {
+    target_uses_chromium && mouse_event_requires_target_focus(kind)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2915,13 +2924,16 @@ fn post_mouse(
         click_count,
         group_id: transition.group_id,
     };
+    let should_focus_target =
+        transition.should_prepare_background && mouse_event_requires_target_focus(kind);
     post_mouse_delivery(
         process_id,
         window_id,
         kind,
         delivery,
-        transition.should_prepare_background
-            && mouse_event_requires_background_preparation(
+        should_focus_target,
+        should_focus_target
+            && mouse_event_requires_chromium_background_preparation(
                 kind,
                 target_uses_chromium_background_preparation,
             ),
@@ -2946,7 +2958,7 @@ fn post_mouse_continuation(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .continued_delivery(kind, modifiers, click_count)
         .ok_or(ApplicationSurfaceError::PointOutsideContent)?;
-    post_mouse_delivery(process_id, window_id, kind, delivery, false)?;
+    post_mouse_delivery(process_id, window_id, kind, delivery, false, false)?;
     pointer_state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2959,7 +2971,8 @@ fn post_mouse_delivery(
     window_id: u32,
     kind: &str,
     delivery: ApplicationSurfacePointerDelivery,
-    should_prepare_background: bool,
+    should_focus_target: bool,
+    should_prepare_chromium_background: bool,
 ) -> anyhow::Result<()> {
     let (event_type, button, button_number) = match kind {
         "mouse_moved" => (CGEventType::MouseMoved, CGMouseButton::Left, 0),
@@ -2973,7 +2986,7 @@ fn post_mouse_delivery(
     };
     let point = CGPoint::new(delivery.screen_x, delivery.screen_y);
     let flags = CGEventFlags::from_bits_truncate(delivery.modifiers);
-    let source = if should_prepare_background {
+    let source = if should_prepare_chromium_background {
         crate::input::mouse::prepare_chromium_background_gesture(
             process_id,
             delivery.screen_x,
@@ -2985,6 +2998,11 @@ fn post_mouse_delivery(
             flags,
         )?
     } else {
+        if should_focus_target
+            && !crate::input::skylight::activate_without_raise(process_id as libc::pid_t, window_id)
+        {
+            return Err(ApplicationSurfaceError::WindowUnavailable.into());
+        }
         CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| anyhow!("could not create mouse event source"))?
     };
@@ -4724,23 +4742,16 @@ mod tests {
     }
 
     #[test]
-    fn mouse_down_events_prepare_target_focus_for_every_application() {
-        assert!(mouse_event_requires_background_preparation(
-            "left_mouse_down",
-            true,
-        ));
-        assert!(mouse_event_requires_background_preparation(
-            "right_mouse_down",
-            true,
-        ));
-        assert!(mouse_event_requires_background_preparation(
-            "left_mouse_down",
-            false,
-        ));
-        assert!(mouse_event_requires_background_preparation(
-            "right_mouse_down",
-            false,
-        ));
+    fn mouse_down_events_focus_every_application_and_prime_only_chromium() {
+        for kind in ["left_mouse_down", "right_mouse_down"] {
+            assert!(mouse_event_requires_target_focus(kind));
+            assert!(mouse_event_requires_chromium_background_preparation(
+                kind, true,
+            ));
+            assert!(!mouse_event_requires_chromium_background_preparation(
+                kind, false,
+            ));
+        }
         for kind in [
             "mouse_moved",
             "left_mouse_dragged",
@@ -4748,7 +4759,10 @@ mod tests {
             "right_mouse_dragged",
             "right_mouse_up",
         ] {
-            assert!(!mouse_event_requires_background_preparation(kind, true));
+            assert!(!mouse_event_requires_target_focus(kind));
+            assert!(!mouse_event_requires_chromium_background_preparation(
+                kind, true,
+            ));
         }
     }
 
