@@ -1194,17 +1194,8 @@ impl CompatState {
         if let Err(result) = self.require_current_lock_epoch(lock_epoch) {
             return result;
         }
-        let native_args = native_action_arguments(
-            json!({
-                "pid": snapshot.app.pid,
-                "window_id": snapshot.window_id,
-                "from_x": from_x,
-                "from_y": from_y,
-                "to_x": to_x,
-                "to_y": to_y,
-            }),
-            args,
-            session,
+        let native_args = compat_drag_native_arguments(
+            snapshot, args, session, from_x, from_y, to_x, to_y,
         );
         super::drag::DragTool::new(snapshot.native.clone())
             .invoke(native_args)
@@ -1545,6 +1536,29 @@ impl CompatState {
             .invoke(native_args)
             .await
     }
+}
+
+fn compat_drag_native_arguments(
+    snapshot: &AppSnapshot,
+    args: &Value,
+    session: &str,
+    from_x: f64,
+    from_y: f64,
+    to_x: f64,
+    to_y: f64,
+) -> Value {
+    native_action_arguments(
+        json!({
+            "pid": snapshot.app.pid,
+            "window_id": snapshot.window_id,
+            "from_x": from_x,
+            "from_y": from_y,
+            "to_x": to_x,
+            "to_y": to_y,
+        }),
+        args,
+        session,
+    )
 }
 
 fn element_supports_native_click(actions: &[String], button: &str) -> bool {
@@ -3280,6 +3294,22 @@ mod tests {
             "cmux-surface-A1B2C3-mcp-42-1000"
         );
         assert_eq!(native["_host_session"], "cmux-surface-A1B2C3");
+    }
+
+    #[test]
+    fn codex_drag_selects_the_supported_foreground_delivery_mode() {
+        let app = snapshot("AppA", Arc::new(ToolState::default()));
+        let native = compat_drag_native_arguments(
+            &app,
+            &json!({}),
+            "session-a",
+            10.0,
+            20.0,
+            30.0,
+            40.0,
+        );
+
+        assert_eq!(native["delivery_mode"], "foreground");
     }
 
     #[tokio::test]
