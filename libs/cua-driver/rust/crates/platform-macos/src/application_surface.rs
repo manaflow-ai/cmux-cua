@@ -4797,6 +4797,13 @@ mod tests {
     }
 
     #[test]
+    fn relative_pointer_motion_maps_to_target_pixels() {
+        assert_eq!(application_surface_pointer_delta(0.125, 2_560.0), 320);
+        assert_eq!(application_surface_pointer_delta(-0.25, 1_440.0), -360);
+        assert_eq!(application_surface_pointer_delta(f64::NAN, 1_440.0), 0);
+    }
+
+    #[test]
     fn application_surface_event_batches_are_bounded_and_session_scoped() {
         let event = |session: &str| ApplicationSurfaceEvent {
             session: session.to_owned(),
@@ -4853,6 +4860,13 @@ mod tests {
             serde_json::json!({
                 "session": "one",
                 "kind": "mouse_moved",
+                "x": 0.5,
+                "y": 0.5,
+            }),
+            serde_json::json!({
+                "session": "one",
+                "kind": "mouse_moved",
+                "frame_sequence": 1,
                 "x": 0.5,
                 "y": 0.5,
             }),
