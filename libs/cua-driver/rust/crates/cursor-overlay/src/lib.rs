@@ -188,6 +188,7 @@ impl CursorConfig {
     /// --glide-ms     <f64>        (glideDurationMs override)
     /// --dwell-ms     <f64>        (dwellAfterClickMs override)
     /// --idle-hide-ms <f64>        (idleHideMs override)
+    /// --cursor-speed <f64>        (glide speed multiplier, clamped to [0.25, 8])
     /// ```
     pub fn from_args() -> Self {
         let args: Vec<String> = std::env::args().collect();
@@ -254,6 +255,12 @@ impl CursorConfig {
                 "--idle-hide-ms" => {
                     if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
                         cfg.motion.idle_hide_ms = v;
+                        i += 1;
+                    }
+                }
+                "--cursor-speed" => {
+                    if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
+                        cfg.motion = cfg.motion.scaled_by(v);
                         i += 1;
                     }
                 }
@@ -477,5 +484,34 @@ impl OverlayCommand {
             CursorIconResolution::Builtin(b) => OverlayCommand::SetBuiltinShape(b),
             CursorIconResolution::Image(s) => OverlayCommand::SetShape(Some(s)),
         }
+    }
+}
+
+#[cfg(test)]
+mod cursor_speed_arg_tests {
+    use super::{CursorConfig, MotionConfig};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn cursor_speed_flag_scales_glide_speed() {
+        let stock = MotionConfig::default();
+        let cfg = CursorConfig::parse(&args(&["--cursor-speed", "1.75"]));
+        assert_eq!(cfg.motion.peak_speed, stock.peak_speed * 1.75);
+        assert_eq!(cfg.motion.min_end_speed, stock.min_end_speed * 1.75);
+        // Click visuals keep their stock durations.
+        assert_eq!(cfg.motion.press_duration_ms, stock.press_duration_ms);
+        assert_eq!(cfg.motion.dwell_after_click_ms, stock.dwell_after_click_ms);
+    }
+
+    #[test]
+    fn cursor_speed_flag_tolerates_garbage_and_missing_values() {
+        let stock = MotionConfig::default();
+        let garbage = CursorConfig::parse(&args(&["--cursor-speed", "fast"]));
+        assert_eq!(garbage.motion.peak_speed, stock.peak_speed);
+        let missing = CursorConfig::parse(&args(&["--cursor-speed"]));
+        assert_eq!(missing.motion.peak_speed, stock.peak_speed);
     }
 }

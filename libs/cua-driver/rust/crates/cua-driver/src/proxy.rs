@@ -26,9 +26,10 @@
 use std::sync::Arc;
 
 use cua_driver_core::protocol::{
-    codex_computer_use_initialize_result, initialize_result, Request, Response, ToolCall,
-    ToolResult,
+    codex_computer_use_initialize_result, initialize_result, Request, Response,
 };
+#[cfg(target_os = "macos")]
+use cua_driver_core::protocol::{ToolCall, ToolResult};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
@@ -959,15 +960,48 @@ struct AppApprovalChallenge {
 }
 
 const APPROVAL_BROKER_TOKEN_ARG: &str = "_cua_approval_broker_token";
+pub(crate) const COMPAT_PROXY_HOST_SESSION_ARG: &str = "_cua_proxy_host_session";
+pub(crate) const COMPAT_PROXY_STATE_OWNER_PID_ARG: &str = "_cua_proxy_state_owner_pid";
 
-fn with_approval_broker_token(
+fn compat_authenticated_arguments(
     mut args: serde_json::Value,
     broker_token: &str,
+    session_id: &str,
+    managed_session: bool,
+    state_owner_pid: Option<u32>,
 ) -> serde_json::Value {
     if !args.is_object() {
         args = serde_json::Value::Object(serde_json::Map::new());
     }
-    args.as_object_mut().unwrap().insert(
+    let object = args.as_object_mut().unwrap();
+
+    // Host authority is transport metadata owned by the embedding proxy. Never
+    // forward caller-provided copies, including values that already use the
+    // proxy-only names below.
+    object.remove(cua_driver_core::HOST_SESSION_ARG);
+    object.remove(cua_driver_core::session_state::STATE_OWNER_PID_ARG);
+    object.remove(COMPAT_PROXY_HOST_SESSION_ARG);
+    object.remove(COMPAT_PROXY_STATE_OWNER_PID_ARG);
+
+    if managed_session {
+        let lifecycle_session = serde_json::Value::String(session_id.to_owned());
+        object.insert("session".to_owned(), lifecycle_session.clone());
+        object.insert("_session_id".to_owned(), lifecycle_session);
+        if let Some(host_session) = managed_host_session(session_id) {
+            object.insert(
+                COMPAT_PROXY_HOST_SESSION_ARG.to_owned(),
+                serde_json::Value::String(host_session.to_owned()),
+            );
+        }
+        if let Some(owner_pid) = state_owner_pid.filter(|value| *value > 1) {
+            object.insert(
+                COMPAT_PROXY_STATE_OWNER_PID_ARG.to_owned(),
+                serde_json::json!(owner_pid),
+            );
+        }
+    }
+
+    object.insert(
         APPROVAL_BROKER_TOKEN_ARG.to_owned(),
         serde_json::Value::String(broker_token.to_owned()),
     );
@@ -1237,7 +1271,15 @@ where
         }
     };
 
-    let authenticated_args = with_approval_broker_token(args, &broker_token);
+    let managed_session = configured_default_session()
+        .is_some_and(|base| session_id.starts_with(&format!("{base}-mcp-")));
+    let authenticated_args = compat_authenticated_arguments(
+        args,
+        &broker_token,
+        session_id,
+        managed_session,
+        configured_state_owner_pid(),
+    );
 
     let first = match call_daemon_tool(
         socket_path,
@@ -1433,8 +1475,15 @@ struct DaemonLifecycleEvent {
 
 #[cfg(target_os = "macos")]
 impl DaemonStartState {
-    fn needs_grant_wait(&self, request_requires_wait: bool, external_permission_flow: bool) -> bool {
-        request_requires_wait && !external_permission_flow && !self.grant_wait_completed
+    fn needs_grant_wait(
+        &self,
+        request_requires_wait: bool,
+        external_permission_flow: bool,
+    ) -> bool {
+        // A host can revoke external readiness without restarting the daemon,
+        // so protected calls must observe that mutable milestone every time.
+        request_requires_wait
+            && (external_permission_flow || !self.grant_wait_completed)
     }
 
     fn complete_grant_wait(&mut self) {
@@ -1679,90 +1728,147 @@ async fn ensure_daemon_started(
             anyhow::bail!("daemon changed while its authoritative tool list was loading");
         }
     }
-    // Onboarding: wait until BOTH TCC grants are in before the first tool
-    // executes. The daemon's startup gate raises the Accessibility + Screen
-    // Recording prompts and re-execs the daemon (~every 25s) to pick up each
-    // grant. If the agent's first tool call runs during that window it races
-    // the re-exec — dropped connections mid-click and a cursor that blinks out
-    // (its overlay state is lost on re-exec until the next move). Holding the
-    // first call until the grants settle makes onboarding go through all steps
-    // first, then run on a stable daemon with a stable cursor. Bounded +
-    // fail-safe: on timeout we proceed and let the tool call surface any real
-    // TCC error, so a user who ignores the prompts is never hung forever.
+    // Hold every driving call until the active permission authority reports the
+    // complete flow ready. Host-owned onboarding additionally requires the
+    // host's explicit post-verification readiness milestone.
     let external_permission_flow =
         crate::bundle::is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW");
-    if state.needs_grant_wait(wait_for_grants, external_permission_flow) {
-        wait_for_daemon_grants(socket_path, session_id).await;
-        state.complete_grant_wait();
-    } else if wait_for_grants && external_permission_flow {
-        // The embedding host owns permission onboarding, so driving calls are
-        // intentionally considered past this proxy-local milestone.
+    let external_permission_readiness_required = external_permission_flow
+        && crate::bundle::is_env_truthy(
+            "CUA_DRIVER_RS_EXTERNAL_PERMISSION_READINESS_PROTOCOL",
+        );
+    if state.needs_grant_wait(wait_for_grants, external_permission_readiness_required) {
+        wait_for_daemon_permission_readiness(
+            socket_path,
+            session_id,
+            external_permission_flow,
+            external_permission_readiness_required,
+        )
+        .await?;
         state.complete_grant_wait();
     }
     Ok(())
 }
 
-/// Poll the daemon's private `permissions_status` control method until both
-/// Accessibility and Screen Recording read granted, or a bounded deadline
-/// elapses. This must not dispatch the public `check_permissions` tool: the
-/// Codex compatibility roster intentionally omits that tool, and private
-/// daemon health must not consume or bypass an app-approval broker token.
-/// Kept under a typical MCP client tool-call timeout so a slow grant degrades
-/// to "first call fails, agent retries on the now-granted daemon" rather than
-/// a hung call. Every failure path (transport error during a gate re-exec,
-/// unexpected shape) just retries until the deadline.
+/// Poll the daemon's private permission state until the complete authority is
+/// ready. The bounded deadline fails closed instead of dispatching protected
+/// work while onboarding is incomplete.
 #[cfg(target_os = "macos")]
-async fn wait_for_daemon_grants(socket_path: &str, session_id: &str) {
-    use std::time::{Duration, Instant};
-    let deadline = Instant::now() + Duration::from_secs(55);
-    loop {
-        if Instant::now() >= deadline {
-            debug!("wait_for_daemon_grants: deadline elapsed; proceeding");
-            return;
-        }
-        let sp = socket_path.to_owned();
-        let sid = session_id.to_owned();
-        let probe = tokio::task::spawn_blocking(move || {
-            let req = DaemonRequest {
-                method: "permissions_status".into(),
-                name: None,
-                args: None,
-                session_id: Some(sid),
-            };
-            send_request(&sp, &req)
-        })
-        .await;
-        if let Ok(Ok(resp)) = probe {
-            if let Some(result) = resp.result.as_ref() {
-                if let Some((ax, sr)) = extract_grants(result) {
-                    if ax && sr {
-                        debug!("wait_for_daemon_grants: both grants active");
+async fn wait_for_daemon_permission_readiness(
+    socket_path: &str,
+    session_id: &str,
+    external_permission_flow: bool,
+    external_permission_readiness_required: bool,
+) -> anyhow::Result<()> {
+    wait_for_daemon_permission_readiness_with_timeout(
+        socket_path,
+        session_id,
+        external_permission_flow,
+        external_permission_readiness_required,
+        std::time::Duration::from_secs(55),
+    )
+    .await
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_daemon_permission_readiness_with_timeout(
+    socket_path: &str,
+    session_id: &str,
+    external_permission_flow: bool,
+    external_permission_readiness_required: bool,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    use std::time::Duration;
+    let wait = async {
+        loop {
+            let sp = socket_path.to_owned();
+            let sid = session_id.to_owned();
+            let probe = tokio::task::spawn_blocking(move || {
+                let req = DaemonRequest {
+                    method: "permissions_status".into(),
+                    name: None,
+                    args: None,
+                    session_id: Some(sid),
+                };
+                send_request(&sp, &req)
+            })
+            .await;
+            if let Ok(Ok(resp)) = probe {
+                if let Some(result) = resp.result.as_ref() {
+                    if daemon_permission_readiness(
+                        result,
+                        external_permission_readiness_required,
+                    ) {
+                        debug!(
+                            external_permission_flow = external_permission_flow,
+                            external_permission_readiness_required =
+                                external_permission_readiness_required,
+                            "daemon permission authority is ready"
+                        );
                         return;
                     }
                 }
             }
+            tokio::time::sleep(Duration::from_millis(750)).await;
         }
-        tokio::time::sleep(Duration::from_millis(750)).await;
+    };
+    if tokio::time::timeout(timeout, wait).await.is_ok() {
+        return Ok(());
     }
+    if external_permission_flow {
+        anyhow::bail!(
+            "Computer Use onboarding is still in progress. Finish setup in cmux, then retry."
+        );
+    }
+    anyhow::bail!(
+        "Computer Use permissions are not ready. Finish granting Accessibility and Screen Recording, then retry."
+    );
 }
 
-/// Recursively locate a permission-status payload — an object carrying both
-/// `accessibility` and `screen_recording` booleans — wherever the daemon nests
-/// it, and return `(accessibility, screen_recording)`. Shape-tolerant so the
-/// poll doesn't depend on the exact result envelope.
 #[cfg(target_os = "macos")]
-fn extract_grants(v: &serde_json::Value) -> Option<(bool, bool)> {
+fn daemon_permission_readiness(
+    value: &serde_json::Value,
+    external_permission_readiness_required: bool,
+) -> bool {
+    extract_permission_readiness(value).is_some_and(
+        |(accessibility, screen_recording, host_ready, readiness_capable)| {
+            accessibility
+                && screen_recording
+                && (!external_permission_readiness_required
+                    // Hosts predating readiness negotiation do not request the
+                    // milestone. Daemons predating the capability field retain
+                    // their grant-only behavior for current hosts as well.
+                    || !readiness_capable
+                    || host_ready == Some(true))
+        },
+    )
+}
+
+/// Recursively locate the permission payload without depending on the daemon's
+/// result-envelope shape.
+#[cfg(target_os = "macos")]
+fn extract_permission_readiness(
+    v: &serde_json::Value,
+) -> Option<(bool, bool, Option<bool>, bool)> {
     match v {
         serde_json::Value::Object(obj) => {
             if let (Some(a), Some(s)) = (
                 obj.get("accessibility").and_then(serde_json::Value::as_bool),
                 obj.get("screen_recording").and_then(serde_json::Value::as_bool),
             ) {
-                return Some((a, s));
+                return Some((
+                    a,
+                    s,
+                    obj.get("external_permission_ready")
+                        .and_then(serde_json::Value::as_bool),
+                    obj.contains_key("external_permission_readiness_protocol"),
+                ));
             }
-            obj.values().find_map(extract_grants)
+            obj.values().find_map(extract_permission_readiness)
         }
-        serde_json::Value::Array(arr) => arr.iter().find_map(extract_grants),
+        serde_json::Value::Array(arr) => {
+            arr.iter().find_map(extract_permission_readiness)
+        }
         _ => None,
     }
 }
@@ -2269,14 +2375,48 @@ mod tests {
 
     #[test]
     fn compat_calls_overwrite_caller_broker_fields_with_the_daemon_token() {
-        let args = with_approval_broker_token(
+        let args = compat_authenticated_arguments(
             serde_json::json!({
                 "app": "Calculator",
                 (APPROVAL_BROKER_TOKEN_ARG): "caller-forged",
             }),
             "daemon-minted",
+            "mcp-4242-99",
+            false,
+            None,
         );
         assert_eq!(args["app"], "Calculator");
+        assert_eq!(args[APPROVAL_BROKER_TOKEN_ARG], "daemon-minted");
+    }
+
+    #[test]
+    fn compat_calls_forward_only_trusted_host_identity() {
+        let managed = "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF-mcp-4242-99";
+        let args = compat_authenticated_arguments(
+            serde_json::json!({
+                "app": "Calculator",
+                "session": "caller-session",
+                "_session_id": "caller-session",
+                (cua_driver_core::HOST_SESSION_ARG): "caller-forged-host",
+                (cua_driver_core::session_state::STATE_OWNER_PID_ARG): 7,
+                (COMPAT_PROXY_HOST_SESSION_ARG): "caller-forged-proxy-host",
+                (COMPAT_PROXY_STATE_OWNER_PID_ARG): 8,
+            }),
+            "daemon-minted",
+            managed,
+            true,
+            Some(4242),
+        );
+
+        assert!(args.get(cua_driver_core::HOST_SESSION_ARG).is_none());
+        assert!(args
+            .get(cua_driver_core::session_state::STATE_OWNER_PID_ARG)
+            .is_none());
+        assert_eq!(
+            args[COMPAT_PROXY_HOST_SESSION_ARG],
+            "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF"
+        );
+        assert_eq!(args[COMPAT_PROXY_STATE_OWNER_PID_ARG], 4242);
         assert_eq!(args[APPROVAL_BROKER_TOKEN_ARG], "daemon-minted");
     }
 
@@ -2615,6 +2755,7 @@ mod tests {
             ok: false,
             result: None,
             error: Some("missing required field `pid`".into()),
+            error_code: None,
             exit_code: Some(64),
         };
         let resp = build_tool_error_response(serde_json::json!(7), daemon_resp);
@@ -2642,6 +2783,7 @@ mod tests {
             ok: false,
             result: None,
             error: None,
+            error_code: None,
             exit_code: None,
         };
         let resp = build_tool_error_response(serde_json::json!("abc"), daemon_resp);
@@ -3053,6 +3195,109 @@ mod tests {
             !state.needs_grant_wait(true, false),
             "a completed wait should not repeat while the daemon remains healthy"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn external_permission_flow_waits_for_host_readiness() {
+        let state = DaemonStartState {
+            reaper_started: true,
+            grant_wait_completed: false,
+            ..DaemonStartState::default()
+        };
+
+        assert!(
+            state.needs_grant_wait(true, true),
+            "host-owned onboarding must gate driving calls until the host publishes readiness"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn external_permission_flow_rechecks_host_readiness_after_completion() {
+        let state = DaemonStartState {
+            reaper_started: true,
+            grant_wait_completed: true,
+            ..DaemonStartState::default()
+        };
+
+        assert!(
+            state.needs_grant_wait(true, true),
+            "external permission flow must observe a host readiness revocation"
+        );
+        assert!(
+            !state.needs_grant_wait(true, false),
+            "driver-owned permission flow may retain its completed grant wait"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn permission_probe_is_bounded_by_the_onboarding_deadline() {
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().expect("socket tempdir");
+        let socket = root.path().join("stalled-permission.sock");
+        let listener = UnixListener::bind(&socket).expect("bind stalled permission daemon");
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept permission probe");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+
+        let readiness = wait_for_daemon_permission_readiness_with_timeout(
+            socket.to_str().expect("UTF-8 socket path"),
+            "deadline-test",
+            true,
+            true,
+            std::time::Duration::from_millis(20),
+        );
+        let bounded = tokio::time::timeout(std::time::Duration::from_millis(100), readiness).await;
+        server.join().expect("stalled permission daemon joins");
+
+        let result = bounded.expect("permission probe outlived its onboarding deadline");
+        assert!(result.is_err(), "deadline must fail closed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn external_permission_readiness_requires_the_host_milestone() {
+        let legacy_granted = serde_json::json!({
+            "accessibility": true,
+            "screen_recording": true,
+        });
+        assert!(
+            daemon_permission_readiness(&legacy_granted, true),
+            "a daemon from before the host-readiness field must retain its granted behavior"
+        );
+
+        let capable_but_unnegotiated = serde_json::json!({
+            "accessibility": true,
+            "screen_recording": true,
+            "external_permission_readiness_protocol": 1,
+        });
+        assert!(
+            !daemon_permission_readiness(&capable_but_unnegotiated, true),
+            "a capable daemon must wait for its host's explicit readiness milestone"
+        );
+
+        let granted_without_host = serde_json::json!({
+            "accessibility": true,
+            "screen_recording": true,
+            "external_permission_readiness_protocol": 1,
+            "external_permission_ready": false,
+        });
+        assert!(daemon_permission_readiness(&granted_without_host, false));
+        assert!(!daemon_permission_readiness(&granted_without_host, true));
+
+        let host_ready = serde_json::json!({
+            "result": {
+                "accessibility": true,
+                "screen_recording": true,
+                "external_permission_readiness_protocol": 1,
+                "external_permission_ready": true,
+            }
+        });
+        assert!(daemon_permission_readiness(&host_ready, true));
     }
 
     #[cfg(target_os = "macos")]

@@ -19,6 +19,7 @@
 //! reverse coupling from core into the platform crates.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -54,6 +55,9 @@ fn is_trackable(id: &str) -> bool {
 /// once. Growth is bounded (one short string per ended session over the
 /// daemon's lifetime); eviction is a deliberate non-blocking follow-up.
 static ENDED_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+const SESSION_LIFECYCLE_LOCK_COUNT: usize = 64;
+static SESSION_LIFECYCLE_LOCKS: OnceLock<[Mutex<()>; SESSION_LIFECYCLE_LOCK_COUNT]> =
+    OnceLock::new();
 
 fn hooks() -> &'static Mutex<Vec<SessionEndHook>> {
     SESSION_END_HOOKS.get_or_init(|| Mutex::new(Vec::new()))
@@ -65,6 +69,14 @@ fn revive_hooks() -> &'static Mutex<Vec<SessionReviveHook>> {
 
 fn ended_sessions() -> &'static Mutex<HashSet<String>> {
     ENDED_SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn session_lifecycle_lock(session_id: &str) -> &'static Mutex<()> {
+    let mut hasher = DefaultHasher::new();
+    session_id.hash(&mut hasher);
+    let index = hasher.finish() as usize % SESSION_LIFECYCLE_LOCK_COUNT;
+    &SESSION_LIFECYCLE_LOCKS
+        .get_or_init(|| std::array::from_fn(|_| Mutex::new(())))[index]
 }
 
 /// Register a callback invoked with the disconnecting `session_id` whenever a
@@ -92,6 +104,7 @@ pub fn register_session_revive_hook(hook: impl Fn(&str) + Send + Sync + 'static)
 /// stray legacy `session_end` (mixed-version rollout) so cursor-remove +
 /// recording-stop run exactly once. No-op when no hooks are registered.
 pub fn fire_session_end(session_id: &str) {
+    let _lifecycle_guard = session_lifecycle_lock(session_id).lock().unwrap();
     // Mark-then-fan-out under a short critical section, releasing the lock
     // before running hooks (hooks may be slow / re-entrant and must not hold
     // the dedupe lock).
@@ -144,6 +157,7 @@ pub fn revive_session(session_id: &str) -> bool {
     if !is_trackable(session_id) {
         return false;
     }
+    let _lifecycle_guard = session_lifecycle_lock(session_id).lock().unwrap();
     // Serialize revivals through the hook lock, but do not hold the ended-set
     // lock while invoking callbacks. The tombstone remains present while hooks
     // enqueue their ordered lifecycle events, so concurrent actions still see
@@ -362,6 +376,48 @@ mod tests {
         assert!(first.join().unwrap());
         assert!(!second.join().unwrap());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn revive_waits_for_in_flight_end_cleanup() {
+        let sid = "test-end-revive-order-session-F6A7B8";
+        let end_entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release_end = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (revive_entered_tx, revive_entered_rx) = std::sync::mpsc::channel();
+        let expected_end = sid.to_owned();
+        let hook_end_entered = end_entered.clone();
+        let hook_release_end = release_end.clone();
+        register_session_end_hook(move |got| {
+            if got == expected_end {
+                hook_end_entered.wait();
+                hook_release_end.wait();
+            }
+        });
+        let expected_revive = sid.to_owned();
+        register_session_revive_hook(move |got| {
+            if got == expected_revive {
+                revive_entered_tx.send(()).unwrap();
+            }
+        });
+
+        let end_sid = sid.to_owned();
+        let ender = std::thread::spawn(move || fire_session_end(&end_sid));
+        end_entered.wait();
+
+        let revive_sid = sid.to_owned();
+        let reviver = std::thread::spawn(move || revive_session(&revive_sid));
+        let revived_before_cleanup_finished = revive_entered_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_ok();
+        release_end.wait();
+        ender.join().unwrap();
+        assert!(reviver.join().unwrap());
+
+        assert!(
+            !revived_before_cleanup_finished,
+            "revival hooks must wait until the older end cleanup completes"
+        );
+        assert!(!is_session_ended(sid));
     }
 
     #[test]

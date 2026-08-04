@@ -340,14 +340,13 @@ impl Tool for DragTool {
                         (true, Some(_wid)) => {
                             let result = do_it();
                             std::thread::sleep(std::time::Duration::from_millis(100));
-                            if let Some(previous_pid) = prior_front {
-                                if previous_pid != pid {
-                                    if result.is_ok() {
-                                        gate.check()?;
-                                        apps::activate_pid(previous_pid);
-                                    }
-                                }
-                            }
+                            restore_prior_frontmost_after_drag(
+                                pid,
+                                prior_front,
+                                |previous_pid| {
+                                    let _ = apps::activate_pid(previous_pid);
+                                },
+                            );
                             result?;
                             Ok(())
                         }
@@ -400,6 +399,18 @@ impl Tool for DragTool {
             })),
             Ok(Err(e)) => ToolResult::error(format!("drag failed: {e}")),
             Err(e)     => ToolResult::error(format!("Task error: {e}")),
+        }
+    }
+}
+
+fn restore_prior_frontmost_after_drag(
+    target_pid: i32,
+    prior_frontmost_pid: Option<i32>,
+    activate: impl FnOnce(i32),
+) {
+    if let Some(previous_pid) = prior_frontmost_pid {
+        if previous_pid != target_pid {
+            activate(previous_pid);
         }
     }
 }
@@ -538,5 +549,18 @@ mod tests {
                 .expect("valid target"),
             1234
         );
+    }
+
+    #[test]
+    fn foreground_drag_restores_prior_app_after_dispatch_failure() {
+        let restored_pid = std::cell::Cell::new(None);
+
+        restore_prior_frontmost_after_drag(
+            42,
+            Some(7),
+            |pid| restored_pid.set(Some(pid)),
+        );
+
+        assert_eq!(restored_pid.get(), Some(7));
     }
 }

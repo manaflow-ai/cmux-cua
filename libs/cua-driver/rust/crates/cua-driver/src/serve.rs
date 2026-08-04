@@ -10,10 +10,16 @@
 //!   {"method":"permissions_status"}       (private macOS operator control)
 //!   {"method":"permissions_present"}      (private macOS operator control)
 //!   {"method":"permissions_refresh"}      (private macOS operator control)
+//!   {"method":"application_windows"}      (private authenticated cmux host control)
+//!   {"method":"application_surface_start","args":{...}}
+//!   {"method":"application_surface_attach","args":{"session":"..."}}
+//!   {"method":"application_surface_stop","args":{"session":"..."}}
+//!   {"method":"application_surface_event","args":{...}}
+//!   {"method":"application_surface_events","args":{"events":[...]}}
 //!
 //! Response shapes:
 //!   {"ok":true,"result":...}
-//!   {"ok":false,"error":"...","exit_code":1}
+//!   {"ok":false,"error":"...","error_code":"...","exit_code":1}
 //!
 //! The socket file is at:
 //!   macOS  — ~/Library/Caches/cua-driver/cua-driver.sock
@@ -809,6 +815,8 @@ pub struct DaemonResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
 }
 
@@ -867,6 +875,32 @@ fn host_request_is_authorized(
         host_authenticated
     } else {
         peer_is_authorized_root
+    }
+}
+
+fn host_permission_control_is_authorized(method: &str, host_request_authorized: bool) -> bool {
+    !matches!(method, "permissions_present" | "permissions_refresh")
+        || host_request_authorized
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct ApplicationSurfaceConnectionSessions {
+    session_ids: std::collections::BTreeSet<String>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl ApplicationSurfaceConnectionSessions {
+    fn register(&mut self, session_id: &str) {
+        self.session_ids.insert(session_id.to_owned());
+    }
+
+    fn release(&mut self, session_id: &str) {
+        self.session_ids.remove(session_id);
+    }
+
+    fn drain(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.session_ids).into_iter().collect()
     }
 }
 
@@ -1216,6 +1250,12 @@ fn validate_system_permission_request(permission: Option<&str>) -> DaemonRespons
     }
 }
 
+fn screen_capture_verification_response(capturable: bool) -> DaemonResponse {
+    DaemonResponse::ok(serde_json::json!({
+        "capturable": capturable,
+    }))
+}
+
 #[cfg(target_os = "macos")]
 fn request_validated_system_permission(permission: &str) {
     match permission {
@@ -1231,10 +1271,32 @@ fn request_validated_system_permission(permission: &str) {
 
 impl DaemonResponse {
     pub fn ok(result: serde_json::Value) -> Self {
-        Self { ok: true, result: Some(result), error: None, exit_code: None }
+        Self {
+            ok: true,
+            result: Some(result),
+            error: None,
+            error_code: None,
+            exit_code: None,
+        }
     }
     pub fn err(msg: impl Into<String>, code: i32) -> Self {
-        Self { ok: false, result: None, error: Some(msg.into()), exit_code: Some(code) }
+        Self {
+            ok: false,
+            result: None,
+            error: Some(msg.into()),
+            error_code: None,
+            exit_code: Some(code),
+        }
+    }
+
+    pub fn coded_err(msg: impl Into<String>, code: i32, error_code: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            result: None,
+            error: Some(msg.into()),
+            error_code: Some(error_code.into()),
+            exit_code: Some(code),
+        }
     }
 
     pub fn tool_error(result: serde_json::Value, msg: impl Into<String>, code: i32) -> Self {
@@ -1242,9 +1304,16 @@ impl DaemonResponse {
             ok: false,
             result: Some(result),
             error: Some(msg.into()),
+            error_code: None,
             exit_code: Some(code),
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn application_surface_failure_response(error: anyhow::Error) -> DaemonResponse {
+    let error_code = platform_macos::application_surface::error_protocol_code(&error);
+    DaemonResponse::coded_err(format!("{error:#}"), 1, error_code)
 }
 
 #[cfg(target_os = "macos")]
@@ -1280,14 +1349,18 @@ fn daemon_permission_attribution() -> &'static str {
 }
 
 #[cfg(target_os = "macos")]
-fn daemon_permission_status(profile: DaemonProfile) -> serde_json::Value {
+fn daemon_permission_status(
+    profile: DaemonProfile,
+    external_permission_ready: Option<bool>,
+) -> serde_json::Value {
     let status = platform_macos::permissions::current_status();
     let panel = platform_macos::permissions::panel::lifecycle();
     let recovery = platform_macos::permissions::gate::recovery_lifecycle();
-    serde_json::json!({
+    let mut result = serde_json::json!({
         "accessibility": status.accessibility,
         "screen_recording": status.screen_recording,
         "all_granted": status.all_granted(),
+        "external_permission_readiness_protocol": 1,
         "profile": profile,
         "panel": {
             "visible": panel.visible,
@@ -1305,7 +1378,26 @@ fn daemon_permission_status(profile: DaemonProfile) -> serde_json::Value {
             "pid": std::process::id(),
             "instance": daemon_instance_id(),
         },
-    })
+    });
+    if let Some(ready) = external_permission_ready {
+        result
+            .as_object_mut()
+            .expect("permission status must be an object")
+            .insert(
+                "external_permission_ready".to_owned(),
+                serde_json::Value::Bool(ready),
+            );
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn external_permission_readiness_from_state(state: u8) -> Option<bool> {
+    match state {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
 }
 
 fn app_approval_broker_matches(
@@ -1338,14 +1430,28 @@ fn authenticate_compat_call(
         return Ok(());
     }
 
-    let supplied_token = args
-        .as_object_mut()
-        .and_then(|object| object.remove(APPROVAL_BROKER_TOKEN_ARG))
+    let object = args.as_object_mut().ok_or_else(|| {
+        "Codex Computer Use tool arguments must be an object.".to_owned()
+    })?;
+    let supplied_token = object
+        .remove(APPROVAL_BROKER_TOKEN_ARG)
         .and_then(|value| value.as_str().map(str::to_owned))
         .ok_or_else(|| {
             "Codex Computer Use tool calls require the authenticated MCP control session."
                 .to_owned()
         })?;
+    let proxy_host_session = object
+        .remove(crate::proxy::COMPAT_PROXY_HOST_SESSION_ARG)
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|value| !value.is_empty());
+    let proxy_state_owner_pid = object
+        .remove(crate::proxy::COMPAT_PROXY_STATE_OWNER_PID_ARG)
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 1);
+    object.remove(cua_driver_core::HOST_SESSION_ARG);
+    object.remove(cua_driver_core::session_state::STATE_OWNER_PID_ARG);
+
     let session_id = session_id.filter(|value| !value.is_empty()).ok_or_else(|| {
         "Codex Computer Use tool calls require the authenticated MCP session id.".to_owned()
     })?;
@@ -1361,6 +1467,22 @@ fn authenticate_compat_call(
         "_session_id".to_owned(),
         serde_json::Value::String(session_id.to_owned()),
     );
+    if let Some(host_session) = proxy_host_session.filter(|host_session| {
+        session_id
+            .strip_prefix(host_session.as_str())
+            .is_some_and(|suffix| suffix.starts_with("-mcp-"))
+    }) {
+        object.insert(
+            cua_driver_core::HOST_SESSION_ARG.to_owned(),
+            serde_json::Value::String(host_session),
+        );
+    }
+    if let Some(owner_pid) = proxy_state_owner_pid {
+        object.insert(
+            cua_driver_core::session_state::STATE_OWNER_PID_ARG.to_owned(),
+            serde_json::json!(owner_pid),
+        );
+    }
     Ok(())
 }
 
@@ -1638,6 +1760,11 @@ pub async fn run_serve(
     let approval_brokers = std::sync::Arc::new(std::sync::Mutex::new(
         std::collections::HashMap::<String, String>::new(),
     ));
+    // State zero means the external host has not negotiated readiness
+    // ownership. Older hosts therefore retain the grant-only behavior. Once a
+    // capable host calls the setter, one and two preserve explicit false/true.
+    let external_permission_readiness =
+        std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
 
     loop {
         tokio::select! {
@@ -1678,6 +1805,7 @@ pub async fn run_serve(
                 let last_activity = last_activity.clone();
                 let approval_peer_pid = approval_broker_peer_pid(&stream);
                 let approval_brokers = approval_brokers.clone();
+                let external_permission_readiness = external_permission_readiness.clone();
 
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.into_split();
@@ -1691,6 +1819,9 @@ pub async fn run_serve(
                     // kernel-guaranteed), the post-loop block reaps the session.
                     let mut control_session_id: Option<String> = None;
                     let mut control_approval_token: Option<(String, String)> = None;
+                    #[cfg(target_os = "macos")]
+                    let mut application_surface_sessions =
+                        ApplicationSurfaceConnectionSessions::default();
 
                     while let Ok(Some(line)) = lines.next_line().await {
                         #[cfg(target_os = "macos")]
@@ -1701,7 +1832,7 @@ pub async fn run_serve(
                                         identity.is_same_generation_as(root_process_identity)
                                     });
                             if !root_is_still_live {
-                                return;
+                                break;
                             }
                         }
                         let parsed = match parse_request(&line) {
@@ -1740,11 +1871,18 @@ pub async fn run_serve(
                                 if let Some(tx) = guard.take() {
                                     let _ = tx.send(());
                                 }
-                                return;
+                                break;
                             }
                             "permissions_status" => {
                                 #[cfg(target_os = "macos")]
-                                let resp = DaemonResponse::ok(daemon_permission_status(profile));
+                                let resp = DaemonResponse::ok(daemon_permission_status(
+                                    profile,
+                                    external_permission_readiness_from_state(
+                                        external_permission_readiness.load(
+                                            std::sync::atomic::Ordering::Acquire
+                                        )
+                                    ),
+                                ));
                                 #[cfg(not(target_os = "macos"))]
                                 let resp = DaemonResponse::err(
                                     "permissions_status is available only on macOS",
@@ -1754,7 +1892,50 @@ pub async fn run_serve(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
                             }
+                            "set_external_permission_ready" => {
+                                let response = if !host_request_authorized {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    )
+                                } else if let Some(ready) = req
+                                    .args
+                                    .as_ref()
+                                    .and_then(|args| args.get("ready"))
+                                    .and_then(serde_json::Value::as_bool)
+                                {
+                                    external_permission_readiness.store(
+                                        if ready { 2 } else { 1 },
+                                        std::sync::atomic::Ordering::Release,
+                                    );
+                                    DaemonResponse::ok(serde_json::json!({
+                                        "external_permission_ready": ready,
+                                    }))
+                                } else {
+                                    DaemonResponse::err(
+                                        "External permission readiness requires a boolean `ready`"
+                                            .to_owned(),
+                                        64,
+                                    )
+                                };
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&response).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
                             "permissions_present" => {
+                                if !host_permission_control_is_authorized(
+                                    req.method.as_str(),
+                                    host_request_authorized,
+                                ) {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
                                 #[cfg(target_os = "macos")]
                                 {
                                     let prepared =
@@ -1794,6 +1975,19 @@ pub async fn run_serve(
                                 }
                             }
                             "permissions_refresh" => {
+                                if !host_permission_control_is_authorized(
+                                    req.method.as_str(),
+                                    host_request_authorized,
+                                ) {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
                                 #[cfg(target_os = "macos")]
                                 {
                                     let available =
@@ -1854,6 +2048,343 @@ pub async fn run_serve(
                                 #[cfg(not(target_os = "macos"))]
                                 let _ = response_sent;
                             }
+                            "application_windows" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    match platform_macos::application_surface::list_windows().await {
+                                        Ok(windows) => DaemonResponse::ok(
+                                            serde_json::json!({"windows": windows}),
+                                        ),
+                                        Err(error) => {
+                                            application_surface_failure_response(error)
+                                        }
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_windows is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "application_surface_start" => {
+                                #[cfg(target_os = "macos")]
+                                let (resp, started_session_id) = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    (
+                                        DaemonResponse::err(
+                                            "Unauthorized host-only application-surface request",
+                                            77,
+                                        ),
+                                        None,
+                                    )
+                                } else {
+                                    let request = req.args
+                                        .ok_or("Missing application-surface arguments")
+                                        .and_then(|args| {
+                                            serde_json::from_value::<
+                                                platform_macos::application_surface::
+                                                    ApplicationSurfaceStartRequest,
+                                            >(args)
+                                            .map_err(|_| {
+                                                "Invalid application-surface arguments"
+                                            })
+                                        });
+                                    match request {
+                                        Ok(request) => match
+                                            platform_macos::application_surface::start(request)
+                                                .await
+                                        {
+                                            Ok(result) => {
+                                                let session_id = result.session_id.clone();
+                                                (
+                                                    DaemonResponse::ok(
+                                                        serde_json::to_value(result).expect(
+                                                            "application start result is serializable"
+                                                        ),
+                                                    ),
+                                                    Some(session_id),
+                                                )
+                                            }
+                                            Err(error) => (
+                                                application_surface_failure_response(error),
+                                                None,
+                                            ),
+                                        },
+                                        Err(error) => (
+                                            DaemonResponse::err(error, 64),
+                                            None,
+                                        ),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_surface_start is available only on macOS",
+                                    64,
+                                );
+                                #[cfg(target_os = "macos")]
+                                if let Some(session_id) = started_session_id.as_deref() {
+                                    application_surface_sessions.register(session_id);
+                                }
+                                let delivery = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                                if delivery.is_err() {
+                                    break;
+                                }
+                            }
+                            "application_surface_stop" => {
+                                #[cfg(target_os = "macos")]
+                                let (resp, stopped_session_id) = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    (
+                                        DaemonResponse::err(
+                                            "Unauthorized host-only application-surface request",
+                                            77,
+                                        ),
+                                        None,
+                                    )
+                                } else {
+                                    let session = req.args.as_ref()
+                                        .and_then(|args| args.get("session"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|value| {
+                                            !value.is_empty() && value.len() <= 128
+                                        })
+                                        .map(str::to_owned);
+                                    match session {
+                                        Some(session) => {
+                                            let stopped =
+                                                platform_macos::application_surface::stop(&session);
+                                            (
+                                                DaemonResponse::ok(
+                                                    serde_json::json!({"stopped": stopped}),
+                                                ),
+                                                Some(session),
+                                            )
+                                        }
+                                        None => (
+                                            DaemonResponse::err(
+                                                "application_surface_stop requires a session",
+                                                64,
+                                            ),
+                                            None,
+                                        ),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_surface_stop is available only on macOS",
+                                    64,
+                                );
+                                #[cfg(target_os = "macos")]
+                                if let Some(session_id) = stopped_session_id {
+                                    application_surface_sessions.release(&session_id);
+                                }
+                                let delivery = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                                if delivery.is_err() {
+                                    break;
+                                }
+                            }
+                            "application_surface_attach" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    let session = req.args.as_ref()
+                                        .and_then(|args| args.get("session"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|value| {
+                                            !value.is_empty() && value.len() <= 128
+                                        })
+                                        .map(str::to_owned);
+                                    match session {
+                                        Some(session) => {
+                                            let attached = tokio::task::spawn_blocking(
+                                                move || {
+                                                    platform_macos::application_surface::
+                                                        acknowledge_attachment(&session)
+                                                },
+                                            ).await.unwrap_or(false);
+                                            DaemonResponse::ok(
+                                                serde_json::json!({"attached": attached}),
+                                            )
+                                        }
+                                        None => DaemonResponse::err(
+                                            "application_surface_attach requires a session",
+                                            64,
+                                        ),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_surface_attach is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "application_surface_event" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    let event = req.args
+                                        .ok_or("Missing application-surface event")
+                                        .and_then(|args| {
+                                            serde_json::from_value::<
+                                                platform_macos::application_surface::
+                                                    ApplicationSurfaceEvent,
+                                            >(args)
+                                            .map_err(|_| "Invalid application-surface event")
+                                        });
+                                    match event {
+                                        Ok(event) => match tokio::task::spawn_blocking(
+                                            move || {
+                                                platform_macos::application_surface::send_event(
+                                                    event,
+                                                )
+                                            },
+                                        ).await {
+                                            Ok(Ok(())) => DaemonResponse::ok(
+                                                serde_json::json!({"sent": true}),
+                                            ),
+                                            Ok(Err(error)) => {
+                                                application_surface_failure_response(error)
+                                            }
+                                            Err(error) => DaemonResponse::err(
+                                                format!(
+                                                    "Application-input task failed: {error}"
+                                                ),
+                                                1,
+                                            ),
+                                        },
+                                        Err(error) => DaemonResponse::err(error, 64),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_surface_event is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "application_surface_events" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    let events = req.args
+                                        .ok_or("Missing application-surface event batch")
+                                        .and_then(|args| {
+                                            serde_json::from_value::<
+                                                platform_macos::application_surface::
+                                                    ApplicationSurfaceEventBatchRequest,
+                                            >(args)
+                                            .map_err(|_| {
+                                                "Invalid application-surface event batch"
+                                            })
+                                        })
+                                        .and_then(|request| {
+                                            request.into_validated_events()
+                                        });
+                                    match events {
+                                        Ok(events) => {
+                                            let event_count = events.len();
+                                            match tokio::task::spawn_blocking(move || {
+                                                platform_macos::application_surface::send_events(
+                                                    events,
+                                                )
+                                            })
+                                            .await
+                                            {
+                                                Ok(Ok(())) => DaemonResponse::ok(
+                                                    serde_json::json!({
+                                                        "sent": event_count
+                                                    }),
+                                                ),
+                                                Ok(Err(error)) => {
+                                                    application_surface_failure_response(error)
+                                                }
+                                                Err(error) => DaemonResponse::err(
+                                                    format!(
+                                                        "Application-input task failed: {error}"
+                                                    ),
+                                                    1,
+                                                ),
+                                            }
+                                        }
+                                        Err(error) => DaemonResponse::err(error, 64),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_surface_events is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "verify_screen_capture" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
+                                #[cfg(target_os = "macos")]
+                                let resp = {
+                                    let capturable =
+                                        platform_macos::tools::verify_screen_capture_ready().await;
+                                    screen_capture_verification_response(capturable)
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "Screen capture verification is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
                             "configure_state_authentication" => {
                                 let response = if !host_request_authorized
                                     || (!host_authority_configured
@@ -1887,6 +2418,7 @@ pub async fn run_serve(
                                 ).await;
                             }
                             "set_cursor_enabled" => {
+                                #[cfg(target_os = "macos")]
                                 let response = if !host_request_authorized {
                                     DaemonResponse::err(
                                         "Unauthorized host-only daemon request".to_owned(),
@@ -1925,6 +2457,11 @@ pub async fn run_serve(
                                         ),
                                     }
                                 };
+                                #[cfg(not(target_os = "macos"))]
+                                let response = DaemonResponse::err(
+                                    "set_cursor_enabled is available only on macOS",
+                                    64,
+                                );
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&response).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -2245,6 +2782,7 @@ pub async fn run_serve(
                                             .lock()
                                             .unwrap()
                                             .insert(sid.to_owned(), token.clone());
+                                        #[cfg(target_os = "macos")]
                                         platform_macos::app_approval::global()
                                             .register_broker(sid, &token);
                                         control_approval_token =
@@ -2310,6 +2848,14 @@ pub async fn run_serve(
                         }
                     }
 
+                    #[cfg(target_os = "macos")]
+                    {
+                        let session_ids = application_surface_sessions.drain();
+                        for session_id in session_ids {
+                            platform_macos::application_surface::stop(&session_id);
+                        }
+                    }
+
                     // Reader EOF (`while let` exited): the kernel closes the
                     // socket on graceful proxy exit AND on kill -9. If this was
                     // the proxy's persistent control connection, reap the
@@ -2330,6 +2876,7 @@ pub async fn run_serve(
                                             &token,
                                         ) =>
                                 {
+                                    #[cfg(target_os = "macos")]
                                     platform_macos::app_approval::global()
                                         .unregister_broker(&owner, &token);
                                     true
@@ -2388,6 +2935,8 @@ pub async fn run_serve(
     }
 
     // Clean up.
+    #[cfg(target_os = "macos")]
+    platform_macos::application_surface::stop_all().await;
     let _ = std::fs::remove_file(socket_path);
     if let Some(pid_path) = pid_file_path {
         let _ = std::fs::remove_file(pid_path);
@@ -2588,6 +3137,8 @@ pub async fn run_serve(
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ServerOptions;
 
+    let host_authority_configured = configured_socket_host_auth_token().is_some();
+
     eprintln!("Cua Driver daemon listening on {socket_path}");
 
     // Build the cross-IL security descriptor once, reuse on every pipe
@@ -2673,7 +3224,7 @@ pub async fn run_serve(
                     let mut control_session_id: Option<String> = None;
 
                     while let Ok(Some(line)) = lines.next_line().await {
-                        let req = match parse_request(&line) {
+                        let parsed = match parse_request(&line) {
                             Ok(request) => request,
                             Err(resp) => {
                                 let _ = writer.write_all(
@@ -2682,9 +3233,25 @@ pub async fn run_serve(
                                 continue;
                             }
                         };
+                        let host_request_authorized = host_request_is_authorized(
+                            host_authority_configured,
+                            parsed.host_authenticated,
+                            !host_authority_configured,
+                        );
+                        let req = parsed.request;
 
                         match req.method.as_str() {
                             "shutdown" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
                                 let resp = DaemonResponse::ok(serde_json::json!({"shutdown": true}));
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -2694,6 +3261,16 @@ pub async fn run_serve(
                                 return;
                             }
                             "request_system_permission" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
                                 let resp = validate_system_permission_request(req.name.as_deref());
                                 let response_sent = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -2706,6 +3283,25 @@ pub async fn run_serve(
                                 }
                                 #[cfg(not(target_os = "macos"))]
                                 let _ = response_sent;
+                            }
+                            "verify_screen_capture" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
+                                let resp = DaemonResponse::err(
+                                    "Screen capture verification is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
                             }
                             "list" => {
                                 // Include full ToolDef so MCP proxy callers can
@@ -3056,7 +3652,12 @@ pub fn run_status_cmd(socket_path: &str, pid_file_path: &str) {
 
 #[cfg(test)]
 mod external_permission_flow_tests {
-    use super::{clamp_external_permission_prompt, validate_system_permission_request};
+    use super::{
+        ApplicationSurfaceConnectionSessions, clamp_external_permission_prompt,
+        screen_capture_verification_response, validate_system_permission_request,
+    };
+    #[cfg(target_os = "macos")]
+    use super::{DaemonProfile, daemon_permission_status};
 
     #[test]
     fn external_permission_flow_clamps_agent_prompt_requests() {
@@ -3069,6 +3670,29 @@ mod external_permission_flow_tests {
         assert_eq!(ordinary_tool_args["prompt"], serde_json::json!(true));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unnegotiated_external_permission_readiness_is_omitted() {
+        let status = daemon_permission_status(DaemonProfile::Native, None);
+
+        assert!(status.get("external_permission_ready").is_none());
+        assert_eq!(
+            status["external_permission_readiness_protocol"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            daemon_permission_status(DaemonProfile::Native, Some(false))
+                ["external_permission_ready"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            daemon_permission_status(DaemonProfile::Native, Some(true))
+                ["external_permission_ready"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     fn host_permission_request_rejects_unknown_permission_without_prompting() {
         let response = validate_system_permission_request(Some("camera"));
@@ -3079,15 +3703,108 @@ mod external_permission_flow_tests {
             Some("Unknown system permission: camera")
         );
     }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn host_permission_request_reports_platform_unavailability() {
+        let response = validate_system_permission_request(Some("camera"));
+        assert!(!response.ok);
+        assert_eq!(response.exit_code, Some(64));
+        assert_eq!(
+            response.error.as_deref(),
+            Some("System permission requests are only supported on macOS")
+        );
+    }
+
+    #[test]
+    fn host_screen_capture_verification_reports_live_readiness_explicitly() {
+        let ready = screen_capture_verification_response(true);
+        assert!(ready.ok);
+        assert_eq!(ready.result.unwrap()["capturable"], serde_json::json!(true));
+
+        let unavailable = screen_capture_verification_response(false);
+        assert!(unavailable.ok);
+        assert_eq!(
+            unavailable.result.unwrap()["capturable"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn connection_close_reaps_every_owned_application_surface() {
+        let mut sessions = ApplicationSurfaceConnectionSessions::default();
+        sessions.register("surface-a");
+        sessions.register("surface-b");
+        sessions.release("surface-a");
+
+        assert_eq!(sessions.drain(), vec!["surface-b".to_owned()]);
+        assert!(sessions.drain().is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn application_surface_errors_have_stable_protocol_codes() {
+        use super::application_surface_failure_response;
+        use platform_macos::application_surface::ApplicationSurfaceError;
+
+        let cases = [
+            (
+                ApplicationSurfaceError::AccessibilityPermissionRequired,
+                "permission_required",
+            ),
+            (
+                ApplicationSurfaceError::ScreenRecordingPermissionRequired,
+                "permission_required",
+            ),
+            (
+                ApplicationSurfaceError::WindowUnavailable,
+                "window_unavailable",
+            ),
+            (
+                ApplicationSurfaceError::PointOutsideContent,
+                "point_outside_content",
+            ),
+            (
+                ApplicationSurfaceError::SessionUnavailable,
+                "session_unavailable",
+            ),
+            (ApplicationSurfaceError::CaptureFailed, "capture_failed"),
+            (
+                ApplicationSurfaceError::CaptureUnavailable,
+                "capture_unavailable",
+            ),
+            (
+                ApplicationSurfaceError::ResourceLimitExceeded,
+                "resource_limit",
+            ),
+        ];
+        for (error, expected_code) in cases {
+            let response =
+                application_surface_failure_response(anyhow::Error::new(error));
+            assert!(!response.ok);
+            assert_eq!(response.error_code.as_deref(), Some(expected_code));
+            assert!(response.error.is_some());
+        }
+    }
 }
 
 #[cfg(test)]
 mod socket_authentication_tests {
     use super::{
-        attach_state_writer_identity, host_request_is_authorized, parse_request_with_token,
+        attach_state_writer_identity, host_permission_control_is_authorized,
+        host_request_is_authorized, parse_request_with_token,
         parse_request_with_tokens, process_descends_from, socket_peer_requires_authorized_root,
         state_authentication_key, DaemonRequest, ProcessIdentity,
     };
+
+    #[test]
+    fn permission_presentation_and_refresh_require_host_authority() {
+        for method in ["permissions_present", "permissions_refresh"] {
+            assert!(host_permission_control_is_authorized(method, true));
+            assert!(!host_permission_control_is_authorized(method, false));
+        }
+        assert!(host_permission_control_is_authorized("permissions_status", false));
+    }
     use std::collections::HashMap;
 
     fn list_request() -> DaemonRequest {
@@ -3774,6 +4491,8 @@ mod session_boundary_tests {
             "app": "Calculator",
             "session": "victim-session",
             "_session_id": "victim-session",
+            (cua_driver_core::HOST_SESSION_ARG): "caller-forged-host",
+            (cua_driver_core::session_state::STATE_OWNER_PID_ARG): 7,
             (APPROVAL_BROKER_TOKEN_ARG): "daemon-minted",
         });
 
@@ -3788,7 +4507,51 @@ mod session_boundary_tests {
         assert_eq!(args["app"], "Calculator");
         assert_eq!(args["_session_id"], "authenticated-session");
         assert!(args.get("session").is_none());
+        assert!(args.get(cua_driver_core::HOST_SESSION_ARG).is_none());
+        assert!(args
+            .get(cua_driver_core::session_state::STATE_OWNER_PID_ARG)
+            .is_none());
         assert!(args.get(APPROVAL_BROKER_TOKEN_ARG).is_none());
+    }
+
+    #[test]
+    fn compat_broker_restores_authenticated_proxy_host_identity() {
+        let session_id = "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF-mcp-4242-99";
+        let brokers = Mutex::new(HashMap::from([(
+            session_id.to_owned(),
+            "daemon-minted".to_owned(),
+        )]));
+        let mut args = json!({
+            "app": "Calculator",
+            (crate::proxy::COMPAT_PROXY_HOST_SESSION_ARG):
+                "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF",
+            (crate::proxy::COMPAT_PROXY_STATE_OWNER_PID_ARG): 4242,
+            (APPROVAL_BROKER_TOKEN_ARG): "daemon-minted",
+        });
+
+        authenticate_compat_call(
+            &mut args,
+            DaemonProfile::CodexComputerUseCompat,
+            Some(session_id),
+            &brokers,
+        )
+        .unwrap();
+
+        assert_eq!(args["_session_id"], session_id);
+        assert_eq!(
+            args[cua_driver_core::HOST_SESSION_ARG],
+            "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF"
+        );
+        assert_eq!(
+            args[cua_driver_core::session_state::STATE_OWNER_PID_ARG],
+            4242
+        );
+        assert!(args
+            .get(crate::proxy::COMPAT_PROXY_HOST_SESSION_ARG)
+            .is_none());
+        assert!(args
+            .get(crate::proxy::COMPAT_PROXY_STATE_OWNER_PID_ARG)
+            .is_none());
     }
 
     #[test]

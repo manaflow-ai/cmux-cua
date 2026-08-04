@@ -824,7 +824,7 @@ fn bgra_and_visible_shape(
 }
 
 #[cfg(all(test, target_os = "linux"))]
-mod tests {
+mod linux_shape_tests {
     use super::bgra_and_visible_shape;
 
     #[test]

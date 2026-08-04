@@ -25,9 +25,9 @@
 //!
 //! Animation state + render pipeline live in `cursor_overlay::render_state`
 //! (`RenderStateCore`, `tick_swift_constants`, `apply_command_base`,
-//! `render_frame`).  macOS uses the hardcoded Swift reference constants
-//! (peakSpeed=900, springK=400, overshoot=0.8) and the sentinel-snap
-//! variants of MoveTo / ClickPulse — see the wrapper around
+//! `render_frame`). macOS uses configured glide speeds with the Swift
+//! reference spring physics and the sentinel-snap variants of MoveTo /
+//! ClickPulse, see the wrapper around
 //! `apply_command_base` below.
 
 use std::collections::HashMap;
@@ -36,10 +36,30 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use cursor_overlay::{
-    CursorConfig, CursorKey, FocusRect, KeyedOverlayCommand, MotionConfig, OverlayCommand,
-    OverlayMsg, Palette, RenderStateCore, ZOrderEnforcer,
+    CursorConfig, CursorKey, FocusRect, KeyedOverlayCommand, MotionConfig, OverlayCommand, Palette,
+    RenderStateCore, ZOrderEnforcer,
 };
 use indexmap::IndexMap;
+
+/// macOS extends the shared keyed command protocol with generation-tagged
+/// moves and timeout recovery. The render side must decide whether recovery
+/// still owns the path after another task has queued a newer move.
+#[derive(Debug, Clone)]
+enum OverlayMsg {
+    Cmd(KeyedOverlayCommand),
+    RegisteredMove {
+        key: CursorKey,
+        cmd: OverlayCommand,
+        generation: u64,
+    },
+    TimeoutRecovery {
+        key: CursorKey,
+        cmd: OverlayCommand,
+        generation: u64,
+    },
+    Remove(CursorKey),
+    Revive(CursorKey),
+}
 
 // ── Arrival-signal channels (one waiter slot per cursor key) ──────────────
 //
@@ -54,8 +74,42 @@ struct ArrivalWaiter {
 
 static ARRIVAL_TX: Mutex<Option<HashMap<CursorKey, ArrivalWaiter>>> = Mutex::new(None);
 static NEXT_ARRIVAL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+// Registration order must match the shared renderer queue order. Otherwise
+// concurrent moves for one cursor can leave the newer waiter behind an older
+// queued generation that can never signal it.
+static ARRIVAL_ENQUEUE_LOCK: Mutex<()> = Mutex::new(());
 
 const ARRIVAL_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_ARRIVAL_TIMEOUT: Duration = Duration::from_secs(60);
+const ARRIVAL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn arrival_timeout_for_path(path_length: f64, motion: &MotionConfig) -> Duration {
+    if !path_length.is_finite() || path_length < 0.0 {
+        return MAX_ARRIVAL_TIMEOUT;
+    }
+    let expected_seconds = if motion.glide_duration_ms.is_finite() && motion.glide_duration_ms > 0.0
+    {
+        motion.glide_duration_ms / 1_000.0
+    } else {
+        let minimum_speed = motion.min_start_speed.min(motion.min_end_speed);
+        if !minimum_speed.is_finite() || minimum_speed <= 0.0 {
+            return MAX_ARRIVAL_TIMEOUT;
+        }
+        path_length / minimum_speed
+    };
+    let bounded_seconds = (expected_seconds * 1.25 + 2.0).clamp(
+        ARRIVAL_TIMEOUT.as_secs_f64(),
+        MAX_ARRIVAL_TIMEOUT.as_secs_f64(),
+    );
+    Duration::from_secs_f64(bounded_seconds)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrivalWaitResult {
+    Signaled,
+    Canceled,
+    TimedOut,
+}
 
 fn arrival_register(key: CursorKey, tx: tokio::sync::oneshot::Sender<()>) -> u64 {
     let generation = NEXT_ARRIVAL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -68,11 +122,16 @@ fn arrival_register(key: CursorKey, tx: tokio::sync::oneshot::Sender<()>) -> u64
     generation
 }
 
-fn arrival_fire(key: &CursorKey) {
+fn arrival_fire(key: &CursorKey, generation: u64) {
     if let Ok(mut guard) = ARRIVAL_TX.lock() {
         if let Some(map) = guard.as_mut() {
-            if let Some(waiter) = map.remove(key) {
-                let _ = waiter.tx.send(());
+            if map
+                .get(key)
+                .is_some_and(|waiter| waiter.generation == generation)
+            {
+                if let Some(waiter) = map.remove(key) {
+                    let _ = waiter.tx.send(());
+                }
             }
         }
     }
@@ -96,13 +155,47 @@ async fn wait_for_arrival(
     generation: u64,
     rx: tokio::sync::oneshot::Receiver<()>,
     timeout: Duration,
-) -> bool {
+) -> ArrivalWaitResult {
     match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(())) => true,
-        Ok(Err(_)) | Err(_) => {
+        Ok(Ok(())) => ArrivalWaitResult::Signaled,
+        Ok(Err(_)) => {
             arrival_cancel(key, generation);
-            false
+            ArrivalWaitResult::Canceled
         }
+        Err(_) => {
+            arrival_cancel(key, generation);
+            ArrivalWaitResult::TimedOut
+        }
+    }
+}
+
+async fn wait_for_rendered_snap(
+    key: &CursorKey,
+    x: f64,
+    y: f64,
+    timeout: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let snapped = {
+            let guard = RENDER.lock().unwrap();
+            guard
+                .as_ref()
+                .and_then(|map| map.cursors.get(key))
+                .is_some_and(|state| {
+                    state.core.path.is_none()
+                        && (state.core.pos.0 - x).abs() <= 0.5
+                        && (state.core.pos.1 - y).abs() <= 0.5
+                })
+        };
+        if snapped {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(8))).await;
     }
 }
 
@@ -118,16 +211,18 @@ static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
 
 /// The keyed, insertion-ordered collection of owned cursors that the render
 /// loop composites every frame. Insertion order = stable z-order (later keys
-/// paint on top). `win_w` / `win_h` are screen-global, hoisted out of the
-/// per-cursor `RenderState` (written once in `run_appkit`).
+/// paint on top). The launch screen bounds are a defensive fallback when
+/// CoreGraphics cannot enumerate the active global display layout.
 struct RenderMap {
     cursors: IndexMap<CursorKey, RenderState>,
+    /// Generation of the move currently rendered for each cursor. Arrival and
+    /// timeout recovery may only resolve or replace this exact generation.
+    active_move_generations: HashMap<CursorKey, u64>,
     /// Most recent cursor key touched by an inbound command. Idle-dwell
     /// timeout selection prefers this cursor so a stale visible cursor cannot
     /// shorten the dwell of the cursor the user just moved.
     last_active_key: Option<CursorKey>,
-    win_w: f64,
-    win_h: f64,
+    fallback_display_bounds: Option<LogicalRect>,
     /// Frozen launch-time config used as the template for lazily-created
     /// cursors (its palette is overridden per-key via `Palette::for_instance`).
     template: CursorConfig,
@@ -166,6 +261,7 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
                 if map.last_active_key.as_deref() == Some(key.as_str()) {
                     map.last_active_key = None;
                 }
+                map.active_move_generations.remove(&key);
                 if let Ok(mut guard) = ARRIVAL_TX.lock() {
                     if let Some(m) = guard.as_mut() {
                         m.remove(&key);
@@ -181,27 +277,69 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
         OverlayMsg::Revive(key) => {
             if key != "default" {
                 map.ended.remove(&key);
+                map.active_move_generations.remove(&key);
             }
             None
         }
         OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }) => {
-            // Drop a command for an already-ended session WITHOUT get-or-create
-            // — this is the resurrection guard. Without it, a ClickPulse/MoveTo
-            // landing after Remove would re-insert (and re-leak) the cursor.
-            if map.ended.contains(&key) {
+            if matches!(
+                &cmd,
+                OverlayCommand::MoveTo { .. } | OverlayCommand::SnapTo { .. }
+            ) {
+                map.active_move_generations.remove(&key);
+            }
+            apply_render_command(map, key, cmd)
+        }
+        OverlayMsg::RegisteredMove {
+            key,
+            cmd,
+            generation,
+        } => {
+            let applied = apply_render_command(map, key.clone(), cmd);
+            if applied.is_some() {
+                map.active_move_generations.insert(key, generation);
+            } else {
+                arrival_cancel(&key, generation);
+            }
+            applied
+        }
+        OverlayMsg::TimeoutRecovery {
+            key,
+            cmd,
+            generation,
+        } => {
+            if map.active_move_generations.get(&key) != Some(&generation) {
                 return None;
             }
-            let template = map.template.clone();
-            let k = key.clone();
-            let rs = map
-                .cursors
-                .entry(key)
-                .or_insert_with(|| render_state_for_key(&template, &k));
-            rs.apply_command(cmd);
-            map.last_active_key = Some(k.clone());
-            Some(k)
+            let applied = apply_render_command(map, key.clone(), cmd);
+            if applied.is_some() {
+                map.active_move_generations.remove(&key);
+            }
+            applied
         }
     }
+}
+
+fn apply_render_command(
+    map: &mut RenderMap,
+    key: CursorKey,
+    cmd: OverlayCommand,
+) -> Option<CursorKey> {
+    // Drop a command for an already-ended session WITHOUT get-or-create —
+    // this is the resurrection guard. Without it, a late click or move would
+    // re-insert and leak the cursor after Remove.
+    if map.ended.contains(&key) {
+        return None;
+    }
+    let template = map.template.clone();
+    let k = key.clone();
+    let rs = map
+        .cursors
+        .entry(key)
+        .or_insert_with(|| render_state_for_key(&template, &k));
+    rs.apply_command(cmd);
+    map.last_active_key = Some(k.clone());
+    Some(k)
 }
 
 /// Initialise global overlay state (call once, before run_on_main_thread).
@@ -224,9 +362,9 @@ pub fn init(cfg: CursorConfig) {
     cursors.insert("default".to_owned(), RenderState::new(cfg.clone()));
     *RENDER.lock().unwrap() = Some(RenderMap {
         cursors,
+        active_move_generations: HashMap::new(),
         last_active_key: None,
-        win_w: 0.0,
-        win_h: 0.0,
+        fallback_display_bounds: None,
         template: cfg,
         ended: std::collections::HashSet::new(),
     });
@@ -257,6 +395,18 @@ fn try_send_command_with_depth(
     cmd: OverlayCommand,
     pending: &std::sync::atomic::AtomicUsize,
 ) -> bool {
+    try_send_render_msg_with_depth(
+        sender,
+        OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }),
+        pending,
+    )
+}
+
+fn try_send_render_msg_with_depth(
+    sender: Option<&std::sync::mpsc::Sender<OverlayMsg>>,
+    msg: OverlayMsg,
+    pending: &std::sync::atomic::AtomicUsize,
+) -> bool {
     let reserved = pending
         .fetch_update(
             std::sync::atomic::Ordering::AcqRel,
@@ -267,10 +417,7 @@ fn try_send_command_with_depth(
     if !reserved {
         return false;
     }
-    let sent = sender.is_some_and(|tx| {
-        tx.send(OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }))
-            .is_ok()
-    });
+    let sent = sender.is_some_and(|tx| tx.send(msg).is_ok());
     if !sent {
         pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -278,7 +425,10 @@ fn try_send_command_with_depth(
 }
 
 fn note_command_dequeued(msg: &OverlayMsg) {
-    if matches!(msg, OverlayMsg::Cmd(_)) {
+    if matches!(
+        msg,
+        OverlayMsg::Cmd(_) | OverlayMsg::RegisteredMove { .. } | OverlayMsg::TimeoutRecovery { .. }
+    ) {
         PENDING_COMMANDS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
@@ -289,12 +439,67 @@ fn send_registered_move(
     cmd: OverlayCommand,
     generation: u64,
 ) -> bool {
-    if try_send_command(sender, key.clone(), cmd) {
+    let msg = OverlayMsg::RegisteredMove {
+        key: key.clone(),
+        cmd,
+        generation,
+    };
+    if try_send_render_msg_with_depth(sender, msg, &PENDING_COMMANDS) {
         true
     } else {
         arrival_cancel(&key, generation);
         false
     }
+}
+
+fn register_cursor_move_if_renderer_available(
+    renderer_available: bool,
+    sender: Option<&std::sync::mpsc::Sender<OverlayMsg>>,
+    key: CursorKey,
+    cmd: OverlayCommand,
+) -> Option<(u64, tokio::sync::oneshot::Receiver<()>)> {
+    register_cursor_move_if_renderer_available_with(
+        renderer_available,
+        sender,
+        key,
+        cmd,
+        || {},
+    )
+}
+
+fn register_cursor_move_if_renderer_available_with<AfterRegistration>(
+    renderer_available: bool,
+    sender: Option<&std::sync::mpsc::Sender<OverlayMsg>>,
+    key: CursorKey,
+    cmd: OverlayCommand,
+    after_registration: AfterRegistration,
+) -> Option<(u64, tokio::sync::oneshot::Receiver<()>)>
+where
+    AfterRegistration: FnOnce(),
+{
+    if !renderer_available {
+        return None;
+    }
+    let sender = sender?;
+    let _enqueue_guard = ARRIVAL_ENQUEUE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (arrival_tx, arrival_rx) = tokio::sync::oneshot::channel();
+    let generation = arrival_register(key.clone(), arrival_tx);
+    after_registration();
+    send_registered_move(Some(sender), key, cmd, generation).then_some((generation, arrival_rx))
+}
+
+fn send_timeout_recovery(key: CursorKey, cmd: OverlayCommand, generation: u64) -> bool {
+    try_send_render_msg_with_depth(
+        CMD_TX.get(),
+        OverlayMsg::TimeoutRecovery {
+            key,
+            cmd,
+            generation,
+        },
+        &PENDING_COMMANDS,
+    )
 }
 
 /// Convenience for callsites not yet threaded with a session key: drives the
@@ -373,26 +578,35 @@ pub fn current_motion(key: &str) -> MotionConfig {
 /// Returns true if a seed was applied (i.e. the cursor was at the sentinel and
 /// is now primed to glide).
 fn seed_start_if_sentinel(key: &CursorKey, target_x: f64, target_y: f64) -> bool {
+    let displays = active_display_geometries(1.0);
     let mut guard = RENDER.lock().unwrap();
     let Some(map) = guard.as_mut() else {
         return false;
     };
-    seed_start_in_map(map, key, target_x, target_y)
+    seed_start_in_map_with_displays(map, key, target_x, target_y, &displays)
 }
 
 /// Pure seed step operating on a borrowed [`RenderMap`] — factored out of
 /// `seed_start_if_sentinel` so the get-or-create + clamp logic is unit-testable
 /// without the global `RENDER` static or AppKit.
+#[cfg(test)]
 fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target_y: f64) -> bool {
-    // Offset the start up-left of the target so the Dubins path has room to
-    // curve in; 140pt is enough to read as motion at 900pt/s peak speed.
-    const SEED_OFFSET: f64 = 140.0;
-    let (win_w, win_h) = (map.win_w, map.win_h);
+    seed_start_in_map_with_displays(map, key, target_x, target_y, &[])
+}
+
+fn seed_start_in_map_with_displays(
+    map: &mut RenderMap,
+    key: &CursorKey,
+    target_x: f64,
+    target_y: f64,
+    displays: &[DisplayGeometry],
+) -> bool {
     // Respect the resurrection guard: never seed (and thus re-create) a cursor
     // whose session already ended.
     if map.ended.contains(key) {
         return false;
     }
+    let fallback_display_bounds = map.fallback_display_bounds;
     // Get-or-create the cursor so the very first AX action seeds + glides even
     // when the lazy render-thread creation hasn't drained the PinAbove yet
     // (the render loop's drain would otherwise win the race and the seed read
@@ -406,23 +620,43 @@ fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target
     if !(rs.core.cfg.enabled && rs.core.is_unplaced()) {
         return false;
     }
-    let mut sx = target_x - SEED_OFFSET;
-    let mut sy = target_y - SEED_OFFSET;
-    // Clamp into the screen frame when we know it (win_w/h are 0 until the
-    // AppKit window is up; in that headless case the unclamped seed is still
-    // on-screen-by-construction for any realistic target).
-    if win_w > 0.0 && win_h > 0.0 {
-        sx = sx.clamp(2.0, win_w - 2.0);
-        sy = sy.clamp(2.0, win_h - 2.0);
-        // If clamping collapsed the seed onto the target (target in a corner),
-        // nudge it the other way so there is still a visible glide distance.
-        if (sx - target_x).abs() < 8.0 && (sy - target_y).abs() < 8.0 {
-            sx = (target_x + SEED_OFFSET).min(win_w - 2.0);
-            sy = (target_y + SEED_OFFSET).min(win_h - 2.0);
-        }
-    }
+    let (sx, sy) = seed_point_for_target(target_x, target_y, displays, fallback_display_bounds);
     rs.core.place_at(sx, sy);
     true
+}
+
+fn seed_point_for_target(
+    target_x: f64,
+    target_y: f64,
+    displays: &[DisplayGeometry],
+    fallback_display_bounds: Option<LogicalRect>,
+) -> (f64, f64) {
+    // Offset the start up-left of the target so the Dubins path has room to
+    // curve in; 140pt is enough to read as motion at 900pt/s peak speed.
+    const SEED_OFFSET: f64 = 140.0;
+    let mut seed = (target_x - SEED_OFFSET, target_y - SEED_OFFSET);
+    let bounds = display_for_cursor(displays, (target_x, target_y), None)
+        .map(|display| display.bounds)
+        .or_else(|| fallback_display_bounds.filter(|bounds| bounds.is_valid()));
+    let Some(bounds) = bounds else {
+        return seed;
+    };
+    let minimum_x = bounds.left + 2.0;
+    let maximum_x = bounds.left + bounds.width - 2.0;
+    let minimum_y = bounds.top + 2.0;
+    let maximum_y = bounds.top + bounds.height - 2.0;
+    if minimum_x > maximum_x || minimum_y > maximum_y {
+        return seed;
+    }
+    seed.0 = seed.0.clamp(minimum_x, maximum_x);
+    seed.1 = seed.1.clamp(minimum_y, maximum_y);
+    // If clamping collapsed the seed onto a corner target, nudge it in the
+    // opposite direction while remaining inside that same global display.
+    if (seed.0 - target_x).abs() < 8.0 && (seed.1 - target_y).abs() < 8.0 {
+        seed.0 = (target_x + SEED_OFFSET).clamp(minimum_x, maximum_x);
+        seed.1 = (target_y + SEED_OFFSET).clamp(minimum_y, maximum_y);
+    }
+    seed
 }
 
 /// Animate the overlay cursor to `(x, y)` and suspend until the Dubins path
@@ -468,24 +702,31 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
 
     // Check whether animation should run for THIS cursor. A disabled cursor
     // never animates; an absent cursor (seed found nothing to prime) is skipped.
-    let should_animate = {
+    let end_heading_radians = std::f64::consts::FRAC_PI_4;
+    let animation = {
         let guard = RENDER.lock().unwrap();
         match guard.as_ref().and_then(|m| m.cursors.get(&key)) {
-            Some(rs) if rs.core.cfg.enabled && !rs.core.is_unplaced() => true,
-            _ => false,
+            Some(rs) if rs.core.cfg.enabled && !rs.core.is_unplaced() => {
+                let path = rs.core.planned_move_path(x, y, end_heading_radians);
+                let endpoint = path.sample(path.length);
+                Some((
+                    arrival_timeout_for_path(path.length, &rs.core.motion),
+                    (endpoint.x, endpoint.y, path.end_visual_heading),
+                ))
+            }
+            _ => None,
         }
     };
-    if !should_animate {
+    let Some((arrival_timeout, (end_x, end_y, end_heading))) = animation else {
         return;
-    }
+    };
 
-    // Create a one-shot channel; store the sender (keyed) so the render thread
-    // can fire it when this cursor's path finishes.
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let generation = arrival_register(key.clone(), tx);
-
-    // Send the MoveTo command (click offset applied inside apply_command).
-    let sent = send_registered_move(
+    // A headless process has no local render loop. Preserve the embedded host
+    // feed above, but never enqueue or wait on the undrained local renderer.
+    // Otherwise register the waiter and enqueue atomically from this caller's
+    // perspective so send failure cannot leave a stale arrival behind.
+    let Some((generation, rx)) = register_cursor_move_if_renderer_available(
+        crate::session::has_graphic_access(),
         CMD_TX.get(),
         key.clone(),
         OverlayCommand::MoveTo {
@@ -493,18 +734,34 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
             y,
             // Arrive pointing upper-left (45°), matching the macOS system-cursor
             // convention and Swift reference (`endAngleDegrees: 45`).
-            end_heading_radians: std::f64::consts::FRAC_PI_4,
+            end_heading_radians,
         },
-        generation,
-    );
-
-    if !sent {
+    ) else {
         return;
-    }
+    };
 
     // Await arrival signal (fired from render thread when Dubins path ends),
     // but never let a stopped/stalled renderer hang a tool call indefinitely.
-    let _ = wait_for_arrival(&key, generation, rx, ARRIVAL_TIMEOUT).await;
+    if wait_for_arrival(&key, generation, rx, arrival_timeout).await == ArrivalWaitResult::TimedOut
+    {
+        // Queue the recovery behind the original move. Subsequent click and
+        // scroll render commands use the same FIFO channel, so the visible
+        // cursor cannot continue its stale path after the tool call resumes.
+        let recovery_sent = send_timeout_recovery(
+            key.clone(),
+            OverlayCommand::SnapTo {
+                x: end_x,
+                y: end_y,
+                heading_radians: Some(end_heading),
+            },
+            generation,
+        );
+        if recovery_sent
+            && !wait_for_rendered_snap(&key, end_x, end_y, ARRIVAL_RECOVERY_TIMEOUT).await
+        {
+            tracing::warn!(cursor_key = %key, "cursor renderer did not apply timeout recovery");
+        }
+    }
 }
 
 /// Block the calling thread (must be the OS main thread) running the AppKit
@@ -584,10 +841,10 @@ impl RenderState {
         }
     }
 
-    /// Advance the animation by `dt`.  Uses the Swift reference constants
-    /// (peakSpeed=900, springK=400, overshoot=0.8) — see
-    /// [`RenderStateCore::tick_swift_constants`].  Returns true if an
-    /// arrival signal should be fired (the path just ended).
+    /// Advance the animation by `dt`. Uses the configured glide speeds and
+    /// Swift reference spring constants, see
+    /// [`RenderStateCore::tick_swift_constants`]. Returns true if an arrival
+    /// signal should be fired (the path just ended).
     fn tick(&mut self, dt: f64) -> bool {
         let fire_arrival = self.core.tick_swift_constants(dt);
 
@@ -819,7 +1076,6 @@ impl LogicalRect {
 
 #[derive(Debug, Clone, Copy)]
 struct ScreenGeometry {
-    origin_x: f64,
     origin_y: f64,
     height: f64,
     fallback_backing_scale: f64,
@@ -873,10 +1129,36 @@ fn cursor_window_collection_behavior() -> u64 {
 
 fn appkit_frame_for_rect(rect: LogicalRect, screen: ScreenGeometry) -> AppKitRect {
     AppKitRect {
-        x: screen.origin_x + rect.left,
+        // Cursor positions originate in Quartz's global desktop space. AppKit
+        // shares that global x-axis, so applying the anchor screen's x origin
+        // again shifts every cursor on a non-primary mainScreen by one whole
+        // display.
+        x: rect.left,
         y: screen.origin_y + screen.height - rect.top - rect.height,
         width: rect.width,
         height: rect.height,
+    }
+}
+
+fn screen_geometry_for_primary_display(
+    primary_display: LogicalRect,
+    fallback_main_screen: LogicalRect,
+    fallback_backing_scale: f64,
+) -> ScreenGeometry {
+    // NSScreen.mainScreen follows the currently key window and can therefore
+    // be any external display. Quartz cursor coordinates, however, are
+    // globally anchored to CGMainDisplayID. Always derive the y-axis flip from
+    // that primary display; use the AppKit main screen only as a defensive
+    // fallback if CoreGraphics returns an invalid bound.
+    let anchor = if primary_display.is_valid() {
+        primary_display
+    } else {
+        fallback_main_screen
+    };
+    ScreenGeometry {
+        origin_y: anchor.top,
+        height: anchor.height,
+        fallback_backing_scale,
     }
 }
 
@@ -1260,8 +1542,13 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     {
         let mut guard = RENDER.lock().unwrap();
         if let Some(m) = guard.as_mut() {
-            m.win_w = win_w;
-            m.win_h = win_h;
+            let bounds = LogicalRect {
+                left: screen_frame.origin.x,
+                top: screen_frame.origin.y,
+                width: win_w,
+                height: win_h,
+            };
+            m.fallback_display_bounds = bounds.is_valid().then_some(bounds);
         }
     }
 
@@ -1279,12 +1566,25 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     }
 
     // ---- Render thread (display-rate while animating, quiescent while idle) ----
-    let screen = ScreenGeometry {
-        origin_x: screen_frame.origin.x,
-        origin_y: screen_frame.origin.y,
-        height: win_h,
-        fallback_backing_scale: backing_scale,
-    };
+    let primary_bounds = core_graphics::display::CGDisplay::new(
+        core_graphics::display::CGMainDisplayID(),
+    )
+    .bounds();
+    let screen = screen_geometry_for_primary_display(
+        LogicalRect {
+            left: primary_bounds.origin.x,
+            top: primary_bounds.origin.y,
+            width: primary_bounds.size.width,
+            height: primary_bounds.size.height,
+        },
+        LogicalRect {
+            left: screen_frame.origin.x,
+            top: screen_frame.origin.y,
+            width: screen_frame.size.width,
+            height: screen_frame.size.height,
+        },
+        backing_scale,
+    );
     std::thread::spawn(move || {
         render_loop(rx, screen, displays, frame_budget);
     });
@@ -1408,14 +1708,22 @@ fn render_loop(
                     // or immediately after a command changed render state. The
                     // latter lets a just-created path/click/focus rect start on
                     // this frame without waiting for the next 16ms tick.
-                    let mut arrived: Vec<CursorKey> = Vec::new();
+                    let mut arrived_keys: Vec<CursorKey> = Vec::new();
                     if frame_tick_needed || had_msg || woke_for_idle_maintenance {
                         for (k, rs) in map.cursors.iter_mut() {
                             if rs.tick(dt) {
-                                arrived.push(k.clone());
+                                arrived_keys.push(k.clone());
                             }
                         }
                     }
+                    let arrived = arrived_keys
+                        .into_iter()
+                        .filter_map(|key| {
+                            map.active_move_generations
+                                .remove(&key)
+                                .map(|generation| (key, generation))
+                        })
+                        .collect::<Vec<_>>();
                     let next_frame_tick_needed = render_map_needs_frame_tick(map);
                     let next_idle_maintenance_due_in = if next_frame_tick_needed {
                         None
@@ -1484,8 +1792,8 @@ fn render_loop(
         };
 
         // Fire arrival signals so each session's animate_cursor_to() unblocks.
-        for k in &arrived {
-            arrival_fire(k);
+        for (key, generation) in &arrived {
+            arrival_fire(key, *generation);
         }
 
         // ── Phase 2: move per-cursor windows and update contents only when needed.
@@ -1999,6 +2307,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    static ARRIVAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn negative_x_cursor_is_not_the_unplaced_sentinel() {
         let mut core = RenderStateCore::new(CursorConfig::default());
@@ -2019,9 +2329,14 @@ mod tests {
         );
         RenderMap {
             cursors,
+            active_move_generations: HashMap::new(),
             last_active_key: None,
-            win_w: 100.0,
-            win_h: 100.0,
+            fallback_display_bounds: Some(LogicalRect {
+                left: 0.0,
+                top: 0.0,
+                width: 100.0,
+                height: 100.0,
+            }),
             template: CursorConfig::default(),
             ended: std::collections::HashSet::new(),
         }
@@ -2174,8 +2489,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tombstone_rejection_cancels_registered_move_waiter() {
+        let _test_guard = ARRIVAL_TEST_LOCK.lock().unwrap();
+        *ARRIVAL_TX.lock().unwrap() = Some(HashMap::new());
+        let mut map = empty_map();
+        let key = "ended-move".to_owned();
+        apply_msg(&mut map, OverlayMsg::Remove(key.clone()));
+        let (arrival_tx, arrival_rx) = tokio::sync::oneshot::channel();
+        let generation = arrival_register(key.clone(), arrival_tx);
+
+        let applied = apply_msg(
+            &mut map,
+            OverlayMsg::RegisteredMove {
+                key: key.clone(),
+                cmd: OverlayCommand::MoveTo {
+                    x: 99.0,
+                    y: 99.0,
+                    end_heading_radians: 0.0,
+                },
+                generation,
+            },
+        );
+
+        assert!(applied.is_none());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(100), arrival_rx).await,
+            Ok(Err(_))
+        ));
+        assert!(!ARRIVAL_TX
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .contains_key(&key));
+        *ARRIVAL_TX.lock().unwrap() = None;
+    }
+
+    #[tokio::test]
     async fn failed_move_send_and_timeout_both_clear_the_registered_waiter() {
-        static ARRIVAL_TEST_LOCK: Mutex<()> = Mutex::new(());
         let _test_guard = ARRIVAL_TEST_LOCK.lock().unwrap();
         *ARRIVAL_TX.lock().unwrap() = Some(HashMap::new());
 
@@ -2211,8 +2562,9 @@ mod tests {
         let key = "arrival-timeout".to_owned();
         let (arrival_tx, arrival_rx) = tokio::sync::oneshot::channel();
         let generation = arrival_register(key.clone(), arrival_tx);
-        assert!(
-            !wait_for_arrival(&key, generation, arrival_rx, Duration::ZERO).await,
+        assert_eq!(
+            wait_for_arrival(&key, generation, arrival_rx, Duration::ZERO).await,
+            ArrivalWaitResult::TimedOut,
             "pending arrival must time out"
         );
         assert!(!ARRIVAL_TX
@@ -2223,6 +2575,177 @@ mod tests {
             .contains_key(&key));
 
         *ARRIVAL_TX.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn headless_animation_does_not_enqueue_or_create_an_arrival_waiter() {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let registration = register_cursor_move_if_renderer_available(
+            false,
+            Some(&command_tx),
+            "headless".to_owned(),
+            OverlayCommand::MoveTo {
+                x: 12.0,
+                y: 34.0,
+                end_heading_radians: 0.0,
+            },
+        );
+
+        assert!(
+            registration.is_none(),
+            "headless animation must not create an arrival waiter"
+        );
+        assert!(
+            matches!(
+                command_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "headless animation must not enqueue into the undrained renderer"
+        );
+    }
+
+    #[test]
+    fn concurrent_same_cursor_registration_preserves_enqueue_order() {
+        let _test_guard = ARRIVAL_TEST_LOCK.lock().unwrap();
+        *ARRIVAL_TX.lock().unwrap() = Some(HashMap::new());
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let first_command_tx = command_tx.clone();
+        let (first_registered_tx, first_registered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            register_cursor_move_if_renderer_available_with(
+                true,
+                Some(&first_command_tx),
+                "ordered".to_owned(),
+                OverlayCommand::MoveTo {
+                    x: 1.0,
+                    y: 1.0,
+                    end_heading_radians: 0.0,
+                },
+                move || {
+                    first_registered_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                },
+            )
+        });
+        first_registered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first waiter was not registered");
+
+        let second_command_tx = command_tx.clone();
+        let (second_registered_tx, second_registered_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            register_cursor_move_if_renderer_available_with(
+                true,
+                Some(&second_command_tx),
+                "ordered".to_owned(),
+                OverlayCommand::MoveTo {
+                    x: 2.0,
+                    y: 2.0,
+                    end_heading_radians: 0.0,
+                },
+                move || second_registered_tx.send(()).unwrap(),
+            )
+        });
+
+        assert!(matches!(
+            second_registered_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_first_tx.send(()).unwrap();
+        second_registered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second waiter did not register after the first enqueue");
+        let first_waiter = first.join().unwrap().expect("first move was not enqueued");
+        let second_waiter = second.join().unwrap().expect("second move was not enqueued");
+
+        let generations = [command_rx.recv().unwrap(), command_rx.recv().unwrap()]
+            .map(|message| match message {
+                OverlayMsg::RegisteredMove { generation, .. } => generation,
+                other => panic!("unexpected renderer message: {other:?}"),
+            });
+        assert!(
+            generations[0] < generations[1],
+            "renderer queue order must match waiter generation order"
+        );
+
+        arrival_cancel(&"ordered".to_owned(), first_waiter.0);
+        arrival_cancel(&"ordered".to_owned(), second_waiter.0);
+        drop((first_waiter, second_waiter));
+        *ARRIVAL_TX.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn slow_wide_glide_extends_arrival_timeout_past_ideal_travel_time() {
+        let motion = MotionConfig::default().scaled_by(0.25);
+        let path_length = 8_000.0;
+        let ideal_travel_time = Duration::from_secs_f64(path_length / motion.peak_speed);
+
+        assert!(
+            arrival_timeout_for_path(path_length, &motion) > ideal_travel_time,
+            "a slow cross-display glide must not time out before even peak speed could arrive"
+        );
+    }
+
+    #[test]
+    fn cursor_arrival_timeout_remains_bounded_for_a_stalled_renderer() {
+        let motion = MotionConfig::default().scaled_by(0.25);
+
+        assert_eq!(
+            arrival_timeout_for_path(1_000_000.0, &motion),
+            MAX_ARRIVAL_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn stale_timeout_recovery_cannot_replace_a_newer_move_generation() {
+        let mut map = empty_map();
+        let key = "generation-race".to_owned();
+        assert!(seed_start_in_map(&mut map, &key, 20.0, 20.0));
+        apply_msg(
+            &mut map,
+            OverlayMsg::RegisteredMove {
+                key: key.clone(),
+                cmd: OverlayCommand::MoveTo {
+                    x: 40.0,
+                    y: 40.0,
+                    end_heading_radians: 0.0,
+                },
+                generation: 1,
+            },
+        );
+        apply_msg(
+            &mut map,
+            OverlayMsg::RegisteredMove {
+                key: key.clone(),
+                cmd: OverlayCommand::MoveTo {
+                    x: 80.0,
+                    y: 80.0,
+                    end_heading_radians: 0.0,
+                },
+                generation: 2,
+            },
+        );
+
+        let applied = apply_msg(
+            &mut map,
+            OverlayMsg::TimeoutRecovery {
+                key: key.clone(),
+                cmd: OverlayCommand::SnapTo {
+                    x: 40.0,
+                    y: 40.0,
+                    heading_radians: Some(0.0),
+                },
+                generation: 1,
+            },
+        );
+
+        assert!(applied.is_none(), "stale recovery must be discarded");
+        assert_eq!(map.active_move_generations.get(&key), Some(&2));
+        assert!(
+            map.cursors[&key].core.path.is_some(),
+            "the newer glide must remain active"
+        );
     }
 
     #[test]
@@ -2307,6 +2830,39 @@ mod tests {
         assert!(
             (pos.0 - 60.0).abs() > 4.0 || (pos.1 - 60.0).abs() > 4.0,
             "seed must differ from target to produce a visible glide, got {pos:?}"
+        );
+    }
+
+    #[test]
+    fn first_seed_uses_the_containing_displays_global_bounds() {
+        let displays = [
+            DisplayGeometry {
+                bounds: LogicalRect {
+                    left: -1920.0,
+                    top: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                },
+                backing_scale: 1.0,
+            },
+            DisplayGeometry {
+                bounds: LogicalRect {
+                    left: 0.0,
+                    top: -1080.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                },
+                backing_scale: 2.0,
+            },
+        ];
+
+        assert_eq!(
+            seed_point_for_target(-1700.0, 400.0, &displays, None),
+            (-1840.0, 260.0)
+        );
+        assert_eq!(
+            seed_point_for_target(400.0, -800.0, &displays, None),
+            (260.0, -940.0)
         );
     }
 
@@ -2421,9 +2977,8 @@ mod tests {
     }
 
     #[test]
-    fn global_appkit_transform_preserves_left_and_above_main_coordinates() {
+    fn global_appkit_transform_does_not_reapply_the_anchor_display_origin() {
         let main = ScreenGeometry {
-            origin_x: 10.0,
             origin_y: 20.0,
             height: 900.0,
             fallback_backing_scale: 2.0,
@@ -2437,7 +2992,10 @@ mod tests {
             },
             main,
         );
-        assert_eq!(left.x, -1790.0);
+        assert_eq!(
+            left.x, -1800.0,
+            "Quartz cursor coordinates are already global; a non-zero NSScreen origin must not be added again"
+        );
         assert_eq!(left.y, 676.0);
 
         let above = appkit_frame_for_rect(
@@ -2449,10 +3007,35 @@ mod tests {
             },
             main,
         );
-        assert_eq!(above.x, 310.0);
+        assert_eq!(above.x, 300.0);
         assert_eq!(above.y, 1376.0);
         assert_eq!(above.width, 144.0);
         assert_eq!(above.height, 144.0);
+    }
+
+    #[test]
+    fn primary_display_geometry_is_stable_when_main_screen_is_external() {
+        let external_main_screen = LogicalRect {
+            left: -575.0,
+            top: -1080.0,
+            width: 1920.0,
+            height: 1080.0,
+        };
+        let primary_display = LogicalRect {
+            left: 0.0,
+            top: 0.0,
+            width: 1512.0,
+            height: 982.0,
+        };
+
+        let screen = screen_geometry_for_primary_display(
+            primary_display,
+            external_main_screen,
+            2.0,
+        );
+
+        assert_eq!(screen.origin_y, 0.0);
+        assert_eq!(screen.height, 982.0);
     }
 
     #[test]
@@ -2662,7 +3245,6 @@ mod tests {
             appkit_frame_for_rect(
                 rect_a,
                 ScreenGeometry {
-                    origin_x: 0.0,
                     origin_y: 0.0,
                     height: 200.0,
                     fallback_backing_scale: 2.0,
@@ -2672,7 +3254,6 @@ mod tests {
             appkit_frame_for_rect(
                 rect_b,
                 ScreenGeometry {
-                    origin_x: 0.0,
                     origin_y: 0.0,
                     height: 200.0,
                     fallback_backing_scale: 2.0,

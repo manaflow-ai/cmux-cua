@@ -12,30 +12,272 @@ use crate::permissions::status::{
 
 pub struct CheckPermissionsTool;
 
+const SCREEN_CAPTURE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScreenCaptureProbeBackend {
+    Stream,
+    ScreenshotManager,
+}
+
+fn screen_capture_probe_backend(macos_major_version: isize) -> ScreenCaptureProbeBackend {
+    if macos_major_version >= 14 {
+        ScreenCaptureProbeBackend::ScreenshotManager
+    } else {
+        ScreenCaptureProbeBackend::Stream
+    }
+}
+
 /// (A) Real ScreenCaptureKit capability probe — what THIS process can
 /// actually capture right now, independent of the CGPreflight cache.
 ///
 /// `CGPreflightScreenCaptureAccess()` (used by `screen_recording_granted`)
 /// answers from a per-process cache that goes stale after `tccutil reset`
 /// and is unreliable for CLI / child processes — the same finding Peekaboo
-/// documents. `SCShareableContent::get()` does a live query: it only
-/// returns displays when the answering process can genuinely capture. When
-/// it disagrees with the preflight boolean, the preflight one is lying.
-fn screen_recording_capturable() -> bool {
-    use screencapturekit::prelude::SCShareableContent;
-    SCShareableContent::get()
-        .map(|c| !c.displays().is_empty())
+/// documents. Display enumeration alone is not sufficient on macOS Tahoe:
+/// `SCShareableContent::get()` can return displays while the separate
+/// direct-capture consent alert is still waiting for a decision. Readiness
+/// therefore requires one real frame. macOS 14 and newer use
+/// `SCScreenshotManager`; macOS 13 uses its supported one-frame `SCStream`
+/// equivalent.
+pub(super) async fn screen_recording_capturable() -> bool {
+    let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        run_owned_screen_recording_probe(response_sender).await;
+    });
+    response_receiver.await.unwrap_or(false)
+}
+
+async fn run_owned_screen_recording_probe(response_sender: tokio::sync::oneshot::Sender<bool>) {
+    use screencapturekit::{
+        async_api::{AsyncSCScreenshotManager, AsyncSCShareableContent},
+        prelude::{SCContentFilter, SCStreamConfiguration},
+    };
+
+    let deadline = tokio::time::Instant::now() + SCREEN_CAPTURE_PROBE_TIMEOUT;
+    let gate = screen_capture_probe_gate();
+    let Ok(probe_guard) = tokio::time::timeout_at(deadline, gate.lock_owned()).await else {
+        let _ = response_sender.send(false);
+        return;
+    };
+    let mut content_probe = Box::pin(AsyncSCShareableContent::get());
+    let content = match tokio::time::timeout_at(deadline, content_probe.as_mut()).await {
+        Ok(Ok(content)) => content,
+        Ok(Err(_)) => {
+            let _ = response_sender.send(false);
+            return;
+        }
+        Err(_) => {
+            let _ = response_sender.send(false);
+            let _ = content_probe.await;
+            return;
+        }
+    };
+    let Some(display) = content.displays().into_iter().next() else {
+        let _ = response_sender.send(false);
+        return;
+    };
+    let filter = SCContentFilter::create()
+        .with_display(&display)
+        .with_excluding_windows(&[])
+        .build();
+    let configuration = SCStreamConfiguration::new().with_width(1).with_height(1);
+    let major_version = objc2_foundation::NSProcessInfo::processInfo()
+        .operatingSystemVersion()
+        .majorVersion;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        let _ = response_sender.send(false);
+        return;
+    }
+    let capturable = match screen_capture_probe_backend(major_version) {
+        ScreenCaptureProbeBackend::Stream => {
+            capture_one_frame_with_stream(filter, configuration, remaining, probe_guard).await
+        }
+        ScreenCaptureProbeBackend::ScreenshotManager => {
+            let screenshot_task = tokio::spawn(async move {
+                AsyncSCScreenshotManager::capture_image(&filter, &configuration)
+                    .await
+                    .is_ok_and(|image| image.width() > 0 && image.height() > 0)
+            });
+            capture_probe_task_with_owned_guard(remaining, screenshot_task, probe_guard).await
+        }
+    };
+    let _ = response_sender.send(capturable);
+}
+
+async fn capture_one_frame_with_stream<LifecycleGuard>(
+    filter: screencapturekit::prelude::SCContentFilter,
+    configuration: screencapturekit::prelude::SCStreamConfiguration,
+    timeout: std::time::Duration,
+    lifecycle_guard: LifecycleGuard,
+) -> bool
+where
+    LifecycleGuard: Send + 'static,
+{
+    use screencapturekit::{
+        async_api::AsyncSCStream,
+        cm::{CMSampleBufferExt, CMSampleBufferSCExt},
+        prelude::SCStreamOutputType,
+    };
+    use std::sync::Arc;
+
+    let stream = Arc::new(AsyncSCStream::new(
+        &filter,
+        &configuration,
+        1,
+        SCStreamOutputType::Screen,
+    ));
+    let start_task = {
+        let stream = Arc::clone(&stream);
+        tokio::task::spawn_blocking(move || stream.start_capture().is_ok())
+    };
+    let receive_stream = Arc::clone(&stream);
+    let stop_stream = Arc::clone(&stream);
+    capture_stream_lifecycle_with_timeout(
+        timeout,
+        start_task,
+        move || async move {
+            while let Some(sample) = receive_stream.next().await {
+                if crate::application_surface::capture_frame_status_is_publishable(
+                    sample.frame_status(),
+                ) && sample.image_buffer().is_some_and(|pixel_buffer| {
+                    pixel_buffer.width() > 0 && pixel_buffer.height() > 0
+                }) {
+                    return true;
+                }
+            }
+            false
+        },
+        move || tokio::task::spawn_blocking(move || stop_stream.stop_capture().is_ok()),
+        lifecycle_guard,
+    )
+    .await
+}
+
+fn screen_capture_probe_gate() -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Mutex::new(()))))
+}
+
+async fn capture_probe_task_with_owned_guard<LifecycleGuard>(
+    timeout: std::time::Duration,
+    mut probe_task: tokio::task::JoinHandle<bool>,
+    lifecycle_guard: LifecycleGuard,
+) -> bool
+where
+    LifecycleGuard: Send + 'static,
+{
+    let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let result = capture_probe_task_before(deadline, &mut probe_task).await;
+        let _ = response_sender.send(result.unwrap_or(false));
+        if result.is_none() {
+            let _ = probe_task.await;
+        }
+        drop(lifecycle_guard);
+    });
+    response_receiver.await.unwrap_or(false)
+}
+
+#[cfg(test)]
+async fn capture_probe_with_owned_task<SpawnProbe>(
+    timeout: std::time::Duration,
+    gate: std::sync::Arc<tokio::sync::Mutex<()>>,
+    spawn_probe: SpawnProbe,
+) -> bool
+where
+    SpawnProbe: FnOnce() -> tokio::task::JoinHandle<bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let Ok(lifecycle_guard) = tokio::time::timeout_at(deadline, gate.lock_owned()).await else {
+        return false;
+    };
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    capture_probe_task_with_owned_guard(remaining, spawn_probe(), lifecycle_guard).await
+}
+
+async fn capture_stream_lifecycle_with_timeout<Receive, ReceiveFuture, Stop, LifecycleGuard>(
+    timeout: std::time::Duration,
+    mut start_task: tokio::task::JoinHandle<bool>,
+    receive: Receive,
+    stop: Stop,
+    lifecycle_guard: LifecycleGuard,
+) -> bool
+where
+    Receive: FnOnce() -> ReceiveFuture + Send + 'static,
+    ReceiveFuture: std::future::Future<Output = bool> + Send + 'static,
+    Stop: FnOnce() -> tokio::task::JoinHandle<bool> + Send + 'static,
+    LifecycleGuard: Send + 'static,
+{
+    let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let start_result = capture_probe_task_before(deadline, &mut start_task).await;
+        let started = start_result.unwrap_or(false);
+        let received = if started {
+            tokio::time::timeout_at(deadline, receive())
+                .await
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let _ = response_sender.send(started && received);
+        if start_result.is_none() {
+            let _ = start_task.await;
+        }
+        let _ = stop().await;
+        drop(lifecycle_guard);
+    });
+    response_receiver.await.unwrap_or(false)
+}
+
+async fn capture_probe_task_before(
+    deadline: tokio::time::Instant,
+    task: &mut tokio::task::JoinHandle<bool>,
+) -> Option<bool> {
+    tokio::time::timeout_at(deadline, task)
+        .await
+        .ok()
+        .map(|result| result.unwrap_or(false))
+}
+
+#[cfg(test)]
+async fn capture_probe_with_timeout(
+    timeout: std::time::Duration,
+    probe: impl std::future::Future<Output = bool>,
+) -> bool {
+    tokio::time::timeout(timeout, probe)
+        .await
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn verify_screen_capture_with<Display>(
+    load_display: impl FnOnce() -> Option<Display>,
+    capture_frame: impl FnOnce(&Display) -> bool,
+) -> bool {
+    load_display().as_ref().is_some_and(capture_frame)
 }
 
 /// Run the ScreenCaptureKit probe only on an explicitly prompt-capable path.
 /// `SCShareableContent::get()` can itself register/raise TCC, so `None` is the
 /// only truthful answer when a silent or host-owned flow skips that probe.
-fn maybe_screen_recording_capture_probe(
+async fn maybe_screen_recording_capture_probe<Probe, ProbeFuture>(
     should_probe: bool,
-    probe: impl FnOnce() -> bool,
-) -> Option<bool> {
-    should_probe.then(probe)
+    probe: Probe,
+) -> Option<bool>
+where
+    Probe: FnOnce() -> ProbeFuture,
+    ProbeFuture: std::future::Future<Output = bool>,
+{
+    if should_probe {
+        Some(probe().await)
+    } else {
+        None
+    }
 }
 
 /// (B) Which TCC identity the booleans in this response reflect.
@@ -227,7 +469,8 @@ impl Tool for CheckPermissionsTool {
         let screen_recording_capturable = maybe_screen_recording_capture_probe(
             should_prompt,
             screen_recording_capturable,
-        );
+        )
+        .await;
         // (B) Which identity the booleans above belong to.
         let source = permission_source();
 
@@ -431,13 +674,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn silent_check_reports_capture_unknown_without_running_probe() {
+    #[tokio::test]
+    async fn silent_check_reports_capture_unknown_without_running_probe() {
         let probe_called = std::cell::Cell::new(false);
         let capturable = maybe_screen_recording_capture_probe(false, || {
             probe_called.set(true);
-            true
-        });
+            std::future::ready(true)
+        })
+        .await;
         assert_eq!(capturable, None);
         assert!(!probe_called.get(), "silent status must not call SCShareableContent");
 
@@ -458,9 +702,168 @@ mod tests {
     }
 
     #[test]
-    fn live_check_reports_probe_true_or_false_and_warns_only_on_false() {
+    fn capture_readiness_requires_a_real_frame_after_display_enumeration() {
+        let captures = std::cell::Cell::new(0);
+        assert!(!verify_screen_capture_with(
+            || None::<u8>,
+            |_| {
+                captures.set(captures.get() + 1);
+                true
+            }
+        ));
+        assert_eq!(captures.get(), 0);
+
+        assert!(!verify_screen_capture_with(
+            || Some(7_u8),
+            |_| {
+                captures.set(captures.get() + 1);
+                false
+            }
+        ));
+        assert_eq!(captures.get(), 1);
+
+        assert!(verify_screen_capture_with(
+            || Some(7_u8),
+            |_| {
+                captures.set(captures.get() + 1);
+                true
+            }
+        ));
+        assert_eq!(captures.get(), 2);
+    }
+
+    #[test]
+    fn capture_probe_keeps_the_macos_thirteen_compatible_backend() {
+        assert_eq!(
+            screen_capture_probe_backend(13),
+            ScreenCaptureProbeBackend::Stream
+        );
+        assert_eq!(
+            screen_capture_probe_backend(14),
+            ScreenCaptureProbeBackend::ScreenshotManager
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_probe_timeout_reports_not_ready() {
+        assert!(
+            !capture_probe_with_timeout(
+                std::time::Duration::from_millis(10),
+                std::future::pending(),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn screenshot_probe_timeout_owns_gate_until_native_completion() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let probe_started = Arc::new(AtomicBool::new(false));
+        let probe_started_marker = Arc::clone(&probe_started);
+        let (release_probe_tx, release_probe_rx) = tokio::sync::oneshot::channel();
+        let result = capture_probe_with_owned_task(
+            std::time::Duration::from_millis(10),
+            Arc::clone(&gate),
+            move || {
+                tokio::spawn(async move {
+                    probe_started_marker.store(true, Ordering::Release);
+                    release_probe_rx.await.is_ok()
+                })
+            },
+        )
+        .await;
+
+        assert!(!result);
+        assert!(probe_started.load(Ordering::Acquire));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), gate.lock())
+                .await
+                .is_err()
+        );
+
+        release_probe_tx.send(()).unwrap();
+        let _released_guard = tokio::time::timeout(std::time::Duration::from_secs(1), gate.lock())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_probe_timeout_defers_shutdown_until_start_finishes() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let receive_called = Arc::new(AtomicBool::new(false));
+        let stop_scheduled = Arc::new(AtomicBool::new(false));
+        let lifecycle_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let lifecycle_guard = Arc::clone(&lifecycle_gate).lock_owned().await;
+        let (release_start_tx, release_start_rx) = tokio::sync::oneshot::channel();
+        let receive_marker = Arc::clone(&receive_called);
+        let stop_marker = Arc::clone(&stop_scheduled);
+        let result = capture_stream_lifecycle_with_timeout(
+            std::time::Duration::from_millis(10),
+            tokio::spawn(async move { release_start_rx.await.is_ok() }),
+            move || {
+                receive_marker.store(true, Ordering::Release);
+                std::future::ready(true)
+            },
+            move || {
+                stop_marker.store(true, Ordering::Release);
+                tokio::spawn(async { true })
+            },
+            lifecycle_guard,
+        )
+        .await;
+
+        assert!(!result);
+        assert!(!receive_called.load(Ordering::Acquire));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!stop_scheduled.load(Ordering::Acquire));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), lifecycle_gate.lock())
+                .await
+                .is_err()
+        );
+
+        release_start_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !stop_scheduled.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let _released_guard =
+            tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_gate.lock())
+                .await
+                .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_probe_cleanup_cannot_negate_a_valid_frame() {
+        let result = capture_stream_lifecycle_with_timeout(
+            std::time::Duration::from_millis(10),
+            tokio::spawn(async { true }),
+            || std::future::ready(true),
+            || tokio::spawn(std::future::pending::<bool>()),
+            (),
+        )
+        .await;
+
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn live_check_reports_probe_true_or_false_and_warns_only_on_false() {
         for (live, should_warn) in [(true, false), (false, true)] {
-            let capturable = maybe_screen_recording_capture_probe(true, || live);
+            let capturable =
+                maybe_screen_recording_capture_probe(true, || std::future::ready(live)).await;
             assert_eq!(capturable, Some(live));
             let result = permission_result(
                 true,

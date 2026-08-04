@@ -41,6 +41,7 @@ const ANONYMOUS_SESSION: &str = "__codex_compat_connection__";
 const MAX_CLICK_COUNT: u64 = 10;
 const MAX_SCROLL_PAGES: f64 = 10.0;
 const WINDOW_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[repr(C)]
 struct __AXObserver(c_void);
@@ -1021,6 +1022,7 @@ impl CompatState {
                 &action_name,
                 action_summary,
                 action_structured,
+                &snapshot,
                 error.into_result(),
             );
         }
@@ -1037,6 +1039,7 @@ impl CompatState {
                 &action_name,
                 action_summary,
                 action_structured,
+                &snapshot,
                 refreshed,
             );
         }
@@ -1191,17 +1194,8 @@ impl CompatState {
         if let Err(result) = self.require_current_lock_epoch(lock_epoch) {
             return result;
         }
-        let native_args = native_action_arguments(
-            json!({
-                "pid": snapshot.app.pid,
-                "window_id": snapshot.window_id,
-                "from_x": from_x,
-                "from_y": from_y,
-                "to_x": to_x,
-                "to_y": to_y,
-            }),
-            args,
-            session,
+        let native_args = compat_drag_native_arguments(
+            snapshot, args, session, from_x, from_y, to_x, to_y,
         );
         super::drag::DragTool::new(snapshot.native.clone())
             .invoke(native_args)
@@ -1544,6 +1538,30 @@ impl CompatState {
     }
 }
 
+fn compat_drag_native_arguments(
+    snapshot: &AppSnapshot,
+    args: &Value,
+    session: &str,
+    from_x: f64,
+    from_y: f64,
+    to_x: f64,
+    to_y: f64,
+) -> Value {
+    native_action_arguments(
+        json!({
+            "pid": snapshot.app.pid,
+            "window_id": snapshot.window_id,
+            "from_x": from_x,
+            "from_y": from_y,
+            "to_x": to_x,
+            "to_y": to_y,
+            "delivery_mode": "foreground",
+        }),
+        args,
+        session,
+    )
+}
+
 fn element_supports_native_click(actions: &[String], button: &str) -> bool {
     match button {
         "left" => actions.iter().any(|action| action == "AXPress"),
@@ -1809,6 +1827,7 @@ fn refresh_warning_after_success(
     action_name: &str,
     action_summary: String,
     action_structured: Option<Value>,
+    snapshot: &AppSnapshot,
     refreshed: ToolResult,
 ) -> ToolResult {
     let refresh_error = first_text(&refreshed);
@@ -1816,6 +1835,8 @@ fn refresh_warning_after_success(
         "{action_name} completed, but refreshing the app state failed. Do not repeat the action; call get_app_state again. {refresh_error}"
     ))
     .with_structured(json!({
+        "pid": snapshot.app.pid,
+        "window_id": snapshot.window_id,
         "state_refresh_failed_after_success": true,
         "warning": "The action completed, but the required refreshed app state and screenshot are unavailable. Do not retry the action automatically.",
         "refresh_error": refresh_error,
@@ -2727,17 +2748,40 @@ fn wait_for_key_window_blocking(pid: i32) -> Result<(u32, String), CompatError> 
         return Ok(window);
     }
 
-    let mut observer = WindowNotificationObserver::new(pid)?;
-    resolve_after_notifications(
-        WINDOW_WAIT_TIMEOUT,
-        || resolve_key_window_info(pid),
-        |remaining| observer.wait(remaining),
-    )
-    .ok_or_else(|| {
+    let resolved = match WindowNotificationObserver::new(pid) {
+        Ok(mut observer) => resolve_after_notifications(
+            WINDOW_WAIT_TIMEOUT,
+            || resolve_key_window_info(pid),
+            |remaining| observer.wait(remaining),
+        ),
+        // Calculator and some other system apps reject every AX window
+        // notification registration during their first launch on Tahoe even
+        // though their key window becomes queryable moments later. The
+        // observer is only a wake-up optimization; bounded polling preserves
+        // the same deadline without forcing a second get_app_state call.
+        Err(_) => resolve_after_polling(WINDOW_WAIT_TIMEOUT, WINDOW_POLL_INTERVAL, || {
+            resolve_key_window_info(pid)
+        }),
+    };
+    resolved.ok_or_else(|| {
         CompatError::new(
             "app_has_no_window",
             format!("App pid {pid} did not expose a key window within 5 seconds."),
         )
+    })
+}
+
+fn resolve_after_polling<T, Resolve>(
+    timeout: Duration,
+    poll_interval: Duration,
+    resolve: Resolve,
+) -> Option<T>
+where
+    Resolve: FnMut() -> Option<T>,
+{
+    resolve_after_notifications(timeout, resolve, |remaining| {
+        std::thread::sleep(remaining.min(poll_interval));
+        true
     })
 }
 
@@ -3253,6 +3297,22 @@ mod tests {
         assert_eq!(native["_host_session"], "cmux-surface-A1B2C3");
     }
 
+    #[test]
+    fn codex_drag_selects_the_supported_foreground_delivery_mode() {
+        let app = snapshot("AppA", Arc::new(ToolState::default()));
+        let native = compat_drag_native_arguments(
+            &app,
+            &json!({}),
+            "session-a",
+            10.0,
+            20.0,
+            30.0,
+            40.0,
+        );
+
+        assert_eq!(native["delivery_mode"], "foreground");
+    }
+
     #[tokio::test]
     async fn action_without_app_snapshot_fails_closed() {
         let state = CompatState::new();
@@ -3676,6 +3736,7 @@ mod tests {
             "click",
             "clicked".to_owned(),
             None,
+            &stored,
             CompatError::new("screen_capture_failed", "capture failed").into_result(),
         );
         assert_ne!(result.is_error, Some(true));
@@ -3981,14 +4042,18 @@ mod tests {
 
     #[test]
     fn completed_action_with_failed_refresh_is_degraded_success_not_retryable_error() {
+        let app_snapshot = snapshot("Calculator", Arc::new(ToolState::default()));
         let result = refresh_warning_after_success(
             "click",
             "clicked".to_owned(),
             Some(json!({"verified": true})),
+            &app_snapshot,
             CompatError::new("screen_capture_failed", "capture failed").into_result(),
         );
         assert_ne!(result.is_error, Some(true));
         let structured = result.structured_content.unwrap();
+        assert_eq!(structured["pid"], app_snapshot.app.pid);
+        assert_eq!(structured["window_id"], app_snapshot.window_id);
         assert_eq!(structured["state_refresh_failed_after_success"], true);
         assert_eq!(structured["action_result"]["text"], "clicked");
         assert_eq!(structured["action_result"]["structured"]["verified"], true);
@@ -4049,6 +4114,18 @@ mod tests {
             final_resolve_count, 2,
             "timeout performs one final race-closing resolve"
         );
+    }
+
+    #[test]
+    fn polling_fallback_resolves_apps_without_window_notifications() {
+        let mut resolutions = 0;
+        let result = resolve_after_polling(Duration::from_secs(1), Duration::ZERO, || {
+            resolutions += 1;
+            (resolutions == 3).then_some("window")
+        });
+
+        assert_eq!(result, Some("window"));
+        assert_eq!(resolutions, 3);
     }
 
     #[tokio::test]

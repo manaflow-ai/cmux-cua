@@ -72,6 +72,10 @@ extern "C" {
         attribute: CFStringRef,
         value: CFTypeRef,
     ) -> AXError;
+    pub fn AXUIElementSetMessagingTimeout(
+        element: AXUIElementRef,
+        timeout_in_seconds: f32,
+    ) -> AXError;
     pub fn AXUIElementGetTypeID() -> CFTypeID;
     pub fn AXIsProcessTrusted() -> bool;
     /// `AXIsProcessTrustedWithOptions(options)` — when called with
@@ -486,30 +490,38 @@ pub unsafe fn ax_get_window_id(element: AXUIElementRef) -> Option<u32> {
 
 /// Read the `AXWindows` attribute of an application element.
 /// Unlike `AXChildren`, this returns the window list regardless of whether
-/// the app is frontmost. Returns a Vec of retained AXUIElementRefs.
-pub unsafe fn copy_ax_windows(element: AXUIElementRef) -> Vec<AXUIElementRef> {
+/// the app is frontmost. A successful empty list stays distinct from an
+/// unavailable or failed attribute read. Returned elements are retained.
+pub unsafe fn copy_ax_windows_if_available(element: AXUIElementRef) -> Option<Vec<AXUIElementRef>> {
     let attr = CFStr::new("AXWindows");
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err != kAXErrorSuccess || value.is_null() {
-        return vec![];
+        return None;
     }
     let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
     if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
         CFRelease(value);
-        return vec![];
+        return None;
     }
     let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
     let ax_type_id = AXUIElementGetTypeID();
-    (0..arr.len())
-        .filter_map(|i| {
-            let item = *arr.get(i)?;
-            if core_foundation::base::CFGetTypeID(item) == ax_type_id {
-                CFRetain(item);
-                Some(item as AXUIElementRef)
-            } else {
-                None
-            }
-        })
-        .collect()
+    Some(
+        (0..arr.len())
+            .filter_map(|i| {
+                let item = *arr.get(i)?;
+                if core_foundation::base::CFGetTypeID(item) == ax_type_id {
+                    CFRetain(item);
+                    Some(item as AXUIElementRef)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Read `AXWindows`, treating an unavailable attribute as an empty list.
+pub unsafe fn copy_ax_windows(element: AXUIElementRef) -> Vec<AXUIElementRef> {
+    copy_ax_windows_if_available(element).unwrap_or_default()
 }

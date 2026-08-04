@@ -64,16 +64,51 @@ pub(crate) fn main_screen_size() -> Option<(i64, i64, f64)> {
     Some((w, h, scale))
 }
 
-/// Estimate backing scale by comparing the display's pixel mode width to its
-/// logical (CoreGraphics) bounds width.
+/// Backing scale from the display's current mode: physical pixel width over
+/// logical point width.
+///
+/// `CGDisplayPixelsWide` cannot be the primary source: on HiDPI ("Retina")
+/// modes it reports the mode's POINT width, so the old pixel/logical ratio
+/// collapsed to 1.0 and every overlay raster (cursor, focus ring) drew at
+/// half resolution on Retina displays.
 pub(crate) fn get_backing_scale(display_id: u32, logical_w: i64) -> f64 {
+    use core_graphics::display::CGDisplay;
+    if let Some(mode) = CGDisplay::new(display_id).display_mode() {
+        if let Some(scale) = scale_from_widths(mode.pixel_width() as f64, mode.width() as f64) {
+            return scale;
+        }
+    }
+    // Legacy framebuffer-width heuristic; correct on non-HiDPI modes.
     use core_graphics::display::CGDisplayPixelsWide;
-    let pixel_w = unsafe { CGDisplayPixelsWide(display_id) } as i64;
-    if pixel_w > 0 && logical_w > 0 {
-        let ratio = pixel_w as f64 / logical_w as f64;
-        // Round to nearest 0.5 to avoid floating point noise.
-        (ratio * 2.0).round() / 2.0
+    let pixel_w = unsafe { CGDisplayPixelsWide(display_id) } as f64;
+    scale_from_widths(pixel_w, logical_w as f64).unwrap_or(1.0)
+}
+
+/// Pixels-per-point ratio rounded to the nearest 0.5 to absorb floating point
+/// noise. `None` when either width is unusable.
+fn scale_from_widths(pixel_w: f64, point_w: f64) -> Option<f64> {
+    if pixel_w > 0.0 && point_w > 0.0 {
+        Some(((pixel_w / point_w) * 2.0).round() / 2.0)
     } else {
-        1.0
+        None
+    }
+}
+
+#[cfg(test)]
+mod backing_scale_tests {
+    use super::scale_from_widths;
+
+    /// Retina regression: the display mode reports 3024 physical pixels over
+    /// 1512 points. The old CGDisplayPixelsWide-based ratio compared points to
+    /// points and collapsed to 1.0, so the overlay rasterized at half
+    /// resolution on every Retina display.
+    #[test]
+    fn retina_mode_widths_yield_2x() {
+        assert_eq!(scale_from_widths(3024.0, 1512.0), Some(2.0));
+        assert_eq!(scale_from_widths(1512.0, 1512.0), Some(1.0));
+        // Scaled "More Space" style modes land on non-integer ratios.
+        assert_eq!(scale_from_widths(3600.0, 2400.0), Some(1.5));
+        assert_eq!(scale_from_widths(0.0, 1512.0), None);
+        assert_eq!(scale_from_widths(3024.0, 0.0), None);
     }
 }

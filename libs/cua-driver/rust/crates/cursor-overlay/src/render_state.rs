@@ -13,9 +13,9 @@
 //!   `pinned_wid`, `gradient_colors`, `bloom_override`).
 //! - [`RenderStateCore::tick_motion`] — speed-profile + spring physics +
 //!   click-pulse + idle-fade using runtime [`MotionConfig`] (Windows + Linux).
-//! - [`RenderStateCore::tick_swift_constants`] — same physics but with the
-//!   hardcoded Swift reference constants used by macOS; returns whether the
-//!   path just ended (so the caller can fire arrival signals).
+//! - [`RenderStateCore::tick_swift_constants`] — configured glide speeds with
+//!   the Swift reference spring physics used by macOS; returns whether the path
+//!   just ended (so the caller can fire arrival signals).
 //! - [`RenderStateCore::apply_command_base`] — the OverlayCommand match arms
 //!   that all three platforms implement identically (MoveTo / ClickPulse /
 //!   SetEnabled / SetMotion / SetPalette / PinAbove / SetShape / SetGradient).
@@ -42,6 +42,10 @@ use crate::{
     BuiltinShape, CursorConfig, CursorShape, MotionConfig, OverlayCommand, Palette, PathPlanner,
     PathState, PlannedPath, Spring,
 };
+
+fn fixed_duration_landing_speed() -> f64 {
+    MotionConfig::default().min_end_speed
+}
 
 /// Platform-agnostic render state shared by macOS / Windows / Linux overlays.
 ///
@@ -184,7 +188,7 @@ impl RenderStateCore {
                 // stays as crisp as a speed-based glide instead of overshooting
                 // proportionally to a short duration.
                 let impulse = if self.motion.glide_duration_ms > 0.0 {
-                    self.motion.min_end_speed
+                    fixed_duration_landing_speed()
                 } else {
                     speed
                 };
@@ -240,10 +244,10 @@ impl RenderStateCore {
         fire_arrival
     }
 
-    /// Advance the animation by `dt` seconds using the hardcoded Swift
-    /// reference constants (`peakSpeed=900`, `minStart=300`, `minEnd=200`,
-    /// `springK=400`, `springC=17`, `springOvershoot=0.8`).  Used by macOS,
-    /// which mirrors `AgentCursorRenderer.swift` 1:1.
+    /// Advance the animation by `dt` seconds using the Swift reference
+    /// spring constants and the configured glide speeds. Used by macOS,
+    /// which mirrors `AgentCursorRenderer.swift` while honoring runtime speed
+    /// overrides.
     ///
     /// Returns `true` when the path just ended (so the caller can fire its
     /// arrival oneshot to unblock `animate_cursor_to`).
@@ -253,9 +257,6 @@ impl RenderStateCore {
     /// peak at 1.0 at u=0.5.  The original Swift code uses the 30/1.875
     /// form so we preserve it here for parity.
     pub fn tick_swift_constants(&mut self, dt: f64) -> bool {
-        const PEAK_SPEED: f64 = 900.0;
-        const MIN_START_SPEED: f64 = 300.0;
-        const MIN_END_SPEED: f64 = 200.0;
         const SPRING_K: f64 = 400.0;
         const SPRING_C: f64 = 17.0;
         const SPRING_OVERSHOOT: f64 = 0.8;
@@ -269,11 +270,12 @@ impl RenderStateCore {
             // Smootherstep speed profile (normalised: peak = 1.0).
             let profile = (30.0 * u * u * (1.0 - u) * (1.0 - u)) / 1.875;
             let floor_speed = if u < 0.5 {
-                MIN_START_SPEED
+                self.motion.min_start_speed
             } else {
-                MIN_END_SPEED
+                self.motion.min_end_speed
             };
-            let speed_based = floor_speed + (PEAK_SPEED - floor_speed) * profile;
+            let speed_based =
+                floor_speed + (self.motion.peak_speed - floor_speed) * profile;
             // Fixed-duration override: when `glide_duration_ms > 0` the move
             // takes exactly that long regardless of distance, so an orchestrator
             // can lock glides to a known cadence. `0` (the default) keeps the
@@ -296,7 +298,7 @@ impl RenderStateCore {
                 // stays as crisp as a speed-based glide instead of overshooting
                 // proportionally to a short duration.
                 let impulse = if self.motion.glide_duration_ms > 0.0 {
-                    MIN_END_SPEED
+                    fixed_duration_landing_speed()
                 } else {
                     current_speed
                 };
@@ -396,6 +398,31 @@ impl RenderStateCore {
         }
     }
 
+    /// Plan the same click-targeted glide consumed by [`Self::apply_command_base`].
+    /// Callers that bound an animation can therefore recover to the exact
+    /// rendered endpoint without duplicating hotspot or path geometry.
+    pub fn planned_move_path(&self, x: f64, y: f64, end_heading_radians: f64) -> PlannedPath {
+        let click_offset = self.click_offset_points();
+        let tx = x + end_heading_radians.cos() * click_offset;
+        let ty = y + end_heading_radians.sin() * click_offset;
+        let (x0, y0) = self.pos;
+        // The resting cursor angle is visual state, not a vehicle-like
+        // constraint. Using it as the Dubins start heading can turn a short
+        // move into a full loop, so the path approaches along its direct
+        // travel heading and adopts the requested visual angle at rest.
+        let travel_heading = (ty - y0).atan2(tx - x0);
+        PathPlanner::plan(
+            x0,
+            y0,
+            travel_heading,
+            tx,
+            ty,
+            travel_heading,
+            end_heading_radians,
+            self.motion.turn_radius,
+        )
+    }
+
     /// Handle the OverlayCommand variants that are identical across all
     /// three platforms.  Returns `true` if the command was consumed; `false`
     /// for variants the platform must handle itself (e.g. macOS's
@@ -430,7 +457,6 @@ impl RenderStateCore {
                 //   tx = clickPoint.x + cos(endAngle) * clickOffset
                 //   ty = clickPoint.y + sin(endAngle) * clickOffset
                 let click_offset = self.click_offset_points();
-                let turn_radius = self.motion.turn_radius;
                 let tx = x + end_heading_radians.cos() * click_offset;
                 let ty = y + end_heading_radians.sin() * click_offset;
 
@@ -439,23 +465,7 @@ impl RenderStateCore {
                 if move_to_snap_sentinel && self.is_unplaced() {
                     self.place_at(tx, ty);
                 }
-                let (x0, y0) = self.pos;
-                // Travel directly toward the target. The resting cursor angle
-                // is visual state, not a vehicle-like turning constraint; using
-                // it as the Dubins start/end heading can turn a short move into
-                // a full loop. The path tangent drives the cursor during the
-                // glide, while `end_heading_radians` remains its resting angle.
-                let travel_heading = (ty - y0).atan2(tx - x0);
-                let plan = PathPlanner::plan(
-                    x0,
-                    y0,
-                    travel_heading,
-                    tx,
-                    ty,
-                    travel_heading,
-                    end_heading_radians,
-                    turn_radius,
-                );
+                let plan = self.planned_move_path(x, y, end_heading_radians);
                 self.path = Some(plan);
                 self.dist = 0.0;
                 self.spring = None;
@@ -819,18 +829,23 @@ pub fn paint_cursor(
     } else {
         None
     };
+    let scaled_cmux_shape = if core.cfg.builtin_shape == BuiltinShape::Cmux {
+        Some(CursorShape::cmux_for_backing_scale(sf))
+    } else {
+        None
+    };
     let shape: Option<&CursorShape> = match (core.shape.as_ref(), core.cfg.builtin_shape) {
         (Some(custom), _) => Some(custom),
         (None, BuiltinShape::Teardrop) => Some(CursorShape::teardrop()),
         (None, BuiltinShape::Sky) => scaled_sky_shape.as_ref(),
-        (None, BuiltinShape::Cmux) => Some(CursorShape::cmux()),
+        (None, BuiltinShape::Cmux) => scaled_cmux_shape.as_ref(),
         (None, BuiltinShape::Arrow) => {
             let grad_override = if core.gradient_colors.is_empty() {
                 None
             } else {
                 Some(&core.gradient_colors)
             };
-            draw_default_arrow(
+            draw_default_arrow_at_backing_scale(
                 pm,
                 &core.palette,
                 grad_override,
@@ -838,6 +853,7 @@ pub fn paint_cursor(
                 py as f32,
                 heading as f32,
                 alpha_scale,
+                sf,
             );
             None
         }
@@ -927,8 +943,36 @@ pub fn draw_default_arrow(
     heading: f32,
     alpha_scale: f32,
 ) {
+    draw_default_arrow_at_backing_scale(
+        pm,
+        palette,
+        gradient_override,
+        px,
+        py,
+        heading,
+        alpha_scale,
+        1.0,
+    );
+}
+
+fn draw_default_arrow_at_backing_scale(
+    pm: &mut tiny_skia::Pixmap,
+    palette: &Palette,
+    gradient_override: Option<&Vec<[u8; 4]>>,
+    px: f32,
+    py: f32,
+    heading: f32,
+    alpha_scale: f32,
+    backing_scale: f32,
+) {
+    let scale = backing_scale.max(1.0);
     // Arrow vertices (tip at +x).
-    let verts: [(f32, f32); 4] = [(14.0, 0.0), (-8.0, -9.0), (-3.0, 0.0), (-8.0, 9.0)];
+    let verts: [(f32, f32); 4] = [
+        (14.0 * scale, 0.0),
+        (-8.0 * scale, -9.0 * scale),
+        (-3.0 * scale, 0.0),
+        (-8.0 * scale, 9.0 * scale),
+    ];
 
     // Rotate by (heading + π) so tip points in the motion direction.
     let angle = heading + std::f64::consts::PI as f32;
@@ -1008,7 +1052,7 @@ pub fn draw_default_arrow(
         tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(255, 255, 255, a));
     stroke_paint.anti_alias = true;
     let stroke = tiny_skia::Stroke {
-        width: 1.5,
+        width: 1.5 * scale,
         ..Default::default()
     };
     pm.stroke_path(
@@ -1028,8 +1072,15 @@ mod glide_duration_tests {
     /// Run a glide of `dist_pts` to completion and return how many seconds it
     /// took. `tick` selects the platform path: `false` = `tick_motion`
     /// (Windows/Linux), `true` = `tick_swift_constants` (macOS reference).
-    fn arrival_secs(glide_ms: f64, dist_pts: f64, swift: bool) -> f64 {
-        let mut core = RenderStateCore::new(CursorConfig::default());
+    fn arrival_secs_with_speed(
+        glide_ms: f64,
+        dist_pts: f64,
+        swift: bool,
+        speed_multiplier: f64,
+    ) -> f64 {
+        let mut config = CursorConfig::default();
+        config.motion = config.motion.scaled_by(speed_multiplier);
+        let mut core = RenderStateCore::new(config);
         core.motion.glide_duration_ms = glide_ms;
         core.motion.idle_hide_ms = 0.0;
         core.place_at(0.0, 0.0);
@@ -1054,6 +1105,34 @@ mod glide_duration_tests {
         t
     }
 
+    fn arrival_secs(glide_ms: f64, dist_pts: f64, swift: bool) -> f64 {
+        arrival_secs_with_speed(glide_ms, dist_pts, swift, 1.0)
+    }
+
+    fn fixed_duration_landing_impulse(swift: bool, speed_multiplier: f64) -> f64 {
+        let mut config = CursorConfig::default();
+        config.motion = config.motion.scaled_by(speed_multiplier);
+        let mut core = RenderStateCore::new(config);
+        core.motion.glide_duration_ms = 300.0;
+        core.place_at(0.0, 0.0);
+        core.path = Some(PathPlanner::plan(
+            0.0, 0.0, 0.0, 600.0, 0.0, 0.0, 0.0, 80.0,
+        ));
+        let dt = 1.0 / 240.0;
+        for _ in 0..1_000 {
+            let arrived = if swift {
+                core.tick_swift_constants(dt)
+            } else {
+                core.tick_motion(dt)
+            };
+            if arrived {
+                let spring = core.spring.expect("arrival installs a landing spring");
+                return spring.vx.hypot(spring.vy);
+            }
+        }
+        panic!("fixed-duration glide did not arrive");
+    }
+
     #[test]
     fn fixed_duration_is_distance_independent_on_both_paths() {
         for swift in [false, true] {
@@ -1075,6 +1154,30 @@ mod glide_duration_tests {
             assert!(
                 long > short + 0.2,
                 "swift={swift} short={short} long={long}"
+            );
+        }
+    }
+
+    #[test]
+    fn speed_multiplier_changes_arrival_timing_on_both_paths() {
+        for swift in [false, true] {
+            let baseline = arrival_secs_with_speed(0.0, 1400.0, swift, 1.0);
+            let fast = arrival_secs_with_speed(0.0, 1400.0, swift, 2.0);
+            assert!(
+                fast < baseline * 0.7,
+                "swift={swift} baseline={baseline} fast={fast}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_duration_landing_impulse_ignores_speed_multiplier_on_both_paths() {
+        for swift in [false, true] {
+            let baseline = fixed_duration_landing_impulse(swift, 1.0);
+            let fast = fixed_duration_landing_impulse(swift, 8.0);
+            assert!(
+                (fast - baseline).abs() < 0.001,
+                "swift={swift} baseline={baseline} fast={fast}"
             );
         }
     }
@@ -1185,7 +1288,7 @@ mod hotspot_shape_tests {
 #[cfg(test)]
 mod backing_scale_tests {
     use super::*;
-    use crate::CursorConfig;
+    use crate::{BuiltinShape, CursorConfig};
 
     /// Count opaque (alpha > 0) pixels in the pixmap — a proxy for the
     /// cursor's on-pixmap footprint that's independent of palette / gradient.
@@ -1209,6 +1312,40 @@ mod backing_scale_tests {
         let mut pm = tiny_skia::Pixmap::new(pm_size, pm_size).unwrap();
         paint_cursor(&mut pm, &core, 0.0, 0.0, None, backing_scale);
         pm
+    }
+
+    fn render_arrow_at(backing_scale: f32, logical_size: u32) -> tiny_skia::Pixmap {
+        let mut config = CursorConfig::default();
+        config.builtin_shape = BuiltinShape::Arrow;
+        let mut core = RenderStateCore::new(config);
+        let centre = logical_size as f64 / 2.0;
+        core.place_at(centre, centre);
+        core.idle_alpha = 1.0;
+        core.visible = true;
+
+        let pm_size = (logical_size as f32 * backing_scale) as u32;
+        let mut pm = tiny_skia::Pixmap::new(pm_size, pm_size).unwrap();
+        paint_cursor(&mut pm, &core, 0.0, 0.0, None, backing_scale);
+        pm
+    }
+
+    fn high_alpha_bounds(pm: &tiny_skia::Pixmap) -> (u32, u32) {
+        let mut min_x = pm.width();
+        let mut min_y = pm.height();
+        let mut max_x = 0;
+        let mut max_y = 0;
+        for (index, pixel) in pm.data().chunks_exact(4).enumerate() {
+            if pixel[3] <= 200 {
+                continue;
+            }
+            let x = index as u32 % pm.width();
+            let y = index as u32 / pm.width();
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+        (max_x - min_x + 1, max_y - min_y + 1)
     }
 
     /// Doubling `backing_scale` doubles every linear dimension of the cursor's
@@ -1237,6 +1374,21 @@ mod backing_scale_tests {
             ratio > 3.0 && ratio < 5.0,
             "2× backing_scale should produce ~4× more opaque pixels — \
              got n_1x={n_1x}, n_2x={n_2x}, ratio={ratio:.2}"
+        );
+    }
+
+    #[test]
+    fn procedural_arrow_keeps_its_logical_size_on_retina() {
+        let (width_1x, height_1x) = high_alpha_bounds(&render_arrow_at(1.0, 200));
+        let (width_2x, height_2x) = high_alpha_bounds(&render_arrow_at(2.0, 200));
+
+        assert!(
+            width_2x >= width_1x * 2 - 2 && width_2x <= width_1x * 2 + 2,
+            "arrow width should double at 2×: {width_1x} -> {width_2x}"
+        );
+        assert!(
+            height_2x >= height_1x * 2 - 2 && height_2x <= height_1x * 2 + 2,
+            "arrow height should double at 2×: {height_1x} -> {height_2x}"
         );
     }
 }

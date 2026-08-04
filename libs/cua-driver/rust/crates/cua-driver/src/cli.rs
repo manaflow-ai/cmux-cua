@@ -158,7 +158,7 @@ pub enum Command {
 /// We skip both the flag and its value when scanning for the subcommand.
 const VALUE_FLAGS: &[&str] = &[
     "--cursor-icon", "--cursor-id", "--cursor-palette", "--cursor-shape",
-    "--glide-ms", "--dwell-ms", "--idle-hide-ms",
+    "--glide-ms", "--dwell-ms", "--idle-hide-ms", "--cursor-speed",
     "--screenshot-out-file", "--client", "--socket", "--pid-file", "--type",
     "--host-bundle-id",
     // Experimental PiP preview — value flag for the optional geometry
@@ -166,6 +166,23 @@ const VALUE_FLAGS: &[&str] = &[
     // need to be listed here).
     "--experimental-pip-geometry",
 ];
+
+fn subcommand_positionals(args: &[String]) -> Vec<&str> {
+    let mut positionals = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if VALUE_FLAGS.contains(&argument) {
+            index += 2;
+        } else if argument.starts_with('-') {
+            index += 1;
+        } else {
+            positionals.push(argument);
+            index += 1;
+        }
+    }
+    positionals
+}
 
 /// Parse cursor flags and apply the Codex compatibility default. Native mode
 /// remains teardrop; Codex compatibility uses Sky unless the caller explicitly
@@ -344,19 +361,7 @@ pub fn parse_command() -> Command {
     }
 
     // Strip cursor-overlay flags (and their values) to expose the subcommand.
-    let mut positionals: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i].as_str();
-        if VALUE_FLAGS.contains(&a) {
-            i += 2; // skip flag + value
-        } else if a.starts_with('-') {
-            i += 1; // skip bare flag
-        } else {
-            positionals.push(a);
-            i += 1;
-        }
-    }
+    let positionals = subcommand_positionals(&args);
 
     let no_daemon_relaunch = args.iter().any(|a| a == "--no-daemon-relaunch");
     let claude_code_compat = args.iter().any(|a| a == "--claude-code-computer-use-compat");
@@ -835,7 +840,6 @@ pub fn launch_daemon_and_wait(
     // user-supplied path that never comes up. Only added when the path
     // actually differs from the default, so the common case keeps the
     // shorter `open` argv (and matches Swift's invocation byte-for-byte).
-    let pass_socket = socket_path != crate::serve::default_socket_path();
     // cmux sets CUA_DRIVER_DAEMON_APP to its bundled "cmux Computer Use.app" so
     // LaunchServices launches THAT app as the serve daemon. A LaunchServices-
     // launched app is its own responsible process (launchd-parented), so macOS
@@ -843,29 +847,13 @@ pub fn launch_daemon_and_wait(
     // — the permission prompt names "cmux Computer Use", not the host app.
     let daemon_app =
         std::env::var("CUA_DRIVER_DAEMON_APP").unwrap_or_else(|_| "CuaDriver".to_string());
-    let mut open_args: Vec<&str> =
-        vec!["-n", "-g", "-a", daemon_app.as_str(), "--args", "serve"];
-    if pass_socket {
-        open_args.push("--socket");
-        open_args.push(socket_path);
-    }
-    // Thread the Claude-Code compat flag through to the daemon. Without this
-    // the proxy-spawned daemon always called build_macos_registry() (compat
-    // hardcoded false), so `cua-driver mcp --claude-code-computer-use-compat`
-    // SILENTLY DROPPED the flag on the proxy path — the path users actually
-    // run on an installed bundle. Today this is latent: the compat screenshot
-    // tool was removed in #1692, so `register_all(compat)` ignores the flag and
-    // the served surface is identical either way. But the flag was being lost
-    // before reaching the daemon at all, so the moment any compat-gated tool is
-    // re-introduced the proxy path would not honour it. This makes the flag
-    // travel end-to-end. Only honoured on a freshly-launched daemon — a
-    // pre-existing daemon keeps whatever surface it launched with.
-    if claude_code_compat {
-        open_args.push("--claude-code-computer-use-compat");
-    }
-    if codex_computer_use_compat {
-        open_args.push("--codex-computer-use-compat");
-    }
+    let open_args = daemon_open_arguments(
+        &daemon_app,
+        socket_path,
+        claude_code_compat,
+        codex_computer_use_compat,
+    );
+    let pass_socket = socket_path != crate::serve::default_socket_path();
 
     let status = Cmd::new("/usr/bin/open")
         // `-n` forces a new instance: CuaDriver.app might already be
@@ -913,6 +901,38 @@ pub fn launch_daemon_and_wait(
     );
 }
 
+fn daemon_open_arguments(
+    daemon_app: &str,
+    socket_path: &str,
+    claude_code_compat: bool,
+    codex_computer_use_compat: bool,
+) -> Vec<String> {
+    let mut arguments = ["-n", "-g", "-a", daemon_app, "--args", "serve"]
+        .map(str::to_owned)
+        .to_vec();
+    if socket_path != crate::serve::default_socket_path() {
+        arguments.push("--socket".to_owned());
+        arguments.push(socket_path.to_owned());
+    }
+    if claude_code_compat {
+        arguments.push("--claude-code-computer-use-compat".to_owned());
+    }
+    if codex_computer_use_compat {
+        arguments.push("--codex-computer-use-compat".to_owned());
+    }
+    arguments
+}
+
+fn validate_mcp_proxy_cursor_speed(cursor_speed: Option<&str>) -> anyhow::Result<()> {
+    if cursor_speed.is_some() {
+        anyhow::bail!(
+            "--cursor-speed configures a shared daemon and cannot be set by an MCP proxy; \
+             pass it to `cua-driver serve` or use --no-daemon-relaunch"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MissingDaemonAction {
     EnterLazyProxy,
@@ -948,6 +968,9 @@ pub fn run_mcp_via_daemon_proxy(
     claude_code_compat: bool,
     codex_computer_use_compat: bool,
 ) -> anyhow::Result<()> {
+    let process_arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let cursor_speed = flag_value(&process_arguments, "--cursor-speed");
+    validate_mcp_proxy_cursor_speed(cursor_speed.as_deref())?;
     // Windows: prefer the uiAccess'd worker pipe over the regular daemon pipe
     // when both are running, so MCP tool calls land in a process that can
     // bypass UIPI for UWP apps. The protocol on both pipes is identical so
@@ -3611,6 +3634,22 @@ fn sanitize_tool_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_speed_value_is_not_misread_as_the_subcommand() {
+        assert!(VALUE_FLAGS.contains(&"--cursor-speed"));
+        let args = ["--cursor-speed", "1.75", "serve"]
+            .map(str::to_owned)
+            .to_vec();
+        assert_eq!(subcommand_positionals(&args), vec!["serve"]);
+    }
+
+    #[test]
+    fn mcp_proxy_rejects_daemon_wide_cursor_speed() {
+        assert!(validate_mcp_proxy_cursor_speed(None).is_ok());
+        let error = validate_mcp_proxy_cursor_speed(Some("1.75")).unwrap_err();
+        assert!(error.to_string().contains("cua-driver serve"));
+    }
 
     #[test]
     fn approvals_parser_accepts_list_revoke_clear_and_rejects_bad_shapes() {
