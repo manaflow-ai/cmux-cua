@@ -5225,6 +5225,46 @@ mod tests {
     }
 
     #[test]
+    fn standard_application_input_uses_one_public_delivery() {
+        let deliveries = std::cell::RefCell::new(Vec::new());
+
+        deliver_application_surface_event(
+            ApplicationSurfaceInputDeliveryMode::Standard,
+            || {
+                deliveries.borrow_mut().push("public");
+                Ok(())
+            },
+            || {
+                deliveries.borrow_mut().push("specialized");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*deliveries.borrow(), ["public"]);
+    }
+
+    #[test]
+    fn chromium_application_input_uses_one_specialized_delivery() {
+        let deliveries = std::cell::RefCell::new(Vec::new());
+
+        deliver_application_surface_event(
+            ApplicationSurfaceInputDeliveryMode::ChromiumBackground,
+            || {
+                deliveries.borrow_mut().push("public");
+                Ok(())
+            },
+            || {
+                deliveries.borrow_mut().push("specialized");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*deliveries.borrow(), ["specialized"]);
+    }
+
+    #[test]
     fn keyboard_targets_keep_same_process_windows_distinct() {
         let first = ApplicationSurfaceKeyboardTarget::new(101, 44).unwrap();
         let second = ApplicationSurfaceKeyboardTarget::new(202, 44).unwrap();
