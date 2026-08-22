@@ -2568,8 +2568,8 @@ fn enforce_target_policy(app: &AppIdentity) -> Result<(), CompatError> {
     let self_target = app.pid > 0 && app.pid == std::process::id() as i32;
     let host_target = !host_bundle.is_empty() && bundle_lower == host_bundle;
     let driver_target = bundle_lower == "com.cmuxterm.cua"
-        || name_lower == "cuadriver"
-        || name_lower == "cua driver";
+        || name_lower == "cmux-cua"
+        || name_lower == "cmux computer use";
     let protected_host_app = is_protected_host_app(&bundle_lower, &name_lower);
     let protected_terminal = is_protected_terminal_target(&bundle_lower, &name_lower);
     let protected_bundle = matches!(
@@ -3784,7 +3784,7 @@ mod tests {
             pid: 0,
         };
         for (name, bundle) in [
-            ("CmuxCua", "com.cmuxterm.cua"),
+            ("cmux Computer Use", "com.cmuxterm.cua"),
             ("SecurityAgent", "com.apple.SecurityAgent"),
             ("System Settings", "com.apple.systempreferences"),
             ("Codex", "com.openai.codex"),

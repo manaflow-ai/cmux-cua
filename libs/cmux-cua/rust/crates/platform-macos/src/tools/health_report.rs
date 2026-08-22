@@ -441,7 +441,7 @@ mod tests {
             entry
                 .hint
                 .as_deref()
-                .is_none_or(|hint| !hint.contains("CmuxCua")),
+                .is_none_or(|hint| !hint.contains("cmux Computer Use")),
             "a healthy host-owned helper must not recommend cmux Computer Use.app",
         );
     }
