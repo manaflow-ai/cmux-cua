@@ -1005,13 +1005,13 @@ fn panel_level_for_pin(pinned_wid: Option<u64>) -> PanelLevel {
 }
 
 fn cursor_window_collection_behavior() -> u64 {
-    // CanJoinAllSpaces | MoveToActiveSpace | FullScreenAuxiliary |
-    // CanJoinAllApplications. The panel follows the active Space when a host
-    // focus transition exposes it, while remaining target-relative at the
-    // normal window level. `Stationary` is intentionally omitted: on recent
-    // macOS releases it can leave a normal-level accessory panel marked
-    // off-screen after another application/Space becomes active.
-    1u64 | (1 << 1) | (1 << 8) | (1 << 18)
+    // CanJoinAllSpaces | FullScreenAuxiliary | CanJoinAllApplications.
+    // `Stationary` is intentionally omitted: on recent macOS releases it can
+    // leave a normal-level accessory panel marked off-screen after another
+    // application/Space becomes active. Do not combine CanJoinAllSpaces with
+    // MoveToActiveSpace: macOS 26 rejects that combination in
+    // `-[NSWindow _validateCollectionBehavior:]` and aborts the helper.
+    1u64 | (1 << 8) | (1 << 18)
 }
 
 fn appkit_frame_for_rect(rect: LogicalRect, screen: ScreenGeometry) -> AppKitRect {
@@ -3006,11 +3006,6 @@ mod tests {
             "cross-application relative ordering requires CanJoinAllApplications"
         );
         assert_ne!(behavior & 1, 0, "cursor must continue joining every Space");
-        assert_ne!(
-            behavior & (1 << 1),
-            0,
-            "cursor must follow the active Space during a focus transition"
-        );
         assert_eq!(
             behavior & (1 << 4),
             0,
