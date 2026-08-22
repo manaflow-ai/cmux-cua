@@ -666,6 +666,31 @@ impl Tool for ClickTool {
                 && modifiers.is_empty()
             {
                 let focus_only = action == "focus";
+                // The AX delivery backend must stay visually identical to the
+                // CGEvent path: glide the branded cursor to the target before
+                // pressing, so a background AX press never looks like the
+                // action teleported. Mirrors the element-click path above
+                // (PinAbove → animate → registry sync). Focus-only actions are
+                // not clicks and stay motionless. If no AX element is found,
+                // the CGEvent fallback below re-animates to the same point,
+                // which is an instant no-op glide.
+                if !focus_only {
+                    if let Some(wid) = window_id {
+                        crate::cursor::overlay::send_command(
+                            cursor_key.clone(),
+                            cursor_overlay::OverlayCommand::PinAbove(wid as u64),
+                        );
+                    }
+                    crate::cursor::overlay::animate_cursor_to(
+                        cursor_key.clone(),
+                        screen_x,
+                        screen_y,
+                    )
+                    .await;
+                    self.state
+                        .cursor_registry
+                        .update_position(&cursor_key, screen_x, screen_y);
+                }
                 let ax_result = tokio::task::spawn_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
@@ -684,6 +709,17 @@ impl Tool for ClickTool {
                 match ax_result {
                     Ok(Ok(true)) => {
                         let label = if focus_only { "focused" } else { "pressed" };
+                        if !focus_only {
+                            // The press landed — pulse the cursor at the click
+                            // point exactly like the CGEvent and element paths.
+                            crate::cursor::overlay::send_command(
+                                cursor_key.clone(),
+                                cursor_overlay::OverlayCommand::ClickPulse {
+                                    x: screen_x,
+                                    y: screen_y,
+                                },
+                            );
+                        }
                         return ToolResult::text(format!(
                             "✅ PX hit-test {label} the background element via AX."
                         ))
