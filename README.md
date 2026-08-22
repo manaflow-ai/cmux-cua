@@ -26,8 +26,8 @@
   <table>
     <tr>
       <td colspan="3" align="center">
-        <a href="#cua-drivers---background-computer-use-on-macos-and-windows-with-linux-pre-release">
-          <img src="img/card-cua-driver.gif" alt="Cua Drivers — background computer-use for any agent" width="790">
+        <a href="#cmux-cuas---background-computer-use-on-macos-and-windows-with-linux-pre-release">
+          <img src="img/card-cmux-cua.gif" alt="cmux CUAs — background computer-use for any agent" width="790">
         </a>
       </td>
     </tr>
@@ -51,7 +51,7 @@
   </table>
   <p>
     <strong>Building your own agent?</strong> Start with <a href="#cua---agent-ready-sandboxes-for-any-os">Cua</a> ·
-    <strong>Giving a coding agent a computer?</strong> <a href="#cua-drivers---background-computer-use-on-macos-and-windows-with-linux-pre-release">Cua Drivers</a> ·
+    <strong>Giving a coding agent a computer?</strong> <a href="#cmux-cuas---background-computer-use-on-macos-and-windows-with-linux-pre-release">cmux CUAs</a> ·
     <strong>Evaluating or training models?</strong> <a href="#cua-bench---benchmarks--rl-environments">Cua Bench</a> ·
     <strong>Need macOS VMs?</strong> <a href="#lume---macos-virtualization">Lume</a>
   </p>
@@ -59,7 +59,7 @@
 
 ---
 
-## Cua Drivers - Background computer-use on macOS, Windows, and Linux
+## cmux CUAs - Background computer-use on macOS, Windows, and Linux
 
 Drive native desktop apps **in the background**. Agents click, type, and verify without stealing the cursor or focus. Use the same CLI and MCP server on macOS, Windows, and Linux from Claude Code, Cursor, Codex, OpenClaw, and custom clients. Linux supports X11 and compositor-specific Wayland routes with explicit limits for raw background input.
 
@@ -78,10 +78,10 @@ irm https://cua.ai/driver/install.ps1 | iex
 Then wire it into Claude Code as an MCP server and your agent can drive the desktop in the background:
 
 ```bash
-claude mcp add --transport stdio cua-driver -- cua-driver mcp
+claude mcp add --transport stdio cmux-cua -- cmux-cua mcp
 ```
 
-Full tool reference, architecture notes, and the optional agent skill pack live here: [`libs/cua-driver/README.md`](libs/cua-driver/README.md).
+Full tool reference, architecture notes, and the optional agent skill pack live here: [`libs/cmux-cua/README.md`](libs/cmux-cua/README.md).
 
 ---
 
@@ -121,7 +121,7 @@ Evaluate computer-use agents on OSWorld, ScreenSpot, Windows Arena, and custom t
 
 ```bash
 # Clone, install, and create base image
-git clone https://github.com/trycua/cua && cd cua/cua-bench
+git clone https://github.com/manaflow-ai/cmux-cua && cd cua/cua-bench
 uv tool install -e . && cb image create linux-docker
 
 # Run benchmark with agent
@@ -152,7 +152,7 @@ autologin, and disable sleep and screen locking. The default credentials are
 `lume` / `lume`.
 
 The Tahoe flow is E2E verified. Sequoia may still open the Accessibility step
-of Setup Assistant on its first display boot; see [issue #2155](https://github.com/trycua/cua/issues/2155).
+of Setup Assistant on its first display boot; see [issue #2155](https://github.com/manaflow-ai/cmux-cua/issues/2155).
 
 **[Get Started](https://cua.ai/docs/lume)** | **[FAQ](https://cua.ai/docs/lume/guide/getting-started/faq)** | **[CLI Reference](https://cua.ai/docs/lume/reference/cli-reference)**
 
@@ -162,7 +162,7 @@ of Setup Assistant on its first display boot; see [issue #2155](https://github.c
 
 | Package                                                              | Description                                                 |
 | -------------------------------------------------------------------- | ----------------------------------------------------------- |
-| [cua-driver](libs/cua-driver/README.md)                              | Background computer-use agent for macOS, Windows, and Linux |
+| [cmux-cua](libs/cmux-cua/README.md)                              | Background computer-use agent for macOS, Windows, and Linux |
 | [cua-agent](https://cua.ai/docs/cua/reference/agent-sdk)             | AI agent framework for computer-use tasks                   |
 | [cua-sandbox](https://cua.ai/docs/cua/reference/sandbox-sdk)         | SDK for creating and controlling sandboxes                  |
 | [cua-computer-server](https://cua.ai/docs/cua/reference/sandbox-sdk) | Driver for UI interactions and code execution in sandboxes  |
@@ -175,7 +175,7 @@ of Setup Assistant on its first display boot; see [issue #2155](https://github.c
 - [Documentation](https://cua.ai/docs) — Guides, examples, and API reference
 - [Blog](https://cua.ai/blog) — Tutorials, updates, and research
 - [Discord](https://discord.com/invite/mVnXXpdE85) — Community support and discussions
-- [GitHub Issues](https://github.com/trycua/cua/issues) — Bug reports and feature requests
+- [GitHub Issues](https://github.com/manaflow-ai/cmux-cua/issues) — Bug reports and feature requests
 
 ## Contributing
 

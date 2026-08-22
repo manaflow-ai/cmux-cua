@@ -5,7 +5,7 @@ description = "Toolkit for computer-use RL environments and benchmarks"
 readme = "README.md"
 license = "MIT"
 authors = [
-    { name = "TryCua", email = "hello@trycua.com" }
+    { name = "cmux contributors", email = "hello@manaflow.ai" }
 ]
 keywords = [
     "computer-use",
@@ -139,10 +139,10 @@ rl = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/trycua/cua"
+Homepage = "https://github.com/manaflow-ai/cmux-cua"
 Documentation = "https://docs.trycua.com"
-Repository = "https://github.com/trycua/cua"
-Issues = "https://github.com/trycua/cua/issues"
+Repository = "https://github.com/manaflow-ai/cmux-cua"
+Issues = "https://github.com/manaflow-ai/cmux-cua/issues"
 
 [project.scripts]
 cb = "cua_bench.cli.main:main"

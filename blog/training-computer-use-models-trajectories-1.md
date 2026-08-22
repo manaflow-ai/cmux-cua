@@ -306,6 +306,6 @@ Now that you know how to create and share trajectories, consider these advanced 
 
 ### Resources
 
-- [Computer-Use Interface GitHub](https://github.com/trycua/cua/tree/main/libs/python/computer)
+- [Computer-Use Interface GitHub](https://github.com/manaflow-ai/cmux-cua/tree/main/libs/python/computer)
 - [Hugging Face Datasets Documentation](https://huggingface.co/docs/datasets)
 - [Example Dataset: ddupont/test-dataset](https://huggingface.co/datasets/ddupont/test-dataset)

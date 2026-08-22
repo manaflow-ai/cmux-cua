@@ -50,7 +50,7 @@ export function DocActionsMenu({ pageUrl, pageTitle, filePath }: DocActionsMenuP
       return;
     }
 
-    const githubEditUrl = `https://github.com/trycua/cua/edit/main/docs/content/docs/${filePath}`;
+    const githubEditUrl = `https://github.com/manaflow-ai/cmux-cua/edit/main/docs/content/docs/${filePath}`;
     window.open(githubEditUrl, '_blank', 'noopener,noreferrer');
   };
 

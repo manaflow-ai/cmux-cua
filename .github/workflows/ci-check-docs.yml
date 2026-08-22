@@ -3,10 +3,10 @@ name: "CI: Check Docs"
 on:
   pull_request:
     paths:
-      # Cua Driver (Rust)
-      - "libs/cua-driver/rust/crates/**"
-      - "libs/cua-driver/rust/Cargo.toml"
-      - "libs/cua-driver/rust/Cargo.lock"
+      # cmux CUA (Rust)
+      - "libs/cmux-cua/rust/crates/**"
+      - "libs/cmux-cua/rust/Cargo.toml"
+      - "libs/cmux-cua/rust/Cargo.lock"
       # Lume (Swift)
       - "libs/lume/src/**"
       # Cua CLI (TypeScript)
@@ -22,7 +22,7 @@ on:
       # Cua-Bot
       - "libs/cuabot/src/**"
       # Documentation files themselves
-      - "docs/content/docs/reference/cua-driver/**"
+      - "docs/content/docs/reference/cmux-cua/**"
       - "docs/content/docs/cua/reference/**"
       - "docs/content/docs/cuabot/reference/**"
       # Generator scripts
@@ -71,8 +71,8 @@ jobs:
           GENERATORS=""
 
           # Source changes
-          if echo "$CHANGED_FILES" | grep -q "^libs/cua-driver/rust/crates/\|^libs/cua-driver/rust/Cargo.toml\|^libs/cua-driver/rust/Cargo.lock\|^docs/content/docs/reference/cua-driver/"; then
-            GENERATORS="$GENERATORS cua-driver"
+          if echo "$CHANGED_FILES" | grep -q "^libs/cmux-cua/rust/crates/\|^libs/cmux-cua/rust/Cargo.toml\|^libs/cmux-cua/rust/Cargo.lock\|^docs/content/docs/reference/cmux-cua/"; then
+            GENERATORS="$GENERATORS cmux-cua"
           fi
           if echo "$CHANGED_FILES" | grep -q "^libs/lume/src/"; then
             GENERATORS="$GENERATORS lume"
@@ -91,8 +91,8 @@ jobs:
           fi
 
           # Individual generator script changes — only trigger their own generator
-          if echo "$CHANGED_FILES" | grep -q "^scripts/docs-generators/cua-driver\.ts"; then
-            GENERATORS="$GENERATORS cua-driver"
+          if echo "$CHANGED_FILES" | grep -q "^scripts/docs-generators/cmux-cua\.ts"; then
+            GENERATORS="$GENERATORS cmux-cua"
           fi
           if echo "$CHANGED_FILES" | grep -q "^scripts/docs-generators/lume\.ts"; then
             GENERATORS="$GENERATORS lume"
@@ -115,10 +115,10 @@ jobs:
 
           echo "generators=$GENERATORS" >> $GITHUB_OUTPUT
 
-      - name: Build cua-driver (if needed)
-        if: contains(steps.changed.outputs.generators, 'cua-driver') || steps.changed.outputs.generators == 'all'
-        run: cargo build -p cua-driver --release
-        working-directory: libs/cua-driver/rust
+      - name: Build cmux-cua (if needed)
+        if: contains(steps.changed.outputs.generators, 'cmux-cua') || steps.changed.outputs.generators == 'all'
+        run: cargo build -p cmux-cua --release
+        working-directory: libs/cmux-cua/rust
 
       - name: Build Lume (if needed)
         if: contains(steps.changed.outputs.generators, 'lume') || steps.changed.outputs.generators == 'all'

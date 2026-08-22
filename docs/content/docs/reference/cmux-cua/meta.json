@@ -1,0 +1,17 @@
+{
+  "title": "cmux CUA",
+  "pages": [
+    "cli-reference",
+    "macos-permissions",
+    "embedding",
+    "mcp-tools",
+    "mcp-tool-notes",
+    "action-selection-policy",
+    "contracts",
+    "platform-support",
+    "platform-roadmap",
+    "process-model",
+    "limits",
+    "development"
+  ]
+}

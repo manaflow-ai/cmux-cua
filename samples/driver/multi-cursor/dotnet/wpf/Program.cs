@@ -8,7 +8,7 @@ using System.Windows.Shapes;
 
 // "Meridian CRM — Account Record" : WPF node (XAML / UIA). Real Slider /
 // ComboBox / InkCanvas (doodle) / DataGrid (spreadsheet). Account Name TextBox
-// + SAVE button are what cua-driver drives.
+// + SAVE button are what cmux-cua drives.
 class Program
 {
     public class RowVM

@@ -7,16 +7,16 @@ on:
     paths:
       - "flake.nix"
       - "flake.lock"
-      - "nix/cua-driver/**"
-      - "libs/cua-driver/rust/**"
+      - "nix/cmux-cua/**"
+      - "libs/cmux-cua/rust/**"
       - ".github/workflows/ci-nix-linux.yml"
   push:
     branches: [main]
     paths:
       - "flake.nix"
       - "flake.lock"
-      - "nix/cua-driver/**"
-      - "libs/cua-driver/rust/**"
+      - "nix/cmux-cua/**"
+      - "libs/cmux-cua/rust/**"
       - ".github/workflows/ci-nix-linux.yml"
   workflow_dispatch:
 
@@ -39,9 +39,9 @@ jobs:
           - name: compositor build
             attribute: cua-compositor-build
           - name: driver package
-            attribute: cua-driver-build
+            attribute: cmux-cua-build
           - name: Rust unit tests
-            attribute: cua-driver-linux-rust-unit
+            attribute: cmux-cua-linux-rust-unit
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install Nix

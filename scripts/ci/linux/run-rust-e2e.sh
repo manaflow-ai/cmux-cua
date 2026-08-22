@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-DRIVER_ROOT="${REPO_ROOT}/libs/cua-driver"
+DRIVER_ROOT="${REPO_ROOT}/libs/cmux-cua"
 RUST_ROOT="${DRIVER_ROOT}/rust"
 BUILD_FIXTURES=1
 SUITE="${CUA_E2E_INTERNAL_LANE:-all}"
@@ -34,7 +34,7 @@ case "$SUITE" in
   *) echo "unsupported internal lane: $SUITE" >&2; exit 2 ;;
 esac
 
-ARTIFACT_DIR="${REPO_ROOT}/artifacts/cua-driver/linux"
+ARTIFACT_DIR="${REPO_ROOT}/artifacts/cmux-cua/linux"
 mkdir -p "${ARTIFACT_DIR}"
 RECORDING_ROOT="${ARTIFACT_DIR}/recordings"
 rm -rf "${RECORDING_ROOT}"
@@ -52,7 +52,7 @@ export CUA_E2E_ENVIRONMENT_FILE="${ENVIRONMENT_FILE}"
 export CUA_E2E_RESULTS_FILE="${RESULTS_FILE}"
 export CUA_E2E_RECORDINGS_ROOT="${RECORDING_ROOT}"
 export CUA_TEST_WORKSPACE_ROOT="${RUST_ROOT}"
-export CUA_TEST_DRIVER_BIN="${RUST_ROOT}/target/release/cua-driver"
+export CUA_TEST_DRIVER_BIN="${RUST_ROOT}/target/release/cmux-cua"
 export CUA_TEST_APPS_ROOT="${RUST_ROOT}/test-apps"
 export CUA_TEST_REQUIRE_FIXTURES=1
 export CUA_TEST_DRIVER_STDERR=1
@@ -84,7 +84,7 @@ command -v ffprobe >/dev/null || { echo "ffprobe is required for E2E trajectory 
 command -v jq >/dev/null || { echo "jq is required for E2E ownership validation" >&2; exit 1; }
 
 if [[ "${BUILD_FIXTURES}" == 1 ]]; then
-  cargo build --release -p cua-driver --manifest-path "${RUST_ROOT}/Cargo.toml"
+  cargo build --release -p cmux-cua --manifest-path "${RUST_ROOT}/Cargo.toml"
   case "${SUITE}" in
     shared) FIXTURE_TARGETS="${CUA_E2E_HARNESS_FILTER:-electron,tauri}" ;;
     native|capture) FIXTURE_TARGETS="electron,gtk3" ;;
@@ -118,7 +118,7 @@ done
 FAILURE_COUNT=0
 
 run_report() {
-  (cd "${RUST_ROOT}" && cargo run -p cua-driver-testkit --bin cua-e2e-report -- \
+  (cd "${RUST_ROOT}" && cargo run -p cmux-cua-testkit --bin cua-e2e-report -- \
     --declarations "${DECLARATIONS_FILE}" \
     --environment "${ENVIRONMENT_FILE}" \
     --results "${RESULTS_FILE}" \
@@ -129,7 +129,7 @@ run_report() {
 
 echo "[PREFLIGHT] Linux desktop, fixture, AX, capture, and video"
 set +e
-(cd "${RUST_ROOT}" && cargo test -p cua-driver --test e2e_environment_preflight_test -- \
+(cd "${RUST_ROOT}" && cargo test -p cmux-cua --test e2e_environment_preflight_test -- \
   --ignored --exact canonical_e2e_environment_is_ready --nocapture --test-threads=1) \
   2>&1 | tee "${ARTIFACT_DIR}/environment-preflight.log"
 PREFLIGHT_EXIT=${PIPESTATUS[0]}
@@ -157,23 +157,23 @@ run_test() {
 
 if [[ "${SUITE}" == shared || "${SUITE}" == all ]]; then
   run_test shared-behavior-matrix \
-    cargo test -p cua-driver --test cross_platform_behavior_test -- \
+    cargo test -p cmux-cua --test cross_platform_behavior_test -- \
       --ignored --exact shared_web_action_matrix_is_state_verified \
       --nocapture --test-threads=1
 fi
 
 if [[ "${SUITE}" == native || "${SUITE}" == all ]]; then
   run_test gtk3-native-harness \
-    cargo test -p cua-driver --test harness_gtk3_test -- \
+    cargo test -p cmux-cua --test harness_gtk3_test -- \
       --ignored --nocapture --test-threads=1
 fi
 
 if [[ "${SUITE}" == capture || "${SUITE}" == all ]]; then
   run_test capture-contract \
-    cargo test -p cua-driver --test capture_contract_test -- \
+    cargo test -p cmux-cua --test capture_contract_test -- \
       --ignored --nocapture --test-threads=1
   run_test desktop-scope \
-    cargo test -p cua-driver --test desktop_scope_linux_test -- \
+    cargo test -p cmux-cua --test desktop_scope_linux_test -- \
       --ignored --nocapture --test-threads=1
 fi
 

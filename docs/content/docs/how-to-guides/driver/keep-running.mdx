@@ -1,6 +1,6 @@
 ---
-title: Keep Cua Driver running
-description: Register Cua Driver as a persistent daemon that starts automatically and survives reboots.
+title: Keep cmux CUA running
+description: Register cmux CUA as a persistent daemon that starts automatically and survives reboots.
 ---
 
 import { Tabs, Tab } from 'fumadocs-ui/components/tabs';
@@ -11,15 +11,15 @@ Use a **persistent daemon** for element-indexed workflows. The per-pid element c
 <Tabs items={['macOS', 'Windows', 'Linux']}>
   <Tab value="macOS">
 
-`cua-driver autostart` is not implemented for macOS yet, so write a LaunchAgent instead.
+`cmux-cua autostart` is not implemented for macOS yet, so write a LaunchAgent instead.
 
-If you have a checkout of the [cua repo](https://github.com/trycua/cua), the helper script writes it for you (run from the repo root):
+If you have a checkout of the [cua repo](https://github.com/manaflow-ai/cmux-cua), the helper script writes it for you (run from the repo root):
 
 ```bash
-bash libs/cua-driver/scripts/install-local.sh --autostart
+bash libs/cmux-cua/scripts/install-local.sh --autostart
 ```
 
-If you installed via the one-line installer and have no checkout, create the plist yourself. Save this file at `~/Library/LaunchAgents/com.trycua.cua-driver.plist`:
+If you installed via the one-line installer and have no checkout, create the plist yourself. Save this file at `~/Library/LaunchAgents/com.cmuxterm.cmux-cua.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -28,10 +28,10 @@ If you installed via the one-line installer and have no checkout, create the pli
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.trycua.cua-driver</string>
+  <string>com.cmuxterm.cmux-cua</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Applications/CuaDriver.app/Contents/MacOS/cua-driver</string>
+    <string>/Applications/cmux Computer Use.app/Contents/MacOS/cmux-cua</string>
     <string>serve</string>
   </array>
   <key>RunAtLoad</key>
@@ -45,11 +45,11 @@ If you installed via the one-line installer and have no checkout, create the pli
 Load the LaunchAgent:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.trycua.cua-driver.plist
+launchctl load ~/Library/LaunchAgents/com.cmuxterm.cmux-cua.plist
 ```
 
 <Callout type="info">
-  A LaunchAgent daemon starts under `launchd` and is attributed to `com.trycua.driver`. Grant Accessibility and Screen Recording once, and those grants persist across reboots. If you start prompts from a terminal without a LaunchAgent, macOS attributes them to the terminal instead of the driver, so the grants do not apply to Cua Driver.
+  A LaunchAgent daemon starts under `launchd` and is attributed to `com.cmuxterm.cua`. Grant Accessibility and Screen Recording once, and those grants persist across reboots. If you start prompts from a terminal without a LaunchAgent, macOS attributes them to the terminal instead of the driver, so the grants do not apply to cmux CUA.
 </Callout>
 
   </Tab>
@@ -58,25 +58,25 @@ launchctl load ~/Library/LaunchAgents/com.trycua.cua-driver.plist
 Run these commands once from an interactive session, either RDP or the local console:
 
 ```powershell
-cua-driver autostart enable
-cua-driver autostart kick
+cmux-cua autostart enable
+cmux-cua autostart kick
 ```
 
-`enable` registers a Scheduled Task named `cua-driver-serve` with `LogonType: Interactive`. That keeps the daemon in Session 1+ instead of Session 0. The command is idempotent, so running it again after an upgrade updates the binary path automatically. Run it from a non-interactive context (over SSH, or in Session 0 as `SYSTEM`) and it fails with a confusing `No mapping between account names and security IDs was done` error — use RDP or the local console instead.
+`enable` registers a Scheduled Task named `cmux-cua-serve` with `LogonType: Interactive`. That keeps the daemon in Session 1+ instead of Session 0. The command is idempotent, so running it again after an upgrade updates the binary path automatically. Run it from a non-interactive context (over SSH, or in Session 0 as `SYSTEM`) and it fails with a confusing `No mapping between account names and security IDs was done` error — use RDP or the local console instead.
 
 `kick` starts the task immediately, so you do not need to wait for the next logon.
 
 Check the task state when you need it:
 
 ```powershell
-cua-driver autostart status
+cmux-cua autostart status
 # registered (running)
 ```
 
 Remove the autostart registration:
 
 ```powershell
-cua-driver autostart disable
+cmux-cua autostart disable
 ```
 
 <Callout type="info">
@@ -88,19 +88,19 @@ The Scheduled Task keeps running after an RDP disconnect. A disconnected session
   </Tab>
   <Tab value="Linux">
 
-`cua-driver autostart` is Windows-only today. Create a systemd user unit by hand.
+`cmux-cua autostart` is Windows-only today. Create a systemd user unit by hand.
 
-Save this unit at `~/.config/systemd/user/cua-driver.service`:
+Save this unit at `~/.config/systemd/user/cmux-cua.service`:
 
 ```ini
 [Unit]
-Description=cua-driver background daemon
+Description=cmux-cua background daemon
 After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/cua-driver serve
+ExecStart=%h/.local/bin/cmux-cua serve
 Restart=on-failure
 RestartSec=2
 
@@ -112,8 +112,8 @@ Reload systemd, enable the unit, and start it:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now cua-driver.service
-systemctl --user status cua-driver.service
+systemctl --user enable --now cmux-cua.service
+systemctl --user status cmux-cua.service
 ```
 
 On CI runners or headless machines where the daemon should survive user logout, enable linger:
@@ -130,18 +130,18 @@ A headless box has no `graphical-session.target`, so on those machines also chan
 ## Verify it's running
 
 ```bash
-cua-driver status
-# Cua Driver daemon is running
-#   socket: /Users/you/Library/Caches/cua-driver/cua-driver.sock
+cmux-cua status
+# cmux CUA daemon is running
+#   socket: /Users/you/Library/Caches/cmux-cua/cmux-cua.sock
 #   pid: 12345
 ```
 
-On Windows the socket path is `\\.\pipe\cua-driver` and `status` also reports the session number.
+On Windows the socket path is `\\.\pipe\cmux-cua` and `status` also reports the session number.
 
 ## Stop it cleanly
 
 ```bash
-cua-driver stop
+cmux-cua stop
 ```
 
 This sends a shutdown signal to the daemon process. The autostart entry, whether LaunchAgent, Scheduled Task, or systemd unit, remains registered and starts it again on the next logon or trigger.

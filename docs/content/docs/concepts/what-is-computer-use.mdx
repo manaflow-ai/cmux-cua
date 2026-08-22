@@ -27,12 +27,12 @@ The observe, decide, act loop belongs specifically to the UI automation surface.
 
 Planning carries the task across changing interface states. A click may open a dialog, a page may reflow after loading, or an application may show an error that changes the next useful action, so the model has to keep track of the goal while the computer responds. Frontier models such as Claude can handle understanding, grounding, and planning together in one call, while grounding-specialist models such as UI-TARS and Moondream can help when coordinate accuracy is the limiting factor.
 
-The narrow origin of computer-use came in October 2024, when Anthropic introduced an agent that operated a GUI through screenshots and input events. Through 2025, coding agents were increasingly recognized as computer-use agents too, with CoAct-1 making the connection explicit. Cua uses **Computer-Use 2.0** as shorthand for that wider model. Francesco Bonacci traces that arc in [A Story of Computer-Use](https://github.com/trycua/cua/blob/main/blog/clawdbot-computer-use-history.md).
+The narrow origin of computer-use came in October 2024, when Anthropic introduced an agent that operated a GUI through screenshots and input events. Through 2025, coding agents were increasingly recognized as computer-use agents too, with CoAct-1 making the connection explicit. Cua uses **Computer-Use 2.0** as shorthand for that wider model. Francesco Bonacci traces that arc in [A Story of Computer-Use](https://github.com/manaflow-ai/cmux-cua/blob/main/blog/clawdbot-computer-use-history.md).
 
 ## Where Cua fits
 
 You bring the agent, which already handles coding and tool-use on its own. Cua gives that agent the UI automation surface and a real computer to act in, so the same task can move from code to tools to the graphical interface when the application requires it.
 
-**Cua Driver** drives the GUI of a real machine you already have, whether that machine runs macOS, Windows, or Linux. It is the right shape when the agent needs to work with local applications, signed-in accounts, existing files, or machine state that already lives on that computer.
+**cmux CUA** drives the GUI of a real machine you already have, whether that machine runs macOS, Windows, or Linux. It is the right shape when the agent needs to work with local applications, signed-in accounts, existing files, or machine state that already lives on that computer.
 
 **Cua Sandbox** is a fresh isolated cloud computer where the agent can run code and drive the GUI together. It is a full computer with all three action surfaces available inside the same environment rather than a remote desktop, which matters when the task needs both programmatic work and visible interaction without touching your local machine. The agent brings the model and its reasoning; Cua provides the computer where that reasoning can turn into action.

@@ -22,7 +22,7 @@ import os
 #   <registry>/datasets/<dataset_id>/<environment_id>/{pyproject.toml, main.py}
 #   <registry>/datasets/meta.json   (OPTIONAL — dataset-level descriptions)
 task_registry = Path(os.environ.get("CUA_REGISTRY_HOME") or Path(__file__).resolve().parents[2])
-task_registry_url = "https://github.com/trycua/cua/tree/main/libs/cua-bench/datasets/"
+task_registry_url = "https://github.com/manaflow-ai/cmux-cua/tree/main/libs/cua-bench/datasets/"
 
 task_datasets = task_registry / "datasets"
 task_metadata = task_datasets / "meta.json"

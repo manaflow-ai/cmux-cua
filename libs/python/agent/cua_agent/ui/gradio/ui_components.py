@@ -211,7 +211,7 @@ if __name__ == "__main__":
                 gr.HTML("""
                     <div style="display: flex; justify-content: center; margin-bottom: 0.5em">
                         <img alt="Cua Logo" style="width: 80px;"
-                             src="https://github.com/trycua/cua/blob/main/img/logo_white.png?raw=true" />
+                             src="https://github.com/manaflow-ai/cmux-cua/blob/main/img/logo_white.png?raw=true" />
                     </div>
                     """)
 
@@ -560,7 +560,7 @@ if __name__ == "__main__":
             # Right column for chat interface
             with gr.Column(scale=2):
                 gr.Markdown(
-                    "Ask me to perform tasks in a virtual environment.<br>Built with <a href='https://github.com/trycua/cua' target='_blank'>github.com/trycua/cua</a>."
+                    "Ask me to perform tasks in a virtual environment.<br>Built with <a href='https://github.com/manaflow-ai/cmux-cua' target='_blank'>github.com/trycua/cua</a>."
                 )
 
                 chatbot_history = gr.Chatbot()

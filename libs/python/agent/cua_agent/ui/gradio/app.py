@@ -14,7 +14,7 @@ Requirements:
     - Mac with Apple Silicon (M1/M2/M3/M4), Linux, or Windows
     - macOS 14 (Sonoma) or newer / Ubuntu 20.04+
     - Python 3.11+
-    - Lume CLI installed (https://github.com/trycua/cua)
+    - Lume CLI installed (https://github.com/manaflow-ai/cmux-cua)
     - OpenAI or Anthropic API key
 """
 

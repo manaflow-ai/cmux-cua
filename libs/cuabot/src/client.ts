@@ -213,7 +213,7 @@ export async function ensureServerRunning(): Promise<number> {
   if (!deps.ok) {
     console.log('deps', deps);
     throw new Error(
-      `Missing dependencies:\n${deps.errors.map((e) => `  - ${e}`).join('\n')}\n\nSee https://github.com/trycua/cuabot#quick-start for installation instructions.`
+      `Missing dependencies:\n${deps.errors.map((e) => `  - ${e}`).join('\n')}\n\nSee https://github.com/manaflow-ai/cmux-cuabot#quick-start for installation instructions.`
     );
   }
 

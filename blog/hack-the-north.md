@@ -55,7 +55,7 @@ Our slot landed at **2:30 a.m.** (_perks of the cheapest sponsor tier_). Thirty 
 
 **Our track rules were simple:**
 
-1. Build a Computer-Use Agent with the [Cua framework](https://github.com/trycua/cua)
+1. Build a Computer-Use Agent with the [Cua framework](https://github.com/manaflow-ai/cmux-cua)
 2. Benchmark the agent on [HUD](https://www.hud.ai)
 3. Use [OSWorld-Tiny](https://huggingface.co/datasets/ddupont/OSWorld-Tiny-Public): a 14-task distillation of the full benchmark (~360 tasks, >1h)
 

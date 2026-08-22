@@ -130,7 +130,7 @@ class CloudProvider(SessionProvider):
             # This is a simplified approach - in practice, you'd want to
             # detect the git remote or require explicit repo_url
             source = {
-                "repo_url": "https://github.com/trycua/cua-bench.git",
+                "repo_url": "https://github.com/manaflow-ai/cmux-cua-bench.git",
                 "ref": "main",
                 "env_path": str(env_path),
             }

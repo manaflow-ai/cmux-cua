@@ -5,7 +5,7 @@ description = "CUA Sandbox — ephemeral and persistent sandboxed computer envir
 readme = "README.md"
 license = "MIT"
 authors = [
-    { name = "TryCua", email = "hello@trycua.com" }
+    { name = "cmux contributors", email = "hello@manaflow.ai" }
 ]
 keywords = [
     "sandbox",
@@ -51,8 +51,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/trycua/cua"
-Repository = "https://github.com/trycua/cua"
+Homepage = "https://github.com/manaflow-ai/cmux-cua"
+Repository = "https://github.com/manaflow-ai/cmux-cua"
 
 [build-system]
 requires = ["hatchling"]

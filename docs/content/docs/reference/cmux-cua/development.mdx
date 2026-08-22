@@ -1,0 +1,56 @@
+---
+title: Development
+description: Source layout, harnesses, and test entry points for contributors working on cmux-cua.
+---
+
+cmux-cua lives under `libs/cmux-cua` in the repository. The hosted docs
+describe the public interface; contributor details live next to the code so
+they stay close to implementation changes.
+
+## Source Map
+
+| Path | Purpose |
+|---|---|
+| `libs/cmux-cua/rust` | Rust workspace for the daemon, platform crates, testkit, and helper crates |
+| `libs/cmux-cua/python` | Python package wrapper around the driver binary |
+| `libs/cmux-cua/tests/fixtures` | Source-built GUI harness apps and shared fixtures |
+| `libs/cmux-cua/rust/crates/cmux-cua/tests` | Rust integration tests for the driver and GUI harnesses |
+| `libs/cmux-cua/scripts` | Install, uninstall, local build, and VM sync helpers |
+
+## Contributor Entry Points
+
+- `libs/cmux-cua/README.md` gives the repo-local overview.
+- `libs/cmux-cua/rust/README.md` maps the Cargo workspace and test classes.
+- `libs/cmux-cua/rust/crates/cmux-cua/tests/README.md` explains Rust test naming and ignored GUI lanes.
+- `libs/cmux-cua/tests/fixtures/README.md` explains source-built harness apps and staged outputs.
+- `libs/cmux-cua/scripts/README.md` explains install and VM sync helpers.
+
+## Desktop Validation Entry Points
+
+The canonical GUI runners execute the complete Rust harness catalog. Their
+internal CI lanes may split shared, native, and capture owners for reporting,
+but contributors do not select those partitions directly.
+
+```text
+Linux X11/session: scripts/ci/linux/run-rust-e2e.sh
+Linux Sway:        scripts/ci/linux/run-rust-e2e-wayland.sh
+Linux nested:      scripts/ci/linux/run-rust-e2e-inject.sh
+Linux GNOME/KDE:   scripts/ci/linux/run-rust-e2e-desktop.sh <gnome|kde>
+Linux real Xorg:   scripts/ci/linux/run-rust-e2e-desktop.sh xorg
+Windows:           .\scripts\ci\windows\run-rust-e2e.ps1 -RequireGui
+macOS:             scripts/ci/macos/run-rust-e2e.sh
+```
+
+The Sway runner creates a controlled stock-wlroots session. Nix owns the Linux
+source/package gate and provides the optional nested `cua-compositor` session;
+it is not the wrapper for every Linux E2E environment. GNOME, KDE, real Xorg,
+Windows, and macOS use an existing graphical login. Windows needs an
+interactive console or RDP session, and macOS needs a logged-in session with
+the required Accessibility and Screen Recording permissions. See
+[Platform support](/reference/cmux-cua/platform-support) for current capability
+boundaries, [How cmux CUA is validated](/concepts/how-cmux-cua-is-validated)
+for the evidence model, and [Platform roadmap](/reference/cmux-cua/platform-roadmap)
+for remaining work.
+
+Build artifacts, VM logs, and local verification journals should stay out of
+git unless they have been promoted into a stable fixture or contributor doc.

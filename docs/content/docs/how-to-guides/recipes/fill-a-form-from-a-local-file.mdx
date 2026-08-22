@@ -6,10 +6,10 @@ description: Drive a browser form from a PDF or CSV file on your local machine.
 import { Callout } from 'fumadocs-ui/components/callout';
 import { Steps, Step } from 'fumadocs-ui/components/steps';
 
-Use this recipe when the data already lives on your machine, for example in a PDF resume or a CSV file, and the form lives in a browser on the same desktop. **Cua Driver** drives both, so the **data never has to be uploaded anywhere** because the agent reads it locally and types it into the form.
+Use this recipe when the data already lives on your machine, for example in a PDF resume or a CSV file, and the form lives in a browser on the same desktop. **cmux CUA** drives both, so the **data never has to be uploaded anywhere** because the agent reads it locally and types it into the form.
 
 <Callout type="info">
-  Before you start: [install Cua Driver](/how-to-guides/driver/install), grant host permissions, and [connect your agent](/how-to-guides/driver/connect-your-agent).
+  Before you start: [install cmux CUA](/how-to-guides/driver/install), grant host permissions, and [connect your agent](/how-to-guides/driver/connect-your-agent).
 </Callout>
 
 <Steps>
@@ -22,7 +22,7 @@ Use this recipe when the data already lives on your machine, for example in a PD
     ~/Downloads/resume.pdf
     ```
 
-    Cua Driver has **no filesystem read tool**. The agent reads local files by opening them in an app it can see, for example Preview, another PDF viewer, or a text editor, then reading the on-screen content with the accessibility tree and screenshots from `get_window_state`.
+    cmux CUA has **no filesystem read tool**. The agent reads local files by opening them in an app it can see, for example Preview, another PDF viewer, or a text editor, then reading the on-screen content with the accessibility tree and screenshots from `get_window_state`.
 
     For a CSV, open the file in a text editor, spreadsheet app, or browser tab. If the file contains many rows, start with one row and name the row or record the agent should use.
   </Step>

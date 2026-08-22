@@ -169,4 +169,4 @@ See you at NeurIPS 2025!
 
 ---
 
-_Want to build your own growth hacking automations? Check out [Cua on GitHub](https://github.com/trycua/cua) or join our [Discord](https://discord.gg/cua) to share your experiments. cua-las not included (yet)._
+_Want to build your own growth hacking automations? Check out [Cua on GitHub](https://github.com/manaflow-ai/cmux-cua) or join our [Discord](https://discord.gg/cua) to share your experiments. cua-las not included (yet)._

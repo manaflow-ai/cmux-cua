@@ -8,7 +8,7 @@ code, or alter branches.
 
 For the test layout and the distinction between unit tests, shared harnesses,
 and native harnesses, see
-`libs/cua-driver/docs/test-harnesses-guide.md`.
+`libs/cmux-cua/docs/test-harnesses-guide.md`.
 
 | Runner | Session | Canonical command |
 | --- | --- | --- |
@@ -24,12 +24,12 @@ private `CUA_E2E_INTERNAL_LANE` partition to `shared`, `native`, or `capture`
 when it fans the same matrix into independent jobs. Those values are not public
 alternate suites.
 
-Run the Wayland wrapper through `nix develop .#cua-driver-wayland-e2e`. It
+Run the Wayland wrapper through `nix develop .#cmux-cua-wayland-e2e`. It
 creates a pure Wayland session with Xwayland disabled and delegates every
 scenario to `run-rust-e2e.sh`.
 
 Run the nested compositor wrapper through
-`nix develop .#cua-driver-inject-e2e`. This environment is experimental and
+`nix develop .#cmux-cua-inject-e2e`. This environment is experimental and
 proves only the private compositor-owned route. Use `run-rust-e2e-desktop.sh`
 for maintainer checks on representative GNOME, KDE, or real-Xorg sessions.
 

@@ -67,4 +67,4 @@ lume ssh macos-tahoe 'id -un'
 The guest should report `lume`, accept SSH with the default `lume` password,
 and boot without Setup Assistant. Tahoe is the currently verified preset;
 Sequoia's remaining Accessibility-step issue is tracked in
-[#2155](https://github.com/trycua/cua/issues/2155).
+[#2155](https://github.com/manaflow-ai/cmux-cua/issues/2155).

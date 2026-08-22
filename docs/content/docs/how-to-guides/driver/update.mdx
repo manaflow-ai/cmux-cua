@@ -1,16 +1,16 @@
 ---
-title: Update Cua Driver
-description: Check whether a newer Cua Driver release is available and install it.
+title: Update cmux CUA
+description: Check whether a newer cmux CUA release is available and install it.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-Cua Driver gives you three update paths: a passive banner at launch time, a CLI command that only checks, and a separate command that installs the update. Keep the **check and apply steps separate** so you can decide when to change the installed binary.
+cmux CUA gives you three update paths: a passive banner at launch time, a CLI command that only checks, and a separate command that installs the update. Keep the **check and apply steps separate** so you can decide when to change the installed binary.
 
 ## Check for updates
 
 ```bash
-cua-driver check-update
+cmux-cua check-update
 ```
 
 When you're behind:
@@ -19,8 +19,8 @@ When you're behind:
 Current: 0.6.9
 Latest:  0.7.0
 
-Update available. Run `cua-driver update --apply` to install.
-Release notes: https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.7.0
+Update available. Run `cmux-cua update --apply` to install.
+Release notes: https://github.com/manaflow-ai/cmux-cua/releases/tag/cmux-cua-v0.7.0
 ```
 
 When you're current:
@@ -41,7 +41,7 @@ The command exits with `0` when the check succeeds. Read `update_available` in t
 ## Apply the update
 
 ```bash
-cua-driver update --apply
+cmux-cua update --apply
 ```
 
 Output:
@@ -50,8 +50,8 @@ Output:
 Current version: 0.6.9
 Checking for updates…
 New version available: 0.7.0
-Downloading and installing Cua Driver 0.7.0…
-Installed Cua Driver 0.7.0.
+Downloading and installing cmux CUA 0.7.0…
+Installed cmux CUA 0.7.0.
 ```
 
 `update --apply` calls the canonical installer script, the same one-line installer used for the first install.
@@ -59,7 +59,7 @@ Installed Cua Driver 0.7.0.
 If the daemon was running before the update, restart it so it uses the new binary:
 
 ```bash
-cua-driver stop && cua-driver serve
+cmux-cua stop && cmux-cua serve
 ```
 
 On Windows with autostart enabled, the Scheduled Task uses the new binary on its next invocation. `autostart enable` is idempotent, and the task path resolves through the `current` junction.
@@ -67,7 +67,7 @@ On Windows with autostart enabled, the Scheduled Task uses the new binary on its
 ## Scripted check (CI / agents)
 
 ```bash
-cua-driver check-update --json
+cmux-cua check-update --json
 ```
 
 ```json
@@ -79,7 +79,7 @@ cua-driver check-update --json
   "checked_at": "2026-07-01T14:30:00Z",
   "cache_hit": false,
   "install_command": "curl -fsSL https://cua.ai/driver/install.sh | bash",
-  "release_notes_url": "https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.7.0",
+  "release_notes_url": "https://github.com/manaflow-ai/cmux-cua/releases/tag/cmux-cua-v0.7.0",
   "error": null
 }
 ```
@@ -89,9 +89,9 @@ When the installed version is current, `install_command` and `release_notes_url`
 Use the JSON form from a bash script:
 
 ```bash
-if cua-driver check-update --json | jq -e '.update_available' > /dev/null; then
-    echo "Cua Driver is outdated — applying update"
-    cua-driver update --apply
+if cmux-cua check-update --json | jq -e '.update_available' > /dev/null; then
+    echo "cmux CUA is outdated — applying update"
+    cmux-cua update --apply
 fi
 ```
 
@@ -99,12 +99,12 @@ The same payload is available over MCP through the `check_for_update` tool. MCP 
 
 ## Passive banner
 
-Every `cua-driver mcp`, `serve`, and `doctor` invocation starts a background version check. If it finds a newer release, Cua Driver prints a two-line banner to stderr:
+Every `cmux-cua mcp`, `serve`, and `doctor` invocation starts a background version check. If it finds a newer release, cmux CUA prints a two-line banner to stderr:
 
 ```
-✨ cua-driver v0.7.0 is available (you have v0.6.9).
-   Update with: cua-driver update
-   Release notes: https://github.com/trycua/cua/releases/tag/cua-driver-rs-v0.7.0
+✨ cmux-cua v0.7.0 is available (you have v0.6.9).
+   Update with: cmux-cua update
+   Release notes: https://github.com/manaflow-ai/cmux-cua/releases/tag/cmux-cua-v0.7.0
 ```
 
 The check uses a 20-hour cache and never blocks startup. One-shot commands such as `--version`, `call`, and `list-tools` skip it so piped output remains clean.
@@ -112,11 +112,11 @@ The check uses a 20-hour cache and never blocks startup. One-shot commands such 
 Disable the check for one invocation:
 
 ```bash
-CUA_DRIVER_RS_UPDATE_CHECK=false cua-driver serve
+CMUX_CUA_UPDATE_CHECK=false cmux-cua serve
 ```
 
 Disable it permanently:
 
 ```bash
-cua-driver config set update_check_enabled false
+cmux-cua config set update_check_enabled false
 ```

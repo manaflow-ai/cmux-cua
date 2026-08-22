@@ -56,8 +56,8 @@ vnc = [
 ]
 
 [project.urls]
-homepage = "https://github.com/trycua/cua"
-repository = "https://github.com/trycua/cua"
+homepage = "https://github.com/manaflow-ai/cmux-cua"
+repository = "https://github.com/manaflow-ai/cmux-cua"
 
 [project.scripts]
 cua-computer-server = "computer_server:run_cli"

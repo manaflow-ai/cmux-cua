@@ -387,7 +387,7 @@ def upload_to_huggingface(dataset_name, visibility, filter_tags=None):
         )
         card = DatasetCard.from_template(
             card_data=card_data,
-            template_str="---\n{{ card_data }}\n---\n\n# Uploaded computer interface trajectories\n\nThese trajectories were generated and uploaded using [cua](https://github.com/trycua/cua)",
+            template_str="---\n{{ card_data }}\n---\n\n# Uploaded computer interface trajectories\n\nThese trajectories were generated and uploaded using [cua](https://github.com/manaflow-ai/cmux-cua)",
         )
         card.push_to_hub(dataset_name, commit_message="Cua dataset card")
 

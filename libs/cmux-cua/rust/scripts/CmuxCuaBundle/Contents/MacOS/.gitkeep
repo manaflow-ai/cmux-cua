@@ -1,0 +1,24 @@
+# Placeholder so the empty MacOS/ directory is tracked in git.
+#
+# This is the source-of-truth skeleton for /Applications/cmux Computer Use.app.
+# It deliberately lives under `scripts/CmuxCuaBundle/` (NOT a
+# `.app` suffix) so macOS LaunchServices on developer machines does
+# not index it as a second installed app with the `com.cmuxterm.cua`
+# bundle id. With the previous `scripts/cmux Computer Use.app/` shape, every
+# `cargo run` from inside the repo would surface a "ghost CmuxCua"
+# entry in System Settings → Privacy & Security pointing at the empty
+# skeleton path.
+#
+# At build / install time the cmux-cua release binary (universal
+# macOS slice — arm64 + x86_64 lipo'd together) is copied into this
+# directory as `cmux-cua`. The Info.plist's CFBundleExecutable
+# points at that name.
+#
+# See:
+#   - .github/workflows/cd-rust-cmux-cua.yml  (copies the skeleton's
+#     Contents/ into the release tarball at CD time and adds the
+#     universal binary)
+#   - libs/cmux-cua/scripts/install.sh        (downloads the
+#     resulting tarball, extracts it to /Applications/cmux Computer Use.app,
+#     and creates the ~/.local/bin/cmux-cua symlink pointing into
+#     the bundle)

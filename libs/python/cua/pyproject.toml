@@ -5,7 +5,7 @@ description = "Cua — Computer-Use Agents: unified SDK meta-package"
 readme = "README.md"
 license = "MIT"
 authors = [
-    { name = "TryCua", email = "hello@trycua.com" }
+    { name = "cmux contributors", email = "hello@manaflow.ai" }
 ]
 keywords = [
     "computer-use",
@@ -43,10 +43,10 @@ uitars-hf  = ["cua-agent[uitars-hf]"]
 all     = ["cua-agent[all]", "cua-cli[all]"]
 
 [project.urls]
-Homepage      = "https://github.com/trycua/cua"
+Homepage      = "https://github.com/manaflow-ai/cmux-cua"
 Documentation = "https://docs.trycua.com"
-Repository    = "https://github.com/trycua/cua"
-Issues        = "https://github.com/trycua/cua/issues"
+Repository    = "https://github.com/manaflow-ai/cmux-cua"
+Issues        = "https://github.com/manaflow-ai/cmux-cua/issues"
 
 # No [project.scripts] — cua-cli already registers 'cua = "cua_cli.main:main"'
 

@@ -3,16 +3,16 @@
 A fleet of deliberately **legacy-looking government records terminals** (navy
 banner, `UNCLASSIFIED // FOR OFFICIAL USE ONLY` strip, function-key bar,
 green-screen records grid, status line) — the kind of internal agency app that,
-in the age of AI, has *no* automation integration. cua-driver automates them
+in the age of AI, has *no* automation integration. cmux-cua automates them
 anyway.
 
 One human action in the foreground "master" terminal is replayed onto **four
-background terminals at the same time**, each driven by its own cua-driver
+background terminals at the same time**, each driven by its own cmux-cua
 session = its own uniquely-coloured agent cursor — with **no window ever
 raised** and **the user's mouse never moved**.
 
-It also proves cua-driver works **with or without an accessibility tree**: the
-five windows span five UI frameworks, and cua-driver's default dispatch
+It also proves cmux-cua works **with or without an accessibility tree**: the
+five windows span five UI frameworks, and cmux-cua's default dispatch
 auto-selects UIA-Invoke where an a11y tree exists and falls back to
 pixel/pointer-injection where it doesn't.
 
@@ -42,7 +42,7 @@ corner ever coming to the front.
 
 ## Frameworks (and what they exercise)
 
-| Window | Framework | Accessibility | cua-driver path |
+| Window | Framework | Accessibility | cmux-cua path |
 |---|---|---|---|
 | TL | Win32 + GDI (custom-drawn) | **none** | pixel hit-test → PostMessage / pointer injection |
 | TR | .NET WinForms | MSAA/UIA | UIA Invoke |
@@ -61,7 +61,7 @@ npm install --prefix electron                 # Electron (downloads electron onc
 ```
 Also build the driver once (repo root workspace):
 ```powershell
-cargo build -p cua-driver --manifest-path ..\..\libs\cua-driver\rust\Cargo.toml
+cargo build -p cmux-cua --manifest-path ..\..\libs\cmux-cua\rust\Cargo.toml
 ```
 
 ## Run
@@ -71,18 +71,18 @@ cargo build -p cua-driver --manifest-path ..\..\libs\cua-driver\rust\Cargo.toml
 .\target\debug\orchestrator.exe --auto     # self-playing: drives a TYPE+CLICK every few seconds
 ```
 
-The orchestrator starts the cua-driver daemon, launches + positions all five
+The orchestrator starts the cmux-cua daemon, launches + positions all five
 windows, and fans every center action out to the four corners over four
-concurrent `cua-driver call` sessions (`crimson` / `amber` / `aqua` /
+concurrent `cmux-cua call` sessions (`crimson` / `amber` / `aqua` /
 `mint_lime` → four cursor colours). Close the center window (or kill the
 orchestrator) to tear everything down — a Windows Job Object kills the whole
 tree, so nothing is orphaned.
 
 ### Env overrides
-`CUA_DRIVER_EXE`, `LEGACY_APP_EXE`, `WINFORMS_EXE`, `WPF_EXE`, `ELECTRON_DIR`.
+`CMUX_CUA_EXE`, `LEGACY_APP_EXE`, `WINFORMS_EXE`, `WPF_EXE`, `ELECTRON_DIR`.
 
 ## How the coloured cursors work
-cua-driver assigns each session a cursor colour by name (palette-name sessions
+cmux-cua assigns each session a cursor colour by name (palette-name sessions
 like `crimson` pick that colour directly). Passing `"session":"<color>"` on each
 `click`/`type_text` call routes it to that session's overlay cursor, which
 glides to the target. Four sessions → four cursors animating at once. See

@@ -5,7 +5,7 @@
         screenshot = await sb.screenshot()
 
 Sandbox.ephemeral() auto-selects LumeRuntime for macOS VMs on a macOS host.
-Requires the Lume CLI: https://github.com/trycua/cua/tree/main/libs/lume
+Requires the Lume CLI: https://github.com/manaflow-ai/cmux-cua/tree/main/libs/lume
 
 Contrast:
     Image.macos("26")  + local=True  -> Lume VM on macOS host (this file)

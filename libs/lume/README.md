@@ -21,7 +21,7 @@ are `lume` / `lume`.
 
 Tahoe is E2E verified from a local IPSW. Sequoia can still present the
 Accessibility step of Setup Assistant on its first display boot; this is
-tracked in [#2155](https://github.com/trycua/cua/issues/2155).
+tracked in [#2155](https://github.com/manaflow-ai/cmux-cua/issues/2155).
 
 To use the other built-in preset, replace `tahoe` with `sequoia` in the
 `--unattended` option and choose a matching VM name.

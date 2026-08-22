@@ -21,7 +21,7 @@ By the end of this tutorial, you'll be able to:
 
 **Prerequisites:**
 
-- Completed setup from Part 1 ([lume CLI installed](https://github.com/trycua/cua?tab=readme-ov-file#option-2-full-computer-use-agent-capabilities), macOS Cua image already pulled)
+- Completed setup from Part 1 ([lume CLI installed](https://github.com/manaflow-ai/cmux-cua?tab=readme-ov-file#option-2-full-computer-use-agent-capabilities), macOS Cua image already pulled)
 - Python 3.10+. We recommend using Conda (or Anaconda) to create an ad hoc Python environment.
 - API keys for OpenAI and/or Anthropic (optional for local models)
 
@@ -171,7 +171,7 @@ The `cua-agent` framework provides multiple agent loop implementations to abstra
 
 - **AgentLoop.OMNI**: The most flexible option that works with virtually any vision-language model including local and open-source ones. Perfect for cost-effective development or when you need to use models without native computer-use capabilities.
 
-These abstractions allow you to easily switch between providers without changing your application code. All loop implementations are available in the [cua-agent GitHub repository](https://github.com/trycua/cua/tree/main/libs/python/agent).
+These abstractions allow you to easily switch between providers without changing your application code. All loop implementations are available in the [cua-agent GitHub repository](https://github.com/manaflow-ai/cmux-cua/tree/main/libs/python/agent).
 
 Choosing the right agent loop depends not only on your API access and technical requirements but also on the specific tasks you need to accomplish. To make an informed decision, it's helpful to understand how these underlying models perform across different computing environments – from desktop operating systems to web browsers and mobile interfaces.
 
@@ -673,7 +673,7 @@ With the basics covered, you might want to explore:
 
 ### Resources
 
-- [cua-agent GitHub repository](https://github.com/trycua/cua/tree/main/libs/python/agent)
+- [cua-agent GitHub repository](https://github.com/manaflow-ai/cmux-cua/tree/main/libs/python/agent)
 - [OpenAI Agent SDK Specification](https://platform.openai.com/docs/api-reference/responses)
 - [Anthropic API Documentation](https://platform.claude.com/docs/en/api/overview)
 - [UI-TARS GitHub](https://github.com/ByteDance/UI-TARS)

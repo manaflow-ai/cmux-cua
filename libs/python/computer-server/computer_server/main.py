@@ -1236,7 +1236,7 @@ async def agent_response_endpoint(
                 # multi-character strings or map to a Key enum — those still
                 # go through press_key unchanged.
                 #
-                # See: https://github.com/trycua/cua/issues/1605
+                # See: https://github.com/manaflow-ai/cmux-cua/issues/1605
                 import unicodedata
 
                 if len(key) == 1 and unicodedata.category(key) not in ("Cc", "Cs", "Cn"):

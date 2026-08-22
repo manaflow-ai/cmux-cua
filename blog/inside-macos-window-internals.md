@@ -2,13 +2,13 @@
 
 _Published on April 23, 2026 by Francesco Bonacci_
 
-![Cua Driver — background any computer-use agent](https://github.com/user-attachments/assets/5e5acd7e-ac02-4f50-be76-0c997152d635)
+![cmux CUA — background any computer-use agent](https://github.com/user-attachments/assets/5e5acd7e-ac02-4f50-be76-0c997152d635)
 
 **TL;DR:**
-- `cua-driver` is an open-source macOS driver that lets any agent (Claude Code, Codex, your own harness) drive any Mac app in the background.
+- `cmux-cua` is an open-source macOS driver that lets any agent (Claude Code, Codex, your own harness) drive any Mac app in the background.
 - The user's cursor doesn't move, focus doesn't change, and macOS doesn't drag them across Spaces - this is called [background computer-use](https://x.com/embirico/status/2044833942856196378).
 - Built on SkyLight's `SLEventPostToPid`, a private AX SPI for sparse accessibility trees, and yabai's focus-without-raise pattern.
-- Source: [github.com/trycua/cua](https://github.com/trycua/cua).
+- Source: [github.com/trycua/cua](https://github.com/manaflow-ai/cmux-cua).
 
 ---
 
@@ -32,7 +32,7 @@ SkyLight is where the interesting stuff is. `SLEventPostToPid` posts synthesized
 
 None of this is documented. Half of it doesn't even appear in any Apple header. I learned about it by reading [yabai's source](https://github.com/koekeishiya/yabai), poking at Chrome's event filter with lldb, and writing a lot of Swift that crashed in informative ways.
 
-What I came out the other side with is **cua-driver** - a macOS driver that lets any agent (Claude, GPT, Codex, your own loop) drive a real Mac app while you keep working in the foreground. The cursor doesn't move. Focus doesn't change. macOS doesn't follow the agent across Spaces. It's v0.1 and in early preview. We're releasing it now under a permissive license so this next wave of agent experiences isn't gated on a single vendor.
+What I came out the other side with is **cmux-cua** - a macOS driver that lets any agent (Claude, GPT, Codex, your own loop) drive a real Mac app while you keep working in the foreground. The cursor doesn't move. Focus doesn't change. macOS doesn't follow the agent across Spaces. It's v0.1 and in early preview. We're releasing it now under a permissive license so this next wave of agent experiences isn't gated on a single vendor.
 
 ## First, the easy way (it doesn't work)
 
@@ -84,13 +84,13 @@ I'd love to tell you I found this by reading a blog post, but I didn't. I found 
 
 With clicks, keystrokes, and AX trees all working backgrounded, there's still a routing decision clients should make: what does the client need to reason over to decide what to click?
 
-cua-driver exposes three capture modes.
+cmux-cua exposes three capture modes.
 
 **`ax`** returns just a simplified AX tree as a Markdown outline, with every actionable node tagged by an index. `ax` doesn't need any screen capture nor Screen Recording permission. It works best with system apps (e.g. Calculator, Notes, iMessage etc) or apps developed with AppKit, SwiftUI whose accessibility trees is well representative of what the user see.
 
 **`vision`** returns just a PNG of the target window. Best for vision-first VLMs that ground on pixels and don't use element_index. Smallest payload, fastest, but the agent has to do all the spatial reasoning itself. Note: Vision-only is still flaky for coding agents like Claude Code (for some reason Anthropic doesn't include computer-use beta fields when uploading images to their endpoint).
 
-**`som`** (default, [set-of-mark](https://arxiv.org/abs/2310.11441)) returns both the AX tree and the screenshot. The tree tells the agent what's clickable, the screenshot disambiguates when labels repeat or are empty. This is the default because it lets element-indexed clicks (the driver's primary addressing mode) work on the first snapshot, with visual confirmation for free. Underneath cua-driver, element-indexed clicks (`click({pid, window_id, element_index})`) are the primary addressing mode. They fire the underlying AX action directly, work on hidden and occluded targets, and don't involve coordinates. Pixel clicks (`click({pid, x, y})`) are the fallback for canvas, WebGL, and other non-AX surfaces, using the SkyLight recipe above.
+**`som`** (default, [set-of-mark](https://arxiv.org/abs/2310.11441)) returns both the AX tree and the screenshot. The tree tells the agent what's clickable, the screenshot disambiguates when labels repeat or are empty. This is the default because it lets element-indexed clicks (the driver's primary addressing mode) work on the first snapshot, with visual confirmation for free. Underneath cmux-cua, element-indexed clicks (`click({pid, window_id, element_index})`) are the primary addressing mode. They fire the underlying AX action directly, work on hidden and occluded targets, and don't involve coordinates. Pixel clicks (`click({pid, x, y})`) are the fallback for canvas, WebGL, and other non-AX surfaces, using the SkyLight recipe above.
 
 ## What I've been using it for
 
@@ -100,7 +100,7 @@ Four things that only work because the driver behaves like a second cursor on my
 
 <div align="center"><video src="https://github.com/user-attachments/assets/c81cac3c-4693-408d-bb9e-870e6a337db0" width="600" controls></video></div>
 
-An agent harness running a repro-fix-verify cycle while I keep typing in the editor. Claude Code drives the target app via cua-driver, reads the pixels, reads the AX tree, edits source, rebuilds, checks the screenshot. Your agent harness never loses focus - and your scroll position never changes. I find out the fix worked because the agent tells me.
+An agent harness running a repro-fix-verify cycle while I keep typing in the editor. Claude Code drives the target app via cmux-cua, reads the pixels, reads the AX tree, edits source, rebuilds, checks the screenshot. Your agent harness never loses focus - and your scroll position never changes. I find out the fix worked because the agent tells me.
 
 **2. Messages I would have forgotten.**
 
@@ -118,7 +118,7 @@ Claude Code reading what's on a Figma canvas, what's in a Preview window, what's
 
 <div align="center"><video src="https://github.com/user-attachments/assets/d5b80bad-bd4f-4690-9512-7b4a7cd44f13" width="600" controls></video></div>
 
-Imagine asking an agent to record a product demo video for you. The agent drives the app being demoed, records the trajectory, and cua-driver renderer zooms on each click at export. Because the clicks are backgrounded, the cursor the driver paints is the only cursor in the final video.
+Imagine asking an agent to record a product demo video for you. The agent drives the app being demoed, records the trajectory, and cmux-cua renderer zooms on each click at export. Because the clicks are backgrounded, the cursor the driver paints is the only cursor in the final video.
 
 ## What's still broken
 
@@ -126,35 +126,35 @@ Two things the SkyLight recipe doesn't fix.
 
 **Chromium coerces synthetic right-clicks on web content to left-clicks.** The renderer-IPC filter drops the right-click subtype on non-HID-tap paths. Element-indexed right-click via AX works fine for AX-addressable targets (links, buttons, toolbar items). Pure web content is stuck on left-click. I don't see a way around this without shipping a browser extension, which defeats the drop-in-driver design.
 
-**Canvas apps (Blender GHOST, Unity, games) filter per-pid routes entirely.** Their event loops only accept events from `cghidEventTap` with a leading `mouseMoved`, which means they need a brief frontmost activation. cua-driver falls back to activating these apps before clicking. The no-foreground-steal promise is broken for this one category. If you're automating Blender, the cursor warps. Sorry.
+**Canvas apps (Blender GHOST, Unity, games) filter per-pid routes entirely.** Their event loops only accept events from `cghidEventTap` with a leading `mouseMoved`, which means they need a brief frontmost activation. cmux-cua falls back to activating these apps before clicking. The no-foreground-steal promise is broken for this one category. If you're automating Blender, the cursor warps. Sorry.
 
 ## Install
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cmux-cua/scripts/install.sh)"
 ```
 
-This drops `CuaDriver.app` into `/Applications`, symlinks the `cua-driver` CLI into `/usr/local/bin`, and installs a weekly auto-updater. Grant Accessibility and Screen Recording to `CuaDriver.app` once in System Settings → Privacy & Security, and it's ready.
+This drops `cmux Computer Use.app` into `/Applications`, symlinks the `cmux-cua` CLI into `/usr/local/bin`, and installs a weekly auto-updater. Grant Accessibility and Screen Recording to `cmux Computer Use.app` once in System Settings → Privacy & Security, and it's ready.
 
 **Wire into Claude Code, Cursor, or any MCP client.** Paste this into the client's MCP config:
 
 ```json
 {
   "mcpServers": {
-    "cua-driver": {
-      "command": "/Applications/CuaDriver.app/Contents/MacOS/cua-driver",
+    "cmux-cua": {
+      "command": "/Applications/cmux Computer Use.app/Contents/MacOS/cmux-cua",
       "args": ["mcp"]
     }
   }
 }
 ```
 
-**Or drive from the shell.** Every MCP tool is a top-level `cua-driver <name>` subcommand. For example:
+**Or drive from the shell.** Every MCP tool is a top-level `cmux-cua <name>` subcommand. For example:
 
 ```bash
-cua-driver list_apps
-cua-driver launch_app '{"bundle_id":"com.apple.calculator"}'
-cua-driver click '{"pid":1234,"window_id":5678,"element_index":14}'
+cmux-cua list_apps
+cmux-cua launch_app '{"bundle_id":"com.apple.calculator"}'
+cmux-cua click '{"pid":1234,"window_id":5678,"element_index":14}'
 ```
 
-Source and issues at [github.com/trycua/cua](https://github.com/trycua/cua). I'd especially love to hear how you end up using this. ***The weirdest use cases are the ones we haven't thought of yet.***
+Source and issues at [github.com/trycua/cua](https://github.com/manaflow-ai/cmux-cua). I'd especially love to hear how you end up using this. ***The weirdest use cases are the ones we haven't thought of yet.***

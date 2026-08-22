@@ -183,7 +183,7 @@ fi
 VERSION=${TAG_NAME#cua-v}
 
 # Construct download URL using the specific cua release tag
-BINARY_URL="https://github.com/trycua/cua/releases/download/${TAG_NAME}/${BINARY_NAME}"
+BINARY_URL="https://github.com/manaflow-ai/cmux-cua/releases/download/${TAG_NAME}/${BINARY_NAME}"
 printf "\033[90mBINARY_URL: %s\033[0m\n" "$BINARY_URL"
 
 # Create ~/.cua/bin directory if it doesn't exist

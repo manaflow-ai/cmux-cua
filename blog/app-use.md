@@ -2,7 +2,7 @@
 
 _Published on May 31, 2025 by The Cua Team_
 
-Today, we are excited to introduce a new experimental feature landing in the [Cua GitHub repository](https://github.com/trycua/cua): **App-Use**. App-Use allows you to create lightweight virtual desktops that limit agent access to specific applications, improving precision of your agent's trajectory. Perfect for parallel workflows, and focused task execution.
+Today, we are excited to introduce a new experimental feature landing in the [Cua GitHub repository](https://github.com/manaflow-ai/cmux-cua): **App-Use**. App-Use allows you to create lightweight virtual desktops that limit agent access to specific applications, improving precision of your agent's trajectory. Perfect for parallel workflows, and focused task execution.
 
 > **Note:** App-Use is currently experimental. To use it, you need to enable it by passing `experiments=["app-use"]` feature flag when creating your Computer instance.
 

@@ -176,7 +176,7 @@ await computer.run()
 
 - **Docker Provider Docs:** [https://cua.ai/docs/cua/reference/computer-sdk](https://cua.ai/docs/cua/reference/computer-sdk)
 - **KasmVNC:** [https://github.com/kasmtech/KasmVNC](https://github.com/kasmtech/KasmVNC)
-- **Container Source:** [https://github.com/trycua/cua/tree/main/libs/kasm](https://github.com/trycua/cua/tree/main/libs/kasm)
+- **Container Source:** [https://github.com/manaflow-ai/cmux-cua/tree/main/libs/kasm](https://github.com/manaflow-ai/cmux-cua/tree/main/libs/kasm)
 - **Computer SDK:** [https://cua.ai/docs/cua/reference/computer-sdk](https://cua.ai/docs/cua/reference/computer-sdk)
 - **Discord:** [https://discord.gg/cua-ai](https://discord.gg/cua-ai)
 

@@ -7,8 +7,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUNTIME_DIR="$(mktemp -d)"
 SWAY_CONFIG="$(mktemp)"
 SESSION_KIND="${CUA_E2E_WAYLAND_SESSION:-sway}"
-COMPOSITOR_LOG="${REPO_ROOT}/artifacts/cua-driver/linux/${SESSION_KIND}.log"
-ATSPI_LOG="${REPO_ROOT}/artifacts/cua-driver/linux/at-spi-bus.log"
+COMPOSITOR_LOG="${REPO_ROOT}/artifacts/cmux-cua/linux/${SESSION_KIND}.log"
+ATSPI_LOG="${REPO_ROOT}/artifacts/cmux-cua/linux/at-spi-bus.log"
 COMPOSITOR_PID=""
 DBUS_PID=""
 ATSPI_PID=""
@@ -53,7 +53,7 @@ export WLR_RENDERER=pixman
 export WLR_RENDERER_ALLOW_SOFTWARE=1
 export WLR_LIBINPUT_NO_DEVICES=1
 export WLR_HEADLESS_OUTPUTS=1
-export CUA_DRIVER_RS_ENABLE_WAYLAND=1
+export CMUX_CUA_ENABLE_WAYLAND=1
 if [[ "${SESSION_KIND}" == cua-compositor ]]; then
   export CUA_E2E_COMPOSITOR=cua-compositor-nested
   export CUA_E2E_INPUT_BACKENDS=atspi,cua-compositor-inject
@@ -214,6 +214,6 @@ set +e
 status=$?
 set -e
 if [[ "${status}" != 0 && "${SESSION_KIND}" == sway ]]; then
-  swaymsg -t get_tree > "${REPO_ROOT}/artifacts/cua-driver/linux/sway-tree.json" 2>/dev/null || true
+  swaymsg -t get_tree > "${REPO_ROOT}/artifacts/cmux-cua/linux/sway-tree.json" 2>/dev/null || true
 fi
 exit "${status}"

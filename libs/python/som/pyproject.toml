@@ -39,9 +39,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/trycua/cua"
-Repository = "https://github.com/trycua/cua"
-Documentation = "https://github.com/trycua/cua/tree/main/docs"
+Homepage = "https://github.com/manaflow-ai/cmux-cua"
+Repository = "https://github.com/manaflow-ai/cmux-cua"
+Documentation = "https://github.com/manaflow-ai/cmux-cua/tree/main/docs"
 
 [tool.pdm]
 distribution = true

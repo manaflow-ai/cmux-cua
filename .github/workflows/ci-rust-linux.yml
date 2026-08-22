@@ -3,13 +3,13 @@ name: "CI: Rust Linux unit"
 on:
   pull_request:
     paths:
-      - "libs/cua-driver/rust/Cargo.toml"
-      - "libs/cua-driver/rust/Cargo.lock"
-      - "libs/cua-driver/rust/crates/cua-driver/**"
-      - "libs/cua-driver/rust/crates/cua-driver-core/**"
-      - "libs/cua-driver/rust/crates/cua-driver-testkit/**"
-      - "libs/cua-driver/rust/crates/platform-linux/**"
-      - "libs/cua-driver/tests/fixtures/**"
+      - "libs/cmux-cua/rust/Cargo.toml"
+      - "libs/cmux-cua/rust/Cargo.lock"
+      - "libs/cmux-cua/rust/crates/cmux-cua/**"
+      - "libs/cmux-cua/rust/crates/cmux-cua-core/**"
+      - "libs/cmux-cua/rust/crates/cmux-cua-testkit/**"
+      - "libs/cmux-cua/rust/crates/platform-linux/**"
+      - "libs/cmux-cua/tests/fixtures/**"
       - "nix/**"
       - "flake.nix"
       - "flake.lock"
@@ -17,8 +17,8 @@ on:
   push:
     branches: [main]
     paths:
-      - "libs/cua-driver/rust/**"
-      - "libs/cua-driver/tests/fixtures/**"
+      - "libs/cmux-cua/rust/**"
+      - "libs/cmux-cua/tests/fixtures/**"
       - "nix/**"
       - "flake.nix"
       - "flake.lock"
@@ -42,7 +42,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
         with:
-          workspaces: "libs/cua-driver/rust -> target"
+          workspaces: "libs/cmux-cua/rust -> target"
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -50,8 +50,8 @@ jobs:
             clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
             libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev
       - name: Run Linux Rust tests
-        working-directory: libs/cua-driver/rust
-        run: cargo test -p cua-driver -p cua-driver-core -p cua-driver-testkit -p platform-linux --all-targets --locked
+        working-directory: libs/cmux-cua/rust
+        run: cargo test -p cmux-cua -p cmux-cua-core -p cmux-cua-testkit -p platform-linux --all-targets --locked
       - name: Compile portable GNOME/KDE portal input
-        working-directory: libs/cua-driver/rust
-        run: cargo check -p cua-driver --features portal-input --locked
+        working-directory: libs/cmux-cua/rust
+        run: cargo check -p cmux-cua --features portal-input --locked

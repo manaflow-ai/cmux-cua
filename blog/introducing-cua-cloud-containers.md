@@ -14,7 +14,7 @@ Think of Cua Cloud as **Docker for Computer-Use Agents**. Instead of managing VM
 
 ## Why Cua Cloud Sandbox?
 
-Four months ago, we launched [**Lume**](https://github.com/trycua/cua/tree/main/libs/lume) and [**Cua**](https://github.com/trycua/cua) with the goal to bring sandboxed VMs and Computer-Use Agents on Apple Silicon. The developer's community response was incredible 🎉
+Four months ago, we launched [**Lume**](https://github.com/manaflow-ai/cmux-cua/tree/main/libs/lume) and [**Cua**](https://github.com/manaflow-ai/cmux-cua) with the goal to bring sandboxed VMs and Computer-Use Agents on Apple Silicon. The developer's community response was incredible 🎉
 
 Going from prototype to production revealed a problem though: **local macOS VMs don't scale**, neither are they easily portable.
 
@@ -226,6 +226,6 @@ Stay tuned for updates and join our [**Discord**](https://discord.gg/cua-ai) to 
 
 Ready to deploy your Computer-Use Agents in the cloud?
 
-Visit [**cua.ai**](https://cua.ai) to sign up and get your API key. Join our [**Discord community**](https://discord.gg/cua-ai) for support and explore more examples on [**GitHub**](https://github.com/trycua/cua).
+Visit [**cua.ai**](https://cua.ai) to sign up and get your API key. Join our [**Discord community**](https://discord.gg/cua-ai) for support and explore more examples on [**GitHub**](https://github.com/manaflow-ai/cmux-cua).
 
 Happy RPA 2.0! 🚀

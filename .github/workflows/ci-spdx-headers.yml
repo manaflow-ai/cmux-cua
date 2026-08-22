@@ -1,6 +1,6 @@
 name: "CI: SPDX Headers"
 
-# Verifies that every cua-driver source file carries an SPDX-License-Identifier
+# Verifies that every cmux-cua source file carries an SPDX-License-Identifier
 # header. Currently warn-only (continue-on-error: true) while we stamp the
 # existing tree in a separate sweep PR; will be flipped to enforcing once the
 # tree is clean. See scripts/spdx-headers.py for the applier and the runbook.
@@ -8,15 +8,15 @@ name: "CI: SPDX Headers"
 on:
   pull_request:
     paths:
-      - "libs/cua-driver/**/*.swift"
-      - "libs/cua-driver/**/*.rs"
+      - "libs/cmux-cua/**/*.swift"
+      - "libs/cmux-cua/**/*.rs"
       - "scripts/spdx-headers.py"
       - ".github/workflows/ci-spdx-headers.yml"
   push:
     branches: [main]
     paths:
-      - "libs/cua-driver/**/*.swift"
-      - "libs/cua-driver/**/*.rs"
+      - "libs/cmux-cua/**/*.swift"
+      - "libs/cmux-cua/**/*.rs"
       - "scripts/spdx-headers.py"
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
       - name: Check SPDX headers
         id: spdx
         continue-on-error: true
-        run: python3 scripts/spdx-headers.py --check libs/cua-driver
+        run: python3 scripts/spdx-headers.py --check libs/cmux-cua
 
       - name: Show help if check failed
         if: steps.spdx.outcome == 'failure'
@@ -45,10 +45,10 @@ jobs:
           echo "║                                                                  ║"
           echo "║  To stamp new files locally:                                     ║"
           echo "║                                                                  ║"
-          echo "║    python3 scripts/spdx-headers.py --apply libs/cua-driver       ║"
+          echo "║    python3 scripts/spdx-headers.py --apply libs/cmux-cua       ║"
           echo "║                                                                  ║"
           echo "║  To preview without writing:                                     ║"
           echo "║                                                                  ║"
-          echo "║    python3 scripts/spdx-headers.py --dry-run libs/cua-driver     ║"
+          echo "║    python3 scripts/spdx-headers.py --dry-run libs/cmux-cua     ║"
           echo "║                                                                  ║"
           echo "╚══════════════════════════════════════════════════════════════════╝"

@@ -10,7 +10,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
-$fixtureBuild = Join-Path $repoRoot "libs\cua-driver\tests\fixtures\build\windows.ps1"
+$fixtureBuild = Join-Path $repoRoot "libs\cmux-cua\tests\fixtures\build\windows.ps1"
 
 & $fixtureBuild -Skip $Skip -Targets $Targets
 if ($LASTEXITCODE -ne 0) {

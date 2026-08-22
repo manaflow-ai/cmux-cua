@@ -149,7 +149,7 @@ jobs:
 
         ### From source
         ```bash
-        git clone -b ${{ needs.prepare.outputs.tag }} https://github.com/trycua/cua.git
+        git clone -b ${{ needs.prepare.outputs.tag }} https://github.com/manaflow-ai/cmux-cua.git
         cd cua/libs/typescript/cua-cli
         bun install
         bun link

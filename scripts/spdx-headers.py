@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Add or verify SPDX + copyright headers on cua-driver source files.
+Add or verify SPDX + copyright headers on cmux-cua source files.
 
 Two modes:
   --apply (default): insert the header on files that lack it
@@ -18,8 +18,8 @@ The script is idempotent: it skips any file that already contains an
 SPDX-License-Identifier marker in its first 2 KiB.
 
 Typical use:
-  scripts/spdx-headers.py                     # apply to libs/cua-driver
-  scripts/spdx-headers.py libs/cua-driver-rs  # apply to a different tree
+  scripts/spdx-headers.py                     # apply to libs/cmux-cua
+  scripts/spdx-headers.py libs/cmux-cua  # apply to a different tree
   scripts/spdx-headers.py --check             # CI gate
   scripts/spdx-headers.py --dry-run           # preview only
 """
@@ -43,7 +43,7 @@ HEADER_LINES = [
 MARKER = "SPDX-License-Identifier"
 EXTENSIONS = {".swift", ".rs"}
 SKIP_DIR_NAMES = {"target", ".build", "build", "node_modules", "DerivedData", ".git"}
-DEFAULT_ROOT = "libs/cua-driver"
+DEFAULT_ROOT = "libs/cmux-cua"
 
 
 def file_has_header(path: pathlib.Path) -> bool:

@@ -2,7 +2,7 @@
 
 _Published on June 10, 2025 by Francesco Bonacci_
 
-Yesterday, Apple announced their new [Containerization framework](https://github.com/apple/containerization) at WWDC. Since then, our Discord and X users have been asking what this means for Cua virtualization capabilities on Apple Silicon. We've been working in this space for months - from [Lume](https://github.com/trycua/cua/tree/main/libs/lume) to [Lumier](https://github.com/trycua/cua/tree/main/libs/lumier) to [Cua Cloud Sandbox](./introducing-cua-cloud-containers). Here's our take on Apple's announcement.
+Yesterday, Apple announced their new [Containerization framework](https://github.com/apple/containerization) at WWDC. Since then, our Discord and X users have been asking what this means for Cua virtualization capabilities on Apple Silicon. We've been working in this space for months - from [Lume](https://github.com/manaflow-ai/cmux-cua/tree/main/libs/lume) to [Lumier](https://github.com/manaflow-ai/cmux-cua/tree/main/libs/lumier) to [Cua Cloud Sandbox](./introducing-cua-cloud-containers). Here's our take on Apple's announcement.
 
 ## Our Story
 
@@ -69,7 +69,7 @@ While Apple's new framework focuses on containers, we've been building VM manage
 
 ### Lume: Simple VM Management
 
-[Lume](https://github.com/trycua/cua/tree/main/libs/lume) is our command-line tool for creating and managing VMs on Apple Silicon. We built it because setting up VMs on macOS was too complicated.
+[Lume](https://github.com/manaflow-ai/cmux-cua/tree/main/libs/lume) is our command-line tool for creating and managing VMs on Apple Silicon. We built it because setting up VMs on macOS was too complicated.
 
 What Lume does:
 
@@ -90,7 +90,7 @@ lume run macos-sequoia-vanilla:latest
 
 ### Lumier: Docker-Style VM Management
 
-[Lumier](https://github.com/trycua/cua/tree/main/libs/lumier) works differently. It lets you use Docker commands to manage VMs. But here's the key: **Docker is just for packaging, not for isolation**.
+[Lumier](https://github.com/manaflow-ai/cmux-cua/tree/main/libs/lumier) works differently. It lets you use Docker commands to manage VMs. But here's the key: **Docker is just for packaging, not for isolation**.
 
 What makes Lumier useful:
 
@@ -172,8 +172,8 @@ Apple's announcement confirms we're on the right path. Here's what we're looking
 ## Learn More
 
 - [Apple Containerization Framework](https://github.com/apple/containerization)
-- [Lume - Direct VM Management](https://github.com/trycua/cua/tree/main/libs/lume)
-- [Lumier - Docker Interface for VMs](https://github.com/trycua/cua/tree/main/libs/lumier)
+- [Lume - Direct VM Management](https://github.com/manaflow-ai/cmux-cua/tree/main/libs/lume)
+- [Lumier - Docker Interface for VMs](https://github.com/manaflow-ai/cmux-cua/tree/main/libs/lumier)
 - [Cua Cloud Sandbox](https://cua.ai)
 - [Join our Discord](https://discord.gg/cua-ai)
 

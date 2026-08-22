@@ -8,7 +8,7 @@ We're early OpenClaw contributors and sponsors (we documented [how to deploy Ope
 
 So we deferred our Hacker News launch to ship something big live on stage.
 
-[CuaBot](https://github.com/trycua/cua) is a CLI that gives any coding agent — Claude Code, Gemini CLI, Codex, OpenClaw, Aider — a sandboxed Linux desktop with computer-use capabilities. The agent's application windows stream individually to your host desktop through Xpra, so you keep full use of your machine while the agent works.
+[CuaBot](https://github.com/manaflow-ai/cmux-cua) is a CLI that gives any coding agent — Claude Code, Gemini CLI, Codex, OpenClaw, Aider — a sandboxed Linux desktop with computer-use capabilities. The agent's application windows stream individually to your host desktop through Xpra, so you keep full use of your machine while the agent works.
 
 The key idea is multi-player computer-use: the agent and the human each have their own cursor, their own keyboard focus, and their own window management, all coexisting on the same screen.
 
@@ -75,7 +75,7 @@ The onboarding handles Docker, Xpra, Playwright, and pulls the container image (
 
 Requires: Node.js 18+, Docker Desktop, Xpra client.
 
-GitHub: [github.com/trycua/cua](https://github.com/trycua/cua)
+GitHub: [github.com/trycua/cua](https://github.com/manaflow-ai/cmux-cua)
 
 ## What's next
 

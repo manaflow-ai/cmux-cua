@@ -92,7 +92,7 @@ except Exception as e:
 #
 # CGWarpMouseCursorPosition works reliably in both VM and bare-metal environments.
 # This descriptor replaces pynput's default position property with a CGWarp-based
-# implementation. See: https://github.com/trycua/cua/issues/1162
+# implementation. See: https://github.com/manaflow-ai/cmux-cua/issues/1162
 class _CGWarpPosition:
     """Descriptor that uses CGWarpMouseCursorPosition instead of pynput's default."""
 

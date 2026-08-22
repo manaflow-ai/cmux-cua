@@ -2,7 +2,7 @@
 //!
 //! Reads a MIDI file (or a built-in demo song), turns each track into its own
 //! instrument window (a miniwob-style minigame), and gives each one its OWN
-//! cua-driver session = its OWN uniquely-coloured agent cursor. While the song
+//! cmux-cua session = its OWN uniquely-coloured agent cursor. While the song
 //! plays, every note steers that track's cursor onto its widget and clicks it
 //! in the background — the click is what makes the sound. One cursor per part,
 //! one colour per agent, all driven off a single clock: the dumbest possible
@@ -43,7 +43,7 @@ const WY1: f64 = 0.92;
 const KEYS_SPAN: i32 = 24;
 const MAX_TRACKS: usize = 9;
 
-// One cua-driver palette per agent. Keying a session to a palette NAME makes
+// One cmux-cua palette per agent. Keying a session to a palette NAME makes
 // that session's overlay cursor render in that palette automatically
 // (`Palette::for_instance(session)`), exactly like the sibling multi-cursor
 // demo. The hex is that palette's mid colour, reused for the instrument window
@@ -167,11 +167,11 @@ fn main() {
     let demo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
     let repo_root = demo_root.parent().unwrap().parent().unwrap().to_path_buf();
 
-    let cua = std::env::var("CUA_DRIVER_EXE").map(PathBuf::from)
-        .unwrap_or_else(|_| repo_root.join("libs/cua-driver/rust/target/debug/cua-driver.exe"));
+    let cua = std::env::var("CMUX_CUA_EXE").map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root.join("libs/cmux-cua/rust/target/debug/cmux-cua.exe"));
     let app = std::env::var("JUKEBOX_APP_EXE").map(PathBuf::from)
         .unwrap_or_else(|_| demo_root.join("target/debug/jukebox-app.exe"));
-    if !cua.exists() { eprintln!("cua-driver.exe not found at {cua:?}"); std::process::exit(1); }
+    if !cua.exists() { eprintln!("cmux-cua.exe not found at {cua:?}"); std::process::exit(1); }
     if !app.exists() { eprintln!("jukebox-app.exe not found at {app:?} — run `cargo build` first"); std::process::exit(1); }
 
     // Raise the system timer resolution to 1ms so the per-note `thread::sleep`
@@ -210,11 +210,11 @@ fn main() {
 
     // Reap any leftover daemon from a previous run FIRST. Its job object only
     // fires KILL_ON_JOB_CLOSE when the *owning* orchestrator exits cleanly, so a
-    // hard-killed run can leave a `cua-driver serve` alive — and a stale daemon
+    // hard-killed run can leave a `cmux-cua serve` alive — and a stale daemon
     // keeps its own full-screen overlay, whose agent0..N cursors stack on top of
     // this run's at the same (deterministic) coordinates. That's what makes it
     // look like more than one cursor per window. Start from a clean slate.
-    for img in ["cua-driver.exe", "jukebox-app.exe"] {
+    for img in ["cmux-cua.exe", "jukebox-app.exe"] {
         let _ = Command::new("taskkill").args(["/F", "/IM", img])
             .stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
@@ -223,10 +223,10 @@ fn main() {
     // daemon's first connections (observed as a one-off ~10s-late performance).
     thread::sleep(Duration::from_millis(800));
 
-    // Start the cua-driver daemon.
-    eprintln!("[orch] starting cua-driver daemon…");
+    // Start the cmux-cua daemon.
+    eprintln!("[orch] starting cmux-cua daemon…");
     let mut daemon = Command::new(&cua).arg("serve").stdout(Stdio::null()).stderr(Stdio::null())
-        .spawn().expect("spawn cua-driver serve");
+        .spawn().expect("spawn cmux-cua serve");
     assign_to_job(&daemon);
     thread::sleep(Duration::from_millis(1500));
 
@@ -396,8 +396,8 @@ fn main() {
                     // a handler task per connection, so the 6 tracks actuate
                     // concurrently; within a track, clicks are lock-step (the
                     // response marks the actuation moment we measure against).
-                    let pipe = std::env::var("CUA_DRIVER_PIPE")
-                        .unwrap_or_else(|_| r"\\.\pipe\cua-driver".into());
+                    let pipe = std::env::var("CMUX_CUA_PIPE")
+                        .unwrap_or_else(|_| r"\\.\pipe\cmux-cua".into());
                     let mut conn = DaemonConn::open(&pipe);
                     for (idx, note) in p.notes.iter().enumerate() {
                         if !playing.load(Ordering::SeqCst) || generation.load(Ordering::SeqCst) != g { return; }
@@ -674,12 +674,12 @@ fn load_midi(path: &str) -> Result<Song, String> {
     Ok(Song { tracks, bpm, dur_sec: dur + 0.5 })
 }
 
-// ── cua-driver call + Win32 helpers ─────────────────────────────────────────────
+// ── cmux-cua call + Win32 helpers ─────────────────────────────────────────────
 
 /// Print the per-note timing diff: how far each actuation landed from its
 /// scheduled beat (actual − scheduled, ms). `mean`→0 means the adaptive lead
 /// has cancelled the systematic latency; `sd`/`p90` are the residual jitter
-/// (dominated by per-note `cua-driver call` subprocess spawn).
+/// (dominated by per-note `cmux-cua call` subprocess spawn).
 fn report_timing(errs: &[f64], base_lead_ms: f64) {
     if errs.is_empty() { eprintln!("[timing] no notes measured"); return; }
     let n = errs.len();
@@ -706,10 +706,10 @@ fn run_call(cua: &PathBuf, tool: &str, json: &str) -> bool {
         .status().map(|s| s.success()).unwrap_or(false)
 }
 
-/// A persistent connection to the `cua-driver serve` daemon over its
-/// line-delimited-JSON named pipe (`\\.\pipe\cua-driver`). The daemon handles
+/// A persistent connection to the `cmux-cua serve` daemon over its
+/// line-delimited-JSON named pipe (`\\.\pipe\cmux-cua`). The daemon handles
 /// many requests per connection, so holding ONE open per track lets us pipeline
-/// every note's click without paying a `cua-driver call` process spawn per note
+/// every note's click without paying a `cmux-cua call` process spawn per note
 /// — that spawn (tens of ms, high variance) was the entire timing-jitter
 /// source. One connection per track also means tracks dispatch concurrently
 /// server-side (a handler task per connection).

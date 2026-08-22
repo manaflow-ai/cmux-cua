@@ -25,14 +25,14 @@ jobs:
           set -uo pipefail
 
           endpoints=(
-            "https://cua.ai/driver/install.sh|cua-driver"
-            "https://cua.ai/driver/install.ps1|cua-driver"
-            "https://cua.ai/driver/uninstall.sh|cua-driver"
-            "https://cua.ai/driver/uninstall.ps1|cua-driver"
-            "https://cua.ai/driver/_install-rust.sh|cua-driver"
-            "https://cua.ai/driver/_install-common.sh|cua-driver"
-            "https://cua.ai/driver/_install-common.psm1|cua-driver"
-            "https://cua.ai/driver/post-install-hints.txt|cua-driver"
+            "https://cua.ai/driver/install.sh|cmux-cua"
+            "https://cua.ai/driver/install.ps1|cmux-cua"
+            "https://cua.ai/driver/uninstall.sh|cmux-cua"
+            "https://cua.ai/driver/uninstall.ps1|cmux-cua"
+            "https://cua.ai/driver/_install-rust.sh|cmux-cua"
+            "https://cua.ai/driver/_install-common.sh|cmux-cua"
+            "https://cua.ai/driver/_install-common.psm1|cmux-cua"
+            "https://cua.ai/driver/post-install-hints.txt|cmux-cua"
             "https://cua.ai/lume/install.sh|Lume"
             "https://cua.ai/lume/uninstall.sh|Lume"
           )

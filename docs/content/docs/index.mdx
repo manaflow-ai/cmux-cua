@@ -3,13 +3,13 @@ title: 'Cua documentation'
 description: 'Open-source computer-use automation for real machines and disposable cloud desktops.'
 ---
 
-Cua is an open-source MIT-licensed platform ([github.com/trycua/cua](https://github.com/trycua/cua)) for **computer-use automation**: letting AI agents operate real computers by clicking, typing, and reading the screen and accessibility tree. What we refer to as **Computer-Use 2.0** treats the GUI as one tool surface in an agent loop, alongside code, shell, files, and APIs. The main decision is whether to drive a machine you already have with Cua Driver, or spin up a fresh, isolated cloud desktop with Cua Sandbox.
+Cua is an open-source MIT-licensed platform ([github.com/trycua/cua](https://github.com/manaflow-ai/cmux-cua)) for **computer-use automation**: letting AI agents operate real computers by clicking, typing, and reading the screen and accessibility tree. What we refer to as **Computer-Use 2.0** treats the GUI as one tool surface in an agent loop, alongside code, shell, files, and APIs. The main decision is whether to drive a machine you already have with cmux CUA, or spin up a fresh, isolated cloud desktop with Cua Sandbox.
 
 import { Card, Cards } from 'fumadocs-ui/components/card';
 
 <Cards>
   <Card
-    title="Drive a real app — Cua Driver"
+    title="Drive a real app — cmux CUA"
     href="/tutorials/drive-your-first-app"
   >
     Run a background driver on macOS, Windows, or Linux so an agent can operate native GUI apps you already have without bringing them to the foreground or moving the real mouse. It speaks MCP over stdio and is also a plain CLI.
@@ -32,4 +32,4 @@ How-to guides: recipes for a goal. Start with [How-to guides](/how-to-guides).
 
 Reference: precise technical description. Start with [Reference](/reference).
 
-For real local apps and signed-in state, start with **Cua Driver**. For fresh isolated desktops, start with **Cua Sandbox**. Lume is the local Apple Silicon VM substrate behind part of the stack.
+For real local apps and signed-in state, start with **cmux CUA**. For fresh isolated desktops, start with **Cua Sandbox**. Lume is the local Apple Silicon VM substrate behind part of the stack.

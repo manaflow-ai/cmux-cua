@@ -179,7 +179,7 @@ if (-not $tagName) {
 $version = $tagName -replace '^cua-v', ''
 
 # Construct download URL using the specific cua release tag
-$binaryUrl = "https://github.com/trycua/cua/releases/download/$tagName/cua-windows-x64.exe"
+$binaryUrl = "https://github.com/manaflow-ai/cmux-cua/releases/download/$tagName/cua-windows-x64.exe"
 
 # Create installation directory
 $installDir = "$env:USERPROFILE\.cua\bin"

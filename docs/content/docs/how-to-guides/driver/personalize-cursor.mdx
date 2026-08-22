@@ -5,7 +5,7 @@ description: "Swap the agent cursor shape and palette: pick a built-in silhouett
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-The Cua Driver agent cursor ships with three built-in silhouettes:
+The cmux CUA agent cursor ships with three built-in silhouettes:
 
 - **`teardrop`** (the default)
 - **`arrow`**
@@ -16,12 +16,12 @@ The Cua Driver agent cursor ships with three built-in silhouettes:
 ## Pick a built-in silhouette
 
 ```bash
-cua-driver serve --cursor-shape teardrop   # explicit; same as the default
-cua-driver serve --cursor-shape arrow      # opt into the procedural arrow
-cua-driver serve --cursor-shape sky        # opt into the gray kite cursor
+cmux-cua serve --cursor-shape teardrop   # explicit; same as the default
+cmux-cua serve --cursor-shape arrow      # opt into the procedural arrow
+cmux-cua serve --cursor-shape sky        # opt into the gray kite cursor
 ```
 
-`--cursor-shape` is parsed on `serve` and `mcp`. It has no effect on one-shot CLI calls like `cua-driver call`, because those do not keep the long-lived UI runloop the overlay needs.
+`--cursor-shape` is parsed on `serve` and `mcp`. It has no effect on one-shot CLI calls like `cmux-cua call`, because those do not keep the long-lived UI runloop the overlay needs.
 
 `--cursor-icon <path>` always wins over `--cursor-shape`: if you pass both, the custom file is what renders.
 
@@ -44,10 +44,10 @@ Switch between the built-in `arrow`, `teardrop`, and `sky` silhouettes at runtim
 
 ## Use your own cursor asset
 
-Pass `--cursor-icon <path>` to `cua-driver serve` (or set `image_path` on `set_agent_cursor_style` at runtime). Supported formats: `.svg`, `.png`, `.ico`. The asset is rasterised once at startup into a 52×52 RGBA buffer and used in place of the built-in silhouette.
+Pass `--cursor-icon <path>` to `cmux-cua serve` (or set `image_path` on `set_agent_cursor_style` at runtime). Supported formats: `.svg`, `.png`, `.ico`. The asset is rasterised once at startup into a 52×52 RGBA buffer and used in place of the built-in silhouette.
 
 ```bash
-cua-driver serve --cursor-icon ~/my-cursor.svg
+cmux-cua serve --cursor-icon ~/my-cursor.svg
 ```
 
 <Callout type="info" title="Tip orientation">
@@ -62,10 +62,10 @@ Custom cursor assets are rendered with no rotation compensation. The driver assu
 `--cursor-palette <name>` picks a built-in colour palette for the cursor at launch. It is the launch-time counterpart to the runtime `set_agent_cursor_style` palette. Like the other cursor flags it is parsed on `serve` and `mcp` only.
 
 ```bash
-cua-driver serve --cursor-palette <name>
+cmux-cua serve --cursor-palette <name>
 ```
 
-Run `cua-driver serve --help` for the available palette names.
+Run `cmux-cua serve --help` for the available palette names.
 
 ## Things that aren't currently personalizable
 
@@ -75,5 +75,5 @@ Run `cua-driver serve --help` for the available palette names.
 
 ## See also
 
-- [Connect your agent](./connect-your-agent): register Cua Driver with Claude Code, Codex, Hermes, and others.
-- [MCP tools](/reference/cua-driver/mcp-tools): full parameter list and return shape.
+- [Connect your agent](./connect-your-agent): register cmux CUA with Claude Code, Codex, Hermes, and others.
+- [MCP tools](/reference/cmux-cua/mcp-tools): full parameter list and return shape.

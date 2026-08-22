@@ -1,7 +1,7 @@
 # CUA Jukebox — coordinated multi-cursor computer-use, as music
 
 A MIDI file (or a built-in demo song) becomes a **grid of miniwob-style
-minigame windows** — one per track. Each window gets its **own cua-driver
+minigame windows** — one per track. Each window gets its **own cmux-cua
 session = its own uniquely-coloured agent cursor**. While the song plays, every
 note steers that track's cursor onto its widget and **clicks it in the
 background** — and the click is what makes the sound. One cursor per part, one
@@ -55,7 +55,7 @@ splits across two. Sizing the pool to the *real* click duration (not just the
 glide) is what keeps every cursor on the beat — otherwise one cursor would fall
 progressively behind on a track whose notes outpace its glide. The built-in demo
 plays Pad triads and dense hats/arps to show this. Slow / sparse tracks keep one
-cursor. Each pool cursor is its own cua-driver session + its own persistent
+cursor. Each pool cursor is its own cmux-cua session + its own persistent
 connection + its own thread, so they actuate concurrently.
 
 ## How the timing stays on the beat
@@ -75,8 +75,8 @@ land on the beat anyway:
    > glide; any value `50–5000` forces that fixed flight time. No platform drift.
 
 2. **Persistent daemon connection.** The orchestrator holds **one named-pipe
-   connection per voice** to `cua-driver serve` and pipelines every click over
-   it — no `cua-driver call` *process spawn per note*. That spawn (tens of ms,
+   connection per voice** to `cmux-cua serve` and pipelines every click over
+   it — no `cmux-cua call` *process spawn per note*. That spawn (tens of ms,
    wildly variable) was the original timing-jitter source; removing it dropped
    the per-note jitter from **sd ≈ 490 ms → ≈ 35 ms**.
 
@@ -110,8 +110,8 @@ cargo build
 # Build the driver RELEASE — the cursor overlay composites a full-virtual-screen
 # bitmap (RGBA→BGRA) and blits it every frame, which is ~5× slower unoptimized.
 # Debug: ~12 fps overlay under the full demo; release: ~60 fps (vsync-capped).
-cargo build -p cua-driver --release --manifest-path ..\..\libs\cua-driver\rust\Cargo.toml
-$env:CUA_DRIVER_EXE = "..\..\libs\cua-driver\rust\target\release\cua-driver.exe"
+cargo build -p cmux-cua --release --manifest-path ..\..\libs\cmux-cua\rust\Cargo.toml
+$env:CMUX_CUA_EXE = "..\..\libs\cmux-cua\rust\target\release\cmux-cua.exe"
 ```
 
 ## Run
@@ -123,7 +123,7 @@ $env:CUA_DRIVER_EXE = "..\..\libs\cua-driver\rust\target\release\cua-driver.exe"
 .\target\debug\jukebox-orchestrator.exe song.mid --auto
 ```
 
-The orchestrator reaps any stale daemon, starts `cua-driver serve`, launches the
+The orchestrator reaps any stale daemon, starts `cmux-cua serve`, launches the
 Transport + one instrument window per track, tiles them (a 600×80 bar over a grid
 of 200×160 tiles), arms one coloured fixed-glide cursor pool per track, and on
 **PLAY** fans beat-synced background clicks out to every instrument. Press **Esc**
@@ -159,14 +159,14 @@ exercise every part of the visualizer — drums, a bass line, an arp, and Pad
 triads that show the cursor pool.
 
 ### Env overrides
-`CUA_DRIVER_EXE`, `JUKEBOX_APP_EXE`, `JUKEBOX_GLIDE_MS` (default 200),
+`CMUX_CUA_EXE`, `JUKEBOX_APP_EXE`, `JUKEBOX_GLIDE_MS` (default 200),
 `JUKEBOX_LEAD_MS` (defaults to the glide). Set
-`CUA_DRIVER_RS_OVERLAY_FPS_FILE=<path>` (read by the daemon) to log the agent
+`CMUX_CUA_OVERLAY_FPS_FILE=<path>` (read by the daemon) to log the agent
 cursor overlay's measured render FPS once a second.
 
 ## How the coloured cursors work
 
-Each track's session is a **cua-driver palette name** (`crimson`, `amber`,
+Each track's session is a **cmux-cua palette name** (`crimson`, `amber`,
 `aqua`, `mint_lime`, `orchid`, …), so its overlay cursor renders in that palette
 automatically (`Palette::for_instance(session)`) — the same trick the
 multi-cursor demo uses. The instrument window's accent and the Transport legend
@@ -185,6 +185,6 @@ palette name instead.)
 - **MIDI parsing uses a single tempo** (first tempo event wins) and ignores
   channel/program data — instrument inference leans on track names. Untitled
   tracks default to a sine pitch-strip.
-- Up to **9 tracks** (one per cua-driver palette); extra tracks are dropped.
+- Up to **9 tracks** (one per cmux-cua palette); extra tracks are dropped.
 - Audio needs a default output device; with none, instruments still flash
   silently.
