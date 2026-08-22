@@ -1967,8 +1967,9 @@ fn dispatch_update_cursor_window(
             // the active collection only in that recovery/order path, then
             // immediately restore target-relative ordering so unrelated
             // foreground windows still occlude it naturally.
-            let on_screen: bool = objc2::msg_send![win, isOnScreen];
-            if !on_screen {
+            let visible: bool = objc2::msg_send![win, isVisible];
+            let on_active_space: bool = objc2::msg_send![win, isOnActiveSpace];
+            if !visible || !on_active_space {
                 let _: () = objc2::msg_send![win, orderFrontRegardless];
             }
             if let Some(target) = payload.order_target {
@@ -2069,8 +2070,9 @@ fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
         // a panel that was moved behind the active Space without changing its
         // normal-level, target-relative occlusion contract.
         let _: () = objc2::msg_send![win, setCollectionBehavior: cursor_window_collection_behavior()];
-        let on_screen: bool = objc2::msg_send![win, isOnScreen];
-        if !on_screen {
+        let visible: bool = objc2::msg_send![win, isVisible];
+        let on_active_space: bool = objc2::msg_send![win, isOnActiveSpace];
+        if !visible || !on_active_space {
             let _: () = objc2::msg_send![win, orderFrontRegardless];
         }
         // NSWindowAbove = 1; relativeTo: takes NSInteger (i64 on 64-bit).
