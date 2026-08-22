@@ -14,6 +14,7 @@
 //!   {"method":"application_surface_start","args":{...}}
 //!   {"method":"application_surface_stop","args":{"session":"..."}}
 //!   {"method":"application_surface_event","args":{...}}
+//!   {"method":"reassert_cursor","args":{"session":"...","window_id":123,"enabled":true}}
 //!
 //! Response shapes:
 //!   {"ok":true,"result":...}
@@ -2196,6 +2197,66 @@ pub async fn run_serve(
                                 #[cfg(not(target_os = "macos"))]
                                 let response = DaemonResponse::err(
                                     "set_cursor_enabled is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&response).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "reassert_cursor" => {
+                                #[cfg(target_os = "macos")]
+                                let response = if !host_request_authorized {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    )
+                                } else {
+                                    let session = req
+                                        .args
+                                        .as_ref()
+                                        .and_then(|args| args.get("session"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|value| {
+                                            !value.is_empty() && value.len() <= 1_024
+                                        });
+                                    let window_id = req
+                                        .args
+                                        .as_ref()
+                                        .and_then(|args| args.get("window_id"))
+                                        .and_then(serde_json::Value::as_u64)
+                                        .filter(|value| {
+                                            *value > 0 && *value <= u64::from(u32::MAX)
+                                        });
+                                    let enabled = req
+                                        .args
+                                        .as_ref()
+                                        .and_then(|args| args.get("enabled"))
+                                        .and_then(serde_json::Value::as_bool);
+                                    match (session, window_id, enabled) {
+                                        (Some(session), Some(window_id), Some(enabled)) => {
+                                            let reasserted =
+                                                platform_macos::cursor::overlay::reassert_for_host_session(
+                                                    session.to_owned(),
+                                                    window_id,
+                                                    enabled,
+                                                );
+                                            DaemonResponse::ok(serde_json::json!({
+                                                "session": session,
+                                                "window_id": window_id,
+                                                "cursor_enabled": enabled,
+                                                "reasserted": reasserted,
+                                            }))
+                                        }
+                                        _ => DaemonResponse::err(
+                                            "reassert_cursor requires a non-empty `session`, positive `window_id`, and boolean `enabled`",
+                                            64,
+                                        ),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let response = DaemonResponse::err(
+                                    "reassert_cursor is available only on macOS",
                                     64,
                                 );
                                 let _ = writer.write_all(

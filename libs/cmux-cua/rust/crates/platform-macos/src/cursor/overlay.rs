@@ -382,6 +382,34 @@ pub fn set_enabled_for_host_session(key: CursorKey, enabled: bool) {
     }
 }
 
+/// Reassert a host-owned cursor's target-relative z-order without moving it.
+///
+/// Focus changes in the embedding app can reorder the helper window after the
+/// last Computer Use action.  The action path normally repairs that ordering
+/// with `PinAbove`, but a host menu transition has no action point to replay.
+/// Queue the pin and visibility commands together so the renderer restores the
+/// exact last cursor position in one host round-trip.
+pub fn reassert_for_host_session(
+    key: CursorKey,
+    target_window_id: u64,
+    enabled: bool,
+) -> bool {
+    if key.is_empty() || target_window_id == 0 {
+        return false;
+    }
+    let pinned = send_command(
+        key.clone(),
+        OverlayCommand::PinAbove(target_window_id),
+    );
+    let visibility = send_command(key.clone(), OverlayCommand::SetEnabled(enabled));
+    if enabled {
+        cmux_cua_core::cursor_feed::emit_visible_if_owned(&key);
+    } else {
+        cmux_cua_core::cursor_feed::emit_hidden_if_owned(&key);
+    }
+    pinned || visibility
+}
+
 /// Remove a session's owned cursor from the render collection (fired from the
 /// `session_end` hook). The `"default"` key is guarded against removal on the
 /// render side, so this is a no-op for it; removing an absent key (anonymous
