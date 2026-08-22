@@ -1238,7 +1238,17 @@ where
         }
     };
 
-    let authenticated_args = with_approval_broker_token(args, &broker_token);
+    // Keep the approval retry on the same managed identity as ordinary
+    // forwarding.  This path used to add only the broker token, skipping
+    // `enforce_proxy_session_identity`; compatibility actions then materialized
+    // their cursor under the short-lived `...-mcp-...` generation and the host
+    // could no longer reassert that cursor after a focus transition.
+    let managed_session = configured_default_session()
+        .is_some_and(|base| session_id.starts_with(&format!("{base}-mcp-")));
+    let authenticated_args = with_approval_broker_token(
+        enforce_proxy_session_identity(args, session_id, managed_session),
+        &broker_token,
+    );
 
     let first = match call_daemon_tool(
         socket_path,
@@ -2527,6 +2537,27 @@ mod tests {
             "the cursor and menu state need a stable identity across MCP proxy generations"
         );
         assert_eq!(args["pid"], 84);
+    }
+
+    #[test]
+    fn approval_forwarding_preserves_stable_cursor_identity() {
+        let managed = "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF-mcp-4242-99";
+        let base = managed.split("-mcp-").next().unwrap();
+        let args = enforce_proxy_session_identity(
+            serde_json::json!({"app": "Calculator"}),
+            managed,
+            true,
+        );
+        let authenticated = with_approval_broker_token(args, "daemon-token");
+
+        // The approval challenge and its retry must carry the same private
+        // host session marker as an ordinary forwarded call. The daemon strips
+        // the public `session` field after authenticating it, but retains this
+        // marker for the cursor and host state writers.
+        assert_eq!(authenticated["session"], managed);
+        assert_eq!(authenticated["_session_id"], managed);
+        assert_eq!(authenticated["_host_session"], base);
+        assert_eq!(authenticated[APPROVAL_BROKER_TOKEN_ARG], "daemon-token");
     }
 
     #[test]

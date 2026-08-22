@@ -1005,12 +1005,13 @@ fn panel_level_for_pin(pinned_wid: Option<u64>) -> PanelLevel {
 }
 
 fn cursor_window_collection_behavior() -> u64 {
-    // CanJoinAllSpaces | FullScreenAuxiliary | Stationary |
-    // CanJoinAllApplications. The final public AppKit behavior (macOS 13+)
-    // lets this accessory panel join the target application's window group,
-    // so orderWindow:relativeTo: can interleave it directly above a foreign
-    // target without promoting it over unrelated foreground applications.
-    1u64 | (1 << 8) | (1 << 4) | (1 << 18)
+    // CanJoinAllSpaces | MoveToActiveSpace | FullScreenAuxiliary |
+    // CanJoinAllApplications. The panel follows the active Space when a host
+    // focus transition exposes it, while remaining target-relative at the
+    // normal window level. `Stationary` is intentionally omitted: on recent
+    // macOS releases it can leave a normal-level accessory panel marked
+    // off-screen after another application/Space becomes active.
+    1u64 | (1 << 1) | (1 << 8) | (1 << 18)
 }
 
 fn appkit_frame_for_rect(rect: LogicalRect, screen: ScreenGeometry) -> AppKitRect {
@@ -1960,8 +1961,21 @@ fn dispatch_update_cursor_window(
             CGImageRelease(payload.cg_image_ptr as *mut c_void);
         }
         if payload.should_order {
-            let relative_to = payload.order_target.unwrap_or(0) as i64;
-            let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: relative_to];
+            // A window created with `orderOut` can retain a valid frame and
+            // layer contents while WindowServer still reports it as
+            // off-screen after a Space/focus transition. Bring it back into
+            // the active collection only in that recovery/order path, then
+            // immediately restore target-relative ordering so unrelated
+            // foreground windows still occlude it naturally.
+            let on_screen: bool = objc2::msg_send![win, isOnScreen];
+            if !on_screen {
+                let _: () = objc2::msg_send![win, orderFrontRegardless];
+            }
+            if let Some(target) = payload.order_target {
+                let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: target as i64];
+            } else {
+                let _: () = objc2::msg_send![win, orderFrontRegardless];
+            }
         }
     }
 
@@ -2051,7 +2065,15 @@ fn dispatch_pin_above(win_ptr: usize, target_wid: u64) {
     unsafe extern "C" fn reorder_cb(ctx: *mut c_void) {
         let (win_ptr, target_wid): (usize, u64) = *Box::from_raw(ctx as *mut (usize, u64));
         let win = win_ptr as *mut objc2::runtime::AnyObject;
-        // NSWindowAbove = 1; relativeTo: takes NSInteger (i64 on 64-bit)
+        // Re-apply the public collection policy before ordering. This repairs
+        // a panel that was moved behind the active Space without changing its
+        // normal-level, target-relative occlusion contract.
+        let _: () = objc2::msg_send![win, setCollectionBehavior: cursor_window_collection_behavior()];
+        let on_screen: bool = objc2::msg_send![win, isOnScreen];
+        if !on_screen {
+            let _: () = objc2::msg_send![win, orderFrontRegardless];
+        }
+        // NSWindowAbove = 1; relativeTo: takes NSInteger (i64 on 64-bit).
         let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_wid as i64];
     }
 
@@ -2984,6 +3006,16 @@ mod tests {
             "cross-application relative ordering requires CanJoinAllApplications"
         );
         assert_ne!(behavior & 1, 0, "cursor must continue joining every Space");
+        assert_ne!(
+            behavior & (1 << 1),
+            0,
+            "cursor must follow the active Space during a focus transition"
+        );
+        assert_eq!(
+            behavior & (1 << 4),
+            0,
+            "Stationary can strand a normal-level cursor off-screen after Space changes"
+        );
         assert_ne!(
             behavior & (1 << 8),
             0,

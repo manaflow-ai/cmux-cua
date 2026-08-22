@@ -162,12 +162,35 @@ fn register_session_cleanup(state: &Arc<CompatState>) {
         let native = native_sessions.lock().unwrap().remove(session_id);
         if let Some(native) = native {
             native.session_config.clear(session_id);
-            native.cursor_registry.remove(session_id);
+            for cursor_id in cursor_ids_for_lifecycle_session(session_id) {
+                native.cursor_registry.remove(&cursor_id);
+            }
         }
-        crate::cursor::overlay::remove_cursor(session_id.to_owned());
-        lock_removed_cursors.lock().unwrap().remove(session_id);
+        let cursor_ids = cursor_ids_for_lifecycle_session(session_id);
+        for cursor_id in &cursor_ids {
+            crate::cursor::overlay::remove_cursor(cursor_id.clone());
+        }
+        let mut removed = lock_removed_cursors.lock().unwrap();
+        for cursor_id in cursor_ids {
+            removed.remove(&cursor_id);
+        }
         operation_locks.lock().unwrap().remove(session_id);
     });
+}
+
+/// Return the lifecycle cursor key and, for a managed Codex proxy generation,
+/// its stable host/surface key. Compatibility actions render under the latter;
+/// tearing down only the generation key leaves a visible overlay orphaned
+/// after a proxy EOF or crash.
+fn cursor_ids_for_lifecycle_session(session_id: &str) -> Vec<String> {
+    let mut ids = vec![session_id.to_owned()];
+    if let Some(marker) = session_id.rfind("-mcp-") {
+        let host = &session_id[..marker];
+        if !host.is_empty() {
+            ids.push(host.to_owned());
+        }
+    }
+    ids
 }
 
 fn register_lock_cleanup(state: &Arc<CompatState>) {
@@ -191,7 +214,7 @@ fn defs() -> &'static [ToolDef] {
             ),
             tool_def(
                 "get_app_state",
-                "Start an app use session if needed, then get the state of the app's key window and return a screenshot and accessibility tree. This must be called once per assistant turn before interacting with the app",
+                "Start an app use session if needed, then get the state of the app's key window and return a screenshot and accessibility tree. Call this once before a grounded action sequence; stable element-index actions may follow without another snapshot while the same window remains active. Refresh after a layout-changing action or an action error.",
                 json!({
                     "type":"object",
                     "required":["app"],
@@ -540,8 +563,10 @@ impl CompatState {
         let mut removed = self.lock_removed_cursors.lock().unwrap();
         for (session_id, native) in native_sessions {
             native.session_config.clear(&session_id);
-            native.cursor_registry.remove(&session_id);
-            removed.insert(session_id);
+            for cursor_id in cursor_ids_for_lifecycle_session(&session_id) {
+                native.cursor_registry.remove(&cursor_id);
+                removed.insert(cursor_id);
+            }
         }
         let cursor_ids = removed.iter().cloned().collect::<Vec<_>>();
         drop(removed);
@@ -962,17 +987,14 @@ impl CompatState {
         let _dispatch_registration =
             crate::dispatch_gate::install(&session, self.guardian.clone(), lock_epoch);
         if let Err(error) = validate_live_snapshot(&snapshot) {
+            self.snapshots.invalidate(&session, &snapshot);
             return error.into_result();
         }
         if let Err(error) = self.validate_lock_epoch(lock_epoch) {
+            self.snapshots.invalidate(&session, &snapshot);
             return error.into_result();
         }
 
-        // Any mutating dispatch can become ambiguous once native code starts.
-        // Retire the input snapshot before entering that boundary so a partial
-        // multi-click, drag, or key sequence can never be retried against the
-        // same element handles after an error.
-        self.snapshots.invalidate(&session, &snapshot);
         let action_name = defs()[kind.index()].name.clone();
         let action_result = match run_guarded_dispatch(&self.guardian, lock_epoch, || async {
             match kind {
@@ -1006,6 +1028,14 @@ impl CompatState {
         {
             Ok(result) => result,
             Err(error) => {
+                // A guarded dispatch failure may have landed only part of a
+                // multi-click/drag/key sequence. Retire the input handles so
+                // the next call must obtain a fresh app snapshot before it can
+                // retry. Successful actions deliberately retain the snapshot:
+                // Codex's grounded action loop sends stable button sequences
+                // as separate calls, and invalidating here forced an avoidable
+                // get_app_state round-trip after every click.
+                self.snapshots.invalidate(&session, &snapshot);
                 self.invalidate_for_session_lock();
                 return lock_guard_error(error).into_result();
             }
@@ -1013,6 +1043,7 @@ impl CompatState {
 
         let action_lock_status = self.validate_lock_epoch(lock_epoch);
         if action_result.is_error == Some(true) {
+            self.snapshots.invalidate(&session, &snapshot);
             if let Err(error) = action_lock_status {
                 return error.into_result();
             }
@@ -1020,6 +1051,7 @@ impl CompatState {
         }
 
         if let Err(error) = action_lock_status {
+            self.snapshots.invalidate(&session, &snapshot);
             return action_ack_with_warning(&action_name, error.into_result());
         }
 
@@ -3331,6 +3363,24 @@ mod tests {
         assert_ne!(session_key(&first), compat_cursor_key(&first));
     }
 
+    #[test]
+    fn lifecycle_cleanup_covers_the_stable_host_cursor_key() {
+        let ids = cursor_ids_for_lifecycle_session(
+            "cmux-surface-A1B2C3-mcp-42-1000",
+        );
+        assert_eq!(
+            ids,
+            vec![
+                "cmux-surface-A1B2C3-mcp-42-1000".to_owned(),
+                "cmux-surface-A1B2C3".to_owned(),
+            ]
+        );
+        assert_eq!(
+            cursor_ids_for_lifecycle_session("standalone-session"),
+            vec!["standalone-session".to_owned()]
+        );
+    }
+
     #[tokio::test]
     async fn action_without_app_snapshot_fails_closed() {
         let state = CompatState::new();
@@ -3613,6 +3663,29 @@ mod tests {
         );
         assert!(!store.is_current("session-a", &original));
         assert!(store.is_current("session-a", &replacement));
+    }
+
+    #[test]
+    fn grounded_snapshot_remains_current_until_a_replacement_is_published() {
+        let store = SnapshotStore::default();
+        let original = store.insert(
+            "session-a",
+            snapshot("AppA", Arc::new(ToolState::default())),
+        );
+
+        // A successful grounded action does not retire the handles. A later
+        // state capture still publishes a new generation and makes the old
+        // one stale, preserving the replacement race guard.
+        assert!(store.lookup("session-a", "AppA").is_ok());
+        let replacement = store.insert(
+            "session-a",
+            snapshot("AppA", Arc::new(ToolState::default())),
+        );
+        assert!(matches!(
+            store.lookup("session-a", "AppA"),
+            Ok(current) if current.generation == replacement.generation
+        ));
+        assert!(!store.is_current("session-a", &original));
     }
 
     #[tokio::test]
