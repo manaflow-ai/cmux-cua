@@ -1,4 +1,4 @@
-# Cua-driver CI runners
+# cmux-cua CI runners
 
 These scripts are thin entrypoints around the Rust integration tests. They
 build the repo-local fixture applications, run one strict Rust environment

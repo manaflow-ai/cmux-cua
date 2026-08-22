@@ -15,8 +15,8 @@ $crossDir = Split-Path -Parent $elecDir
 $appsDir = Split-Path -Parent $crossDir
 $harnessDir = Split-Path -Parent $appsDir
 $testsDir = Split-Path -Parent $harnessDir
-$cuaDriverDir = Split-Path -Parent $testsDir
-$testAppsDir = Join-Path $cuaDriverDir "rust\test-apps"
+$cmuxCuaDir = Split-Path -Parent $testsDir
+$testAppsDir = Join-Path $cmuxCuaDir "rust\test-apps"
 $outDir = Join-Path $testAppsDir "harness-electron"
 
 if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {

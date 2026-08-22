@@ -14,7 +14,7 @@
 
     Earlier releases of the Rust port shipped under
     `/Applications/CmuxCua.app` with bundle id
-    `com.trycua.cuadriverrs` so the two could coexist on the same
+    `com.cmuxterm.cua` so the two could coexist on the same
     machine. That coexistence path has been retired — the Rust port
     replaces the Swift driver, not parallels it.
 

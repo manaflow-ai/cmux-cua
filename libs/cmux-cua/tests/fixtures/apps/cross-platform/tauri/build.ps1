@@ -10,8 +10,8 @@ $crossDir = Split-Path -Parent $tauriDir
 $appsDir = Split-Path -Parent $crossDir
 $harnessDir = Split-Path -Parent $appsDir
 $testsDir = Split-Path -Parent $harnessDir
-$cuaDriverDir = Split-Path -Parent $testsDir
-$testAppsDir = Join-Path $cuaDriverDir "rust\test-apps"
+$cmuxCuaDir = Split-Path -Parent $testsDir
+$testAppsDir = Join-Path $cmuxCuaDir "rust\test-apps"
 $outDir = Join-Path $testAppsDir "harness-tauri"
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {

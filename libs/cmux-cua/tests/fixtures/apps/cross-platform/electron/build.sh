@@ -15,8 +15,8 @@ elecDir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 crossDir="$(dirname "$elecDir")"
 appsDir="$(dirname "$crossDir")"
 harnessDir="$(dirname "$appsDir")"
-cuaDriverDir="$(cd "$harnessDir/../.." && pwd)"
-outDir="$cuaDriverDir/rust/test-apps/harness-electron"
+cmuxCuaDir="$(cd "$harnessDir/../.." && pwd)"
+outDir="$cmuxCuaDir/rust/test-apps/harness-electron"
 platform="$(uname -s)"
 
 if ! command -v npm >/dev/null 2>&1; then

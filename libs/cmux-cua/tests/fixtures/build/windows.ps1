@@ -23,8 +23,8 @@ $ErrorActionPreference = "Stop"
 $buildDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $harnessDir = Split-Path -Parent $buildDir
 $testsDir = Split-Path -Parent $harnessDir
-$cuaDriverDir = Split-Path -Parent $testsDir
-$testAppsDir = Join-Path $cuaDriverDir "rust\test-apps"
+$cmuxCuaDir = Split-Path -Parent $testsDir
+$testAppsDir = Join-Path $cmuxCuaDir "rust\test-apps"
 
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
     Write-Host "[ERROR] dotnet CLI not found on PATH. Install .NET 8 SDK first." -ForegroundColor Red

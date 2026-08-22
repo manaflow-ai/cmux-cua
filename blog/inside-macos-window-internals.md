@@ -80,7 +80,7 @@ Chrome, Slack, VS Code, Discord, Notion, and basically everything else built on 
 
 I'd love to tell you I found this by reading a blog post, but I didn't. I found it by comparing what Accessibility Inspector does when it introspects an occluded Electron window against what my own wrapper was doing, and noticing that Inspector's path touches one extra symbol we didn't have.
 
-## Cua-Driver comes with three modalities
+## cmux-cua comes with three modalities
 
 With clicks, keystrokes, and AX trees all working backgrounded, there's still a routing decision clients should make: what does the client need to reason over to decide what to click?
 

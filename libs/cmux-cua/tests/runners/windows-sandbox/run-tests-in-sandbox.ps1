@@ -36,11 +36,11 @@ function Close-Sandbox {
 $runnerDir     = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $runnersDir    = Split-Path -Parent $runnerDir
 $testsDir      = Split-Path -Parent $runnersDir
-$cuaDriverRoot = Split-Path -Parent $testsDir
-$rustRoot      = Join-Path $cuaDriverRoot "rust"
+$cmuxCuaRoot = Split-Path -Parent $testsDir
+$rustRoot      = Join-Path $cmuxCuaRoot "rust"
 
 Write-Host "=== cmux-cua Windows Sandbox Test Runner ===" -ForegroundColor Cyan
-Write-Host "cmux-cua root: $cuaDriverRoot"
+Write-Host "cmux-cua root: $cmuxCuaRoot"
 Write-Host "Rust workspace : $rustRoot"
 
 # -- Pre-flight: fail fast if a sandbox is already running --------------------
@@ -98,7 +98,7 @@ try {
 # a dependency isn't available - the smoke tests degrade to "skipped" inside
 # the sandbox rather than failing the whole run.
 if (Get-Command dotnet -ErrorAction SilentlyContinue) {
-    $harnessBuild = Join-Path $cuaDriverRoot "tests\fixtures\build\windows.ps1"
+    $harnessBuild = Join-Path $cmuxCuaRoot "tests\fixtures\build\windows.ps1"
     if (Test-Path $harnessBuild) {
         Write-Host "`n[BUILD] test fixtures (dotnet publish)..." -ForegroundColor Yellow
         # build.ps1 sets $ErrorActionPreference=Stop and throws on
@@ -135,7 +135,7 @@ $wsbContent = @"
 <Configuration>
   <MappedFolders>
     <MappedFolder>
-      <HostFolder>$cuaDriverRoot</HostFolder>
+      <HostFolder>$cmuxCuaRoot</HostFolder>
       <SandboxFolder>C:\cmux-cua</SandboxFolder>
       <ReadOnly>true</ReadOnly>
     </MappedFolder>

@@ -10,8 +10,8 @@ tauriDir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 crossDir="$(dirname "$tauriDir")"
 appsDir="$(dirname "$crossDir")"
 harnessDir="$(dirname "$appsDir")"
-cuaDriverDir="$(cd "$harnessDir/../.." && pwd)"
-outDir="$cuaDriverDir/rust/test-apps/harness-tauri"
+cmuxCuaDir="$(cd "$harnessDir/../.." && pwd)"
+outDir="$cmuxCuaDir/rust/test-apps/harness-tauri"
 platform="$(uname -s)"
 
 if ! command -v cargo >/dev/null 2>&1; then
