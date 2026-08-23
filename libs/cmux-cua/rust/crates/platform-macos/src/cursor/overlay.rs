@@ -374,6 +374,14 @@ pub fn set_enabled_for_host_session(key: CursorKey, enabled: bool) {
     if key.is_empty() {
         return;
     }
+    // A host may send visibility/reassertion requests to both protocol
+    // profiles, while only one profile has actually handled this session's
+    // first action. Do not lazily materialize a cursor for the inactive
+    // profile: that creates a second overlay (often retaining an old display
+    // coordinate) which can be mistaken for the cursor that is clicking.
+    if !cursor_is_materialized(&key) {
+        return;
+    }
     let _ = send_command(key.clone(), OverlayCommand::SetEnabled(enabled));
     if enabled {
         cmux_cua_core::cursor_feed::emit_visible_if_owned(&key);
@@ -397,6 +405,12 @@ pub fn reassert_for_host_session(
     if key.is_empty() || target_window_id == 0 {
         return false;
     }
+    // Reassertion must repair an existing cursor only. `send_command` is
+    // intentionally lazy for real actions, but making this host-only repair
+    // path lazy would create a phantom cursor in the other daemon profile.
+    if !cursor_is_materialized(&key) {
+        return false;
+    }
     let pinned = send_command(
         key.clone(),
         OverlayCommand::PinAbove(target_window_id),
@@ -408,6 +422,18 @@ pub fn reassert_for_host_session(
         cmux_cua_core::cursor_feed::emit_hidden_if_owned(&key);
     }
     pinned || visibility
+}
+
+fn cursor_is_materialized(key: &str) -> bool {
+    RENDER
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|map| cursor_is_materialized_in_map(map, key)))
+        .unwrap_or(false)
+}
+
+fn cursor_is_materialized_in_map(map: &RenderMap, key: &str) -> bool {
+    map.cursors.contains_key(key)
 }
 
 /// Remove a session's owned cursor from the render collection (fired from the
@@ -963,6 +989,7 @@ impl LogicalRect {
 struct ScreenGeometry {
     origin_x: f64,
     origin_y: f64,
+    width: f64,
     height: f64,
     fallback_backing_scale: f64,
 }
@@ -1045,9 +1072,45 @@ fn screen_geometry_for_primary_display(
     ScreenGeometry {
         origin_x: anchor.left,
         origin_y: anchor.top,
+        width: anchor.width,
         height: anchor.height,
         fallback_backing_scale,
     }
+}
+
+/// Re-read the primary display anchor used for AppKit's y-axis conversion.
+///
+/// `NSScreen.mainScreen`/`CGDisplayBounds` can change while a helper daemon is
+/// alive (for example, when a MacBook is moved between its panel and a Studio
+/// Display, or when the user changes the scaled resolution). The cursor's
+/// Quartz coordinates are global and remain valid, but the AppKit frame flip
+/// must use the *current* primary-display height. Keeping the launch-time
+/// height shifts every visible cursor after such a change while input still
+/// lands at the correct Quartz point.
+fn refresh_primary_screen_geometry(previous: ScreenGeometry) -> ScreenGeometry {
+    let primary_bounds = core_graphics::display::CGDisplay::new(
+        unsafe { core_graphics::display::CGMainDisplayID() },
+    )
+    .bounds();
+    let primary = LogicalRect {
+        left: primary_bounds.origin.x,
+        top: primary_bounds.origin.y,
+        width: primary_bounds.size.width,
+        height: primary_bounds.size.height,
+    };
+    let fallback = LogicalRect {
+        left: previous.origin_x,
+        top: previous.origin_y,
+        // Only the height is used by the fallback path; keep width positive so
+        // the defensive LogicalRect validation accepts it.
+        width: previous.width.max(1.0),
+        height: previous.height,
+    };
+    screen_geometry_for_primary_display(
+        primary,
+        fallback,
+        previous.fallback_backing_scale,
+    )
 }
 
 fn normalized_backing_scale(scale: f64, fallback: f64) -> f64 {
@@ -1505,7 +1568,7 @@ struct CursorWindowUpdate {
 
 fn render_loop(
     rx: std::sync::mpsc::Receiver<OverlayMsg>,
-    screen: ScreenGeometry,
+    mut screen: ScreenGeometry,
     mut displays: Vec<DisplayGeometry>,
     target_frame_ms: Duration,
 ) {
@@ -1545,9 +1608,20 @@ fn render_loop(
             || last_geometry_refresh
                 .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
         {
+            // Display configuration is mutable while the helper stays alive.
+            // Refresh the primary anchor alongside the per-display list so a
+            // resolution/monitor change cannot leave the AppKit y-flip using
+            // the daemon's launch-time height.
+            screen = refresh_primary_screen_geometry(screen);
             let refreshed_displays = active_display_geometries(screen.fallback_backing_scale);
             if !refreshed_displays.is_empty() {
                 displays = refreshed_displays;
+            }
+            if let Ok(mut guard) = RENDER.lock() {
+                if let Some(map) = guard.as_mut() {
+                    map.win_w = screen.width;
+                    map.win_h = screen.height;
+                }
             }
             pinned_bounds = window_bounds_snapshot();
             last_geometry_refresh = Some(now);
@@ -2234,6 +2308,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn host_reassertion_only_targets_a_materialized_cursor() {
+        let mut map = empty_map();
+        assert!(cursor_is_materialized_in_map(&map, "default"));
+        assert!(!cursor_is_materialized_in_map(&map, "inactive-profile"));
+
+        map.cursors.insert(
+            "active-profile".to_owned(),
+            RenderState::new(CursorConfig::default()),
+        );
+        assert!(cursor_is_materialized_in_map(&map, "active-profile"));
+    }
+
     fn empty_map() -> RenderMap {
         let mut cursors = IndexMap::new();
         cursors.insert(
@@ -2648,6 +2735,7 @@ mod tests {
         let main = ScreenGeometry {
             origin_x: 10.0,
             origin_y: 20.0,
+            width: 1_600.0,
             height: 900.0,
             fallback_backing_scale: 2.0,
         };
@@ -2705,6 +2793,47 @@ mod tests {
         assert_eq!(screen.origin_x, 0.0);
         assert_eq!(screen.origin_y, 0.0);
         assert_eq!(screen.height, 982.0);
+    }
+
+    #[test]
+    fn refreshed_primary_geometry_replaces_a_stale_launch_height() {
+        let launch_geometry = ScreenGeometry {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 1512.0,
+            height: 982.0,
+            fallback_backing_scale: 2.0,
+        };
+        let current_primary = LogicalRect {
+            left: 0.0,
+            top: 0.0,
+            width: 2560.0,
+            height: 1440.0,
+        };
+        let fallback = LogicalRect {
+            left: launch_geometry.origin_x,
+            top: launch_geometry.origin_y,
+            width: launch_geometry.width,
+            height: launch_geometry.height,
+        };
+
+        let refreshed = screen_geometry_for_primary_display(
+            current_primary,
+            fallback,
+            launch_geometry.fallback_backing_scale,
+        );
+
+        assert_eq!(refreshed.width, 2560.0);
+        assert_eq!(refreshed.height, 1440.0);
+        let cursor = LogicalRect::around((1_000.0, 500.0), CURSOR_WINDOW_MARGIN_POINTS);
+        let frame = appkit_frame_for_rect(cursor, launch_geometry);
+        assert_eq!(frame.height, 144.0);
+        // The y conversion must use the refreshed primary height, not the
+        // launch-time 982-point height. (The direct helper call above is kept
+        // pure; this assertion locks the expected anchor arithmetic.)
+        let refreshed_frame = appkit_frame_for_rect(cursor, refreshed);
+        assert_eq!(refreshed_frame.y, 868.0);
+        assert_ne!(frame.y, refreshed_frame.y);
     }
 
     #[test]
@@ -2916,6 +3045,7 @@ mod tests {
                 ScreenGeometry {
                     origin_x: 0.0,
                     origin_y: 0.0,
+                    width: 256.0,
                     height: 200.0,
                     fallback_backing_scale: 2.0,
                 }
@@ -2926,6 +3056,7 @@ mod tests {
                 ScreenGeometry {
                     origin_x: 0.0,
                     origin_y: 0.0,
+                    width: 256.0,
                     height: 200.0,
                     fallback_backing_scale: 2.0,
                 }
