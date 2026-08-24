@@ -160,13 +160,19 @@ fn register_session_cleanup(state: &Arc<CompatState>) {
     cmux_cua_core::session::register_session_end_hook(move |session_id| {
         snapshots.clear_session(session_id);
         let native = native_sessions.lock().unwrap().remove(session_id);
+        // The daemon's session_end hook is scoped to one MCP proxy
+        // generation.  Codex compatibility actions render under the stable
+        // host/surface key, so removing that key here would tombstone the
+        // cursor when a turn ends and make the next proxy generation unable
+        // to show it again.  The host owns whole-driver-session visibility;
+        // this hook only reclaims the short-lived generation state.
+        let cursor_ids = cursor_ids_for_proxy_generation_cleanup(session_id);
         if let Some(native) = native {
             native.session_config.clear(session_id);
-            for cursor_id in cursor_ids_for_lifecycle_session(session_id) {
+            for cursor_id in &cursor_ids {
                 native.cursor_registry.remove(&cursor_id);
             }
         }
-        let cursor_ids = cursor_ids_for_lifecycle_session(session_id);
         for cursor_id in &cursor_ids {
             crate::cursor::overlay::remove_cursor(cursor_id.clone());
         }
@@ -178,11 +184,22 @@ fn register_session_cleanup(state: &Arc<CompatState>) {
     });
 }
 
-/// Return the lifecycle cursor key and, for a managed Codex proxy generation,
-/// its stable host/surface key. Compatibility actions render under the latter;
-/// tearing down only the generation key leaves a visible overlay orphaned
-/// after a proxy EOF or crash.
-fn cursor_ids_for_lifecycle_session(session_id: &str) -> Vec<String> {
+/// Return only the cursor key owned by a short-lived Codex proxy generation.
+///
+/// Managed compatibility sessions carry a stable host key in the
+/// `...-mcp-...` prefix, but that key belongs to cmux's whole driver session,
+/// not to the proxy connection that is ending.  Keeping this distinction
+/// explicit prevents a normal proxy EOF from removing/tombstoning the cursor
+/// that a later generation must reuse.
+fn cursor_ids_for_proxy_generation_cleanup(session_id: &str) -> Vec<String> {
+    vec![session_id.to_owned()]
+}
+
+/// Return every cursor key that must be invalidated when the whole helper
+/// session is forcibly reset (for example, when macOS locks the login
+/// session). Compatibility actions render under the stable host/surface key,
+/// so that key is included alongside the current proxy generation key here.
+fn cursor_ids_for_session_lock_cleanup(session_id: &str) -> Vec<String> {
     let mut ids = vec![session_id.to_owned()];
     if let Some(marker) = session_id.rfind("-mcp-") {
         let host = &session_id[..marker];
@@ -563,7 +580,7 @@ impl CompatState {
         let mut removed = self.lock_removed_cursors.lock().unwrap();
         for (session_id, native) in native_sessions {
             native.session_config.clear(&session_id);
-            for cursor_id in cursor_ids_for_lifecycle_session(&session_id) {
+            for cursor_id in cursor_ids_for_session_lock_cleanup(&session_id) {
                 native.cursor_registry.remove(&cursor_id);
                 removed.insert(cursor_id);
             }
@@ -3364,8 +3381,8 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_cleanup_covers_the_stable_host_cursor_key() {
-        let ids = cursor_ids_for_lifecycle_session(
+    fn lock_cleanup_covers_the_stable_host_cursor_key() {
+        let ids = cursor_ids_for_session_lock_cleanup(
             "cmux-surface-A1B2C3-mcp-42-1000",
         );
         assert_eq!(
@@ -3376,7 +3393,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            cursor_ids_for_lifecycle_session("standalone-session"),
+            cursor_ids_for_session_lock_cleanup("standalone-session"),
             vec!["standalone-session".to_owned()]
         );
     }
