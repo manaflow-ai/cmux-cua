@@ -5,7 +5,11 @@
 //! where codex wrapper wants control over the cursor icon.
 
 use async_trait::async_trait;
-use cmux_cua_core::{protocol::ToolResult, tool::{Tool, ToolDef}};
+use cmux_cua_core::{
+    protocol::ToolResult,
+    tool::{Tool, ToolDef},
+    tool_args::ArgsExt,
+};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -23,6 +27,16 @@ pub(crate) const NO_CURSOR: &str = "";
 /// process session. Truly anonymous serve/CLI calls remain cursor-less.
 pub(crate) fn resolve_cursor_key(args: &Value) -> String {
     resolve_cursor_key_with_default(args, cmux_cua_core::embedded_default_session_id())
+}
+
+/// A daemon request can pass the resurrection gate and then be overtaken by
+/// proxy EOF before its async AX work reaches the cursor seam. Such a stale
+/// request may still finish its app operation, but it must not activate a
+/// stable host cursor for the completed generation.
+pub(crate) fn host_cursor_lifecycle_is_live(args: &Value) -> bool {
+    args.opt_str("session")
+        .map(|session| !cmux_cua_core::session::is_session_ended(&session))
+        .unwrap_or(true)
 }
 
 fn resolve_cursor_key_with_default(args: &Value, embedded_default: Option<&str>) -> String {
@@ -52,6 +66,23 @@ pub(crate) async fn animate_to_action_point(
     window_id: Option<u32>,
 ) {
     let cursor_key = resolve_cursor_key(args);
+    if args.opt_str(cmux_cua_core::HOST_SESSION_ARG).is_some()
+        && !host_cursor_lifecycle_is_live(args)
+    {
+        return;
+    }
+    if host_cursor_lifecycle_is_live(args) {
+        if let Some(host_session) = args.opt_str(cmux_cua_core::HOST_SESSION_ARG) {
+            if let Some(generation) = args.opt_str("session") {
+                crate::cursor::overlay::begin_reusable_cursor_generation(
+                    host_session,
+                    generation,
+                );
+            } else {
+                crate::cursor::overlay::activate_reusable_cursor(host_session);
+            }
+        }
+    }
     if let Some(wid) = window_id {
         crate::cursor::overlay::send_command(
             cursor_key.clone(),
@@ -129,18 +160,48 @@ impl Tool for SetAgentCursorEnabledTool {
         let enabled = match args.require_bool("enabled") { Ok(v) => v, Err(e) => return e };
         let key = resolve_cursor_key(&args);
         self.state.cursor_registry.set_enabled(&key, enabled);
-        // Drive the visual overlay for THIS session's cursor.
-        crate::cursor::overlay::send_command(
-            key.clone(),
-            cursor_overlay::OverlayCommand::SetEnabled(enabled),
-        );
-        // Keep the cmux host feed in lockstep with the in-process overlay.
-        // Re-enable restores the last owned position without waiting for
-        // another move; both paths are ownership-safe across sessions.
-        if enabled {
-            cmux_cua_core::cursor_feed::emit_visible_if_owned(&key);
+        // Hosted cmux sessions use an explicit reusable lifecycle. A stale
+        // generation may still have an in-flight `set_enabled=true`, so route
+        // host visibility through Activate/HideReusable rather than a generic
+        // render command that could resurrect a completed turn.
+        if let Some(host_session) = args.opt_str(cmux_cua_core::HOST_SESSION_ARG) {
+            if host_cursor_lifecycle_is_live(&args) {
+                if enabled {
+                    if let Some(generation) = args
+                        .opt_str("generation")
+                        .or_else(|| args.opt_str("session"))
+                    {
+                        crate::cursor::overlay::begin_reusable_cursor_generation(
+                            host_session,
+                            generation,
+                        );
+                    } else {
+                        crate::cursor::overlay::activate_reusable_cursor(host_session);
+                    }
+                } else {
+                    if let Some(generation) = args
+                        .opt_str("generation")
+                        .or_else(|| args.opt_str("session"))
+                    {
+                        crate::cursor::overlay::end_reusable_cursor_generation(
+                            host_session,
+                            &generation,
+                        );
+                    } else {
+                        crate::cursor::overlay::hide_reusable_cursor(host_session);
+                    }
+                }
+            }
         } else {
-            cmux_cua_core::cursor_feed::emit_hidden_if_owned(&key);
+            crate::cursor::overlay::send_command(
+                key.clone(),
+                cursor_overlay::OverlayCommand::SetEnabled(enabled),
+            );
+            if enabled {
+                cmux_cua_core::cursor_feed::emit_visible_if_owned(&key);
+            } else {
+                cmux_cua_core::cursor_feed::emit_hidden_if_owned(&key);
+            }
         }
         ToolResult::text(format!("Agent cursor '{}' {}.", key, if enabled { "enabled" } else { "disabled" }))
     }

@@ -22,8 +22,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 #[cfg(target_os = "linux")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 use cursor_overlay::ZOrderEnforcer;
@@ -131,6 +132,20 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
         OverlayMsg::Revive(key) => {
             if key != "default" {
                 map.ended.remove(&key);
+            }
+            None
+        }
+        OverlayMsg::HideReusable(key) => {
+            if let Some(cursor) = map.cursors.get_mut(&key) {
+                cursor.core.visible = false;
+            }
+            None
+        }
+        OverlayMsg::Activate(key) => {
+            if !map.ended.contains(&key) {
+                if let Some(cursor) = map.cursors.get_mut(&key) {
+                    cursor.core.visible = true;
+                }
             }
             None
         }

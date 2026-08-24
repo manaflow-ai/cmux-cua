@@ -586,6 +586,18 @@ pub fn register_all(registry: &mut ToolRegistry, compat: bool) {
             // cursor are a harmless no-op.
             cursor_registry.remove(session_id);
             crate::cursor::overlay::remove_cursor(session_id.to_owned());
+            // A managed cmux proxy generation owns only its short-lived
+            // lifecycle state. Its actions render under the stable host key,
+            // which must be hidden (not removed) so the next generation can
+            // reuse the same cursor without leaving a visible remnant.
+            if let Some(host_session) =
+                cmux_cua_core::host_session_id_from_proxy(session_id)
+            {
+                crate::cursor::overlay::end_reusable_cursor_generation(
+                    host_session.to_owned(),
+                    session_id,
+                );
+            }
             // Process-global cursor feed: hide only if the ending session still
             // owns the host-rendered cursor, so another active session remains
             // visible. No-op unless CMUX_CUA_STATE_DIR is set.

@@ -14,7 +14,7 @@
 //!   {"method":"application_surface_start","args":{...}}
 //!   {"method":"application_surface_stop","args":{"session":"..."}}
 //!   {"method":"application_surface_event","args":{...}}
-//!   {"method":"reassert_cursor","args":{"session":"...","window_id":123,"enabled":true}}
+//!   {"method":"reassert_cursor","args":{"session":"...","window_id":123}}
 //!
 //! Response shapes:
 //!   {"ok":true,"result":...}
@@ -2176,12 +2176,23 @@ pub async fn run_serve(
                                         .as_ref()
                                         .and_then(|args| args.get("enabled"))
                                         .and_then(serde_json::Value::as_bool);
+                                    let generation = req
+                                        .args
+                                        .as_ref()
+                                        .and_then(|args| args.get("generation"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|value| {
+                                            !value.is_empty() && value.len() <= 1_024
+                                        })
+                                        .map(str::to_owned);
                                     match (session, enabled) {
                                         (Some(session), Some(enabled)) => {
                                             platform_macos::cursor::overlay::
-                                                set_enabled_for_host_session(
+                                                set_enabled_for_host_session_generation(
                                                     session.to_owned(),
                                                     enabled,
+                                                    generation,
                                                 );
                                             DaemonResponse::ok(serde_json::json!({
                                                 "session": session,
@@ -2228,28 +2239,21 @@ pub async fn run_serve(
                                         .filter(|value| {
                                             *value > 0 && *value <= u64::from(u32::MAX)
                                         });
-                                    let enabled = req
-                                        .args
-                                        .as_ref()
-                                        .and_then(|args| args.get("enabled"))
-                                        .and_then(serde_json::Value::as_bool);
-                                    match (session, window_id, enabled) {
-                                        (Some(session), Some(window_id), Some(enabled)) => {
+                                    match (session, window_id) {
+                                        (Some(session), Some(window_id)) => {
                                             let reasserted =
                                                 platform_macos::cursor::overlay::reassert_for_host_session(
                                                     session.to_owned(),
                                                     window_id,
-                                                    enabled,
                                                 );
                                             DaemonResponse::ok(serde_json::json!({
                                                 "session": session,
                                                 "window_id": window_id,
-                                                "cursor_enabled": enabled,
                                                 "reasserted": reasserted,
                                             }))
                                         }
                                         _ => DaemonResponse::err(
-                                            "reassert_cursor requires a non-empty `session`, positive `window_id`, and boolean `enabled`",
+                                            "reassert_cursor requires a non-empty `session` and positive `window_id`",
                                             64,
                                         ),
                                     }
@@ -2570,6 +2574,15 @@ pub async fn run_serve(
                                     // session first; the new control declaration revives it
                                     // before accepting more calls.
                                     cmux_cua_core::session::revive_session(sid);
+                                    #[cfg(target_os = "macos")]
+                                    if let Some(host_session) =
+                                        cmux_cua_core::host_session_id_from_proxy(sid)
+                                    {
+                                        platform_macos::cursor::overlay::begin_reusable_cursor_generation(
+                                            host_session.to_owned(),
+                                            sid.to_owned(),
+                                        );
+                                    }
                                     control_session_id = Some(sid.to_owned());
                                     if approval_broker_requested
                                         && profile == DaemonProfile::CodexComputerUseCompat
@@ -3218,6 +3231,15 @@ pub async fn run_serve(
                                 // session in the post-loop block below. ACK ok.
                                 if let Some(sid) = req.session_id.as_deref() {
                                     cmux_cua_core::session::revive_session(sid);
+                                    #[cfg(target_os = "macos")]
+                                    if let Some(host_session) =
+                                        cmux_cua_core::host_session_id_from_proxy(sid)
+                                    {
+                                        platform_macos::cursor::overlay::begin_reusable_cursor_generation(
+                                            host_session.to_owned(),
+                                            sid.to_owned(),
+                                        );
+                                    }
                                     control_session_id = Some(sid.to_owned());
                                 }
                                 let resp = DaemonResponse::ok(

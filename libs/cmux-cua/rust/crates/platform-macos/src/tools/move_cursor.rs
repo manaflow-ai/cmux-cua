@@ -52,6 +52,23 @@ impl Tool for MoveCursorTool {
         let x = match args.require_f64("x") { Ok(v) => v, Err(e) => return e };
         let y = match args.require_f64("y") { Ok(v) => v, Err(e) => return e };
         let cursor_id = super::cursor_tools::resolve_cursor_key(&args);
+        if args.opt_str(cmux_cua_core::HOST_SESSION_ARG).is_some()
+            && !super::cursor_tools::host_cursor_lifecycle_is_live(&args)
+        {
+            return ToolResult::text(format!(
+                "Agent cursor '{cursor_id}' move ignored after its session ended."
+            ));
+        }
+        if let Some(host_session) = args.opt_str(cmux_cua_core::HOST_SESSION_ARG) {
+            if let Some(generation) = args.opt_str("session") {
+                crate::cursor::overlay::begin_reusable_cursor_generation(
+                    host_session,
+                    generation,
+                );
+            } else {
+                crate::cursor::overlay::activate_reusable_cursor(host_session);
+            }
+        }
 
         // Unlike click/scroll/drag, move_cursor has no target window id to pin
         // above. Re-anchor the overlay above WindowServer's real frontmost

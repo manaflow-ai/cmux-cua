@@ -194,6 +194,20 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
             }
             None
         }
+        OverlayMsg::HideReusable(key) => {
+            if let Some(cursor) = map.cursors.get_mut(&key) {
+                cursor.core.visible = false;
+            }
+            None
+        }
+        OverlayMsg::Activate(key) => {
+            if !map.ended.contains(&key) {
+                if let Some(cursor) = map.cursors.get_mut(&key) {
+                    cursor.core.visible = true;
+                }
+            }
+            None
+        }
         OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }) => {
             // Drop a command for an already-ended session WITHOUT get-or-create
             // — this is the resurrection guard. Without it, a ClickPulse/MoveTo

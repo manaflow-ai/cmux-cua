@@ -166,6 +166,14 @@ const MAX_PENDING_COMMANDS: usize = 4096;
 // Single-consumer slot; receiver is moved into run_on_main_thread().
 static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<OverlayMsg>>> = Mutex::new(None);
 static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
+/// Current proxy generation for each stable host cursor. Proxy EOF cleanup is
+/// conditional on this token, so an older generation cannot hide a cursor that
+/// a newer generation has already activated.
+static HOST_GENERATIONS: OnceLock<Mutex<HashMap<CursorKey, String>>> = OnceLock::new();
+
+fn host_generations() -> &'static Mutex<HashMap<CursorKey, String>> {
+    HOST_GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// The keyed, insertion-ordered collection of owned cursors that the render
 /// loop composites every frame. Insertion order = stable z-order (later keys
@@ -190,6 +198,10 @@ struct RenderMap {
     /// key when `start_session` intentionally reuses an id. "default" is never
     /// tombstoned.
     ended: std::collections::HashSet<CursorKey>,
+    /// Stable host cursors that are between tasks. A reusable-hidden cursor
+    /// keeps its position and palette, but ordinary action commands cannot make
+    /// it visible again; only an explicit `Activate` lifecycle event can do so.
+    hidden_reusable: std::collections::HashSet<CursorKey>,
 }
 
 /// Build the `RenderState` for a lazily-created cursor key: derive from the
@@ -217,6 +229,7 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
                 if map.last_active_key.as_deref() == Some(key.as_str()) {
                     map.last_active_key = None;
                 }
+                map.hidden_reusable.remove(&key);
                 if let Ok(mut guard) = ARRIVAL_TX.lock() {
                     if let Some(m) = guard.as_mut() {
                         m.remove(&key);
@@ -232,6 +245,38 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
         OverlayMsg::Revive(key) => {
             if key != "default" {
                 map.ended.remove(&key);
+                map.hidden_reusable.remove(&key);
+            }
+            None
+        }
+        OverlayMsg::HideReusable(key) => {
+            if key != "default"
+                && !map.ended.contains(&key)
+                && map.cursors.contains_key(&key)
+            {
+                map.hidden_reusable.insert(key.clone());
+                if let Some(cursor) = map.cursors.get_mut(&key) {
+                    cursor.core.visible = false;
+                    cursor.core.path = None;
+                    cursor.core.spring = None;
+                    cursor.core.spring_tgt = None;
+                    cursor.core.click_t = None;
+                    cursor.core.pressed = false;
+                }
+            }
+            None
+        }
+        OverlayMsg::Activate(key) => {
+            if key != "default"
+                && !map.ended.contains(&key)
+                && map.cursors.contains_key(&key)
+            {
+                map.hidden_reusable.remove(&key);
+                if let Some(cursor) = map.cursors.get_mut(&key) {
+                    cursor.core.visible = true;
+                    cursor.core.idle_secs = 0.0;
+                    cursor.core.idle_alpha = 1.0;
+                }
             }
             None
         }
@@ -242,6 +287,14 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
             if map.ended.contains(&key) {
                 return None;
             }
+            let reusable_hidden = map.hidden_reusable.contains(&key);
+            // A stale in-flight lifecycle command must not be able to revive a
+            // completed turn. Visibility is changed only by the explicit
+            // Activate/HideReusable messages; an ordinary SetEnabled(true)
+            // arriving while hidden is therefore ignored.
+            if reusable_hidden && matches!(&cmd, OverlayCommand::SetEnabled(true)) {
+                return None;
+            }
             let template = map.template.clone();
             let k = key.clone();
             let rs = map
@@ -249,6 +302,9 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
                 .entry(key)
                 .or_insert_with(|| render_state_for_key(&template, &k));
             rs.apply_command(cmd);
+            if reusable_hidden {
+                rs.core.visible = false;
+            }
             map.last_active_key = Some(k.clone());
             Some(k)
         }
@@ -271,6 +327,7 @@ pub fn init(cfg: CursorConfig) {
     PENDING_COMMANDS.store(0, std::sync::atomic::Ordering::Release);
     *CMD_RX_CELL.lock().unwrap() = Some(rx);
     *ARRIVAL_TX.lock().unwrap() = Some(HashMap::new());
+    host_generations().lock().unwrap().clear();
     let mut cursors = IndexMap::new();
     cursors.insert("default".to_owned(), RenderState::new(cfg.clone()));
     *RENDER.lock().unwrap() = Some(RenderMap {
@@ -280,6 +337,7 @@ pub fn init(cfg: CursorConfig) {
         win_h: 0.0,
         template: cfg,
         ended: std::collections::HashSet::new(),
+        hidden_reusable: std::collections::HashSet::new(),
     });
 }
 
@@ -371,23 +429,132 @@ pub fn send_command_default(cmd: OverlayCommand) {
 /// Applies the embedding host's cursor visibility choice without exposing a
 /// public MCP tool in narrow compatibility profiles.
 pub fn set_enabled_for_host_session(key: CursorKey, enabled: bool) {
-    if key.is_empty() {
-        return;
-    }
-    // A host may send visibility/reassertion requests to both protocol
-    // profiles, while only one profile has actually handled this session's
-    // first action. Do not lazily materialize a cursor for the inactive
-    // profile: that creates a second overlay (often retaining an old display
-    // coordinate) which can be mistaken for the cursor that is clicking.
-    if !cursor_is_materialized(&key) {
-        return;
-    }
-    let _ = send_command(key.clone(), OverlayCommand::SetEnabled(enabled));
     if enabled {
-        cmux_cua_core::cursor_feed::emit_visible_if_owned(&key);
+        activate_reusable_cursor(key);
     } else {
-        cmux_cua_core::cursor_feed::emit_hidden_if_owned(&key);
+        hide_reusable_cursor(key);
     }
+}
+
+/// Apply a host visibility transition scoped to one proxy generation. When a
+/// generation token is present, an older completion cannot hide a newer task;
+/// legacy callers without a token retain the idempotent unconditional behavior.
+pub fn set_enabled_for_host_session_generation(
+    key: CursorKey,
+    enabled: bool,
+    generation: Option<String>,
+) {
+    match generation {
+        Some(generation) if enabled => {
+            begin_reusable_cursor_generation(key, generation);
+        }
+        Some(generation) => {
+            end_reusable_cursor_generation(key, &generation);
+        }
+        None => set_enabled_for_host_session(key, enabled),
+    }
+}
+
+/// Mark a proxy generation as the current owner of a stable host cursor and
+/// activate the retained cursor if this helper profile has materialized it.
+pub fn begin_reusable_cursor_generation(host: CursorKey, generation: String) {
+    if host.is_empty() || host == "default" || generation.is_empty() {
+        return;
+    }
+    host_generations().lock().unwrap().insert(host.clone(), generation);
+    activate_reusable_cursor(host);
+}
+
+/// Hide a stable host cursor only if the ending proxy generation is still the
+/// current owner. A newer generation wins even when EOF cleanup arrives late.
+pub fn end_reusable_cursor_generation(host: CursorKey, generation: &str) {
+    if host.is_empty() || host == "default" || generation.is_empty() {
+        return;
+    }
+    let should_hide = {
+        let mut generations = host_generations().lock().unwrap();
+        if generations.get(&host).is_some_and(|current| current == generation) {
+            generations.remove(&host);
+            true
+        } else {
+            false
+        }
+    };
+    if should_hide {
+        hide_reusable_cursor(host);
+    }
+}
+
+/// Hide a materialized host cursor while retaining its position and palette for
+/// the next Computer Use task. The render map is updated synchronously before
+/// the ordered lifecycle message is queued, so an in-flight action cannot emit
+/// a visible feed state during the handoff.
+pub fn hide_reusable_cursor(key: CursorKey) {
+    if key.is_empty() || key == "default" {
+        return;
+    }
+    let materialized = {
+        let mut guard = match RENDER.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        let Some(map) = guard.as_mut() else { return };
+        if map.ended.contains(&key) || !map.cursors.contains_key(&key) {
+            false
+        } else {
+            map.hidden_reusable.insert(key.clone());
+            if let Some(cursor) = map.cursors.get_mut(&key) {
+                cursor.core.visible = false;
+                cursor.core.path = None;
+                cursor.core.spring = None;
+                cursor.core.spring_tgt = None;
+                cursor.core.click_t = None;
+                cursor.core.pressed = false;
+            }
+            true
+        }
+    };
+    if !materialized {
+        return;
+    }
+    if let Some(tx) = CMD_TX.get() {
+        let _ = tx.send(OverlayMsg::HideReusable(key.clone()));
+    }
+    cmux_cua_core::cursor_feed::emit_hidden_if_owned(&key);
+}
+
+/// Activate a previously retained host cursor for a new Computer Use task.
+/// This never lazily creates a cursor in a helper profile that has not handled
+/// an action yet; the first action remains the sole materialization point.
+pub fn activate_reusable_cursor(key: CursorKey) {
+    if key.is_empty() || key == "default" {
+        return;
+    }
+    let materialized = {
+        let mut guard = match RENDER.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        let Some(map) = guard.as_mut() else { return };
+        if map.ended.contains(&key) || !map.cursors.contains_key(&key) {
+            false
+        } else {
+            map.hidden_reusable.remove(&key);
+            if let Some(cursor) = map.cursors.get_mut(&key) {
+                cursor.core.visible = true;
+                cursor.core.idle_secs = 0.0;
+                cursor.core.idle_alpha = 1.0;
+            }
+            true
+        }
+    };
+    if !materialized {
+        return;
+    }
+    if let Some(tx) = CMD_TX.get() {
+        let _ = tx.send(OverlayMsg::Activate(key.clone()));
+    }
+    cmux_cua_core::cursor_feed::emit_visible_if_owned(&key);
 }
 
 /// Reassert a host-owned cursor's target-relative z-order without moving it.
@@ -395,12 +562,11 @@ pub fn set_enabled_for_host_session(key: CursorKey, enabled: bool) {
 /// Focus changes in the embedding app can reorder the helper window after the
 /// last Computer Use action.  The action path normally repairs that ordering
 /// with `PinAbove`, but a host menu transition has no action point to replay.
-/// Queue the pin and visibility commands together so the renderer restores the
-/// exact last cursor position in one host round-trip.
+/// Queue only the pin command. Visibility is an explicit lifecycle transition
+/// and must never be mutated by a focus-order repair.
 pub fn reassert_for_host_session(
     key: CursorKey,
     target_window_id: u64,
-    enabled: bool,
 ) -> bool {
     if key.is_empty() || target_window_id == 0 {
         return false;
@@ -411,17 +577,10 @@ pub fn reassert_for_host_session(
     if !cursor_is_materialized(&key) {
         return false;
     }
-    let pinned = send_command(
+    send_command(
         key.clone(),
         OverlayCommand::PinAbove(target_window_id),
-    );
-    let visibility = send_command(key.clone(), OverlayCommand::SetEnabled(enabled));
-    if enabled {
-        cmux_cua_core::cursor_feed::emit_visible_if_owned(&key);
-    } else {
-        cmux_cua_core::cursor_feed::emit_hidden_if_owned(&key);
-    }
-    pinned || visibility
+    )
 }
 
 fn cursor_is_materialized(key: &str) -> bool {
@@ -444,6 +603,7 @@ pub fn remove_cursor(key: CursorKey) {
     if key.is_empty() {
         return;
     }
+    host_generations().lock().unwrap().remove(&key);
     if let Some(tx) = CMD_TX.get() {
         let _ = tx.send(OverlayMsg::Remove(key));
     }
@@ -522,7 +682,7 @@ fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target
         .cursors
         .entry(key.clone())
         .or_insert_with(|| render_state_for_key(&template, &k));
-    if !(rs.core.cfg.enabled && rs.core.is_unplaced()) {
+    if !(rs.core.cfg.enabled && rs.core.visible && rs.core.is_unplaced()) {
         return false;
     }
     let mut sx = target_x - SEED_OFFSET;
@@ -573,6 +733,32 @@ pub async fn animate_cursor_for_action(
     y: f64,
     args: &serde_json::Value,
 ) {
+    let request_session_is_live = args
+        .get("session")
+        .and_then(serde_json::Value::as_str)
+        .map(|session| !cmux_cua_core::session::is_session_ended(session))
+        .unwrap_or(true);
+    if !request_session_is_live {
+        return;
+    }
+    if let Some(host_session) = args
+        .get(cmux_cua_core::HOST_SESSION_ARG)
+        .and_then(serde_json::Value::as_str)
+        .filter(|session| !session.is_empty())
+    {
+        if let Some(generation) = args
+            .get("session")
+            .and_then(serde_json::Value::as_str)
+            .filter(|session| !session.is_empty())
+        {
+            begin_reusable_cursor_generation(
+                host_session.to_owned(),
+                generation.to_owned(),
+            );
+        } else {
+            activate_reusable_cursor(host_session.to_owned());
+        }
+    }
     if args
         .get("_codex_compat_close_enough_cursor")
         .and_then(serde_json::Value::as_bool)
@@ -608,7 +794,7 @@ async fn animate_cursor_to_with_timing(
         guard
             .as_ref()
             .and_then(|m| m.cursors.get(&key))
-            .map(|rs| rs.core.cfg.enabled)
+            .map(|rs| rs.core.cfg.enabled && rs.core.visible)
             .unwrap_or(true)
     };
     if cursor_enabled && !cmux_cua_core::session::is_session_ended(&key) {
@@ -626,7 +812,7 @@ async fn animate_cursor_to_with_timing(
     let should_animate = {
         let guard = RENDER.lock().unwrap();
         match guard.as_ref().and_then(|m| m.cursors.get(&key)) {
-            Some(rs) if rs.core.cfg.enabled && !rs.core.is_unplaced() => true,
+            Some(rs) if rs.core.cfg.enabled && rs.core.visible && !rs.core.is_unplaced() => true,
             _ => false,
         }
     };
@@ -2334,6 +2520,7 @@ mod tests {
             win_h: 100.0,
             template: CursorConfig::default(),
             ended: std::collections::HashSet::new(),
+            hidden_reusable: std::collections::HashSet::new(),
         }
     }
 
@@ -2481,6 +2668,40 @@ mod tests {
         let resolved = apply_msg(&mut map, move_msg("sessA", 55.0, 66.0));
         assert_eq!(resolved.as_deref(), Some("sessA"));
         assert!(map.cursors.contains_key("sessA"));
+    }
+
+    #[test]
+    fn reusable_hide_blocks_stale_enable_until_explicit_activation() {
+        let mut map = empty_map();
+        apply_msg(&mut map, move_msg("host-session", 10.0, 10.0));
+        assert!(map.cursors["host-session"].core.visible);
+
+        apply_msg(
+            &mut map,
+            OverlayMsg::HideReusable("host-session".to_owned()),
+        );
+        assert!(map.hidden_reusable.contains("host-session"));
+        assert!(!map.cursors["host-session"].core.visible);
+
+        // A delayed host/set-enabled request from the completed turn cannot
+        // resurrect the overlay while it is in the reusable-hidden phase.
+        apply_msg(
+            &mut map,
+            OverlayMsg::Cmd(KeyedOverlayCommand {
+                key: "host-session".to_owned(),
+                cmd: OverlayCommand::SetEnabled(true),
+            }),
+        );
+        assert!(!map.cursors["host-session"].core.visible);
+
+        // The next task has an explicit lifecycle activation before its first
+        // action, which makes the retained cursor visible at its last position.
+        apply_msg(
+            &mut map,
+            OverlayMsg::Activate("host-session".to_owned()),
+        );
+        assert!(!map.hidden_reusable.contains("host-session"));
+        assert!(map.cursors["host-session"].core.visible);
     }
 
     #[tokio::test]

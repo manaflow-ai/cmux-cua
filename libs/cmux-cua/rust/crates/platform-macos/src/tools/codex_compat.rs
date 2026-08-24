@@ -176,6 +176,14 @@ fn register_session_cleanup(state: &Arc<CompatState>) {
         for cursor_id in &cursor_ids {
             crate::cursor::overlay::remove_cursor(cursor_id.clone());
         }
+        if let Some(host_session) =
+            cmux_cua_core::host_session_id_from_proxy(session_id)
+        {
+            crate::cursor::overlay::end_reusable_cursor_generation(
+                host_session.to_owned(),
+                session_id,
+            );
+        }
         let mut removed = lock_removed_cursors.lock().unwrap();
         for cursor_id in cursor_ids {
             removed.remove(&cursor_id);
@@ -922,6 +930,18 @@ impl CompatState {
             },
         );
         let cursor_key = compat_cursor_key(compat_args);
+        if !cmux_cua_core::session::is_session_ended(session) {
+            if let Some(host_session) = compat_args
+                .get(cmux_cua_core::HOST_SESSION_ARG)
+                .and_then(Value::as_str)
+                .filter(|session| !session.is_empty())
+            {
+                crate::cursor::overlay::begin_reusable_cursor_generation(
+                    host_session.to_owned(),
+                    session.to_owned(),
+                );
+            }
+        }
         let revived_cursor = self.revive_cursor_after_fresh_state(&cursor_key);
         if let Err(error) = self.validate_lock_epoch(lock_epoch) {
             return error.into_result();

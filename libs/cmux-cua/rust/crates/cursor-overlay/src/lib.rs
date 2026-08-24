@@ -429,6 +429,12 @@ pub struct KeyedOverlayCommand {
 pub enum OverlayMsg {
     Cmd(KeyedOverlayCommand),
     Remove(CursorKey),
+    /// Hide a live cursor while retaining its position/configuration for the
+    /// next task on the same stable host session.
+    HideReusable(CursorKey),
+    /// Activate a retained cursor for a new task. This is the only lifecycle
+    /// event that may make a reusable-hidden cursor visible again.
+    Activate(CursorKey),
     /// An explicit `start_session` reused an ended id. Clear only that id's
     /// resurrection tombstone so commands after the revive are accepted while
     /// commands queued between `Remove` and `Revive` remain rejected.
