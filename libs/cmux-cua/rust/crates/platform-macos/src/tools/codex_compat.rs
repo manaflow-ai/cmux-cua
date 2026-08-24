@@ -3381,6 +3381,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proxy_generation_cleanup_preserves_stable_host_cursor_for_next_generation() {
+        let host = "cmux-surface-A1B2C3";
+        let first_generation = "cmux-surface-A1B2C3-mcp-42-1000";
+        let second_generation = "cmux-surface-A1B2C3-mcp-84-2000";
+
+        // The compatibility cursor is keyed by the host surface, while the
+        // daemon lifecycle hook receives one short-lived proxy generation at
+        // EOF. Reaping the first generation must leave the host cursor alive
+        // so the next generation can reuse it without a tombstone.
+        let mut remaining = HashSet::from([host.to_owned()]);
+        for cursor_id in cursor_ids_for_proxy_generation_cleanup(first_generation) {
+            remaining.remove(&cursor_id);
+        }
+        assert!(remaining.contains(host));
+
+        // A later generation has the same stable host key and must have the
+        // same property when its own connection ends.
+        for cursor_id in cursor_ids_for_proxy_generation_cleanup(second_generation) {
+            remaining.remove(&cursor_id);
+        }
+        assert!(remaining.contains(host));
+    }
+
     #[tokio::test]
     async fn action_without_app_snapshot_fails_closed() {
         let state = CompatState::new();
