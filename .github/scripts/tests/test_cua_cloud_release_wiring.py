@@ -16,7 +16,7 @@ class TestCuaCloudReleaseWiring(unittest.TestCase):
     def test_release_on_merge_tracks_cua_cloud(self) -> None:
         workflow = self.read(".github/workflows/release-on-merge.yml")
 
-        self.assertIn('["libs/python/cua-cloud/"]="pypi/cloud"', workflow)
+        self.assertIn("['libs/python/cua-cloud/', 'pypi/cloud']", workflow)
 
     def test_release_bump_version_supports_cua_cloud(self) -> None:
         workflow = self.read(".github/workflows/release-bump-version.yml")
