@@ -28,6 +28,7 @@ jobs:
     # check against the live GitHub API before any artifact is downloaded.
     if: >-
       github.event_name == 'workflow_run' &&
+      github.ref == 'refs/heads/main' &&
       github.event.workflow_run.workflow_id == 311952875 &&
       github.event.workflow_run.name == 'CD: Cua Driver (cross-platform)' &&
       github.event.workflow_run.event == 'push' &&

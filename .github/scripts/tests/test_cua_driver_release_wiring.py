@@ -18,6 +18,7 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
 
         self.assertIn("workflow_run:", workflow)
         self.assertNotIn("workflow_dispatch:", workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
         self.assertIn('workflows: ["CD: Cua Driver (cross-platform)"]', workflow)
         self.assertIn("workflow_id == 311952875", workflow)
         self.assertIn("github.event.workflow_run.conclusion == 'success'", workflow)
