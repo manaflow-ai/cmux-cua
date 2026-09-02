@@ -54,6 +54,7 @@ jobs:
           # mutable branch that could change during a release run.
           ref: ${{ github.sha }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Use Node.js 24.x
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -158,40 +159,29 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  publish:
+  publish-oidc:
     needs: build
+    if: inputs.allow_legacy_token == false && needs.build.outputs.should_publish == 'true'
     permissions:
       actions: read
       id-token: write
     runs-on: ubuntu-latest
-    outputs:
-      should_publish: ${{ needs.build.outputs.should_publish }}
     steps:
       - name: Use Node.js 24.x
-        if: needs.build.outputs.should_publish == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24.x"
           package-manager-cache: false
+
       - name: Download package artifact
-        if: needs.build.outputs.should_publish == 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: npm-${{ inputs.package_name }}
           path: npm-dist
 
       - name: Publish with npm trusted publishing
-        if: needs.build.outputs.should_publish == 'true' && inputs.allow_legacy_token == false
         working-directory: npm-dist
         run: npm publish ./*.tgz --access public --provenance --ignore-scripts
-
-      - name: Skip legacy fallback job
-        if: inputs.allow_legacy_token == true
-        run: echo "Legacy token fallback is delegated to the protected environment job."
-
-      - name: Skip unchanged package
-        if: needs.build.outputs.should_publish != 'true'
-        run: echo "Package version is unchanged; nothing to publish."
 
   publish-legacy-token:
     needs: build
