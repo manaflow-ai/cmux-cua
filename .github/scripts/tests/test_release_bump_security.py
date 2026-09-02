@@ -60,10 +60,16 @@ class TestReleaseBumpRequestValidator(unittest.TestCase):
         }
 
     @staticmethod
-    def responses(values: dict[str, str], request_size: int = 128) -> dict[str, dict[str, Any]]:
+    def responses(
+        values: dict[str, str],
+        request_size: int = 128,
+        main_commit: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
         base = "/repos/manaflow-ai/cmux-cua"
         run_id = values["SOURCE_RUN_ID"]
-        return {
+        source_commit = values["SOURCE_SHA"]
+        main_commit = main_commit or source_commit
+        responses = {
             f"{base}/actions/runs/{run_id}": {
                 "id": int(run_id),
                 "workflow_id": int(values["SOURCE_WORKFLOW_ID"]),
@@ -79,7 +85,7 @@ class TestReleaseBumpRequestValidator(unittest.TestCase):
                 "head_repository": {"full_name": values["EXPECTED_REPOSITORY"]},
             },
             f"{base}/git/ref/heads/main": {
-                "object": {"type": "commit", "sha": values["SOURCE_SHA"]}
+                "object": {"type": "commit", "sha": main_commit}
             },
             f"{base}/actions/runs/{run_id}/artifacts?per_page=100": {
                 "artifacts": [
@@ -93,6 +99,13 @@ class TestReleaseBumpRequestValidator(unittest.TestCase):
                 ]
             },
         }
+        comparison_status = "identical" if source_commit == main_commit else "behind"
+        responses[f"{base}/compare/{main_commit}...{source_commit}"] = {
+            "status": comparison_status,
+            "ahead_by": 0,
+            "behind_by": 0 if comparison_status == "identical" else 3,
+        }
+        return responses
 
     @staticmethod
     def request_file(
@@ -119,6 +132,7 @@ class TestReleaseBumpRequestValidator(unittest.TestCase):
         self.assertEqual(result["service"], "lume")
         self.assertEqual(result["bump_type"], "patch")
         self.assertEqual(result["commit"], values["SOURCE_SHA"])
+        self.assertEqual(result["source_commit"], values["SOURCE_SHA"])
 
     def test_rejects_feature_branch_or_invalid_request(self) -> None:
         validator = self.validator()
@@ -149,6 +163,34 @@ class TestReleaseBumpRequestValidator(unittest.TestCase):
                 Path(request_dir.name) / "request.json",
             )
 
+    def test_accepts_older_main_request_and_rejects_non_ancestor(self) -> None:
+        validator = self.validator()
+        source_commit = "a" * 40
+        current_main = "b" * 40
+        values = self.values(source_commit)
+        values["TRUSTED_SHA"] = current_main
+        request_dir = self.request_file()
+        self.addCleanup(request_dir.cleanup)
+        result = validator.validate(
+            FakeApi(self.responses(values, main_commit=current_main)),
+            values,
+            Path(request_dir.name) / "request.json",
+        )
+        self.assertEqual(result["commit"], current_main)
+
+        non_ancestor = self.responses(values, main_commit=current_main)
+        non_ancestor[f"/repos/manaflow-ai/cmux-cua/compare/{current_main}...{source_commit}"] = {
+            "status": "ahead",
+            "ahead_by": 1,
+            "behind_by": 0,
+        }
+        with self.assertRaises(validator.ValidationError):
+            validator.validate(
+                FakeApi(non_ancestor),
+                values,
+                Path(request_dir.name) / "request.json",
+            )
+
 
 class TestReleaseBumpWorkflowContracts(unittest.TestCase):
     @staticmethod
@@ -172,6 +214,8 @@ class TestReleaseBumpWorkflowContracts(unittest.TestCase):
         self.assertIn("validate_release_bump_request.py", workflow)
         self.assertIn("environment: release-bump", workflow)
         self.assertIn("ref: ${{ needs.validate-request.outputs.commit }}", workflow)
+        self.assertIn("group: release-bump-service-${{ needs.validate-request.outputs.service }}", workflow)
+        self.assertIn("git merge-base --is-ancestor \"$REQUEST_COMMIT\" origin/main", workflow)
 
     def test_auto_release_dispatches_request_then_waits_for_consumer(self) -> None:
         workflow = self.read(".github/workflows/release-on-merge.yml")

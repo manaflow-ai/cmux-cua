@@ -222,6 +222,26 @@ def _validate_artifact(api: Api, repository: str, run_id: int, source_sha: str) 
     same(artifact_run.get("head_sha"), source_sha, "request artifact head SHA")
 
 
+def _require_ancestor(
+    api: Api, repository: str, base: str, candidate: str, name: str
+) -> None:
+    """Require ``candidate`` to be reachable from ``base`` without rewriting refs."""
+
+    comparison = api.get(repository_path(repository, f"/compare/{base}...{candidate}"))
+    status = comparison.get("status")
+    ahead_by = comparison.get("ahead_by")
+    if (
+        status not in {"behind", "identical"}
+        or isinstance(ahead_by, bool)
+        or not isinstance(ahead_by, int)
+        or ahead_by != 0
+    ):
+        raise ValidationError(
+            f"{name} {candidate} is not an ancestor of main {base} "
+            f"(status={status!r}, ahead_by={ahead_by!r})"
+        )
+
+
 def _read_request(path: Path) -> dict[str, str]:
     if path.is_symlink() or not path.is_file():
         raise ValidationError("request artifact path is not a regular file")
@@ -265,13 +285,14 @@ def validate(api: Api, values: Mapping[str, str], request_path: Path) -> dict[st
         raise ValidationError("main ref has no object")
     same(main_object.get("type"), "commit", "main object type")
     main_sha = full_sha(main_object.get("sha"), "main commit SHA")
-    same(source_sha, main_sha, "request source and current main commit")
     same(trusted_sha, main_sha, "trusted consumer and current main commit")
+    _require_ancestor(api, repository, main_sha, source_sha, "request source")
 
     request = _read_request(request_path)
     return {
         **request,
         "commit": main_sha,
+        "source_commit": source_sha,
         "source_run_id": str(run_id),
     }
 
@@ -280,7 +301,7 @@ def write_outputs(values: Mapping[str, str], output_path: str) -> None:
     if not output_path:
         return
     with Path(output_path).open("a", encoding="utf-8") as output:
-        for key in ("service", "bump_type", "commit", "source_run_id"):
+        for key in ("service", "bump_type", "commit", "source_commit", "source_run_id"):
             output.write(f"{key}={values[key]}\n")
 
 
