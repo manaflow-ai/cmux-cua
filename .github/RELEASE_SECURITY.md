@@ -43,7 +43,9 @@ release, documentation, and cua-driver publish or write job has a job-level
 permissions, and executes the protected-main `validate_publisher_repository.py`
 gate immediately before the credentialed operation. The gate has no
 caller-controlled repository input. The fork is intentionally skipped until
-the migration is complete.
+the migration is complete. The observer provenance validators use the same
+canonical repository constant, so a fork run cannot become a valid source for
+a canonical publish.
 
 GitHub resolves a `workflow_run` consumer from the default branch. Release tags
 first run the credential-free `Release tag request` observer. Consumers then

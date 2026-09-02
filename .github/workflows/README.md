@@ -27,6 +27,8 @@ Every credentialed publisher also runs the protected-main
 other forks. This ownership check is separate from source SHA and release-tag
 provenance. Do not replace it with a workflow input. Migrate package metadata
 and the registry Trusted Publisher record together before changing the gate.
+The protected source-provenance validators use the same canonical repository,
+so a fork event cannot authorize a canonical publish.
 
 Credentialed jobs also have a job-level `github.repository == 'trycua/cua'`
 condition. GitHub evaluates this condition before granting the job's

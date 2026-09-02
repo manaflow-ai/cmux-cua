@@ -26,7 +26,7 @@ from validate_release_request import (
 )
 
 
-EXPECTED_REPOSITORY = "manaflow-ai/cmux-cua"
+EXPECTED_REPOSITORY = "trycua/cua"
 OBSERVER_WORKFLOW_NAME = "Docs MCP Server publish request"
 OBSERVER_WORKFLOW_PATH = ".github/workflows/docs-mcp-server-publish-request.yml"
 

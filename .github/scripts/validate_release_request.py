@@ -20,7 +20,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
-EXPECTED_REPOSITORY = "manaflow-ai/cmux-cua"
+EXPECTED_REPOSITORY = "trycua/cua"
 OBSERVER_WORKFLOW_NAME = "Release tag request"
 OBSERVER_WORKFLOW_PATH = ".github/workflows/release-tag-request.yml"
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
