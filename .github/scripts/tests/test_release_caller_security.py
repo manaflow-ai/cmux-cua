@@ -232,6 +232,15 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
             self.assertIn("skip_arm64: true", manual, filename)
             self.assertIn("skip_arm64: true", publish, filename)
 
+    def test_ci_container_arm64_gaps_are_explicit(self) -> None:
+        for filename in (
+            "ci-container-cuabot.yml",
+            "ci-container-kasm.yml",
+            "ci-container-xfce.yml",
+        ):
+            source = text(WORKFLOWS / filename)
+            self.assertIn("skip_arm64: true", source, filename)
+
     def test_manual_build_paths_have_no_credentials(self) -> None:
         for path in PY_CALLERS + TS_CALLERS + CONTAINER_CALLERS:
             source = text(path)

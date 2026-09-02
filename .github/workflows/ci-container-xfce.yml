@@ -13,3 +13,6 @@ jobs:
     with:
       image_name: cua-xfce
       context_dir: libs/xfce
+      # kicad/kicad:9.0 has no arm64 manifest. Keep CI aligned with the
+      # release caller until the upstream image publishes one.
+      skip_arm64: true

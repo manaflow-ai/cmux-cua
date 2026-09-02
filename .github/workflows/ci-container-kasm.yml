@@ -13,3 +13,6 @@ jobs:
     with:
       image_name: cua-ubuntu
       context_dir: libs/kasm
+      # The Firefox setup is not stable on the arm64 emulation runner. Keep
+      # CI on the supported amd64 base image until the image is fixed.
+      skip_arm64: true

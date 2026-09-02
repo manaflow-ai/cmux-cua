@@ -14,3 +14,6 @@ jobs:
     with:
       image_name: cuabot
       context_dir: libs/cuabot
+      # The current xpra package available to this image is not supported on
+      # arm64. Keep CI aligned with the release caller until upstream adds it.
+      skip_arm64: true
