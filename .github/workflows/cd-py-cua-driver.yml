@@ -1,7 +1,10 @@
 name: "CD: Python cua-driver"
 
-# Triggered after cua-driver-rs releases to build platform-specific wheels
-# with bundled binaries and publish to PyPI.
+# Build the Python wrapper only from a verified cua-driver-rs release.  The
+# workflow_run event starts a new, privileged workflow, so every value from the
+# event is treated as untrusted until verify_cua_driver_release.py binds it to
+# a successful source run, an immutable tag, a release, and that run's
+# artifacts.
 
 on:
   workflow_dispatch:
@@ -10,73 +13,71 @@ on:
         description: "cua-driver-rs version to package (without v prefix)"
         required: false
         default: ""
-  # Auto-trigger when cua-driver-rs releases (after CD workflow completes)
-  workflow_run:
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- live provenance validation below
     workflows: ["CD: Cua Driver (cross-platform)"]
-    types:
-      - completed
+    types: [completed]
 
 permissions:
   contents: read
+  actions: read
+
+concurrency:
+  # Serialize retries for one source run.  A rerun remains eligible, but two
+  # publishers cannot race to upload the same distribution set.
+  group: cua-driver-pypi-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
-  # Extract version from the triggering workflow or input
-  get-version:
-    runs-on: ubuntu-latest
-    if: |
+  validate-provenance:
+    name: Validate source release provenance
+    runs-on: ubuntu-24.04
+    # This expression is only an early filter.  The validator repeats every
+    # check against the live GitHub API before any artifact is downloaded.
+    if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion != 'cancelled'
+      (github.event.workflow_run.workflow_id == 311952875 &&
+       github.event.workflow_run.name == 'CD: Cua Driver (cross-platform)' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.status == 'completed' &&
+       github.event.workflow_run.conclusion == 'success')
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      should_publish: ${{ steps.version.outputs.should_publish }}
+      provenance: ${{ steps.validate.outputs.provenance }}
+      source_run_id: ${{ steps.validate.outputs.source_run_id }}
+      source_head_sha: ${{ steps.validate.outputs.source_head_sha }}
+      version: ${{ steps.validate.outputs.version }}
+      tag: ${{ steps.validate.outputs.tag }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # This checkout is the trusted publisher code from the default branch.
+      # The source release is checked out separately, after its SHA is proven.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Determine version
-        id: version
+      - name: Validate workflow, tag, release, and artifact provenance
+        id: validate
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
-            if [ -z "$VERSION" ]; then
-              VERSION=$(sed -n -E 's/^version = "([^"]+)"/\1/p' libs/cua-driver/rust/Cargo.toml | head -1)
-            fi
-            SHOULD_PUBLISH="true"
-          else
-            # Extract from the tag that triggered the workflow_run
-            # Validate SHA format to prevent injection
-            HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
-            if ! echo "$HEAD_SHA" | grep -qE '^[0-9a-f]{40}$'; then
-              echo "Invalid SHA format: $HEAD_SHA"
-              VERSION="0.0.0"
-              SHOULD_PUBLISH="false"
-            else
-              git fetch --tags
-              TAG=$(git tag --points-at "$HEAD_SHA" | grep '^cua-driver-rs-v' | head -1 || echo "")
-              if [ -n "$TAG" ]; then
-                VERSION="${TAG#cua-driver-rs-v}"
-                if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-                  SHOULD_PUBLISH="true"
-                else
-                  echo "GitHub Release $TAG is not available; skipping PyPI publish."
-                  SHOULD_PUBLISH="false"
-                fi
-              else
-                # No matching tag, skip
-                VERSION="0.0.0"
-                SHOULD_PUBLISH="false"
-              fi
-            fi
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "should_publish=$SHOULD_PUBLISH" >> "$GITHUB_OUTPUT"
-          echo "Detected version: $VERSION (publish: $SHOULD_PUBLISH)"
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_REF: ${{ github.ref }}
+          MANUAL_VERSION: ${{ inputs.version }}
+          DEFAULT_VERSION_FILE: libs/cua-driver/rust/Cargo.toml
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          WORKFLOW_RUN_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
+          WORKFLOW_RUN_STATUS: ${{ github.event.workflow_run.status }}
+          WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: python3 .github/scripts/verify_cua_driver_release.py
 
-  # Build wheels for each platform (with bundled binaries)
   build-wheels:
-    needs: get-version
-    if: needs.get-version.outputs.should_publish == 'true'
+    name: Build ${{ matrix.platform }}-${{ matrix.arch }} wheel
+    needs: validate-provenance
+    if: needs.validate-provenance.result == 'success'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -85,87 +86,257 @@ jobs:
           - os: macos-latest
             platform: macos
             arch: universal
+            provenance_key: darwin-universal
+            archive_suffix: darwin-universal-binary.tar.gz
+            wheel_tag: py3-none-macosx_11_0_universal2
+            python_host_platform: ""
           - os: ubuntu-latest
             platform: linux
             arch: x86_64
+            provenance_key: linux-x86_64
+            archive_suffix: linux-x86_64-binary.tar.gz
+            wheel_tag: py3-none-manylinux_2_31_x86_64
+            python_host_platform: ""
           - os: ubuntu-24.04-arm
             platform: linux
             arch: arm64
+            provenance_key: linux-arm64
+            archive_suffix: linux-arm64-binary.tar.gz
+            wheel_tag: py3-none-manylinux_2_31_aarch64
+            python_host_platform: ""
           - os: windows-latest
             platform: windows
             arch: x86_64
+            provenance_key: windows-x86_64
+            archive_suffix: windows-x86_64-binary.zip
+            wheel_tag: py3-none-win_amd64
+            python_host_platform: win-amd64
           - os: windows-latest
             platform: windows
             arch: arm64
+            provenance_key: windows-arm64
+            archive_suffix: windows-arm64-binary.zip
+            wheel_tag: py3-none-win_arm64
+            python_host_platform: win-arm64
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
-      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+      - uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v6.0.0
         with:
           python-version: "3.12"
 
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build hatchling
-
-      - name: Update version in pyproject.toml and __init__.py
+      - name: Install wheel build tools
         shell: bash
         run: |
-          VERSION="${{ needs.get-version.outputs.version }}"
-          cd libs/cua-driver/python
-          # Portable sed: use temp file approach for all platforms
-          sed "s/^version = .*/version = \"$VERSION\"/" pyproject.toml > pyproject.toml.tmp
-          mv pyproject.toml.tmp pyproject.toml
-          sed "s/^__version__ = .*/__version__ = \"$VERSION\"/" src/cua_driver/__init__.py > __init__.py.tmp
-          mv __init__.py.tmp src/cua_driver/__init__.py
-          echo "Updated versions:"
-          grep "^version = " pyproject.toml
-          grep "^__version__ = " src/cua_driver/__init__.py
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-input \
+            --require-hashes -r .github/scripts/cua-driver-build-requirements.txt
 
-      - name: Build wheel with bundled binary
+      - name: Select the validated source artifact ID
+        id: source-artifact
+        env:
+          PROVENANCE_JSON: ${{ needs.validate-provenance.outputs.provenance }}
+          PROVENANCE_KEY: ${{ matrix.provenance_key }}
         shell: bash
         run: |
-          cd libs/cua-driver/python
-          python build_wheel.py --version "${{ needs.get-version.outputs.version }}" --arch "${{ matrix.arch }}"
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(os.environ["PROVENANCE_JSON"])
+          artifact = manifest["artifacts"][os.environ["PROVENANCE_KEY"]]
+          artifact_id = artifact["id"]
+          if not isinstance(artifact_id, int) or artifact_id <= 0:
+              raise SystemExit("validated source artifact ID is invalid")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"id={artifact_id}\n")
+          PY
+
+      - name: Download the exact source-run artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ steps.source-artifact.outputs.id }}
+          path: source-artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.validate-provenance.outputs.source_run_id }}
+
+      - name: Check out the exact source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          ref: ${{ needs.validate-provenance.outputs.source_head_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source checkout and extract the release binary
+        env:
+          PROVENANCE_JSON: ${{ needs.validate-provenance.outputs.provenance }}
+          PROVENANCE_KEY: ${{ matrix.provenance_key }}
+          VERSION: ${{ needs.validate-provenance.outputs.version }}
+          ARCHIVE_SUFFIX: ${{ matrix.archive_suffix }}
+          PLATFORM_KEY: ${{ matrix.provenance_key }}
+          SOURCE_HEAD_SHA: ${{ needs.validate-provenance.outputs.source_head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_HEAD_SHA"
+          printf '%s' "$PROVENANCE_JSON" > "$RUNNER_TEMP/cua-driver-provenance.json"
+          python .github/scripts/prepare_cua_driver_binary.py \
+            --artifact-dir source-artifact \
+            --archive-name "cua-driver-rs-${VERSION}-${ARCHIVE_SUFFIX}" \
+            --platform "$PLATFORM_KEY" \
+            --provenance "$RUNNER_TEMP/cua-driver-provenance.json" \
+            --destination source/libs/cua-driver/python/src/cua_driver/bin
+
+      - name: Set the package version
+        working-directory: source
+        env:
+          VERSION: ${{ needs.validate-provenance.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          replacements = {
+              Path("libs/cua-driver/python/pyproject.toml"): (
+                  'version = "',
+                  'version = "' + version + '"',
+              ),
+              Path("libs/cua-driver/python/src/cua_driver/__init__.py"): (
+                  "__version__ = ",
+                  '__version__ = "' + version + '"',
+              ),
+          }
+          for path, (prefix, replacement) in replacements.items():
+              lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+              matches = [index for index, line in enumerate(lines) if line.startswith(prefix)]
+              if len(matches) != 1:
+                  raise SystemExit(f"expected one version line in {path}")
+              index = matches[0]
+              newline = "\n" if lines[index].endswith("\n") else ""
+              lines[index] = replacement + newline
+              path.write_text("".join(lines), encoding="utf-8")
+          PY
+
+      - name: Build wheel with the verified binary
+        working-directory: source/libs/cua-driver/python
+        env:
+          CUA_DRIVER_WHEEL_TAG: ${{ matrix.wheel_tag }}
+          PYTHON_HOST_PLATFORM: ${{ matrix.python_host_platform }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            test -f src/cua_driver/bin/cua-driver.exe
+          else
+            test -f src/cua_driver/bin/cua-driver
+          fi
+          if [[ -n "${PYTHON_HOST_PLATFORM:-}" ]]; then
+            export _PYTHON_HOST_PLATFORM="$PYTHON_HOST_PLATFORM"
+          fi
+          # Use the hash-locked host toolchain.  Isolated PEP 517 builds would
+          # download an unpinned hatchling from pyproject.toml again.
+          python -m build --wheel --no-isolation
 
       - name: List built artifacts
+        working-directory: source
         shell: bash
-        run: |
-          ls -lh libs/cua-driver/python/dist/
+        run: ls -lh libs/cua-driver/python/dist/
 
-      - uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b # v4.5.0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheel-${{ matrix.platform }}-${{ matrix.arch }}
-          path: libs/cua-driver/python/dist/*.whl
+          path: source/libs/cua-driver/python/dist/*.whl
           if-no-files-found: error
 
-  # Publish all wheels to PyPI
   publish-pypi:
-    needs: [get-version, build-wheels]
-    runs-on: ubuntu-latest
+    name: Publish verified wheels to PyPI
+    needs: [validate-provenance, build-wheels]
+    if: needs.validate-provenance.result == 'success' && needs.build-wheels.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: pypi
     permissions:
       contents: read
+      actions: read
+      id-token: write
     steps:
-      - name: Download all wheels
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+      - name: Download wheels from this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: wheel-*
           path: dist
           merge-multiple: true
 
-      - name: List wheels to publish
-        run: |
-          ls -lh dist/
-
-      - name: Install twine
-        run: |
-          python -m pip install --upgrade pip
-          pip install twine
-
-      - name: Publish to PyPI
+      - name: Verify the complete wheel set
         env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+          VERSION: ${{ needs.validate-provenance.outputs.version }}
         run: |
-          python -m twine upload --skip-existing --verbose dist/*
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import zipfile
+          from pathlib import Path
+
+          wheels = sorted(Path("dist").glob("*.whl"))
+          if len(wheels) != 5:
+              raise SystemExit(f"expected five wheels, found {len(wheels)}")
+          expected_version = os.environ["VERSION"]
+          seen_platforms = set()
+          platform_tokens = {
+              "macosx_": "macos",
+              "manylinux_2_31_x86_64": "linux-x86_64",
+              "manylinux_2_31_aarch64": "linux-arm64",
+              "win_amd64": "windows-x86_64",
+              "win_arm64": "windows-arm64",
+          }
+          for wheel in wheels:
+              if not wheel.name.startswith("cua_driver-"):
+                  raise SystemExit(f"unexpected wheel name: {wheel.name}")
+              with zipfile.ZipFile(wheel) as archive:
+                  metadata_names = [
+                      name for name in archive.namelist()
+                      if name.endswith(".dist-info/METADATA")
+                  ]
+                  if len(metadata_names) != 1:
+                      raise SystemExit(f"{wheel.name} has invalid metadata layout")
+                  metadata = archive.read(metadata_names[0]).decode("utf-8")
+              fields = dict(
+                  line.split(": ", 1)
+                  for line in metadata.splitlines()
+                  if ": " in line and line.split(": ", 1)[0] in {"Name", "Version"}
+              )
+              if fields.get("Name") != "cua-driver":
+                  raise SystemExit(f"{wheel.name} has unexpected package name")
+              if fields.get("Version") not in {expected_version, expected_version.replace("-", ".")}:
+                  raise SystemExit(f"{wheel.name} has unexpected package version")
+              matches = [
+                  value for token, value in platform_tokens.items() if token in wheel.name
+              ]
+              if len(matches) != 1 or matches[0] in seen_platforms:
+                  raise SystemExit(f"{wheel.name} has an unexpected platform tag")
+              seen_platforms.add(matches[0])
+          if seen_platforms != set(platform_tokens.values()):
+              raise SystemExit(f"wheel platform set is incomplete: {seen_platforms}")
+          PY
+
+      # PyPI Trusted Publishing exchanges this job's short-lived GitHub OIDC
+      # identity for a short-lived upload token.  No repository secret or
+      # other long-lived credential is available to the runner.
+      - name: Publish with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist
+          verify-metadata: true
+          skip-existing: true
+          print-hash: true
+          attestations: true

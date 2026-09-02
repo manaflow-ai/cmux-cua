@@ -17,9 +17,41 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
         workflow = self.read(".github/workflows/cd-py-cua-driver.yml")
 
         self.assertIn('workflows: ["CD: Cua Driver (cross-platform)"]', workflow)
-        self.assertNotIn("branches:\n      - main", workflow)
-        self.assertIn('github.event.workflow_run.conclusion != \'cancelled\'', workflow)
-        self.assertIn('gh release view "$TAG" --repo "$GITHUB_REPOSITORY"', workflow)
+        self.assertIn("workflow_id == 311952875", workflow)
+        self.assertIn("github.event.workflow_run.conclusion == 'success'", workflow)
+        self.assertIn("verify_cua_driver_release.py", workflow)
+        self.assertIn("prepare_cua_driver_binary.py", workflow)
+        self.assertIn("python -m build --wheel --no-isolation", workflow)
+
+    def test_python_publish_is_tokenless_and_actions_are_pinned(self) -> None:
+        workflow = self.read(".github/workflows/cd-py-cua-driver.yml")
+
+        self.assertNotIn("PYPI_TOKEN", workflow)
+        self.assertIn("id-token: write", workflow)
+        self.assertIn("environment: pypi", workflow)
+        self.assertIn(
+            "--require-hashes -r .github/scripts/cua-driver-build-requirements.txt",
+            workflow,
+        )
+        self.assertEqual(workflow.count("persist-credentials: false"), 3)
+        self.assertIn(
+            "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33",
+            workflow,
+        )
+        self.assertNotIn("@v4", workflow)
+        self.assertNotIn("@v5", workflow)
+        self.assertNotIn("@v6", workflow)
+
+    def test_python_publish_checks_source_commit_and_run_artifacts(self) -> None:
+        workflow = self.read(".github/workflows/cd-py-cua-driver.yml")
+
+        self.assertIn("ref: ${{ needs.validate-provenance.outputs.source_head_sha }}", workflow)
+        self.assertIn("artifact-ids: ${{ steps.source-artifact.outputs.id }}", workflow)
+        self.assertIn("run-id: ${{ needs.validate-provenance.outputs.source_run_id }}", workflow)
+        self.assertIn(
+            "target commit",
+            self.read(".github/scripts/verify_cua_driver_release.py"),
+        )
 
     def test_python_publish_defaults_to_current_rust_version(self) -> None:
         workflow = self.read(".github/workflows/cd-py-cua-driver.yml")

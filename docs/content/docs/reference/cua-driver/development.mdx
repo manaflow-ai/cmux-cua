@@ -54,3 +54,21 @@ for remaining work.
 
 Build artifacts, VM logs, and local verification journals should stay out of
 git unless they have been promoted into a stable fixture or contributor doc.
+
+## Python Release Provenance
+
+The `cua-driver` PyPI publisher accepts only a completed success run of
+`CD: Cua Driver (cross-platform)`. Before building a wheel it verifies the
+workflow ID and path, the exact source SHA, the `cua-driver-rs-v*` tag, the
+GitHub Release target and SHA-256 asset digests, and the five source-run
+artifacts. Each wheel is built from that source SHA and the matching binary
+archive, not from a floating branch or release URL. The build toolchain is
+installed from the hash-locked
+`.github/scripts/cua-driver-build-requirements.txt` file.
+
+Publishing uses PyPI Trusted Publishing through the `pypa/gh-action-pypi-publish`
+action. The repository must have a PyPI trusted publisher configured for
+`manaflow-ai/cmux-cua`, `.github/workflows/cd-py-cua-driver.yml`, and the
+`pypi` GitHub environment. The workflow does not use a long-lived PyPI token.
+Manual dispatch remains available from `main`; an empty version uses the
+checked-in Rust version, then resolves the corresponding successful source run.
