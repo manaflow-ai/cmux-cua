@@ -45,10 +45,10 @@ checkout stops the job before a credential is requested. Keep `main` protected
 and reviewed; changing this checkout back to the tag reintroduces the
 historical-workflow risk.
 
-The CuaBot, Kasm, and XFCE container callers set `skip_arm64: true` because
-their current upstream base or package repositories do not provide a supported
-arm64 build. The reusable Docker workflow still builds arm64 for every other
-caller and fails if that platform cannot build.
+The CuaBot, Kasm, and XFCE CI and release container callers set
+`skip_arm64: true` because their current upstream base or package repositories
+do not provide a supported arm64 build. The reusable Docker workflow still
+builds arm64 for every other caller and fails if that platform cannot build.
 
 ## Workflow invariants
 
