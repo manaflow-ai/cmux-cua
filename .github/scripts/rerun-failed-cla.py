@@ -199,6 +199,11 @@ def unique_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def reject_json_constant(value: str) -> None:
+    """Reject Python's non-standard NaN and Infinity JSON extensions."""
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
 @dataclass(frozen=True)
 class Context:
     event_name: str
@@ -552,7 +557,7 @@ class GhApi:
         if not expect_json:
             return None
         try:
-            return json.loads(output)
+            return json.loads(output, parse_constant=reject_json_constant)
         except (RecursionError, ValueError):
             reject(f"GitHub API returned invalid JSON for {endpoint}")
 
@@ -1381,7 +1386,11 @@ def validate_ledger(api: Any, context: Context, snapshot: Snapshot) -> None:
         reject("The CLA ledger is not valid base64")
     require(len(decoded) <= MAX_LEDGER_BYTES, "The CLA ledger exceeds its byte bound")
     try:
-        ledger = json.loads(decoded, object_pairs_hook=unique_object_pairs)
+        ledger = json.loads(
+            decoded,
+            object_pairs_hook=unique_object_pairs,
+            parse_constant=reject_json_constant,
+        )
     except (UnicodeDecodeError, RecursionError, ValueError):
         reject("The CLA ledger is not valid JSON")
     ledger = obj(ledger, "CLA ledger")
