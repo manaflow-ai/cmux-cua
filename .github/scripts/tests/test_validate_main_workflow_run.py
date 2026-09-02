@@ -25,7 +25,7 @@ MAIN_SHA = "b" * 40
 class FakeApi:
     def __init__(self) -> None:
         self.responses = {
-            "/repos/manaflow-ai/cmux-cua/actions/runs/42": {
+            "/repos/trycua/cua/actions/runs/42": {
                 "id": 42,
                 "name": OBSERVER_WORKFLOW_NAME,
                 "path": OBSERVER_WORKFLOW_PATH,
@@ -38,17 +38,17 @@ class FakeApi:
                 "head_branch": "main",
                 "head_sha": SHA,
             },
-            "/repos/manaflow-ai/cmux-cua/branches/main": {
+            "/repos/trycua/cua/branches/main": {
                 "protected": True,
                 "commit": {"sha": MAIN_SHA},
             },
-            f"/repos/manaflow-ai/cmux-cua/compare/{SHA}...{MAIN_SHA}": {
+            f"/repos/trycua/cua/compare/{SHA}...{MAIN_SHA}": {
                 "status": "ahead",
                 "base_commit": {"sha": SHA},
                 "head_commit": {"sha": MAIN_SHA},
                 "merge_base_commit": {"sha": SHA},
             },
-            f"/repos/manaflow-ai/cmux-cua/compare/{MAIN_SHA}...{MAIN_SHA}": {
+            f"/repos/trycua/cua/compare/{MAIN_SHA}...{MAIN_SHA}": {
                 "status": "identical",
                 "base_commit": {"sha": MAIN_SHA},
                 "head_commit": {"sha": MAIN_SHA},
@@ -58,7 +58,7 @@ class FakeApi:
 
     def get(self, path: str):
         if path.endswith("/branches/main") and path not in self.responses:
-            return self.responses["/repos/manaflow-ai/cmux-cua/branches/main"]
+            return self.responses["/repos/trycua/cua/branches/main"]
         try:
             return self.responses[path]
         except KeyError as error:
@@ -97,6 +97,12 @@ class MainWorkflowValidatorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "event source repository"):
             validate(FakeApi(), candidate)
 
+    def test_manaflow_fork_repository_is_rejected(self) -> None:
+        candidate = values()
+        candidate["REPOSITORY"] = "manaflow-ai/cmux-cua"
+        with self.assertRaisesRegex(ValidationError, "publisher repository"):
+            validate(FakeApi(), candidate)
+
     def test_unprotected_consumer_is_rejected(self) -> None:
         candidate = values()
         candidate["TRUSTED_REF_PROTECTED"] = "false"
@@ -105,13 +111,13 @@ class MainWorkflowValidatorTests(unittest.TestCase):
 
     def test_wrong_observer_path_is_rejected(self) -> None:
         api = FakeApi()
-        api.responses["/repos/manaflow-ai/cmux-cua/actions/runs/42"]["path"] = "old.yml"
+        api.responses["/repos/trycua/cua/actions/runs/42"]["path"] = "old.yml"
         with self.assertRaisesRegex(ValidationError, "source workflow path"):
             validate(api, values())
 
     def test_source_sha_must_be_ancestor(self) -> None:
         api = FakeApi()
-        api.responses[f"/repos/manaflow-ai/cmux-cua/compare/{SHA}...{MAIN_SHA}"]["status"] = "behind"
+        api.responses[f"/repos/trycua/cua/compare/{SHA}...{MAIN_SHA}"]["status"] = "behind"
         with self.assertRaisesRegex(ValidationError, "not an ancestor"):
             validate(api, values())
 

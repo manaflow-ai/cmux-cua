@@ -38,7 +38,7 @@ class FakeApi:
 
 
 def path(suffix: str) -> str:
-    return f"/repos/manaflow-ai/cmux-cua{suffix}"
+    return f"/repos/trycua/cua{suffix}"
 
 
 def responses() -> dict[str, Mapping[str, Any]]:
@@ -109,6 +109,13 @@ class ReleaseRequestTests(unittest.TestCase):
     def test_rejects_non_workflow_run_event(self) -> None:
         with self.assertRaises(validator.ValidationError):
             validator.validate(FakeApi(responses()), values(EVENT_NAME="push"))
+
+    def test_rejects_manaflow_fork_repository(self) -> None:
+        with self.assertRaisesRegex(validator.ValidationError, "publisher repository"):
+            validator.validate(
+                FakeApi(responses()),
+                values(REPOSITORY="manaflow-ai/cmux-cua"),
+            )
 
     def test_rejects_unprotected_consumer(self) -> None:
         with self.assertRaises(validator.ValidationError):
