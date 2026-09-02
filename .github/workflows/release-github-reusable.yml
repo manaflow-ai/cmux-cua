@@ -1,18 +1,26 @@
 name: Reusable GitHub Release Workflow
 
+# A release can be created only by a protected semantic-version tag. The
+# caller supplies the expected prefix, while the verifier binds that tag to
+# the exact commit and to the protected main branch before write permission is
+# used.
 on:
   workflow_call:
     inputs:
+      tag_prefix:
+        description: "Exact protected release tag prefix, for example agent-v"
+        required: true
+        type: string
       tag_name:
-        description: "Git tag name (e.g., computer-v0.5.0)"
+        description: "Git tag name, which must equal the triggering ref"
         required: true
         type: string
       release_name:
-        description: "Release display name (e.g., cua-computer v0.5.0)"
+        description: "Release display name"
         required: true
         type: string
       module_path:
-        description: "Path to the module for filtering commits (e.g., libs/python/agent)"
+        description: "Path to the module for filtering commits"
         required: false
         type: string
         default: ""
@@ -22,12 +30,12 @@ on:
         type: boolean
         default: true
       body:
-        description: "Custom release notes content (appended to auto-generated notes)"
+        description: "Custom release notes content"
         required: false
         type: string
         default: ""
       attach_artifacts:
-        description: "Whether to download and attach workflow artifacts to the release"
+        description: "Whether to download and attach workflow artifacts"
         required: false
         type: boolean
         default: false
@@ -42,140 +50,231 @@ on:
         type: boolean
         default: false
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
+  verify-tag:
+    name: Verify protected release tag
+    if: >-
+      github.event_name == 'push' &&
+      github.ref_type == 'tag' &&
+      github.ref_protected == true &&
+      github.ref_name == inputs.tag_name
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify-release-tag.yml
+    with:
+      tag_prefix: ${{ inputs.tag_prefix }}
+
   create-release:
+    name: Create GitHub release
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      github.ref_type == 'tag' &&
+      github.ref_protected == true &&
+      github.ref_name == inputs.tag_name &&
+      needs.verify-tag.result == 'success'
+    needs: verify-tag
     runs-on: ubuntu-latest
+    environment: github-release
+    permissions:
+      actions: read # Download release artifacts from this run.
+      contents: write # Create the release and its tag metadata.
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Check out the verified tag commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Recheck tag provenance before write operations
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          RELEASE_TAG_PREFIX: ${{ inputs.tag_prefix }}
+          RELEASE_BASE_BRANCH: main
+          RELEASE_TRUSTED_REPOSITORY: trycua/cua
+        run: python3 .github/scripts/verify_release_tag.py
+
+      - name: Validate release input paths
+        env:
+          RELEASE_TAG: ${{ inputs.tag_name }}
+          RELEASE_NAME: ${{ inputs.release_name }}
+          MODULE_PATH: ${{ inputs.module_path }}
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_TAG" != "$GITHUB_REF_NAME" ]]; then
+            echo "release tag input does not match the triggering ref" >&2
+            exit 1
+          fi
+          if [[ -z "$RELEASE_NAME" || "$RELEASE_NAME" == *$'\n'* || "$RELEASE_NAME" == *$'\r'* ]]; then
+            echo "release name is empty or contains a line break" >&2
+            exit 1
+          fi
+          if [[ -n "$MODULE_PATH" ]]; then
+            if [[ "$MODULE_PATH" == /* || "$MODULE_PATH" == *$'\n'* || "$MODULE_PATH" == *$'\r'* ]]; then
+              echo "module path must be a relative repository path" >&2
+              exit 1
+            fi
+            IFS=/ read -r -a module_parts <<< "$MODULE_PATH"
+            for part in "${module_parts[@]}"; do
+              if [[ -z "$part" || "$part" == . || "$part" == .. ]]; then
+                echo "module path contains an unsafe component" >&2
+                exit 1
+              fi
+            done
+            [[ -d "$MODULE_PATH" ]] || {
+              echo "module path does not exist: $MODULE_PATH" >&2
+              exit 1
+            }
+          fi
 
       - name: Generate path-filtered release notes
         if: inputs.module_path != '' && inputs.generate_notes
-        id: release-notes
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ inputs.tag_name }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          MODULE_PATH: ${{ inputs.module_path }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          # Extract tag prefix to find previous release (e.g., "pypi-agent-v" from "pypi-agent-v0.5.0")
-          TAG_PREFIX=$(echo "${{ inputs.tag_name }}" | sed 's/[0-9]*\.[0-9]*\.[0-9]*$//')
+          set -euo pipefail
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          : > "$notes_file"
 
-          # Find previous tag with same prefix
-          PREV_TAG=$(git tag -l "${TAG_PREFIX}*" --sort=-v:refname | grep -v "^${{ inputs.tag_name }}$" | head -n 1 || echo "")
+          previous_tag=""
+          while IFS= read -r candidate; do
+            [[ "$candidate" == "$TAG_NAME" ]] && continue
+            candidate_version="${candidate#"$TAG_PREFIX"}"
+            [[ "$candidate" != "$candidate_version" ]] || continue
+            [[ "$candidate_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
+            git merge-base --is-ancestor "$candidate" HEAD || continue
+            previous_tag="$candidate"
+            break
+          done < <(git tag -l "${TAG_PREFIX}*" --sort=-v:refname)
 
-          echo "Current tag: ${{ inputs.tag_name }}"
-          echo "Tag prefix: $TAG_PREFIX"
-          echo "Previous tag: $PREV_TAG"
-
-          # Generate release notes with GitHub username attribution
-          NOTES=""
-
-          if [ -n "$PREV_TAG" ]; then
-            echo "Generating notes for commits between $PREV_TAG and HEAD in ${{ inputs.module_path }}"
-            COMMIT_RANGE="${PREV_TAG}..HEAD"
+          if [[ -n "$previous_tag" ]]; then
+            commit_range="${previous_tag}..HEAD"
           else
-            echo "No previous tag found, generating notes for all commits in ${{ inputs.module_path }}"
-            COMMIT_RANGE="HEAD"
+            commit_range="HEAD"
           fi
 
-          # Get commits and process each one to fetch GitHub username
-          while IFS='|' read -r sha subject; do
-            # Skip automated bump commits (e.g., "Bump cua-agent to v0.7.22")
-            if [[ "$subject" =~ ^Bump\ cua- ]]; then
-              continue
-            fi
+          printf '%s\n\n' "## What's Changed" >> "$notes_file"
+          found_commit=false
+          while IFS=$'\t' read -r sha subject; do
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+            [[ "$subject" =~ ^Bump[[:space:]]cua- ]] && continue
 
-            # Try to get GitHub username via API
-            USERNAME=$(gh api repos/${{ github.repository }}/commits/${sha} --jq '.author.login' 2>/dev/null || echo "")
-
-            # If API call fails or no author found (empty or "null"), fall back to commit author email
-            if [ -z "$USERNAME" ] || [ "$USERNAME" = "null" ]; then
-              AUTHOR_EMAIL=$(git show -s --format='%ae' ${sha})
-              # Try to extract username from GitHub noreply email format
-              if [[ "$AUTHOR_EMAIL" =~ ^([0-9]+\+)?([^@]+)@users\.noreply\.github\.com$ ]]; then
-                USERNAME="${BASH_REMATCH[2]}"
+            username="$(gh api "repos/${REPOSITORY}/commits/${sha}" --jq '.author.login' 2>/dev/null || true)"
+            if [[ ! "$username" =~ ^[A-Za-z0-9-]+$ ]]; then
+              author_email="$(git show -s --format='%ae' "$sha")"
+              if [[ "$author_email" =~ ^([0-9]+\+)?([A-Za-z0-9-]+)@users\.noreply\.github\.com$ ]]; then
+                username="${BASH_REMATCH[2]}"
               else
-                # Last resort: use author name without @ symbol
-                USERNAME=$(git show -s --format='%an' ${sha})
+                username="github-actions"
               fi
             fi
 
-            # Link PR numbers: (#123) -> ([#123](https://github.com/REPO/pull/123))
-            LINKED_SUBJECT=$(echo "$subject" | sed 's~(#\([0-9]*\))~([#\1](https://github.com/${{ github.repository }}/pull/\1))~g')
+            linked_subject="$(printf '%s' "$subject" | sed -E "s~\\(#([0-9]+)\\)~([#\\1](https://github.com/${REPOSITORY}/pull/\\1))~g")"
+            printf '* %s (%s) by @%s\n' "$linked_subject" "${sha:0:7}" "$username" >> "$notes_file"
+            found_commit=true
+          done < <(git log "$commit_range" --pretty=format:'%H%x09%s' -- "$MODULE_PATH" | sed -n '1,50p')
 
-            SHORT_SHA=$(echo ${sha} | cut -c1-7)
-            NOTES="${NOTES}* ${LINKED_SUBJECT} (${SHORT_SHA}) by @${USERNAME}"$'\n'
-          done < <(git log ${COMMIT_RANGE} --pretty=format:"%H|%s" -- "${{ inputs.module_path }}" | head -50)
-
-          if [ -z "$NOTES" ]; then
-            NOTES="Maintenance release — dependency updates only."
+          if [[ "$found_commit" != true ]]; then
+            printf '%s\n' 'Maintenance release: dependency updates only.' >> "$notes_file"
           fi
 
-          # Store notes in output (handle multiline)
-          echo "RELEASE_NOTES<<EOF" >> $GITHUB_OUTPUT
-          echo "## What's Changed" >> $GITHUB_OUTPUT
-          echo "" >> $GITHUB_OUTPUT
-          echo "$NOTES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+      - name: Prepare release artifact directory
+        run: mkdir -p "$RUNNER_TEMP/release-assets"
 
-      - name: Download artifacts
+      - name: Download release artifacts
         if: inputs.attach_artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          path: release-assets
+          path: ${{ runner.temp }}/release-assets
           merge-multiple: true
 
-      - name: List downloaded artifacts
+      - name: Reject symlink release artifacts
         if: inputs.attach_artifacts
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/release-assets
         run: |
-          echo "Downloaded artifacts:"
-          ls -lah release-assets/
+          set -euo pipefail
+          if find "$ARTIFACT_DIR" -type l -print -quit | grep -q .; then
+            echo "release artifacts must not contain symlinks" >&2
+            exit 1
+          fi
+          artifact_count=0
+          while IFS= read -r -d '' _; do
+            artifact_count=$((artifact_count + 1))
+          done < <(find "$ARTIFACT_DIR" -type f -print0)
+          if [[ "$artifact_count" -eq 0 ]]; then
+            echo "attach_artifacts requested, but no regular files were downloaded" >&2
+            exit 1
+          fi
+          if [[ "$artifact_count" -gt 64 ]]; then
+            echo "release artifact count exceeds the safety limit" >&2
+            exit 1
+          fi
 
       - name: Prepare release body
         id: prepare-body
         env:
-          # Use env vars to avoid shell interpretation of backticks in commit messages
-          RELEASE_NOTES: ${{ steps.release-notes.outputs.RELEASE_NOTES }}
           CUSTOM_BODY: ${{ inputs.body }}
         run: |
-          # Combine path-filtered notes with custom body
-          BODY=""
-
-          # Add path-filtered notes if available
-          if [ -n "$RELEASE_NOTES" ]; then
-            BODY="$RELEASE_NOTES"
+          set -euo pipefail
+          body_file="$RUNNER_TEMP/release-body.md"
+          : > "$body_file"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          if [[ -s "$notes_file" ]]; then
+            cat "$notes_file" >> "$body_file"
           fi
-
-          # Add custom body if provided
-          if [ -n "$CUSTOM_BODY" ]; then
-            if [ -n "$BODY" ]; then
-              BODY="$BODY
-
-          $CUSTOM_BODY"
+          if [[ -n "$CUSTOM_BODY" ]]; then
+            if [[ -s "$body_file" ]]; then
+              printf '\n%s\n' "$CUSTOM_BODY" >> "$body_file"
             else
-              BODY="$CUSTOM_BODY"
+              printf '%s\n' "$CUSTOM_BODY" >> "$body_file"
             fi
           fi
+          printf 'path=%s\n' "$body_file" >> "$GITHUB_OUTPUT"
 
-          # Store in output
-          echo "BODY<<EOF" >> $GITHUB_OUTPUT
-          echo "$BODY" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.tag_name }}
-          name: ${{ inputs.release_name }}
-          body: ${{ steps.prepare-body.outputs.BODY }}
-          draft: ${{ inputs.draft }}
-          prerelease: ${{ inputs.prerelease }}
-          # Only use GitHub auto-generated notes if module_path is not specified
-          generate_release_notes: ${{ inputs.module_path == '' && inputs.generate_notes }}
-          files: |
-            release-assets/*
+      - name: Create release with GitHub CLI
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG_NAME: ${{ inputs.tag_name }}
+          RELEASE_NAME: ${{ inputs.release_name }}
+          BODY_FILE: ${{ steps.prepare-body.outputs.path }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          GENERATE_NOTES: ${{ inputs.module_path == '' && inputs.generate_notes }}
+          ATTACH_ARTIFACTS: ${{ inputs.attach_artifacts }}
+          ARTIFACT_DIR: ${{ runner.temp }}/release-assets
+        run: |
+          set -euo pipefail
+
+          release_args=(
+            release create "$TAG_NAME"
+            --repo "$REPOSITORY"
+            --verify-tag
+            --title "$RELEASE_NAME"
+            --notes-file "$BODY_FILE"
+          )
+          [[ "$DRAFT" == "true" ]] && release_args+=(--draft)
+          [[ "$PRERELEASE" == "true" ]] && release_args+=(--prerelease)
+          [[ "$GENERATE_NOTES" == "true" ]] && release_args+=(--generate-notes)
+
+          if [[ "$ATTACH_ARTIFACTS" == "true" ]]; then
+            while IFS= read -r -d '' artifact; do
+              release_args+=("$artifact")
+            done < <(find "$ARTIFACT_DIR" -type f -print0 | sort -z)
+          fi
+
+          gh "${release_args[@]}"

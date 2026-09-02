@@ -7,161 +7,140 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to publish (without v prefix)"
+        description: "Version to build without publishing"
         required: true
-        default: "0.1.0"
-  workflow_call:
-    inputs:
-      version:
-        description: "Version to publish"
-        required: true
-        type: string
-    outputs:
-      version:
-        description: "The version that was published"
-        value: ${{ jobs.prepare.outputs.version }}
 
-# Adding permissions at workflow level
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
+  # Read-only provenance check. It is skipped for manual unsigned builds.
+  verify-tag:
+    if: github.event_name == 'push' && github.ref_protected == true
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify-release-tag.yml
+    with:
+      tag_prefix: mcp-server-v
+
+  # Independent check immediately gates registry credentials.
+  verify-publish:
+    if: github.event_name == 'push' && github.ref_protected == true
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify-release-tag.yml
+    with:
+      tag_prefix: mcp-server-v
+
   prepare:
+    permissions:
+      contents: read
     runs-on: macos-latest
     outputs:
       version: ${{ steps.get-version.outputs.version }}
-      agent_version: ${{ steps.update-deps.outputs.agent_version }}
-      computer_version: ${{ steps.update-deps.outputs.computer_version }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Determine version
-        id: get-version
-        run: |
-          # Check inputs.version first (set by workflow_call)
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION=${{ inputs.version }}
-          elif [ "${{ github.event_name }}" == "push" ]; then
-            # Extract version from tag (for package-specific tags)
-            if [[ "${{ github.ref }}" =~ ^refs/tags/mcp-server-v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-              VERSION=${BASH_REMATCH[1]}
-            else
-              echo "Invalid tag format for mcp-server"
-              exit 1
-            fi
-          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # Use version from workflow dispatch
-            VERSION=${{ github.event.inputs.version }}
-          else
-            echo "No version provided"
-            exit 1
-          fi
-          echo "VERSION=$VERSION"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          python-version: "3.11"
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Update dependencies to latest versions
-        id: update-deps
-        run: |
-          cd libs/python/mcp-server
-
-          # Install required package for PyPI API access
-          pip install requests
-
-          # Create a Python script for PyPI version checking
-          cat > get_latest_versions.py << 'EOF'
-          import requests
-          import json
-          import sys
-
-          def get_package_version(package_name, fallback="0.1.0"):
-              try:
-                  response = requests.get(f'https://pypi.org/pypi/{package_name}/json')
-                  print(f"API Response Status for {package_name}: {response.status_code}", file=sys.stderr)
-                  
-                  if response.status_code != 200:
-                      print(f"API request failed for {package_name}, using fallback version", file=sys.stderr)
-                      return fallback
-                  
-                  data = json.loads(response.text)
-                  
-                  if 'info' not in data:
-                      print(f"Missing 'info' key in API response for {package_name}, using fallback version", file=sys.stderr)
-                      return fallback
-                      
-                  return data['info']['version']
-              except Exception as e:
-                  print(f"Error fetching version for {package_name}: {str(e)}", file=sys.stderr)
-                  return fallback
-
-          # Get latest versions
-          print(get_package_version('cua-agent'))
-          print(get_package_version('cua-computer'))
-          EOF
-
-          # Execute the script to get the versions
-          VERSIONS=($(python get_latest_versions.py))
-          LATEST_AGENT=${VERSIONS[0]}
-          LATEST_COMPUTER=${VERSIONS[1]}
-
-          echo "Latest cua-agent version: $LATEST_AGENT"
-          echo "Latest cua-computer version: $LATEST_COMPUTER"
-
-          # Output the versions for the next job
-          echo "agent_version=$LATEST_AGENT" >> $GITHUB_OUTPUT
-          echo "computer_version=$LATEST_COMPUTER" >> $GITHUB_OUTPUT
-
-          # Determine major version for version constraint
-          AGENT_MAJOR=$(echo $LATEST_AGENT | cut -d. -f1)
-          COMPUTER_MAJOR=$(echo $LATEST_COMPUTER | cut -d. -f1)
-
-          NEXT_AGENT_MAJOR=$((AGENT_MAJOR + 1))
-          NEXT_COMPUTER_MAJOR=$((COMPUTER_MAJOR + 1))
-
-          # Update dependencies in pyproject.toml
-          if [[ "$OSTYPE" == "darwin"* ]]; then
-            # macOS version of sed needs an empty string for -i
-            # Update cua-agent with all extras
-            sed -i '' "s/\"cua-agent\[all\]>=.*,<.*\"/\"cua-agent[all]>=$LATEST_AGENT,<$NEXT_AGENT_MAJOR.0.0\"/" pyproject.toml
-            sed -i '' "s/\"cua-computer>=.*,<.*\"/\"cua-computer>=$LATEST_COMPUTER,<$NEXT_COMPUTER_MAJOR.0.0\"/" pyproject.toml
-          else
-            # Linux version
-            sed -i "s/\"cua-agent\[all\]>=.*,<.*\"/\"cua-agent[all]>=$LATEST_AGENT,<$NEXT_AGENT_MAJOR.0.0\"/" pyproject.toml
-            sed -i "s/\"cua-computer>=.*,<.*\"/\"cua-computer>=$LATEST_COMPUTER,<$NEXT_COMPUTER_MAJOR.0.0\"/" pyproject.toml
-          fi
-
-          # Display the updated dependencies
-          echo "Updated dependencies in pyproject.toml:"
-          grep -E "cua-agent|cua-computer" pyproject.toml
-
-  publish:
-    needs: prepare
-    uses: ./.github/workflows/py-reusable-publish.yml
+      - name: Resolve release version
+        id: get-version
+        env:
+          RELEASE_EVENT_NAME: ${{ github.event_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_VERSION_INPUT: ${{ inputs.version }}
+          RELEASE_TAG_PREFIX: mcp-server-v
+        run: python3 "${GITHUB_WORKSPACE}/.github/scripts/resolve_release_version.py"
+  build-package:
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' || needs.verify-tag.result == 'success') &&
+      needs.prepare.result == 'success'
+    needs: [prepare, verify-tag]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/py-reusable-build.yml
     with:
       package_name: "mcp-server"
       package_dir: "libs/python/mcp-server"
       version: ${{ needs.prepare.outputs.version }}
-      base_package_name: "cua-mcp-server"
-    secrets:
-      PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
 
-  set-env-variables:
-    needs: [prepare, publish]
-    runs-on: macos-latest
+  publish:
+    if: >-
+      always() &&
+      github.event_name == 'push' && github.ref_type == 'tag' && github.ref_protected == true &&
+      needs.prepare.result == 'success' &&
+      needs.build-package.result == 'success' &&
+      needs.verify-publish.result == 'success'
+    needs: [prepare, build-package, verify-publish]
+    permissions:
+      contents: read # Check out and verify the release source.
+      actions: read # Download the built package artifact.
+      id-token: write # Mint the PyPI Trusted Publishing identity.
+    runs-on: ubuntu-latest
+    environment: pypi-release
     steps:
-      - name: Set environment variables for use in other jobs
-        run: |
-          echo "AGENT_VERSION=${{ needs.prepare.outputs.agent_version }}" >> $GITHUB_ENV
-          echo "COMPUTER_VERSION=${{ needs.prepare.outputs.computer_version }}" >> $GITHUB_ENV
+      - name: Check tag provenance before requesting PyPI OIDC
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/scripts/verify_release_tag.py
+            .github/scripts/validate_publish_artifacts.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
 
+      - name: Recheck release tag provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          RELEASE_TAG_PREFIX: mcp-server-v
+          RELEASE_BASE_BRANCH: main
+          RELEASE_TRUSTED_REPOSITORY: trycua/cua
+        run: python3 "${GITHUB_WORKSPACE}/.github/scripts/verify_release_tag.py"
+
+      - name: Download package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pypi-mcp-server
+          path: dist
+
+      - name: Reject unsafe or mismatched package artifacts
+        env:
+          EXPECTED_PACKAGE: cua-mcp-server
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+        run: >-
+          python3 .github/scripts/validate_publish_artifacts.py dist
+          --suffix .whl --suffix .tar.gz
+          --expected-package "$EXPECTED_PACKAGE"
+          --expected-version "$EXPECTED_VERSION"
+          --max-files 2
+
+      - name: Publish with PyPI trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/
   create-release:
-    needs: [prepare, publish]
+    if: >-
+      always() &&
+      github.event_name == 'push' && github.ref_type == 'tag' &&
+      github.ref_protected == true &&
+      needs.verify-tag.result == 'success' &&
+      needs.verify-publish.result == 'success' &&
+      needs.publish.result == 'success'
+    needs: [prepare, verify-tag, verify-publish, publish]
+    permissions:
+      contents: write # Create the GitHub release after publication.
     uses: ./.github/workflows/release-github-reusable.yml
     with:
+      tag_prefix: mcp-server-v
       tag_name: "mcp-server-v${{ needs.prepare.outputs.version }}"
       release_name: "cua-mcp-server v${{ needs.prepare.outputs.version }}"
       module_path: "libs/python/mcp-server"
