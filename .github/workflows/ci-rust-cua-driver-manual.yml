@@ -1,0 +1,41 @@
+name: "CI: Cua Driver Rust (manual unsigned)"
+
+# The release workflow is tag-only because it signs and publishes artifacts.
+# This branch-selectable workflow is intentionally read-only and unsigned, so
+# it remains safe for build iteration on untrusted branches.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: cua-driver-rs-manual-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned Cua Driver
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout selected source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxi-dev libxtst-dev libxext-dev libwayland-dev \
+            libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        # zizmor: ignore[superfluous-actions] -- installs the exact stable toolchain.
+        with:
+          toolchain: stable
+
+      - name: Build unsigned release
+        working-directory: libs/cua-driver/rust
+        run: cargo build -p cua-driver --release --features portal-input

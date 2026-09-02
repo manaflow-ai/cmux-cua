@@ -1,0 +1,60 @@
+name: "CI: Lume (manual unsigned)"
+
+# Manual runs are deliberately separate from the tag-only notarization
+# workflow. The selected branch may contain untrusted code, so this workflow
+# has no signing, notarization, release, or write credentials.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to compile (for example 0.5.1)"
+        required: true
+        default: "0.1.0"
+
+permissions: {}
+
+concurrency:
+  group: lume-manual-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned Lume
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout selected source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Validate version input
+        env:
+          VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Version must be a semantic version such as 0.5.1" >&2
+            exit 1
+          fi
+
+      - name: Select Xcode 16.3
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.3.app
+          xcodebuild -version
+
+      - name: Install dependencies
+        run: brew install cpio
+
+      - name: Set version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          sed -i '' "s/static let current: String = \".*\"/static let current: String = \"${VERSION}\"/" libs/lume/src/Main.swift
+
+      - name: Build unsigned release
+        working-directory: libs/lume
+        run: swift build --configuration release
