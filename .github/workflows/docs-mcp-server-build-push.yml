@@ -4,7 +4,7 @@ name: "CD: Docs MCP Server"
 # cache writes. The publish consumer starts only from the credential-free main
 # observer and validates its source commit from protected main.
 on:
-  workflow_run:
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- protected-main validator binds the exact source run
     workflows: ["Docs MCP Server publish request"]
     types: [completed]
   pull_request:

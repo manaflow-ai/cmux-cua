@@ -1,7 +1,7 @@
 name: "CD: Container QEMU Linux"
 
 on:
-  workflow_run:
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- protected-main validator binds the exact source run
     workflows:
       - "Release tag request"
     types: [completed]

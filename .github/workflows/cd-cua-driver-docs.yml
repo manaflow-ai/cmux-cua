@@ -3,7 +3,7 @@ name: "CD: Cua Driver Reference Docs"
 # The credential-free tag observer starts this protected-main consumer. Manual
 # runs only build and upload generated files and never receive write tokens.
 on:
-  workflow_run:
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- protected-main validator binds the exact source run
     workflows:
       - "Release tag request"
     types: [completed]

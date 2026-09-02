@@ -149,11 +149,12 @@ jobs:
       - name: Validate release input paths
         env:
           RELEASE_TAG: ${{ inputs.tag_name }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
           RELEASE_NAME: ${{ inputs.release_name }}
           MODULE_PATH: ${{ inputs.module_path }}
         run: |
           set -euo pipefail
-          if [[ "$RELEASE_TAG" != "${{ inputs.source_tag }}" ]]; then
+          if [[ "$RELEASE_TAG" != "$SOURCE_TAG" ]]; then
             echo "release tag input does not match the validated source tag" >&2
             exit 1
           fi
