@@ -168,6 +168,20 @@ fn build_macos_registry_with_compat(compat: bool) -> cua_driver_core::tool::Tool
 fn main() {
     init_logging();
 
+    // Standalone-helper identity: when cmux spawns the bundled helper (both the
+    // long-running `mcp` server and one-shot `call check_permissions` status
+    // probes) it sets CUA_DRIVER_DISCLAIM, asking this process to disclaim
+    // responsibility so it becomes its own responsible process. Because the
+    // executable lives inside the helper's own .app bundle, macOS then
+    // attributes — and reports — its Accessibility / Screen Recording grants
+    // under that bundle's identity ("cmux Computer Use") instead of cmux's.
+    // Runs before command dispatch so it applies uniformly to every subcommand;
+    // reexec_disclaimed_if_needed is still a no-op for embedded mode, an
+    // already-disclaimed re-exec, or a binary inside CuaDriver.app.
+    if crate::bundle::is_env_truthy("CUA_DRIVER_DISCLAIM") {
+        responsibility::reexec_disclaimed_if_needed();
+    }
+
     // ── CLI subcommand dispatch ──────────────────────────────────────────────
     // Handled before AppKit init so `list-tools` / `describe` / `call` exit
     // cleanly without starting the overlay or NSApplication.
@@ -513,9 +527,10 @@ fn main() {
                 let registry = Arc::new(build_macos_registry_with_compat(compat));
                 // Wire up replay tool's back-reference to the registry.
                 registry.init_self_weak();
-                if let Err(e) = cua_driver_core::server::run(registry).await {
+                if let Err(e) = cua_driver_core::server::run(registry.clone()).await {
                     tracing::error!("MCP server error: {e}");
                 }
+                registry.remove_state_file();
             });
             // MCP server exited (stdin closed / client disconnected).
             // The main thread is blocked in NSApplication.run() and won't
@@ -729,10 +744,11 @@ async fn async_main() -> anyhow::Result<()> {
     let registry = Arc::new(build_registry(cursor_cfg));
     registry.init_self_weak();
     maybe_init_pip();
-    let result = cua_driver_core::server::run(registry).await;
+    let result = cua_driver_core::server::run(registry.clone()).await;
     if let Err(e) = &result {
         tracing::error!("MCP server error: {e}");
     }
+    registry.remove_state_file();
 
     // The stdio MCP server loop has ended — the client disconnected (stdin
     // EOF) or a fatal I/O error occurred. The cursor overlay runs on its own

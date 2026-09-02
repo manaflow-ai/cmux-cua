@@ -47,6 +47,8 @@ fn def() -> &'static ToolDef {
              mouseDragged events linearly interpolated along the path. Increase both for \
              slower, more human drags; decrease for snap gestures.\n\n\
              `modifier` keys (cmd/shift/option/ctrl) are held across the entire gesture.\n\n\
+             Background drag is unavailable on macOS because pid-posted drag streams \
+             drop background CGEvents. Pass delivery_mode=`foreground`.\n\n\
              When `from_zoom` is true, coordinates are in the last zoom image for this \
              pid; the driver maps them back to window coordinates before dispatching."
             .into(),
@@ -54,7 +56,7 @@ fn def() -> &'static ToolDef {
             "type": "object",
             "required": ["pid", "from_x", "from_y", "to_x", "to_y"],
             "properties": {
-                "session": { "type": "string", "description": "Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less." },
+                "session": { "type": "string", "description": "Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-<pid>); anonymous non-embedded calls remain cursor-less." },
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "window_id": {
                     "type": "integer",
@@ -90,7 +92,9 @@ fn def() -> &'static ToolDef {
                     "type": "boolean",
                     "description": "When true, coordinates are in the last zoom image for this pid; driver maps back to window coordinates."
                 },
-                "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema()
+                "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema_with(
+                    "Background drag is unavailable on macOS and returns code=\"background_unavailable\" without posting. Pass \"foreground\" to front the window, perform the gesture, then restore the prior app."
+                )
             },
             "additionalProperties": false
         }),
@@ -356,18 +360,14 @@ impl Tool for DragTool {
             format!(" ({button_str} button)")
         };
 
-        let mode_label = if fg {
-            " (delivery_mode:foreground)"
-        } else {
-            ""
-        };
+        let mode_label = if fg { "foreground" } else { "background" };
         match result {
             Ok(Ok(())) => ToolResult::text(format!(
                 "✅ Posted drag{btn_suffix}{mod_suffix} to pid {pid} \
                  from window-pixel ({}, {}) → ({}, {}), \
                  screen ({}, {}) → ({}, {}) \
-                 in {duration_ms}ms / {steps} steps{mode_label} \
-                 (background CGEvent; not driver-verified — confirm via screenshot).{}",
+                 in {duration_ms}ms / {steps} steps ({mode_label} CGEvent; \
+                 not driver-verified — confirm via screenshot).{}",
                 from_x as i64, from_y as i64,
                 to_x   as i64, to_y   as i64,
                 from_sx as i64, from_sy as i64,

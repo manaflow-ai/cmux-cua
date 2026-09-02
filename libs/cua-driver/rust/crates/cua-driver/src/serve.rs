@@ -299,6 +299,25 @@ pub struct DaemonResponse {
     pub exit_code: Option<i32>,
 }
 
+/// Keep permission prompting under an embedding application's explicit UX.
+///
+/// The daemon remains the permission-status authority, but an agent cannot
+/// bypass the host's onboarding by sending `check_permissions {prompt:true}`.
+fn clamp_external_permission_prompt(
+    external_permission_flow: bool,
+    tool_name: &str,
+    args: &mut serde_json::Value,
+) {
+    if !external_permission_flow || tool_name != "check_permissions" {
+        return;
+    }
+    if let Some(object) = args.as_object_mut() {
+        object.insert("prompt".to_owned(), serde_json::Value::Bool(false));
+    } else {
+        *args = serde_json::json!({ "prompt": false });
+    }
+}
+
 impl DaemonResponse {
     pub fn ok(result: serde_json::Value) -> Self {
         Self { ok: true, result: Some(result), error: None, exit_code: None }
@@ -667,6 +686,13 @@ pub async fn run_serve(
                                 let mut args = req.args.unwrap_or(serde_json::Value::Object(
                                     serde_json::Map::new()
                                 ));
+                                clamp_external_permission_prompt(
+                                    crate::bundle::is_env_truthy(
+                                        "CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW"
+                                    ),
+                                    &tool_name,
+                                    &mut args,
+                                );
                                 // Apply the caller-declared session identity
                                 // (explicit `session` → `_session_id`; minted id
                                 // as the recording/config fallback only). See
@@ -843,6 +869,7 @@ pub async fn run_serve(
     if let Some(pid_path) = pid_file_path {
         let _ = std::fs::remove_file(pid_path);
     }
+    registry.remove_state_file();
 
     Ok(())
 }
@@ -1202,6 +1229,13 @@ pub async fn run_serve(
                                     "type_text".to_owned()
                                 } else { raw_name.clone() };
                                 let mut args = req.args.unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                                clamp_external_permission_prompt(
+                                    crate::bundle::is_env_truthy(
+                                        "CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW"
+                                    ),
+                                    &tool_name,
+                                    &mut args,
+                                );
                                 // Apply the caller-declared session identity
                                 // (see the unix branch + apply_session_identity).
                                 let effective_session =
@@ -1410,10 +1444,11 @@ pub fn run_serve_cmd(
         .expect("tokio runtime");
 
     if let Err(e) = rt.block_on(run_serve(
-        registry,
+        registry.clone(),
         &socket_path,
         pid_file_path.as_deref(),
     )) {
+        registry.remove_state_file();
         eprintln!("cua-driver serve error: {e}");
         std::process::exit(1);
     }
@@ -1474,6 +1509,22 @@ pub fn run_status_cmd(socket_path: &str, pid_file_path: &str) {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod external_permission_flow_tests {
+    use super::clamp_external_permission_prompt;
+
+    #[test]
+    fn external_permission_flow_clamps_agent_prompt_requests() {
+        let mut args = serde_json::json!({ "prompt": true });
+        clamp_external_permission_prompt(true, "check_permissions", &mut args);
+        assert_eq!(args["prompt"], serde_json::json!(false));
+
+        let mut ordinary_tool_args = serde_json::json!({ "prompt": true });
+        clamp_external_permission_prompt(true, "click", &mut ordinary_tool_args);
+        assert_eq!(ordinary_tool_args["prompt"], serde_json::json!(true));
+    }
+}
 
 #[cfg(all(test, unix))]
 mod gate_tests {

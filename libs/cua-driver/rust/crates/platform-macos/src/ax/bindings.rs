@@ -103,6 +103,7 @@ pub unsafe fn element_at_screen_position(pid: i32, x: f64, y: f64) -> Option<AXU
 // ── AXValue functions ────────────────────────────────────────────────────────
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
+    pub fn AXValueGetTypeID() -> CFTypeID;
     pub fn AXValueGetType(value: AXValueRef) -> AXValueType;
     pub fn AXValueGetValue(
         value: AXValueRef,
@@ -130,6 +131,71 @@ pub unsafe fn copy_string_attr(element: AXUIElementRef, attr_name: &str) -> Opti
     }
     let s = CFStr::wrap_under_create_rule(value as _);
     Some(s.to_string())
+}
+
+/// Copy any scalar AX attribute and render it as text. Unlike
+/// [`copy_string_attr`], this preserves numeric/boolean AXValue payloads (for
+/// example sliders, steppers, and Calculator's display). Uncommon value types
+/// are omitted because Core Foundation descriptions may contain process-local
+/// pointer addresses and therefore are not deterministic.
+pub unsafe fn copy_stringified_attr(element: AXUIElementRef, attr_name: &str) -> Option<String> {
+    use core_foundation::{boolean::CFBoolean, number::CFNumber, string::CFString};
+
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if err != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+
+    let type_id = core_foundation::base::CFGetTypeID(value);
+    if type_id == CFString::type_id() {
+        return Some(CFString::wrap_under_create_rule(value as _).to_string());
+    }
+    if type_id == CFNumber::type_id() {
+        let number = CFNumber::wrap_under_create_rule(value as _);
+        return number.to_f64().map(|number| {
+            if number.fract() == 0.0 {
+                format!("{number:.0}")
+            } else {
+                number.to_string()
+            }
+        });
+    }
+    if type_id == CFBoolean::type_id() {
+        let boolean = bool::from(CFBoolean::wrap_under_create_rule(value as _));
+        return Some(boolean.to_string());
+    }
+
+    CFRelease(value);
+    None
+}
+
+/// Copy an AXValue(CFRange) attribute such as `AXVisibleCharacterRange`.
+pub unsafe fn copy_range_attr(
+    element: AXUIElementRef,
+    attr_name: &str,
+) -> Option<core_foundation::base::CFRange> {
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if err != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    if core_foundation::base::CFGetTypeID(value) != AXValueGetTypeID()
+        || AXValueGetType(value as AXValueRef) != kAXValueCFRangeType
+    {
+        CFRelease(value);
+        return None;
+    }
+    let mut range = core_foundation::base::CFRange::init(0, 0);
+    let ok = AXValueGetValue(
+        value as AXValueRef,
+        kAXValueCFRangeType,
+        &mut range as *mut _ as *mut c_void,
+    );
+    CFRelease(value);
+    ok.then_some(range)
 }
 
 /// Copy a numeric attribute from an AX element as an `f64`. Returns `None` on

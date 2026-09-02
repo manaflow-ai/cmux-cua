@@ -40,9 +40,8 @@ pub struct CursorConfig {
     pub shape: Option<CursorShape>,
 
     /// Which built-in silhouette to render when no custom `shape` is set.
-    /// Defaults to [`BuiltinShape::Arrow`] (the procedural gradient
-    /// diamond) until the embedded teardrop's retina rasterisation is
-    /// fully sorted; opt into the teardrop via `--cursor-shape teardrop`.
+    /// Defaults to [`BuiltinShape::Teardrop`]; embedding hosts can select a
+    /// branded built-in with `--cursor-shape <name>`.
     pub builtin_shape: BuiltinShape,
 
     /// Initial motion config (can be updated at runtime via MCP tool).
@@ -51,6 +50,15 @@ pub struct CursorConfig {
     /// Whether the overlay is visible at startup.
     /// Pass `--no-overlay` to disable.
     pub enabled: bool,
+
+    /// Launch-time gradient default from `CUA_DRIVER_CURSOR_GRADIENT`.
+    pub gradient_colors: Vec<[u8; 4]>,
+
+    /// Launch-time halo default from `CUA_DRIVER_CURSOR_BLOOM`.
+    pub bloom_color: Option<[u8; 4]>,
+
+    /// Launch-time per-instance label default from `CUA_DRIVER_CURSOR_LABEL`.
+    pub cursor_label: Option<String>,
 }
 
 impl Default for CursorConfig {
@@ -61,7 +69,108 @@ impl Default for CursorConfig {
             builtin_shape: BuiltinShape::default(),
             motion: MotionConfig::default(),
             enabled: true,
+            gradient_colors: Vec::new(),
+            bloom_color: None,
+            cursor_label: None,
         }
+    }
+}
+
+/// Cursor-branding defaults injected by an embedding host.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentCursorDefaults {
+    pub gradient_colors: Vec<[u8; 4]>,
+    pub bloom_color: Option<[u8; 4]>,
+    pub cursor_label: Option<String>,
+}
+
+impl AgentCursorDefaults {
+    /// Parse environment-shaped values without touching process-global env.
+    /// The returned strings are warnings for invalid values that were ignored.
+    pub fn parse_values(
+        gradient: Option<&str>,
+        bloom: Option<&str>,
+        label: Option<&str>,
+    ) -> (Self, Vec<String>) {
+        let mut defaults = Self::default();
+        let mut warnings = Vec::new();
+
+        if let Some(value) = gradient {
+            let stops: Option<Vec<[u8; 4]>> = (!value.trim().is_empty())
+                .then(|| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .map(parse_hex_color)
+                        .collect::<Option<Vec<_>>>()
+                })
+                .flatten()
+                .filter(|stops| !stops.is_empty());
+            match stops {
+                Some(stops) => defaults.gradient_colors = stops,
+                None => warnings.push(format!(
+                    "invalid CUA_DRIVER_CURSOR_GRADIENT={value:?}; expected comma-separated #RGB/#RRGGBB stops"
+                )),
+            }
+        }
+
+        if let Some(value) = bloom {
+            match (!value.trim().is_empty()).then(|| parse_hex_color(value.trim())).flatten() {
+                Some(color) => defaults.bloom_color = Some(color),
+                None => warnings.push(format!(
+                    "invalid CUA_DRIVER_CURSOR_BLOOM={value:?}; expected #RGB or #RRGGBB"
+                )),
+            }
+        }
+
+        if let Some(value) = label {
+            let value = value.trim();
+            if value.is_empty() {
+                warnings.push(
+                    "invalid CUA_DRIVER_CURSOR_LABEL: label must not be empty".to_owned(),
+                );
+            } else {
+                defaults.cursor_label = Some(value.to_owned());
+            }
+        }
+
+        (defaults, warnings)
+    }
+
+    pub fn from_env() -> Self {
+        let gradient = std::env::var("CUA_DRIVER_CURSOR_GRADIENT").ok();
+        let bloom = std::env::var("CUA_DRIVER_CURSOR_BLOOM").ok();
+        let label = std::env::var("CUA_DRIVER_CURSOR_LABEL").ok();
+        let (defaults, warnings) = Self::parse_values(
+            gradient.as_deref(),
+            bloom.as_deref(),
+            label.as_deref(),
+        );
+        for warning in warnings {
+            eprintln!("[cua-driver] warning: {warning}");
+        }
+        defaults
+    }
+}
+
+/// Parse `#RRGGBB` or `#RGB` to opaque RGBA. This intentionally matches the
+/// accepted set_agent_cursor_style colour vocabulary.
+pub fn parse_hex_color(hex: &str) -> Option<[u8; 4]> {
+    let value = hex.strip_prefix('#').unwrap_or(hex);
+    match value.len() {
+        6 => Some([
+            u8::from_str_radix(&value[0..2], 16).ok()?,
+            u8::from_str_radix(&value[2..4], 16).ok()?,
+            u8::from_str_radix(&value[4..6], 16).ok()?,
+            255,
+        ]),
+        3 => Some([
+            u8::from_str_radix(&value[0..1].repeat(2), 16).ok()?,
+            u8::from_str_radix(&value[1..2].repeat(2), 16).ok()?,
+            u8::from_str_radix(&value[2..3].repeat(2), 16).ok()?,
+            255,
+        ]),
+        _ => None,
     }
 }
 
@@ -72,8 +181,8 @@ impl CursorConfig {
     /// ```text
     /// --cursor-icon  <path.svg|path.ico|path.png>
     /// --cursor-id    <id>
-    /// --cursor-shape <arrow|teardrop>  (selects a built-in silhouette;
-    ///                                   default: arrow)
+    /// --cursor-shape <arrow|teardrop|cmux>  (selects a built-in silhouette;
+    ///                                        default: teardrop)
     /// --cursor-palette <name>     (selects a named Palette)
     /// --no-overlay                (start with overlay disabled)
     /// --glide-ms     <f64>        (glideDurationMs override)
@@ -87,6 +196,10 @@ impl CursorConfig {
 
     pub fn parse(args: &[String]) -> Self {
         let mut cfg = CursorConfig::default();
+        let defaults = AgentCursorDefaults::from_env();
+        cfg.gradient_colors = defaults.gradient_colors;
+        cfg.bloom_color = defaults.bloom_color;
+        cfg.cursor_label = defaults.cursor_label;
         let mut i = 0usize;
         while i < args.len() {
             match args[i].as_str() {
@@ -118,7 +231,8 @@ impl CursorConfig {
                         match BuiltinShape::parse(name) {
                             Some(s) => cfg.builtin_shape = s,
                             None => tracing::warn!(
-                                "--cursor-shape {name}: unknown shape (expected arrow|teardrop); falling back to default"
+                                "--cursor-shape {name}: unknown shape (expected {}); falling back to default",
+                                BuiltinShape::names_help()
                             ),
                         }
                         i += 1;
@@ -199,33 +313,41 @@ pub struct CursorInstanceState {
 /// Global registry of cursor instances, keyed by `cursor_id`.
 pub struct CursorRegistry {
     inner: Mutex<HashMap<String, CursorInstanceState>>,
+    default_config: CursorInstanceConfig,
 }
 
 impl CursorRegistry {
     pub fn new() -> Self {
+        let defaults = AgentCursorDefaults::from_env();
+        let mut default_config = CursorInstanceConfig::default();
+        default_config.cursor_label = defaults.cursor_label;
         let mut map = HashMap::new();
         map.insert("default".into(), CursorInstanceState {
-            config: CursorInstanceConfig::default(),
+            config: default_config.clone(),
             x: None,
             y: None,
         });
-        Self { inner: Mutex::new(map) }
+        Self { inner: Mutex::new(map), default_config }
+    }
+
+    fn config_for(&self, cursor_id: &str) -> CursorInstanceConfig {
+        CursorInstanceConfig { cursor_id: cursor_id.to_owned(), ..self.default_config.clone() }
     }
 
     pub fn get_or_create(&self, cursor_id: &str) -> CursorInstanceState {
+        let config = self.config_for(cursor_id);
         let mut inner = self.inner.lock().unwrap();
         inner.entry(cursor_id.to_owned()).or_insert_with(|| CursorInstanceState {
-            config: CursorInstanceConfig {
-                cursor_id: cursor_id.to_owned(), ..Default::default()
-            },
+            config,
             x: None, y: None,
         }).clone()
     }
 
     pub fn update_position(&self, cursor_id: &str, x: f64, y: f64) {
+        let config = self.config_for(cursor_id);
         let mut inner = self.inner.lock().unwrap();
         let state = inner.entry(cursor_id.to_owned()).or_insert_with(|| CursorInstanceState {
-            config: CursorInstanceConfig { cursor_id: cursor_id.to_owned(), ..Default::default() },
+            config,
             x: None, y: None,
         });
         state.x = Some(x);
@@ -233,18 +355,20 @@ impl CursorRegistry {
     }
 
     pub fn set_enabled(&self, cursor_id: &str, enabled: bool) {
+        let config = self.config_for(cursor_id);
         let mut inner = self.inner.lock().unwrap();
         let state = inner.entry(cursor_id.to_owned()).or_insert_with(|| CursorInstanceState {
-            config: CursorInstanceConfig { cursor_id: cursor_id.to_owned(), ..Default::default() },
+            config,
             x: None, y: None,
         });
         state.config.enabled = enabled;
     }
 
     pub fn update_config(&self, cursor_id: &str, f: impl FnOnce(&mut CursorInstanceConfig)) {
+        let config = self.config_for(cursor_id);
         let mut inner = self.inner.lock().unwrap();
         let state = inner.entry(cursor_id.to_owned()).or_insert_with(|| CursorInstanceState {
-            config: CursorInstanceConfig { cursor_id: cursor_id.to_owned(), ..Default::default() },
+            config,
             x: None, y: None,
         });
         f(&mut state.config);

@@ -21,11 +21,17 @@ pub struct WindowInfo {
     pub title: String,
     pub bounds: WindowBounds,
     pub layer: i32,
+    /// WindowServer compositing alpha. Used to ignore detectably transparent
+    /// helper windows during pixel-delivery obstruction checks.
+    #[serde(default = "default_window_alpha")]
+    pub alpha: f64,
     pub z_index: usize,
     pub is_on_screen: bool,
     pub on_current_space: Option<bool>,
     pub space_ids: Option<Vec<u64>>,
 }
+
+fn default_window_alpha() -> f64 { 1.0 }
 
 // ── CGWindow option flags ─────────────────────────────────────────────────────
 // Apple-canonical kCG* naming preserved to match the public Apple headers — the
@@ -67,6 +73,19 @@ pub fn visible_windows() -> Vec<WindowInfo> {
 }
 
 fn enumerate_windows(options: u32) -> Vec<WindowInfo> {
+    enumerate_windows_inner(options, true)
+}
+
+/// On-screen windows in WindowServer's native front-to-back order, including
+/// non-zero layers. Public window listing deliberately remains layer-0-only.
+fn hit_test_windows() -> Vec<WindowInfo> {
+    enumerate_windows_inner(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        false,
+    )
+}
+
+fn enumerate_windows_inner(options: u32, layer_zero_only: bool) -> Vec<WindowInfo> {
     use core_foundation::{
         array::CFArray,
         base::{CFGetTypeID, TCFType, CFTypeRef},
@@ -142,10 +161,11 @@ fn enumerate_windows(options: u32) -> Vec<WindowInfo> {
         let app_name = get_str("kCGWindowOwnerName");
         let title = get_str("kCGWindowName");
         let layer = get_num("kCGWindowLayer") as i32;
+        let alpha = get_number(&dict, "kCGWindowAlpha");
         let is_on_screen = get_bool("kCGWindowIsOnscreen");
 
         // Only include layer-0 windows.
-        if layer != 0 { continue; }
+        if layer_zero_only && layer != 0 { continue; }
 
         // Parse bounds dict.
         let bounds = {
@@ -176,6 +196,7 @@ fn enumerate_windows(options: u32) -> Vec<WindowInfo> {
             title,
             bounds,
             layer,
+            alpha,
             z_index,
             is_on_screen,
             on_current_space: None,
@@ -184,6 +205,87 @@ fn enumerate_windows(options: u32) -> Vec<WindowInfo> {
     }
 
     result
+}
+
+/// Return the first real input-owning window at a screen point after excluding
+/// windows owned by the driver itself (notably its cursor overlay) and
+/// detectably transparent overlay helpers.
+///
+/// `windows` must be ordered front-to-back, as returned by
+/// `CGWindowListCopyWindowInfo`. Kept as pure logic so obstruction behaviour is
+/// regression-testable without posting GUI events.
+fn frontmost_input_window_at_point(
+    windows: &[WindowInfo],
+    x: f64,
+    y: f64,
+    driver_pid: i32,
+) -> Option<&WindowInfo> {
+    let window_server_pid = windows
+        .iter()
+        .find(|window| is_window_server_owner_name(&window.app_name))
+        .map(|window| window.pid);
+    windows.iter().find(|window| {
+        if window.pid == driver_pid
+            || window_server_pid == Some(window.pid)
+            || is_window_server_owner_name(&window.app_name)
+            || window.window_id == 0
+            || !window.is_on_screen
+        {
+            return false;
+        }
+        // A completely transparent window cannot own a meaningful visible
+        // pixel. Translucent non-normal layers are typically annotation/cursor
+        // overlays; skip them when WindowServer exposes that fact.
+        if window.alpha <= 0.01 || (window.layer != 0 && window.alpha < 0.95) {
+            return false;
+        }
+        let bounds = &window.bounds;
+        bounds.width > 0.0
+            && bounds.height > 0.0
+            && x >= bounds.x
+            && y >= bounds.y
+            && x < bounds.x + bounds.width
+            && y < bounds.y + bounds.height
+    })
+}
+
+fn is_window_server_owner_name(app_name: &str) -> bool {
+    matches!(app_name.trim(), "Window Server" | "WindowServer")
+}
+
+/// Resolve an occluding window for a background pixel dispatch.
+///
+/// Returns `Some(window)` only when the first input-owning window at `(x, y)`
+/// is not the exact requested `(pid, window_id)`. Foreground delivery skips
+/// this check because fronting establishes the requested Z order.
+pub fn pixel_obstruction(
+    target_pid: i32,
+    target_window_id: u32,
+    x: f64,
+    y: f64,
+) -> Option<WindowInfo> {
+    let windows = hit_test_windows();
+    let driver_pid = std::process::id() as i32;
+    pixel_obstruction_in_stack(
+        &windows,
+        target_pid,
+        target_window_id,
+        x,
+        y,
+        driver_pid,
+    )
+}
+
+fn pixel_obstruction_in_stack(
+    windows: &[WindowInfo],
+    target_pid: i32,
+    target_window_id: u32,
+    x: f64,
+    y: f64,
+    driver_pid: i32,
+) -> Option<WindowInfo> {
+    let owner = frontmost_input_window_at_point(windows, x, y, driver_pid)?;
+    (owner.pid != target_pid || owner.window_id != target_window_id).then(|| owner.clone())
 }
 
 fn get_bounds_num(
@@ -206,6 +308,13 @@ fn get_bounds_num(
             } else { None }
         })
         .unwrap_or(0.0)
+}
+
+fn get_number(
+    dict: &core_foundation::dictionary::CFDictionary<*const std::os::raw::c_void, *const std::os::raw::c_void>,
+    key: &str,
+) -> f64 {
+    get_bounds_num(dict, key)
 }
 
 /// Look up a window's bounds by its CGWindowID.
@@ -237,4 +346,100 @@ pub fn resolve_main_window_id(pid: i32) -> anyhow::Result<u32> {
         area_a.partial_cmp(&area_b).unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(largest.unwrap().window_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_without_alpha_defaults_to_opaque() {
+        let info: WindowInfo = serde_json::from_value(serde_json::json!({
+            "window_id": 1,
+            "pid": 2,
+            "app_name": "Notes",
+            "title": "Note",
+            "bounds": {"x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0},
+            "layer": 0,
+            "z_index": 0,
+            "is_on_screen": true,
+            "on_current_space": true,
+            "space_ids": null
+        })).unwrap();
+        assert_eq!(info.alpha, 1.0);
+    }
+
+    fn window(window_id: u32, pid: i32, app_name: &str, layer: i32, alpha: f64) -> WindowInfo {
+        WindowInfo {
+            window_id,
+            pid,
+            app_name: app_name.to_owned(),
+            title: format!("{app_name} window"),
+            bounds: WindowBounds {
+                x: 10.0,
+                y: 20.0,
+                width: 200.0,
+                height: 100.0,
+            },
+            layer,
+            alpha,
+            z_index: 1,
+            is_on_screen: true,
+            on_current_space: Some(true),
+            space_ids: None,
+        }
+    }
+
+    #[test]
+    fn hit_test_reports_frontmost_occluder() {
+        let windows = vec![
+            window(8, 200, "Notes", 0, 1.0),
+            window(9, 300, "Calculator", 0, 1.0),
+        ];
+        let obstruction = pixel_obstruction_in_stack(&windows, 300, 9, 50.0, 50.0, 100).unwrap();
+        assert_eq!(obstruction.window_id, 8);
+        assert_eq!(obstruction.app_name, "Notes");
+    }
+
+    #[test]
+    fn hit_test_allows_exact_target_window() {
+        let windows = vec![
+            window(9, 300, "Calculator", 0, 1.0),
+            window(8, 200, "Notes", 0, 1.0),
+        ];
+        assert!(pixel_obstruction_in_stack(&windows, 300, 9, 50.0, 50.0, 100).is_none());
+    }
+
+    #[test]
+    fn driver_cursor_overlay_never_obstructs_pixel_hit_test() {
+        let driver_pid = 100;
+        let windows = vec![
+            // The real cursor overlay is layer 0 and spans the screen.
+            window(7, driver_pid, "cua-driver", 0, 1.0),
+            window(9, 300, "Calculator", 0, 1.0),
+        ];
+        let owner = frontmost_input_window_at_point(&windows, 50.0, 50.0, driver_pid).unwrap();
+        assert_eq!(owner.window_id, 9, "driver-owned overlay must be skipped");
+    }
+
+    #[test]
+    fn transparent_non_normal_overlay_is_skipped() {
+        let windows = vec![
+            window(7, 200, "Screen annotation", 25, 0.5),
+            window(9, 300, "Calculator", 0, 1.0),
+        ];
+        let owner = frontmost_input_window_at_point(&windows, 50.0, 50.0, 100).unwrap();
+        assert_eq!(owner.window_id, 9);
+    }
+
+    #[test]
+    fn window_server_windows_and_owner_pid_are_skipped() {
+        let windows = vec![
+            window(1, 88, "Window Server", 101, 1.0),
+            window(2, 88, "Hardware Cursor", 101, 1.0),
+            window(9, 300, "Calculator", 0, 1.0),
+        ];
+        let owner = frontmost_input_window_at_point(&windows, 50.0, 50.0, 100).unwrap();
+        assert_eq!(owner.window_id, 9);
+    }
 }

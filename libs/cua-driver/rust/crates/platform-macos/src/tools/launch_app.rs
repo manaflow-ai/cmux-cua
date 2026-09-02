@@ -158,7 +158,20 @@ impl Tool for LaunchAppTool {
         // re-activates the prior frontmost if the target is still
         // frontmost — handles the intra-`open()` synchronous activation
         // that fired before we could arm with the real pid.
-        let prior_frontmost = crate::apps::frontmost_pid();
+        //
+        // Embedded "watchable" mode is the exception: the user is watching the
+        // agent drive apps (there is an on-screen agent-cursor overlay), so a
+        // launched app must come to the FRONT, not hide behind the host. When
+        // embedded we skip the suppression entirely (prior_frontmost stays
+        // `None`, so no lease is armed and the belt-and-braces demotion block is
+        // skipped) and front the launched app after it starts. Outside embedded
+        // mode the background-launch suppression below is unchanged.
+        let embedded = cua_driver_core::embedded_mode();
+        let prior_frontmost = if suppresses_activation(embedded) {
+            crate::apps::frontmost_pid()
+        } else {
+            None
+        };
 
         let wildcard_lease = prior_frontmost.map(|prior| {
             crate::focus_steal::FocusStealPreventer::begin_suppression(
@@ -406,12 +419,31 @@ impl Tool for LaunchAppTool {
             drop(wildcard_lease);
         }
 
+        // Embedded "watchable" fronting: bring the just-launched app forward so
+        // the user watching the agent sees the app they asked to open. Best-
+        // effort — a rejected activation never fails the launch. Only runs when
+        // embedded (otherwise suppression above kept it in the background).
+        if embedded {
+            if let Ok(Ok((pid, _, _))) = &launch_result {
+                let activated = crate::apps::activate_pid_all_windows(*pid);
+                if !activated {
+                    tracing::warn!(
+                        target: "platform_macos::tools::launch_app",
+                        launched_pid = *pid,
+                        "embedded watchable launch: activation returned NO — \
+                         launched app may not have come to the foreground"
+                    );
+                }
+            }
+        }
+
         match launch_result {
             Ok(Ok((pid, app_info, windows))) => {
                 let app_name = app_info.as_ref().map(|a| a.name.as_str()).unwrap_or("?");
                 let bid = app_info.as_ref().and_then(|a| a.bundle_id.as_deref()).unwrap_or("?");
 
-                let mut summary = format!("Launched {app_name} (pid {pid}) in background.{port_summary}");
+                let placement = if embedded { "foreground" } else { "background" };
+                let mut summary = format!("Launched {app_name} (pid {pid}) in {placement}.{port_summary}");
 
                 if !windows.is_empty() {
                     summary.push_str("\n\nWindows:");
@@ -461,6 +493,17 @@ impl Tool for LaunchAppTool {
             Err(e)     => ToolResult::error(format!("Task error: {e}")),
         }
     }
+}
+
+/// Whether `launch_app` should arm background-launch focus-steal suppression.
+///
+/// Non-embedded (serve/daemon/one-shot CLI): `true` — keep the launched app in
+/// the background and restore the prior frontmost, exactly as before. Embedded
+/// "watchable" mode: `false` — no suppression, because the launched app is then
+/// fronted so the watching user sees it. Pure seam for unit testing the
+/// mode gate without a live launch.
+fn suppresses_activation(embedded: bool) -> bool {
+    !embedded
 }
 
 // ── Blocking helpers ──────────────────────────────────────────────────────────
@@ -592,8 +635,28 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{local_file_target, preflight_file_urls};
+    use super::{local_file_target, preflight_file_urls, suppresses_activation};
     use std::path::PathBuf;
+
+    #[test]
+    fn non_embedded_launch_still_suppresses_activation() {
+        // Serve/daemon/one-shot CLI: background launch + prior-frontmost restore
+        // is unchanged — suppression stays armed.
+        assert!(
+            suppresses_activation(false),
+            "non-embedded launch_app must keep background-launch suppression"
+        );
+    }
+
+    #[test]
+    fn embedded_launch_does_not_suppress_activation() {
+        // Watchable embedded mode fronts the launched app instead of hiding it,
+        // so no focus-steal suppression is armed.
+        assert!(
+            !suppresses_activation(true),
+            "embedded launch_app must front the launched app (no suppression)"
+        );
+    }
 
     #[test]
     fn local_file_target_treats_plain_paths_as_files() {

@@ -34,6 +34,71 @@ pub const DEFAULT_MAX_DEPTH: usize = 25;
 /// (issue #22865).
 pub const DEFAULT_MAX_ELEMENTS: usize = 2_000;
 
+/// Maximum number of Unicode scalar values emitted for one AXValue. Large
+/// document/text-area values otherwise duplicate entire documents into both
+/// the structured array and Markdown tree.
+pub const MAX_AX_VALUE_CHARS: usize = 512;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ActionableSignature {
+    role: String,
+    label: String,
+    frame_bits: [u64; 4],
+}
+
+#[derive(Default)]
+struct DuplicateTracker {
+    actionable_signatures: HashSet<ActionableSignature>,
+}
+
+impl DuplicateTracker {
+    fn should_emit(
+        &mut self,
+        is_actionable: bool,
+        role: &str,
+        label: Option<&str>,
+        frame: Option<[f64; 4]>,
+    ) -> bool {
+        !is_actionable || !self.is_duplicate_actionable(role, label, frame)
+    }
+
+    fn is_duplicate_actionable(
+        &mut self,
+        role: &str,
+        label: Option<&str>,
+        frame: Option<[f64; 4]>,
+    ) -> bool {
+        let (Some(label), Some(frame)) = (label.filter(|v| !v.is_empty()), frame) else {
+            return false;
+        };
+        !self.actionable_signatures.insert(ActionableSignature {
+            role: role.to_owned(),
+            label: label.to_owned(),
+            frame_bits: frame.map(f64::to_bits),
+        })
+    }
+}
+
+pub(crate) fn truncate_ax_value(value: String) -> String {
+    if value.chars().count() <= MAX_AX_VALUE_CHARS {
+        return value;
+    }
+    let mut truncated: String = value.chars().take(MAX_AX_VALUE_CHARS).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// Human-facing label shared by the Markdown/structured dedupe logic. Preserve
+/// the established title-first order used by structured consumers.
+pub(crate) fn preferred_label<'a>(
+    title: Option<&'a str>,
+    description: Option<&'a str>,
+    value: Option<&'a str>,
+    identifier: Option<&'a str>,
+) -> Option<&'a str> {
+    title.or(description).or(value).or(identifier)
+}
+
 /// How long to let a freshly-enabled Chromium/Electron app build its
 /// web-content AX tree before we read it. The tree is materialized
 /// asynchronously over IPC once the app detects an assistive client, so a
@@ -126,6 +191,7 @@ pub fn walk_tree_bounded(
     let mut index_counter = 0usize;
     // Shared visited-node counter passed into walk_element to enforce the cap.
     let mut visited_count = 0usize;
+    let mut duplicates = DuplicateTracker::default();
     // Set to true only when walk_element actually stops early due to the cap —
     // avoids a false-positive when the tree naturally ends on exactly the cap.
     let mut truncated = false;
@@ -197,6 +263,7 @@ pub fn walk_tree_bounded(
                 &mut truncated,
                 max_elements,
                 max_depth,
+                &mut duplicates,
             );
         }
 
@@ -240,6 +307,7 @@ unsafe fn walk_element(
     truncated: &mut bool,
     max_elements: usize,
     max_depth: usize,
+    duplicates: &mut DuplicateTracker,
 ) {
     if depth > max_depth { return; }
     // Enforce total-node cap — mirrors Swift's maxElements guard.
@@ -271,6 +339,7 @@ unsafe fn walk_element(
                 truncated,
                 max_elements,
                 max_depth,
+                duplicates,
             );
             CFRelease(child as CFTypeRef);
         }
@@ -283,7 +352,7 @@ unsafe fn walk_element(
     // (digit buttons). Merging them would produce "2" (quoted) instead of (2)
     // (parens), breaking _find_calc_button which searches for "(2)".
     let title = copy_string_attr(element, "AXTitle");
-    let value = copy_string_attr(element, "AXValue");
+    let value = copy_stringified_attr(element, "AXValue");
     // AXPlaceholderValue as fallback for empty text fields.
     let value = value.filter(|v| !v.trim().is_empty())
         .or_else(|| copy_string_attr(element, "AXPlaceholderValue"));
@@ -295,6 +364,7 @@ unsafe fn walk_element(
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
     let visible_value = value.as_deref().unwrap_or("").trim().to_owned();
+    let visible_value = truncate_ax_value(visible_value);
 
     let has_content = !visible_title.is_empty()
         || !visible_description.is_empty()
@@ -315,6 +385,7 @@ unsafe fn walk_element(
                 truncated,
                 max_elements,
                 max_depth,
+                duplicates,
             );
             CFRelease(child as CFTypeRef);
         }
@@ -323,6 +394,15 @@ unsafe fn walk_element(
 
     let element_ptr = element as usize;
     let frame = element_screen_rect(element);
+    let label = preferred_label(
+        (!visible_title.is_empty()).then_some(visible_title.as_str()),
+        (!visible_description.is_empty()).then_some(visible_description.as_str()),
+        (!visible_value.is_empty()).then_some(visible_value.as_str()),
+        identifier.as_deref(),
+    );
+    if !duplicates.should_emit(is_actionable, &role, label, frame) {
+        return;
+    }
     let node = if is_actionable {
         let idx = *counter;
         *counter += 1;
@@ -382,6 +462,7 @@ unsafe fn walk_element(
             truncated,
             max_elements,
             max_depth,
+            duplicates,
         );
         CFRelease(child as CFTypeRef);
     }
@@ -497,4 +578,73 @@ fn leading_indent_depth(line: &str) -> usize {
         if ch == ' ' { count += 1; } else { break; }
     }
     count / 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_tracker_rejects_same_role_label_and_frame() {
+        let mut tracker = DuplicateTracker::default();
+        let frame = Some([10.0, 20.0, 30.0, 40.0]);
+        assert!(!tracker.is_duplicate_actionable("AXButton", Some("7"), frame));
+        assert!(tracker.is_duplicate_actionable("AXButton", Some("7"), frame));
+        assert!(!tracker.is_duplicate_actionable("AXButton", Some("8"), frame));
+    }
+
+    #[test]
+    fn duplicate_tracker_does_not_merge_same_label_at_different_frames() {
+        let mut tracker = DuplicateTracker::default();
+        assert!(!tracker.is_duplicate_actionable(
+            "AXButton",
+            Some("OK"),
+            Some([10.0, 20.0, 30.0, 40.0]),
+        ));
+        assert!(!tracker.is_duplicate_actionable(
+            "AXButton",
+            Some("OK"),
+            Some([50.0, 20.0, 30.0, 40.0]),
+        ));
+    }
+
+    #[test]
+    fn walk_with_interleaved_release_and_reallocation_keeps_distinct_elements() {
+        // AX child refs are released during a depth-first walk, so the allocator
+        // may reuse the same address for a later, logically distinct element.
+        // Pointer addresses must not participate in dedupe; only the stable
+        // role + label + frame signature does.
+        let simulated_addresses = [0x1234usize, 0x1234usize, 0x1234usize];
+        let mut tracker = DuplicateTracker::default();
+        let emitted = [
+            tracker.should_emit(
+                true,
+                "AXMenuItem",
+                Some("View"),
+                Some([10.0, 20.0, 30.0, 40.0]),
+            ),
+            tracker.should_emit(
+                false,
+                "AXStaticText",
+                Some("78+2"),
+                Some([50.0, 60.0, 70.0, 80.0]),
+            ),
+            tracker.should_emit(
+                false,
+                "AXStaticText",
+                Some("80"),
+                Some([50.0, 90.0, 70.0, 80.0]),
+            ),
+        ];
+        assert!(simulated_addresses.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(emitted, [true, true, true]);
+    }
+
+    #[test]
+    fn truncate_ax_value_keeps_unicode_boundaries() {
+        let value = "é".repeat(MAX_AX_VALUE_CHARS + 1);
+        let truncated = truncate_ax_value(value);
+        assert_eq!(truncated.chars().count(), MAX_AX_VALUE_CHARS + 1);
+        assert!(truncated.ends_with('…'));
+    }
 }
