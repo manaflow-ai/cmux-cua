@@ -16,9 +16,7 @@ use cua_driver_core::health_report::{
     NAME_SESSION_ACTIVE, NAME_TCC_ACCESSIBILITY, NAME_TCC_SCREEN_RECORDING,
 };
 
-use crate::permissions::status::{
-    accessibility_granted, current_status, screen_recording_granted,
-};
+use crate::permissions::status::{accessibility_granted, current_status, screen_recording_granted};
 
 /// macOS run order, in the order consumers see them reflected back in
 /// `report.checks[]`. Matches the Swift PR #1905 contract.
@@ -112,36 +110,76 @@ pub(crate) fn check_bundle_identity() -> CheckEntry {
         .and_then(|p| p.to_str().map(str::to_owned))
         .unwrap_or_default();
 
-    let is_correct = bid.as_deref() == Some(CANONICAL_BUNDLE_ID);
+    check_bundle_identity_for_context(
+        bid,
+        exe,
+        crate::permissions::external_permission_flow_enabled(),
+    )
+}
+
+fn check_bundle_identity_for_context(
+    bid: Option<String>,
+    exe: String,
+    _external_permission_flow: bool,
+) -> CheckEntry {
+    let is_canonical = bid.as_deref() == Some(CANONICAL_BUNDLE_ID);
+    let is_external_helper = _external_permission_flow
+        && exe.contains(".app/Contents/MacOS/")
+        && bid
+            .as_deref()
+            .is_some_and(|identifier| !identifier.is_empty());
     let data = CheckData {
         bundle_identifier: bid.clone(),
         executable_path: if exe.is_empty() { None } else { Some(exe) },
         ..Default::default()
     };
-    if is_correct {
+    if is_canonical {
         return CheckEntry::pass(
             NAME_BUNDLE_IDENTITY,
             format!("Bundle is {CANONICAL_BUNDLE_ID}."),
         )
         .with_data(data);
     }
-    let (message, hint) = match bid.as_deref() {
-        None | Some("") => (
-            "Process has no CFBundleIdentifier.".to_owned(),
-            format!(
-                "Run the binary inside CuaDriver.app so TCC grants attribute correctly. \
+    if is_external_helper {
+        let identifier = bid.as_deref().unwrap_or_default();
+        return CheckEntry::pass(
+            NAME_BUNDLE_IDENTITY,
+            format!("Bundle is {identifier}; the embedding host owns permission setup."),
+        )
+        .with_data(data);
+    }
+    let (message, hint) = if _external_permission_flow {
+        match bid.as_deref() {
+            None | Some("") => (
+                "Process has no CFBundleIdentifier.".to_owned(),
+                "Restart the embedding host so it can launch its bundled Computer Use helper. Do not run the standalone cua-driver permission flow."
+                    .to_owned(),
+            ),
+            Some(other) => (
+                format!("Bundle is {other}, but the executable is not inside its helper app."),
+                "Restart the embedding host's Computer Use runtime so permission status comes from its own LaunchServices helper. Do not run `cua-driver permissions grant`."
+                    .to_owned(),
+            ),
+        }
+    } else {
+        match bid.as_deref() {
+            None | Some("") => (
+                "Process has no CFBundleIdentifier.".to_owned(),
+                format!(
+                    "Run the binary inside CuaDriver.app so TCC grants attribute correctly. \
                  Start the daemon with `open -n -g -a CuaDriver --args serve` and \
                  connect via `cua-driver mcp`."
+                ),
             ),
-        ),
-        Some(other) => (
-            format!("Bundle is {other}, not {CANONICAL_BUNDLE_ID}."),
-            format!(
-                "TCC grants will be attributed to {other}, not the cua-driver daemon. \
+            Some(other) => (
+                format!("Bundle is {other}, not {CANONICAL_BUNDLE_ID}."),
+                format!(
+                    "TCC grants will be attributed to {other}, not the cua-driver daemon. \
                  Run via `cua-driver mcp` (auto-relaunches inside CuaDriver.app) or \
-                 start the daemon manually: `open -n -g -a CuaDriver --args serve`."
+                start the daemon manually: `open -n -g -a CuaDriver --args serve`."
+                ),
             ),
-        ),
+        }
     };
     CheckEntry::fail(NAME_BUNDLE_IDENTITY, message, hint).with_data(data)
 }
@@ -157,13 +195,15 @@ fn check_tcc_accessibility() -> CheckEntry {
         return CheckEntry::pass(NAME_TCC_ACCESSIBILITY, "Accessibility is granted.")
             .with_data(data);
     }
+    let hint = if crate::permissions::external_permission_flow_enabled() {
+        "Grant Accessibility to the Computer Use helper reported by bundle_identity using the embedding host's onboarding. Do not run the standalone cua-driver permission flow."
+    } else {
+        "Grant Accessibility to CuaDriver.app in System Settings → Privacy & Security → Accessibility. If the process bundle is not com.trycua.driver (see bundle_identity), the grant must target the responsible app — restart via `cua-driver mcp` to relaunch inside CuaDriver.app."
+    };
     CheckEntry::fail(
         NAME_TCC_ACCESSIBILITY,
         "Accessibility is NOT granted for this process.",
-        "Grant Accessibility to CuaDriver.app in System Settings → Privacy & Security → \
-         Accessibility. If the process bundle is not com.trycua.driver (see bundle_identity), \
-         the grant must target the responsible app — restart via `cua-driver mcp` to relaunch \
-         inside CuaDriver.app.",
+        hint,
     )
     .with_data(data)
 }
@@ -178,12 +218,15 @@ fn check_tcc_screen_recording() -> CheckEntry {
         return CheckEntry::pass(NAME_TCC_SCREEN_RECORDING, "Screen Recording is granted.")
             .with_data(data);
     }
+    let hint = if crate::permissions::external_permission_flow_enabled() {
+        "Grant Screen Recording to the Computer Use helper reported by bundle_identity using the embedding host's onboarding. Do not run the standalone cua-driver permission flow."
+    } else {
+        "Grant Screen Recording to CuaDriver.app in System Settings → Privacy & Security → Screen Recording. The grant is attributed to the responsible process — see bundle_identity to confirm the right binary is being prompted."
+    };
     CheckEntry::fail(
         NAME_TCC_SCREEN_RECORDING,
         "Screen Recording is NOT granted for this process.",
-        "Grant Screen Recording to CuaDriver.app in System Settings → Privacy & Security → \
-         Screen Recording. The grant is attributed to the responsible process — see \
-         bundle_identity to confirm the right binary is being prompted.",
+        hint,
     )
     .with_data(data)
 }
@@ -206,6 +249,12 @@ fn check_ax_capability() -> CheckEntry {
 }
 
 async fn check_screen_capture_capability() -> CheckEntry {
+    if let Some(entry) = external_screen_capture_check(
+        crate::permissions::external_permission_flow_enabled(),
+    ) {
+        return entry;
+    }
+
     // Live ScreenCaptureKit probe — same shape as `check_permissions`'s
     // `screen_recording_capturable`, but answer the consumer-facing
     // capability question and surface the display count.
@@ -238,6 +287,15 @@ async fn check_screen_capture_capability() -> CheckEntry {
     }
 }
 
+fn external_screen_capture_check(external_permission_flow: bool) -> Option<CheckEntry> {
+    external_permission_flow.then(|| {
+        CheckEntry::skip(
+            NAME_SCREEN_CAPTURE_CAPABILITY,
+            "Live ScreenCaptureKit probe skipped because the embedding host owns permission onboarding.",
+        )
+    })
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Live ScreenCaptureKit probe — enumerates shareable displays. Writes
@@ -253,7 +311,7 @@ fn probe_shareable_displays() -> Result<u32, String> {
 /// Read the running process's `CFBundleIdentifier` via CoreFoundation.
 /// Returns `None` when the process has no associated bundle (e.g.
 /// running the bare binary outside `CuaDriver.app`).
-fn current_bundle_identifier() -> Option<String> {
+pub(crate) fn current_bundle_identifier() -> Option<String> {
     use core_foundation::base::TCFType;
     use core_foundation::bundle::{CFBundle, CFBundleGetMainBundle};
     use core_foundation::string::CFString;
@@ -369,6 +427,32 @@ mod tests {
             data.executable_path.is_some(),
             "executable_path must be set so consumers can identify the wrong binary"
         );
+    }
+
+    #[test]
+    fn external_cmux_helper_bundle_identity_passes_without_standalone_hint() {
+        let entry = check_bundle_identity_for_context(
+            Some("com.cmuxterm.app.debug.tag.computer-use".to_owned()),
+            "/Library/Application Support/cmux/computer-use/helper/tag/cmux Computer Use.app/Contents/MacOS/cmux-cua-driver".to_owned(),
+            true,
+        );
+
+        assert_eq!(entry.status, CheckStatus::Pass);
+        assert!(
+            entry
+                .hint
+                .as_deref()
+                .is_none_or(|hint| !hint.contains("CuaDriver")),
+            "a healthy host-owned helper must not recommend CuaDriver.app",
+        );
+    }
+
+    #[test]
+    fn external_permission_flow_skips_live_screen_capture_probe() {
+        let entry = external_screen_capture_check(true)
+            .expect("host-owned permission flow must provide a silent check result");
+        assert_eq!(entry.status, CheckStatus::Skip);
+        assert_eq!(entry.name, NAME_SCREEN_CAPTURE_CAPABILITY);
     }
 
     // End-to-end through the dispatcher — checks every macOS canonical

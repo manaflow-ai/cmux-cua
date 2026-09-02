@@ -132,13 +132,14 @@ target, ring-ripples on landing, idle-hides after ~1.5s. Motion knobs:
 `end_handle`, `arc_size`, `arc_flow`, `spring` — tuneable at runtime,
 persisted to config.
 
-**Per-session cursors.** Each MCP session automatically owns its own
-cursor, keyed by the session's id (the proxy mints one session id per
-MCP connection and the daemon scopes the cursor, config overrides, and
-recording to it). You normally pass nothing — the session key is wired
-through for you. Pass an explicit `cursor_id` only to *deliberately
-share* one cursor across sessions. When a session ends (the MCP client
-disconnects) its cursor is removed automatically.
+**Per-session cursors.** In **embedded** mode (`CUA_DRIVER_EMBEDDED=1`)
+anonymous calls automatically own a default cursor keyed by
+`CUA_DRIVER_DEFAULT_SESSION` (else `embedded-<pid>`), so you pass nothing
+and still get a cursor. Outside embedded mode you must pass an explicit
+`session` to get a cursor — anonymous non-embedded calls are cursor-less.
+Pass an explicit `cursor_id` to *deliberately share* one cursor across
+sessions. When a session ends (the MCP client disconnects) its cursor is
+removed automatically.
 
 **Visibility caveat (AX runs).** On a pure accessibility-action run
 (clicking by `element_index`), the first action **seeds the cursor

@@ -39,7 +39,7 @@ fn def() -> &'static ToolDef {
             "type": "object",
             "required": ["pid"],
             "properties": {
-                "session": { "type": "string", "description": "Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less." },
+                "session": { "type": "string", "description": "Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-<pid>); anonymous non-embedded calls remain cursor-less." },
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "element_index": {
                     "type": "integer",
@@ -80,6 +80,26 @@ fn def() -> &'static ToolDef {
 #[async_trait]
 impl Tool for RightClickTool {
     fn def(&self) -> &ToolDef { def() }
+
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        cua_driver_core::tool::validate_dispatch_args(self.def(), args)?;
+        let address = super::preflight_action_address(args, "right_click")?;
+        if address.partial_xy {
+            return Err(ToolResult::error("Provide both x and y together, not just one."));
+        }
+        if address.element && address.has_xy {
+            return Err(ToolResult::error("Provide either element_index or (x, y), not both."));
+        }
+        if !address.element && !address.has_xy {
+            return Err(ToolResult::error(
+                "Provide element_index or (x, y) to address the right-click target.",
+            ));
+        }
+        if address.element && address.window_id.is_none() {
+            return Err(ToolResult::error("window_id is required when element_index is used."));
+        }
+        Ok(())
+    }
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;

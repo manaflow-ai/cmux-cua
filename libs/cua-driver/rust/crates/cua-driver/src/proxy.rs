@@ -26,6 +26,8 @@
 use std::sync::Arc;
 
 use cua_driver_core::protocol::{initialize_result, Request, Response};
+#[cfg(target_os = "macos")]
+use cua_driver_core::protocol::{ToolCall, ToolResult};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
@@ -44,14 +46,7 @@ use crate::serve::{is_daemon_listening, send_request, DaemonRequest};
 /// clear startup error instead of a "successful" handshake that
 /// advertises zero tools and then errors on every call. Matches
 /// Swift `makeProxy`'s `fetchProxyToolList` pre-check.
-pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
-    if !is_daemon_listening(&socket_path) {
-        anyhow::bail!(
-            "cua-driver-rs daemon not reachable on {socket_path}. Start it \
-             with `open -n -g -a CuaDriver --args serve` and retry."
-        );
-    }
-
+pub async fn run_proxy(socket_path: String, claude_code_compat: bool) -> anyhow::Result<()> {
     // Mint this MCP session's identity once at proxy startup. One proxy process
     // == one MCP session; the daemon outlives it. We stamp this id on every
     // forwarded request so the daemon can OWN and CLEAN UP this session's
@@ -62,52 +57,87 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
     let session_id = mint_session_id();
     debug!(session_id = %session_id, "proxy session minted");
 
-    // Open ONE long-lived "control" connection to the daemon and hold it open
-    // for this proxy's entire lifetime (separate from the per-call connections
-    // that `send_request` opens and closes per tool call). It sends a single
-    // `session_begin` line and then parks reading — it never writes again and
-    // never closes until this process dies.
+    // Serve `initialize` and `tools/list` WITHOUT the daemon so the
+    // permission-requesting daemon stays DORMANT until the agent actually
+    // invokes a tool.
     //
-    // This is the reaper: when the proxy exits (graceful stdin EOF) OR is
-    // SIGKILLed/crashes, the kernel closes this socket; the daemon's
-    // per-connection reader hits EOF and fires `session_end` for `session_id`,
+    // The "control" connection referenced below is the reaper: it holds one
+    // long-lived socket to the daemon and sends a single `session_begin`; when
+    // the proxy exits (graceful stdin EOF) OR is SIGKILLed/crashes, the kernel
+    // closes it and the daemon fires `session_end` for this `session_id`,
     // tearing down every piece of state this session owns (overlay cursor,
-    // config overrides, recording). Liveness is connection-based, so an
-    // alive-but-idle session — one issuing zero tool calls — is never reaped:
-    // its control connection stays parked open.
+    // config overrides, recording).
     //
-    // Detached + fire-and-forget. If the connect races daemon startup and
-    // fails, we log and continue — the per-call `send_request` has its own
-    // retry/timeout, and a restarted daemon loses session state anyway, so a
-    // missing control connection only degrades to no-reaper (the recording
-    // idle-TTL still backstops a leaked recording). It must NOT bail the proxy.
-    {
-        let socket = socket_path.clone();
-        let sid = session_id.clone();
-        tokio::spawn(async move {
-            run_control_connection(socket, sid).await;
-        });
-    }
+    // macOS: build the tool list from the in-process registry — a pure,
+    // permission-free operation — and launch the daemon (plus the reaper) lazily
+    // on the FIRST `tools/call` (see `ensure_daemon_started`). Nothing prompts
+    // merely because an agent registered this MCP server at session start.
+    //
+    // Other platforms: there is no lazy `open -a` launch path, so the caller
+    // guarantees a daemon is already up. Fetch the list from it and start the
+    // reaper immediately (unchanged behaviour).
+    #[cfg(target_os = "macos")]
+    let bootstrap_tools_list =
+        Arc::new(crate::build_macos_registry_with_compat(claude_code_compat).tools_list());
+    #[cfg(not(target_os = "macos"))]
+    let cached_tools_list = {
+        let _ = claude_code_compat;
+        if !is_daemon_listening(&socket_path) {
+            anyhow::bail!(
+                "cua-driver-rs daemon not reachable on {socket_path}. Start it \
+                 with `cua-driver serve` and retry."
+            );
+        }
+        {
+            let socket = socket_path.clone();
+            let sid = session_id.clone();
+            tokio::spawn(async move {
+                run_control_connection(socket, sid).await;
+            });
+        }
+        Arc::new(fetch_tools_list_from_daemon(&socket_path, &session_id)?)
+    };
 
-    // Cache the tool list once at startup. The daemon's registry is
-    // static for the lifetime of the daemon, so polling on every
-    // `tools/list` would waste a round-trip per call. Swift does the
-    // same caching in `fetchProxyToolList`.
-    let cached_tools_list = fetch_tools_list_from_daemon(&socket_path, &session_id)?;
-    let cached_tools_list = Arc::new(cached_tools_list);
+    // macOS: the daemon/reaper lifecycle and the onboarding grant wait are
+    // tracked separately. A first `check_permissions` call must be forwarded
+    // promptly, but that status call must not let a later driving action skip
+    // the grant wait. The stdin loop is a single sequential task, so plain
+    // state threaded by `&mut` is race-free — no lock needed.
+    #[cfg(target_os = "macos")]
+    let mut daemon_state = DaemonStartState::default();
+    #[cfg(target_os = "macos")]
+    let (daemon_lifecycle_tx, mut daemon_lifecycle_rx) =
+        tokio::sync::mpsc::unbounded_channel::<DaemonLifecycleEvent>();
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin);
+    let mut lines = BufReader::new(stdin).lines();
     let mut writer = tokio::io::BufWriter::new(stdout);
-    let mut line = String::new();
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
+        // The persistent control connection is also the authoritative daemon
+        // lifetime signal. A helper can exit and finish relaunching between
+        // two MCP calls, leaving the same socket path reachable; a transient
+        // `is_daemon_listening` probe cannot identify that replacement. Its
+        // EOF event invalidates the generation/cache before the next request.
+        // `next_line` is cancellation-safe, so selecting it against lifecycle
+        // events cannot discard a partially received JSON-RPC line.
+        #[cfg(target_os = "macos")]
+        let line = tokio::select! {
+            biased;
+            event = daemon_lifecycle_rx.recv() => {
+                if let Some(event) = event {
+                    daemon_state.observe_control_connection_end(event.generation);
+                }
+                continue;
+            }
+            line = lines.next_line() => line?,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let line = lines.next_line().await?;
+        let Some(line) = line else {
             break; // EOF — MCP client disconnected (stdin closed).
-        }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -125,7 +155,63 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
             }
             Ok(req) => {
                 let id = req.id.clone().unwrap_or(serde_json::Value::Null);
-                handle_proxy_request(req, id, &socket_path, &cached_tools_list, &session_id).await
+                // macOS: bring the daemon (and the reaper control connection) up
+                // on the FIRST `tools/call` only. `initialize` and `tools/list`
+                // are served locally, so the Accessibility / Screen Recording
+                // prompts the daemon's gate raises appear when a computer-use
+                // tool is actually invoked — not when the MCP server was merely
+                // registered at agent-session start.
+                #[cfg(target_os = "macos")]
+                {
+                    if req.method.as_str() == "tools/call" {
+                        let tools_list = daemon_state.tools_list_or(&bootstrap_tools_list);
+                        match admit_bootstrap_tool_call(&req, tools_list) {
+                            BootstrapToolCallAdmission::InvalidParams(error) => {
+                                Response::error(id, -32602, format!("Invalid params: {error}"))
+                            }
+                            BootstrapToolCallAdmission::Rejected(result) => {
+                                response_from_tool_result(id, result)
+                            }
+                            BootstrapToolCallAdmission::Ready {
+                                call,
+                                wait_for_grants,
+                            } => {
+                                if let Err(e) = ensure_daemon_started(
+                                    &socket_path,
+                                    &mut daemon_state,
+                                    &session_id,
+                                    claude_code_compat,
+                                    wait_for_grants,
+                                    &daemon_lifecycle_tx,
+                                )
+                                .await
+                                {
+                                    Response::error(
+                                        id,
+                                        -32603,
+                                        format!("computer-use daemon failed to start: {e}"),
+                                    )
+                                } else {
+                                    forward_tool_call(
+                                        id,
+                                        call.name,
+                                        call.args,
+                                        &socket_path,
+                                        &session_id,
+                                    )
+                                    .await
+                                }
+                            }
+                        }
+                    } else {
+                        let tools_list = daemon_state.tools_list_or(&bootstrap_tools_list);
+                        handle_proxy_request(req, id, &socket_path, tools_list, &session_id).await
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    handle_proxy_request(req, id, &socket_path, &cached_tools_list, &session_id).await
+                }
             }
         };
 
@@ -286,6 +372,10 @@ fn mint_session_id() -> String {
 /// `tools/list` result. The daemon now returns the full ToolDef
 /// (`name`, `description`, `input_schema`, annotation hints) per
 /// commit 3's `serve.rs` change.
+///
+/// macOS serves the in-process list only while its lazy proxy is dormant. Once
+/// connected, it fetches this daemon-authored list once per observed daemon
+/// generation and caches it for later `tools/list` requests.
 fn fetch_tools_list_from_daemon(
     socket_path: &str,
     session_id: &str,
@@ -392,12 +482,402 @@ fn fetch_tools_list_from_daemon(
     }))
 }
 
+/// Bring the daemon (and the reaper control connection) up exactly once, on the
+/// first `tools/call`. Serving `initialize` / `tools/list` from the in-process
+/// registry keeps the permission-requesting daemon dormant until the agent
+/// actually invokes a tool, so its Accessibility / Screen Recording prompts
+/// appear on real use rather than at agent-session start.
+///
+/// `launch_daemon_and_wait` runs `open -n -g -a <helper> --args serve` and
+/// blocks until the daemon's socket is up (the daemon binds before running its
+/// permission gate, so this returns promptly even while the gate prompts). It's
+/// a blocking call, so it runs on the blocking pool.
+#[cfg(target_os = "macos")]
+async fn ensure_daemon_available_with<Probe, Launch>(
+    previously_started: bool,
+    externally_owned: bool,
+    timeout: std::time::Duration,
+    retry_interval: std::time::Duration,
+    mut probe: Probe,
+    launch: Launch,
+) -> anyhow::Result<()>
+where
+    Probe: FnMut() -> bool,
+    Launch: FnOnce() -> anyhow::Result<()>,
+{
+    if probe() {
+        return Ok(());
+    }
+
+    if externally_owned {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                let state = if previously_started {
+                    "after the previously-connected daemon exited"
+                } else {
+                    "during initial connection"
+                };
+                anyhow::bail!("cmux-owned Computer Use daemon stayed unavailable {state}");
+            }
+            tokio::time::sleep(retry_interval).await;
+            if probe() {
+                return Ok(());
+            }
+        }
+    }
+
+    launch()?;
+    if probe() {
+        Ok(())
+    } else {
+        anyhow::bail!("launched Computer Use daemon did not become reachable")
+    }
+}
+
+/// Lazy proxy startup has two independent milestones: the daemon/reaper is
+/// connected, and the onboarding grant wait has completed. Keeping them
+/// separate ensures a prompt status call cannot accidentally waive onboarding
+/// for the next driving action.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+struct DaemonStartState {
+    reaper_started: bool,
+    grant_wait_completed: bool,
+    daemon_generation: u64,
+    tools_list_generation: Option<u64>,
+    authoritative_tools_list: Option<Arc<serde_json::Value>>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DaemonLifecycleEvent {
+    generation: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl DaemonStartState {
+    fn needs_grant_wait(&self, request_requires_wait: bool, external_permission_flow: bool) -> bool {
+        request_requires_wait && !external_permission_flow && !self.grant_wait_completed
+    }
+
+    fn complete_grant_wait(&mut self) {
+        self.grant_wait_completed = true;
+    }
+
+    /// Record an observed socket outage. Until a replacement daemon is
+    /// connected and queried, `tools/list` must fall back to the local,
+    /// permission-free bootstrap registry rather than advertise the vanished
+    /// daemon's contract.
+    fn observe_daemon_loss(&mut self) {
+        self.reaper_started = false;
+        self.grant_wait_completed = false;
+        self.tools_list_generation = None;
+        self.authoritative_tools_list = None;
+    }
+
+    /// Apply the EOF signal from the generation-tagged control connection.
+    /// Returns whether the event invalidated the current daemon. A delayed EOF
+    /// from an older control task must not tear down a replacement generation.
+    fn observe_control_connection_end(&mut self, generation: u64) -> bool {
+        if !self.reaper_started || generation != self.daemon_generation {
+            return false;
+        }
+        self.observe_daemon_loss();
+        true
+    }
+
+    /// Start a new observed daemon generation and return its stable token.
+    /// The token lets the cache policy distinguish a replacement daemon from
+    /// the one whose list it previously stored without a list round-trip on
+    /// every tool call.
+    fn begin_daemon_generation(&mut self) -> u64 {
+        self.daemon_generation = self.daemon_generation.wrapping_add(1).max(1);
+        self.reaper_started = true;
+        self.daemon_generation
+    }
+
+    fn tools_list_refresh_generation(&self) -> Option<u64> {
+        if self.reaper_started
+            && self.tools_list_generation != Some(self.daemon_generation)
+        {
+            Some(self.daemon_generation)
+        } else {
+            None
+        }
+    }
+
+    fn cache_authoritative_tools_list(
+        &mut self,
+        generation: u64,
+        tools_list: Arc<serde_json::Value>,
+    ) -> bool {
+        if !self.reaper_started || generation != self.daemon_generation {
+            return false;
+        }
+        self.authoritative_tools_list = Some(tools_list);
+        self.tools_list_generation = Some(generation);
+        true
+    }
+
+    fn tools_list_or<'a>(
+        &'a self,
+        bootstrap: &'a Arc<serde_json::Value>,
+    ) -> &'a Arc<serde_json::Value> {
+        match (
+            self.tools_list_generation,
+            self.authoritative_tools_list.as_ref(),
+        ) {
+            (Some(generation), Some(tools_list))
+                if self.reaper_started && generation == self.daemon_generation =>
+            {
+                tools_list
+            }
+            _ => bootstrap,
+        }
+    }
+}
+
+/// `check_permissions` is itself the supported permission/status surface. It
+/// must reach the daemon immediately, whether it is a read-only
+/// `{ "prompt": false }` probe or the explicit prompting form, instead of
+/// waiting up to 55 seconds for the condition it reports/requests. Every other
+/// tool call retains the onboarding wait, including all driving actions.
+#[cfg(target_os = "macos")]
+fn tool_call_requires_grant_wait(req: &Request) -> bool {
+    req.tool_call()
+        .map(|call| call.name != "check_permissions")
+        .unwrap_or(true)
+}
+
+/// Permission-free admission for macOS lazy proxy calls. Protocol shape, tool
+/// identity, and the advertised input schema are checked before the helper is
+/// started or health-recovered. The supplied list is the bootstrap registry
+/// while dormant and the cached daemon-authored list after connection.
+#[cfg(target_os = "macos")]
+enum BootstrapToolCallAdmission {
+    InvalidParams(String),
+    Rejected(ToolResult),
+    Ready {
+        call: ToolCall,
+        wait_for_grants: bool,
+    },
+}
+
+#[cfg(target_os = "macos")]
+fn admit_bootstrap_tool_call(
+    req: &Request,
+    tools_list: &serde_json::Value,
+) -> BootstrapToolCallAdmission {
+    let call = match req.tool_call() {
+        Ok(call) => call,
+        Err(error) => return BootstrapToolCallAdmission::InvalidParams(error.to_string()),
+    };
+
+    // Preserve the registry's sole deprecated alias even though aliases are
+    // intentionally omitted from tools/list.
+    let advertised_name = match call.name.as_str() {
+        "type_text_chars" => "type_text",
+        other => other,
+    };
+    let Some(entry) = tools_list
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|tools| {
+            tools.iter().find(|tool| {
+                tool.get("name").and_then(serde_json::Value::as_str)
+                    == Some(advertised_name)
+            })
+        })
+    else {
+        return BootstrapToolCallAdmission::Rejected(ToolResult::error(format!(
+            "Unknown tool: {}",
+            call.name
+        )));
+    };
+
+    let def = cua_driver_core::tool::ToolDef {
+        name: advertised_name.to_owned(),
+        description: String::new(),
+        input_schema: entry
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
+        read_only: false,
+        destructive: false,
+        idempotent: false,
+        open_world: false,
+    };
+    if let Err(result) = cua_driver_core::tool::validate_dispatch_args(&def, &call.args) {
+        return BootstrapToolCallAdmission::Rejected(result);
+    }
+
+    let wait_for_grants = tool_call_requires_grant_wait(req);
+    BootstrapToolCallAdmission::Ready {
+        call,
+        wait_for_grants,
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn ensure_daemon_started(
+    socket_path: &str,
+    state: &mut DaemonStartState,
+    session_id: &str,
+    claude_code_compat: bool,
+    wait_for_grants: bool,
+    lifecycle_tx: &tokio::sync::mpsc::UnboundedSender<DaemonLifecycleEvent>,
+) -> anyhow::Result<()> {
+    let listening = is_daemon_listening(socket_path);
+    if !listening {
+        // A replacement daemon needs a fresh control connection and, for the
+        // next driving action, a fresh onboarding stability wait.
+        let previously_started = state.reaper_started;
+        state.observe_daemon_loss();
+        // FORCE_PROXY callers supply their own daemon and have no bundle to
+        // relaunch into — never auto-launch on their behalf.
+        if crate::bundle::requires_external_daemon() {
+            ensure_daemon_available_with(
+                previously_started,
+                true,
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_millis(100),
+                || is_daemon_listening(socket_path),
+                || anyhow::bail!("forced proxy cannot launch a standalone daemon"),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(
+                "the tag-scoped cmux Computer Use runtime is not listening on {socket_path}: {e}"
+            ))?;
+        } else {
+            let sp = socket_path.to_owned();
+            tokio::task::spawn_blocking(move || {
+                crate::cli::launch_daemon_and_wait(&sp, 10, claude_code_compat)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("daemon launch task failed: {e}"))??;
+        }
+    }
+    // Daemon is up: start the reaper now (deferred from proxy startup).
+    if !state.reaper_started {
+        let generation = state.begin_daemon_generation();
+        let socket = socket_path.to_owned();
+        let sid = session_id.to_owned();
+        let lifecycle_tx = lifecycle_tx.clone();
+        tokio::spawn(async move {
+            run_control_connection(socket, sid).await;
+            let _ = lifecycle_tx.send(DaemonLifecycleEvent { generation });
+        });
+    }
+    // The bootstrap list intentionally keeps initialize/tools/list local and
+    // permission-free while the lazy daemon is dormant. Once a daemon is
+    // connected, however, that daemon is the execution authority and its
+    // schema must win. Fetch once for this observed generation, then reuse the
+    // cache until a socket outage invalidates it. `send_request` is blocking
+    // UDS I/O, so keep it off Tokio's worker threads.
+    if let Some(generation) = state.tools_list_refresh_generation() {
+        let socket = socket_path.to_owned();
+        let sid = session_id.to_owned();
+        let tools_list = tokio::task::spawn_blocking(move || {
+            fetch_tools_list_from_daemon(&socket, &sid)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("daemon tool-list task failed: {e}"))??;
+        if !state.cache_authoritative_tools_list(generation, Arc::new(tools_list)) {
+            anyhow::bail!("daemon changed while its authoritative tool list was loading");
+        }
+    }
+    // Onboarding: wait until BOTH TCC grants are in before the first tool
+    // executes. The daemon's startup gate raises the Accessibility + Screen
+    // Recording prompts and re-execs the daemon (~every 25s) to pick up each
+    // grant. If the agent's first tool call runs during that window it races
+    // the re-exec — dropped connections mid-click and a cursor that blinks out
+    // (its overlay state is lost on re-exec until the next move). Holding the
+    // first call until the grants settle makes onboarding go through all steps
+    // first, then run on a stable daemon with a stable cursor. Bounded +
+    // fail-safe: on timeout we proceed and let the tool call surface any real
+    // TCC error, so a user who ignores the prompts is never hung forever.
+    let external_permission_flow =
+        crate::bundle::is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW");
+    if state.needs_grant_wait(wait_for_grants, external_permission_flow) {
+        wait_for_daemon_grants(socket_path, session_id).await;
+        state.complete_grant_wait();
+    } else if wait_for_grants && external_permission_flow {
+        // The embedding host owns permission onboarding, so driving calls are
+        // intentionally considered past this proxy-local milestone.
+        state.complete_grant_wait();
+    }
+    Ok(())
+}
+
+/// Poll the daemon's `check_permissions` (read-only, `prompt:false`) until both
+/// Accessibility and Screen Recording read granted, or a bounded deadline
+/// elapses. Kept under a typical MCP client tool-call timeout so a slow grant
+/// degrades to "first call fails, agent retries on the now-granted daemon"
+/// rather than a hung call. Every failure path (transport error during a gate
+/// re-exec, unexpected shape) just retries until the deadline.
+#[cfg(target_os = "macos")]
+async fn wait_for_daemon_grants(socket_path: &str, session_id: &str) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(55);
+    loop {
+        if Instant::now() >= deadline {
+            debug!("wait_for_daemon_grants: deadline elapsed; proceeding");
+            return;
+        }
+        let sp = socket_path.to_owned();
+        let sid = session_id.to_owned();
+        let probe = tokio::task::spawn_blocking(move || {
+            let req = DaemonRequest {
+                method: "call".into(),
+                name: Some("check_permissions".into()),
+                args: Some(serde_json::json!({ "prompt": false })),
+                session_id: Some(sid),
+            };
+            send_request(&sp, &req)
+        })
+        .await;
+        if let Ok(Ok(resp)) = probe {
+            if let Some(result) = resp.result.as_ref() {
+                if let Some((ax, sr)) = extract_grants(result) {
+                    if ax && sr {
+                        debug!("wait_for_daemon_grants: both grants active");
+                        return;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+}
+
+/// Recursively locate the `check_permissions` structured payload — an object
+/// carrying both `accessibility` and `screen_recording` booleans — wherever the
+/// daemon nests it, and return `(accessibility, screen_recording)`. Shape-
+/// tolerant so the poll doesn't depend on the exact result envelope.
+#[cfg(target_os = "macos")]
+fn extract_grants(v: &serde_json::Value) -> Option<(bool, bool)> {
+    match v {
+        serde_json::Value::Object(obj) => {
+            if let (Some(a), Some(s)) = (
+                obj.get("accessibility").and_then(serde_json::Value::as_bool),
+                obj.get("screen_recording").and_then(serde_json::Value::as_bool),
+            ) {
+                return Some((a, s));
+            }
+            obj.values().find_map(extract_grants)
+        }
+        serde_json::Value::Array(arr) => arr.iter().find_map(extract_grants),
+        _ => None,
+    }
+}
+
 /// JSON-RPC method dispatcher for the proxy. Mirrors
 /// `cua_driver_core::server::handle_request`:
 ///   - `initialize`     → static `initialize_result()` (same envelope
 ///                        the in-process path returns; the daemon's
 ///                        identity is hidden from the MCP client).
-///   - `tools/list`     → return the cached daemon tool list.
+///   - `tools/list`     → return the current bootstrap/daemon cache.
 ///   - `tools/call`     → forward to the daemon and reshape the
 ///                        response into MCP's `CallTool.Result`.
 ///   - other            → method-not-found, same as in-process.
@@ -405,13 +885,13 @@ async fn handle_proxy_request(
     req: Request,
     id: serde_json::Value,
     socket_path: &str,
-    cached_tools_list: &Arc<serde_json::Value>,
+    cached_tools_list: &serde_json::Value,
     session_id: &str,
 ) -> Response {
     match req.method.as_str() {
         "initialize" => Response::ok(id, initialize_result()),
 
-        "tools/list" => Response::ok(id, (**cached_tools_list).clone()),
+        "tools/list" => Response::ok(id, cached_tools_list.clone()),
 
         "tools/call" => match req.tool_call() {
             Err(e) => Response::error(id, -32602, format!("Invalid params: {e}")),
@@ -422,6 +902,14 @@ async fn handle_proxy_request(
             warn!(method = other, "unknown method");
             Response::method_not_found(id, other)
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn response_from_tool_result(id: serde_json::Value, result: ToolResult) -> Response {
+    match serde_json::to_value(result) {
+        Ok(value) => Response::ok(id, value),
+        Err(error) => Response::error(id, -32603, format!("Serialize error: {error}")),
     }
 }
 
@@ -526,6 +1014,10 @@ async fn forward_tool_call(
 mod tests {
     use super::*;
     use crate::serve::DaemonResponse;
+    #[cfg(target_os = "macos")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(target_os = "macos")]
+    use std::time::Duration;
 
     /// Reconstruct the `!resp.ok` branch in isolation so we can assert
     /// on the serialized shape without spinning up a real daemon /
@@ -584,5 +1076,312 @@ mod tests {
         assert_eq!(value["result"]["isError"], serde_json::json!(true));
         assert_eq!(value["result"]["content"][0]["text"], "daemon reported failure");
         assert_eq!(value["result"]["structuredContent"]["exit_code"], 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_admission_rejects_malformed_unknown_and_invalid_calls() {
+        fn request(params: serde_json::Value) -> Request {
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": params,
+            }))
+            .expect("request envelope")
+        }
+
+        let tools_list = crate::build_macos_registry_with_compat(false).tools_list();
+
+        let malformed = request(serde_json::json!({ "arguments": {} }));
+        assert!(matches!(
+            admit_bootstrap_tool_call(&malformed, &tools_list),
+            BootstrapToolCallAdmission::InvalidParams(_)
+        ));
+
+        let unknown = request(serde_json::json!({
+            "name": "definitely_not_a_tool",
+            "arguments": {},
+        }));
+        match admit_bootstrap_tool_call(&unknown, &tools_list) {
+            BootstrapToolCallAdmission::Rejected(result) => {
+                let value = serde_json::to_value(result).expect("serialize rejection");
+                assert_eq!(value["isError"], true);
+                assert_eq!(
+                    value["content"][0]["text"],
+                    "Unknown tool: definitely_not_a_tool"
+                );
+            }
+            _ => panic!("unknown tools must be rejected before daemon startup"),
+        }
+
+        let invalid = request(serde_json::json!({
+            "name": "set_agent_cursor_enabled",
+            "arguments": {},
+        }));
+        assert!(matches!(
+            admit_bootstrap_tool_call(&invalid, &tools_list),
+            BootstrapToolCallAdmission::Rejected(_)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_admission_accepts_only_real_calls_and_preserves_wait_policy() {
+        fn request(name: &str, arguments: serde_json::Value) -> Request {
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments },
+            }))
+            .expect("request envelope")
+        }
+
+        let tools_list = crate::build_macos_registry_with_compat(false).tools_list();
+
+        match admit_bootstrap_tool_call(
+            &request("check_permissions", serde_json::json!({ "prompt": false })),
+            &tools_list,
+        ) {
+            BootstrapToolCallAdmission::Ready { wait_for_grants, .. } => {
+                assert!(!wait_for_grants, "permission status must remain prompt");
+            }
+            _ => panic!("check_permissions must be admitted"),
+        }
+
+        match admit_bootstrap_tool_call(
+            &request("set_agent_cursor_enabled", serde_json::json!({ "enabled": true })),
+            &tools_list,
+        ) {
+            BootstrapToolCallAdmission::Ready { wait_for_grants, .. } => {
+                assert!(wait_for_grants, "ordinary tools retain the onboarding wait");
+            }
+            _ => panic!("a schema-valid tool call must be admitted"),
+        }
+
+        assert!(matches!(
+            admit_bootstrap_tool_call(
+                &request(
+                    "type_text_chars",
+                    serde_json::json!({ "pid": 1, "text": "a" }),
+                ),
+                &tools_list,
+            ),
+            BootstrapToolCallAdmission::Ready { .. }
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn external_proxy_waits_for_cmux_daemon_without_launching_standalone() {
+        let probes = AtomicUsize::new(0);
+        let launches = AtomicUsize::new(0);
+
+        let result = ensure_daemon_available_with(
+            true,
+            true,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            || probes.fetch_add(1, Ordering::SeqCst) >= 2,
+            || {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result.is_ok(), "cmux recovered within the bounded wait");
+        assert!(probes.load(Ordering::SeqCst) >= 3);
+        assert_eq!(
+            launches.load(Ordering::SeqCst),
+            0,
+            "an externally-owned proxy must never launch CuaDriver.app"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn previously_started_proxy_rechecks_daemon_health() {
+        let probes = AtomicUsize::new(0);
+
+        let result = ensure_daemon_available_with(
+            true,
+            true,
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            || probes.fetch_add(1, Ordering::SeqCst) >= 1,
+            || Ok(()),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(
+            probes.load(Ordering::SeqCst) >= 2,
+            "started state must not bypass a fresh socket health check"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn grant_wait_policy_bypasses_only_permission_status_calls() {
+        fn request(name: &str, arguments: serde_json::Value) -> Request {
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
+            .expect("valid request")
+        }
+
+        assert!(!tool_call_requires_grant_wait(&request(
+            "check_permissions",
+            serde_json::json!({ "prompt": false }),
+        )));
+        assert!(!tool_call_requires_grant_wait(&request(
+            "check_permissions",
+            serde_json::json!({ "prompt": true }),
+        )));
+
+        for driving_tool in ["click", "move_cursor", "type_text", "scroll"] {
+            assert!(
+                tool_call_requires_grant_wait(&request(driving_tool, serde_json::json!({}))),
+                "{driving_tool} must retain the onboarding grant wait"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn permission_status_skip_does_not_waive_later_driving_wait() {
+        let mut state = DaemonStartState {
+            reaper_started: true,
+            grant_wait_completed: false,
+            ..DaemonStartState::default()
+        };
+
+        assert!(
+            !state.needs_grant_wait(false, false),
+            "the first permission status call must be forwarded promptly"
+        );
+        assert!(
+            !state.grant_wait_completed,
+            "skipping the status call must leave the grant milestone pending"
+        );
+
+        assert!(
+            state.needs_grant_wait(true, false),
+            "the next driving call must still perform the grant wait"
+        );
+        state.complete_grant_wait();
+        assert!(state.grant_wait_completed);
+        assert!(
+            !state.needs_grant_wait(true, false),
+            "a completed wait should not repeat while the daemon remains healthy"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn tool_list_cache_tracks_observed_daemon_generations() {
+        let bootstrap = Arc::new(serde_json::json!({ "source": "bootstrap" }));
+        let daemon_v1 = Arc::new(serde_json::json!({ "source": "daemon-v1" }));
+        let daemon_v2 = Arc::new(serde_json::json!({ "source": "daemon-v2" }));
+        let mut state = DaemonStartState::default();
+
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "bootstrap");
+        assert_eq!(state.tools_list_refresh_generation(), None);
+
+        let first_generation = state.begin_daemon_generation();
+        assert_eq!(
+            state.tools_list_refresh_generation(),
+            Some(first_generation),
+            "a newly connected daemon needs exactly one authoritative list fetch"
+        );
+        assert!(state.cache_authoritative_tools_list(first_generation, daemon_v1));
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "daemon-v1");
+        assert_eq!(
+            state.tools_list_refresh_generation(),
+            None,
+            "healthy calls must reuse the generation cache instead of round-tripping"
+        );
+
+        state.observe_daemon_loss();
+        assert_eq!(
+            state.tools_list_or(&bootstrap)["source"],
+            "bootstrap",
+            "an observed outage must stop advertising the vanished daemon's schema"
+        );
+        assert_eq!(state.tools_list_refresh_generation(), None);
+
+        let second_generation = state.begin_daemon_generation();
+        assert_ne!(second_generation, first_generation);
+        assert_eq!(
+            state.tools_list_refresh_generation(),
+            Some(second_generation),
+            "a replacement daemon must refresh the authoritative contract"
+        );
+        assert!(state.cache_authoritative_tools_list(second_generation, daemon_v2));
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "daemon-v2");
+        assert_eq!(state.tools_list_refresh_generation(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_daemon_generation_cannot_overwrite_replacement_tool_list() {
+        let bootstrap = Arc::new(serde_json::json!({ "source": "bootstrap" }));
+        let stale = Arc::new(serde_json::json!({ "source": "stale-daemon" }));
+        let current = Arc::new(serde_json::json!({ "source": "current-daemon" }));
+        let mut state = DaemonStartState::default();
+
+        let stale_generation = state.begin_daemon_generation();
+        state.observe_daemon_loss();
+        let current_generation = state.begin_daemon_generation();
+
+        assert!(!state.cache_authoritative_tools_list(stale_generation, stale));
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "bootstrap");
+        assert!(state.cache_authoritative_tools_list(current_generation, current));
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "current-daemon");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn control_eof_detects_replacement_completed_between_requests() {
+        let bootstrap = Arc::new(serde_json::json!({ "source": "bootstrap" }));
+        let daemon_v1 = Arc::new(serde_json::json!({ "source": "daemon-v1" }));
+        let daemon_v2 = Arc::new(serde_json::json!({ "source": "daemon-v2" }));
+        let mut state = DaemonStartState::default();
+
+        let first_generation = state.begin_daemon_generation();
+        assert!(state.cache_authoritative_tools_list(first_generation, daemon_v1));
+        state.complete_grant_wait();
+        assert!(state.reaper_started);
+        assert!(state.grant_wait_completed);
+
+        // The helper exits and its replacement binds the same path before the
+        // next MCP request. Socket reachability alone is true both before and
+        // after, but EOF from the old control connection identifies the loss.
+        assert!(state.observe_control_connection_end(first_generation));
+        assert!(!state.reaper_started);
+        assert!(!state.grant_wait_completed);
+        assert_eq!(state.tools_list_generation, None);
+        assert!(state.authoritative_tools_list.is_none());
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "bootstrap");
+
+        let replacement_generation = state.begin_daemon_generation();
+        assert_ne!(replacement_generation, first_generation);
+        assert_eq!(
+            state.tools_list_refresh_generation(),
+            Some(replacement_generation)
+        );
+        assert!(state.cache_authoritative_tools_list(replacement_generation, daemon_v2));
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "daemon-v2");
+
+        assert!(
+            !state.observe_control_connection_end(first_generation),
+            "a delayed EOF from the old control task must not invalidate the replacement"
+        );
+        assert_eq!(state.tools_list_or(&bootstrap)["source"], "daemon-v2");
     }
 }

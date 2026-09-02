@@ -61,8 +61,12 @@ fn def() -> &'static ToolDef {
                next snapshot of the same window — re-snapshot every turn before clicking.\n\n\
              - x, y (window-local screenshot pixels, top-left origin of the PNG returned \
                by get_window_state): CGEvent path. Synthesizes mouse events and posts to \
-               pid. Use modifier for cmd/shift/option/ctrl. Needs a visible on-screen \
-               window to anchor the conversion.\n\n\
+               pid. Before a background post with pid+window_id, the driver checks the \
+               front-to-back WindowServer stack and returns error=`obstructed`, \
+               code=`background_occluded` without posting if another app/window owns \
+               that point. Use modifier for \
+               cmd/shift/option/ctrl. Needs a visible on-screen window to anchor the \
+               conversion.\n\n\
              button: \"left\" (default), \"right\", or \"middle\". Defaults to left so the \
              field is fully back-compat — omit it and you get the legacy left-click behaviour. \
              Pixel path: routes through the CGEvent left/right/middle mouse-button primitives. \
@@ -82,7 +86,7 @@ fn def() -> &'static ToolDef {
             // cua_driver_core::tool_schema.)
             "required": [],
             "properties": {
-                "session": { "type": "string", "description": "Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less." },
+                "session": { "type": "string", "description": "Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-<pid>); anonymous non-embedded calls remain cursor-less." },
                 "pid":           { "type": "integer", "description": "Target process ID." },
                 "window_id":     { "type": "integer", "description": "Target window ID. Required for element_index. Optional when element_token is supplied (the token carries it)." },
                 "element_index": { "type": "integer", "description": "Element index from last get_window_state. REQUIRES `pid` and `window_id` to be passed alongside it — element_index alone (no pid) fails fast with \"Missing required integer field: pid\"; it is not a silent no-op." },
@@ -112,7 +116,7 @@ fn def() -> &'static ToolDef {
                 "delivery_mode": {
                     "type": "string",
                     "enum": ["background", "foreground"],
-                    "description": "Best-effort-background ladder rung (default \"background\"). \"background\": perform the AX action or post the CGEvent without fronting. \"foreground\": briefly front the window, act, let transient UI settle, then restore the prior frontmost app. Requires window_id. A click is never driver-verifiable (no read-back), so both report verified:false — confirm the effect via screenshot. Use the agent loop: background AX (element_index) → screenshot → background pixel (x/y) → screenshot → delivery_mode:\"foreground\"."
+                    "description": "Best-effort-background ladder rung (default \"background\"). \"background\": perform the AX action or post the CGEvent without fronting; pixel dispatch with pid+window_id fails with structured error=\"obstructed\", code=\"background_occluded\" when a different visible window owns the screen point. \"foreground\": briefly front the window, act, let transient UI settle, then restore the prior frontmost app; foreground skips the obstruction check because fronting resolves Z order. Requires window_id. A click that is dispatched remains verified:false — confirm its effect via get_window_state."
                 },
                 "scope": {
                     "type": "string",
@@ -133,6 +137,10 @@ fn def() -> &'static ToolDef {
 impl Tool for ClickTool {
     fn def(&self) -> &ToolDef {
         def()
+    }
+
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        click_dispatch_preflight(args)
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
@@ -619,7 +627,12 @@ impl Tool for ClickTool {
                 if let (Some(b), scale) = result {
                     let wx = cx / scale;
                     let wy = cy / scale;
-                    (b.x + wx, b.y + wy, wx, wy)
+                    // Window-local screenshot pixel → GLOBAL top-left-origin
+                    // screen point; this is the coordinate space the cursor
+                    // feed emits in (see cua_driver_core::cursor_feed).
+                    let (gx, gy) =
+                        cua_driver_core::cursor_feed::window_local_to_global((b.x, b.y), scale, (cx, cy));
+                    (gx, gy, wx, wy)
                 } else {
                     // window_id not found — fall back to treating x,y as screen coords.
                     (cx, cy, cx, cy)
@@ -682,6 +695,20 @@ impl Tool for ClickTool {
                             }));
                     }
                     _ => {}
+                }
+            }
+
+            // PID-posted CGEvents are still hit-tested by WindowServer at the
+            // screen point. If another window owns that pixel, fail before
+            // posting instead of claiming an unverifiable success. Foreground
+            // mode intentionally skips this check because it fronts the target.
+            if !delivery_mode.is_foreground() {
+                if let Some(wid) = window_id {
+                    if let Some(error) =
+                        super::pixel_obstruction_error(pid, wid, screen_x, screen_y, None)
+                    {
+                        return error;
+                    }
                 }
             }
 
@@ -824,6 +851,58 @@ impl Tool for ClickTool {
             )
         }
     }
+}
+
+/// Side-effect-free validation performed before explicit watchable mode may
+/// front the target. Runtime cache/AX failures remain ordinary dispatch
+/// failures, but malformed addressing and delivery requests cannot steal focus.
+fn click_dispatch_preflight(args: &Value) -> Result<(), ToolResult> {
+    use cua_driver_core::tool_args::ArgsExt;
+
+    cua_driver_core::tool::validate_dispatch_args(def(), args)?;
+    let has_pid = args.get("pid").is_some_and(|value| !value.is_null());
+    let has_window_id = args.get("window_id").is_some_and(|value| !value.is_null());
+    let has_x = args.get("x").is_some_and(Value::is_number);
+    let has_y = args.get("y").is_some_and(Value::is_number);
+
+    if has_x && has_y && !has_pid && !has_window_id {
+        return if args.str_or("scope", "window") == "desktop" {
+            Ok(())
+        } else {
+            Err(ToolResult::error(
+                "click: x,y given with no pid/window_id, but scope is \"window\". \
+                 Screen-absolute clicks require desktop scope. Pass scope=\"desktop\" \
+                 (and use get_desktop_state with scope=\"desktop\" to read true \
+                 screen pixels) first."
+                    .to_owned(),
+            )
+            .with_structured(serde_json::json!({
+                "code": "desktop_scope_disabled",
+                "scope": "window",
+                "suggestion": "pass scope=\"desktop\"",
+            })))
+        };
+    }
+
+    let address = super::preflight_action_address(args, "click")?;
+    let has_element_target = address.element && address.window_id.is_some();
+    if !has_element_target && !address.has_xy {
+        return Err(ToolResult::error(
+            "Provide either (element_index + window_id) or (x + y). pid is always required.",
+        ));
+    }
+    if !has_element_target && args.opt_str("debug_image_out").is_some() {
+        if args.bool_or("from_zoom", false) {
+            return Err(ToolResult::error(
+                "debug_image_out is incompatible with from_zoom — received (x, y) \
+                 would be in zoom-crop space, not window-local.",
+            ));
+        }
+        if address.window_id.is_none() {
+            return Err(ToolResult::error("debug_image_out requires window_id."));
+        }
+    }
+    Ok(())
 }
 
 // ── AX click implementation (blocking) ───────────────────────────────────────

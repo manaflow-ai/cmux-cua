@@ -46,6 +46,29 @@ pub fn is_executable_inside_cuadriver_app() -> bool {
     s.contains("/CuaDriver.app/Contents/MacOS/")
 }
 
+/// Returns `true` when the running image lives inside any macOS application
+/// bundle. Host-owned helpers launched through LaunchServices are already
+/// their own responsible process and must not be responsibility-reexecuted.
+#[cfg(target_os = "macos")]
+pub fn is_executable_inside_app_bundle() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .as_deref()
+        .is_some_and(is_executable_inside_app_bundle_path)
+}
+
+#[cfg(target_os = "macos")]
+fn is_executable_inside_app_bundle_path(path: &std::path::Path) -> bool {
+    path.to_str()
+        .is_some_and(|path| path.contains(".app/Contents/MacOS/"))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn is_executable_inside_app_bundle() -> bool {
+    false
+}
+
 #[cfg(not(target_os = "macos"))]
 #[allow(dead_code)] // Non-macOS stub kept for API symmetry — see module header.
 pub fn is_executable_inside_cuadriver_app() -> bool {
@@ -98,6 +121,31 @@ pub fn is_env_truthy(name: &str) -> bool {
     }
 }
 
+/// Returns `true` for the executable name cmux uses for every bundled proxy
+/// and helper binary. Unlike an environment variable, the current executable
+/// name cannot be changed by an ambient agent-session environment.
+pub fn is_cmux_branded_executable() -> bool {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .is_some_and(is_cmux_branded_executable_path)
+}
+
+fn is_cmux_branded_executable_path(path: &std::path::Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("cmux-cua-driver")
+}
+
+/// Whether an embedding host owns daemon lifecycle and permission UX.
+///
+/// cmux sets both environment flags on its MCP proxy. The executable-name
+/// fallback keeps a directly invoked bundled binary fail-closed even when an
+/// agent supplies a hostile or incomplete environment.
+pub fn requires_external_daemon() -> bool {
+    is_cmux_branded_executable()
+        || is_env_truthy("CUA_DRIVER_RS_MCP_FORCE_PROXY")
+        || is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW")
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -111,6 +159,14 @@ mod tests {
         // false in CI / local dev, which is exactly the behavior we
         // want so `cargo run` callers stay in-process.
         assert!(!is_executable_inside_cuadriver_app());
+    }
+
+    #[test]
+    fn cmux_helper_path_is_recognized_as_an_app_bundle() {
+        let path = std::path::Path::new(
+            "/Library/Application Support/cmux/computer-use/helper/tag/cmux Computer Use.app/Contents/MacOS/cmux-cua-driver",
+        );
+        assert!(is_executable_inside_app_bundle_path(path));
     }
 
     #[test]
@@ -142,5 +198,18 @@ mod tests {
         // launched it (cargo / IDE / shell), not directly under
         // launchd. The helper should report true.
         assert!(parent_is_not_launchd());
+    }
+
+    #[test]
+    fn cmux_branded_binary_requires_external_daemon() {
+        assert!(is_cmux_branded_executable_path(std::path::Path::new(
+            "/Applications/cmux.app/Contents/Resources/bin/cmux-cua-driver"
+        )));
+        assert!(is_cmux_branded_executable_path(std::path::Path::new(
+            "/Library/Application Support/cmux/computer-use/helper/tag/cmux Computer Use.app/Contents/MacOS/cmux-cua-driver"
+        )));
+        assert!(!is_cmux_branded_executable_path(std::path::Path::new(
+            "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
+        )));
     }
 }

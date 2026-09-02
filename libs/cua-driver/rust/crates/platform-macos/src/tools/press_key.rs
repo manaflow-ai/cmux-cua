@@ -41,7 +41,7 @@ fn def() -> &'static ToolDef {
             "type": "object",
             "required": ["pid", "key"],
             "properties": {
-                "session": { "type": "string", "description": "Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less." },
+                "session": { "type": "string", "description": "Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-<pid>); anonymous non-embedded calls remain cursor-less." },
                 "pid": { "type": "integer" },
                 "key": { "type": "string", "description": "Key name: return, tab, escape, up, down, etc." },
                 "modifiers": {
@@ -68,6 +68,17 @@ fn def() -> &'static ToolDef {
 #[async_trait]
 impl Tool for PressKeyTool {
     fn def(&self) -> &ToolDef { def() }
+
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        cua_driver_core::tool::validate_dispatch_args(self.def(), args)?;
+        let address = super::preflight_action_address(args, "press_key")?;
+        if address.element && address.has_xy {
+            return Err(ToolResult::error(
+                "Pass either element_index (ax) or x,y (px) to press_key, not both.",
+            ));
+        }
+        Ok(())
+    }
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;

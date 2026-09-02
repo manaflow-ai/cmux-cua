@@ -59,7 +59,7 @@ fn def() -> &'static ToolDef {
             "type": "object",
             "required": ["pid", "value"],
             "properties": {
-                "session": { "type": "string", "description": "Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less." },
+                "session": { "type": "string", "description": "Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-<pid>); anonymous non-embedded calls remain cursor-less." },
                 "pid": { "type": "integer" },
                 "window_id": {
                     "type": "integer",
@@ -84,6 +84,22 @@ fn def() -> &'static ToolDef {
 #[async_trait]
 impl Tool for SetValueTool {
     fn def(&self) -> &ToolDef { def() }
+
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        cua_driver_core::tool::validate_dispatch_args(self.def(), args)?;
+        let address = super::preflight_action_address(args, "set_value")?;
+        if !address.element {
+            return Err(ToolResult::error(
+                "set_value requires element_index (+ window_id) or element_token to address the target element.",
+            ));
+        }
+        if address.window_id.is_none() {
+            return Err(ToolResult::error(
+                "set_value requires window_id when element_index is used (omit only when supplying element_token, which carries it).",
+            ));
+        }
+        Ok(())
+    }
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
@@ -133,6 +149,18 @@ impl Tool for SetValueTool {
             )),
         };
         let element_ptr = element_guard.as_ptr();
+
+        // AXValue writes have a concrete on-screen target even though they do
+        // not synthesize pointer input. Show/glide the owning cursor there
+        // before changing the control so embedded actions remain observable.
+        if let Some(point) = super::cursor_tools::retained_element_center(element_ptr).await {
+            super::cursor_tools::animate_to_action_point(
+                &self.state,
+                &args,
+                point,
+                Some(window_id),
+            ).await;
+        }
 
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // AXValue writes on popups / sliders can cause reflex activations

@@ -28,10 +28,12 @@ fn should_skip_disclaim(embedded: bool, already_disclaimed: bool, inside_bundle:
 
 #[cfg(target_os = "macos")]
 pub fn reexec_disclaimed_if_needed() {
+    let host_owned_app_bundle = crate::bundle::requires_external_daemon()
+        && crate::bundle::is_executable_inside_app_bundle();
     if should_skip_disclaim(
         cua_driver_core::embedded_mode(),
         already_disclaimed(),
-        crate::bundle::is_executable_inside_cuadriver_app(),
+        crate::bundle::is_executable_inside_cuadriver_app() || host_owned_app_bundle,
     ) {
         return;
     }

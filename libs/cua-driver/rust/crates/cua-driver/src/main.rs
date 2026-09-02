@@ -168,6 +168,15 @@ fn build_macos_registry_with_compat(compat: bool) -> cua_driver_core::tool::Tool
 fn main() {
     init_logging();
 
+    // Legacy explicit responsibility-disclaim path for callers that launch a
+    // bare helper binary. Host-owned helpers launched inside their own app via
+    // LaunchServices are already responsible processes and skip the later
+    // `serve` re-exec; this path remains for non-LaunchServices integrations.
+    // Runs before command dispatch so it applies uniformly to every subcommand.
+    if crate::bundle::is_env_truthy("CUA_DRIVER_DISCLAIM") {
+        responsibility::reexec_disclaimed_if_needed();
+    }
+
     // ── CLI subcommand dispatch ──────────────────────────────────────────────
     // Handled before AppKit init so `list-tools` / `describe` / `call` exit
     // cleanly without starting the overlay or NSApplication.
@@ -513,9 +522,10 @@ fn main() {
                 let registry = Arc::new(build_macos_registry_with_compat(compat));
                 // Wire up replay tool's back-reference to the registry.
                 registry.init_self_weak();
-                if let Err(e) = cua_driver_core::server::run(registry).await {
+                if let Err(e) = cua_driver_core::server::run(registry.clone()).await {
                     tracing::error!("MCP server error: {e}");
                 }
+                registry.remove_state_file();
             });
             // MCP server exited (stdin closed / client disconnected).
             // The main thread is blocked in NSApplication.run() and won't
@@ -729,10 +739,11 @@ async fn async_main() -> anyhow::Result<()> {
     let registry = Arc::new(build_registry(cursor_cfg));
     registry.init_self_weak();
     maybe_init_pip();
-    let result = cua_driver_core::server::run(registry).await;
+    let result = cua_driver_core::server::run(registry.clone()).await;
     if let Err(e) = &result {
         tracing::error!("MCP server error: {e}");
     }
+    registry.remove_state_file();
 
     // The stdio MCP server loop has ended — the client disconnected (stdin
     // EOF) or a fatal I/O error occurred. The cursor overlay runs on its own

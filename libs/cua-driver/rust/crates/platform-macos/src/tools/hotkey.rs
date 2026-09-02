@@ -50,7 +50,7 @@ fn def() -> &'static ToolDef {
             "type": "object",
             "required": ["pid", "keys"],
             "properties": {
-                "session": { "type": "string", "description": "Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less." },
+                "session": { "type": "string", "description": "Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-<pid>); anonymous non-embedded calls remain cursor-less." },
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "keys": {
                     "type": "array",
@@ -86,6 +86,17 @@ fn is_modifier(k: &str) -> bool {
 #[async_trait]
 impl Tool for HotkeyTool {
     fn def(&self) -> &ToolDef { def() }
+
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        cua_driver_core::tool::validate_dispatch_args(self.def(), args)?;
+        let raw_keys = args.get("keys").and_then(Value::as_array).expect("schema validated keys");
+        if !raw_keys.iter().filter_map(Value::as_str).any(|key| !is_modifier(key)) {
+            return Err(ToolResult::error(
+                "keys must include at least one non-modifier key (e.g. \"c\" in [\"cmd\", \"c\"]).",
+            ));
+        }
+        Ok(())
+    }
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
