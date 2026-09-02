@@ -84,6 +84,7 @@ jobs:
       - name: Set package directory and type
         id: package
         run: |
+          set -euo pipefail
           case "$SERVICE" in
             "pypi/cua")
               echo "directory=libs/python/cua" >> "$GITHUB_OUTPUT"
@@ -371,8 +372,8 @@ jobs:
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
+          owner: manaflow-ai
+          repositories: cmux-cua
           permission-contents: write
 
       - name: Push release to target branch
