@@ -179,6 +179,7 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
         publish = "\n".join(workflow_lines("ts-reusable-publish.yml"))
         self.assertIn('bun-version: "1.1.38"', publish)
         self.assertNotIn("bun-version: latest", publish)
+        self.assertEqual(publish.count("npm@11.5.1"), 2)
 
     def test_typescript_identity_contract_is_documented(self) -> None:
         readme = WORKFLOW_README.read_text(encoding="utf-8")

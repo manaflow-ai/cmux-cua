@@ -164,6 +164,17 @@ class PypiPublishIdentityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("exact SemVer", result.stderr)
 
+    def test_tag_prefix_requires_version_marker(self) -> None:
+        result = self.run_gate(
+            TRUSTED_TAG_PREFIX="agent-",
+            GITHUB_REF_NAME="agent-1.2.3",
+            GITHUB_WORKFLOW_REF=(
+                "trycua/cua/.github/workflows/cd-py-agent.yml@refs/tags/agent-1.2.3"
+            ),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted tag prefix", result.stderr)
+
     def test_source_and_wheel_pass_together(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifacts = Path(directory)

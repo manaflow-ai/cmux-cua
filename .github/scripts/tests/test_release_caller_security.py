@@ -60,6 +60,8 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
         self.assertIn('name: "Release tag request"', source)
         self.assertIn("  push:", source)
         self.assertIn("permissions: {}", source)
+        self.assertIn('test "$REPOSITORY" = "trycua/cua"', source)
+        self.assertNotIn("manaflow-ai/cmux-cua", source)
         self.assertNotIn("actions/checkout", source)
         self.assertNotIn("secrets.", source)
         self.assertNotIn("token:", source)
@@ -73,6 +75,13 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
         self.assertIn("SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}", source)
         self.assertIn("EXPECTED_TAG: ${{ inputs.expected_tag }}", source)
         self.assertIn("EXPECTED_SHA: ${{ inputs.expected_sha }}", source)
+
+        for path in WORKFLOWS.glob("*.yml"):
+            for block in re.split(r"(?m)^  (?=[A-Za-z0-9_-]+:\n)", text(path))[1:]:
+                if "uses: ./.github/workflows/validate-release-request.yml" not in block:
+                    continue
+                self.assertIn("actions: read", block, path.name)
+                self.assertIn("contents: read", block, path.name)
 
     def test_callers_are_dispatchable_builds_not_reusable_entrypoints(self) -> None:
         for path in RELEASE_CALLERS:
@@ -267,6 +276,7 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
             self.assertIn("github.event_name == 'workflow_run'", block, path.name)
             self.assertIn("github.event.workflow_run.conclusion == 'success'", block, path.name)
             self.assertIn("needs.verify-publish.result == 'success'", block, path.name)
+            self.assertIn("needs.verify-tag.result == 'success'", block, path.name)
             self.assertIn("source_sha: ${{ needs.verify-tag.outputs.commit }}", block, path.name)
             self.assertIn("source_tag: ${{ needs.verify-tag.outputs.tag }}", block, path.name)
             self.assertNotIn("secrets.", block, path.name)
@@ -351,7 +361,8 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
                 self.assertTrue(
                     "ref: ${{ github.event_name == 'workflow_run' && needs.verify-tag.outputs.commit || github.workflow_sha || github.sha }}"
                     in block
-                    or "ref: ${{ needs.verify-tag.outputs.commit || github.sha }}" in block,
+                    or "ref: ${{ needs.verify-tag.outputs.commit || github.workflow_sha || github.sha }}"
+                    in block,
                     f"{path.name} checkout must use protected workflow or validated source",
                 )
                 self.assertIn("persist-credentials: false", block, path.name)
@@ -412,6 +423,9 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
             block.index("Recheck release request provenance before credentials"),
             block.index("Generate GitHub App token"),
         )
+        self.assertIn("${{ runner.temp }}/cua-driver-reference-docs", block)
+        self.assertIn("credential.helper=", block)
+        self.assertNotIn("x-access-token:${GH_TOKEN}", block)
 
     def test_version_bump_has_no_branch_selectable_write_path(self) -> None:
         bump_source = text(WORKFLOWS / "release-bump-version.yml")
@@ -423,6 +437,9 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
         self.assertIn("environment: release-control", bump)
 
         dispatch = job_block(text(WORKFLOWS / "release-on-merge.yml"), "dispatch")
+        plan = job_block(text(WORKFLOWS / "release-on-merge.yml"), "plan")
+        self.assertIn("github.repository == 'trycua/cua'", plan)
+        self.assertNotIn("manaflow-ai/cmux-cua", plan)
         self.assertIn("permissions: {}", dispatch)
         self.assertIn("environment: release-control", dispatch)
         self.assertIn("github.rest.repos.createDispatchEvent", dispatch)
@@ -592,6 +609,8 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
         self.assertIn("workflow_run:", source)
         self.assertIn("permissions: {}", source)
         self.assertIn("permissions: {}", observer)
+        self.assertIn('[[ "$REPOSITORY" == "trycua/cua" ]]', observer)
+        self.assertNotIn("manaflow-ai/cmux-cua", observer)
         self.assertNotIn("secrets.", observer)
         for job in ("publish-build", "publish-manifest"):
             block = job_block(source, job)
