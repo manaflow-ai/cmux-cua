@@ -1,5 +1,8 @@
 name: CLA Assistant v3
 
+# pull_request_target is required for the protected lifecycle check. Every
+# lifecycle step uses trusted base-revision code or a pinned action and never
+# checks out pull-request code.
 on:
   issue_comment:
     types: [created]
@@ -49,9 +52,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: read
-      issues: read
-      pull-requests: read
+      contents: read # Read live commit and pull-request metadata.
+      issues: read # Read the triggering issue and comment.
+      pull-requests: read # Read the live pull-request identity.
     concurrency:
       group: cla-admission-${{ github.repository }}-${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}
       cancel-in-progress: false
@@ -193,9 +196,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      contents: write
-      issues: write
-      pull-requests: write
+      contents: write # Persist signatures through the pinned CLA action.
+      issues: write # Publish the action's trusted CLA status comment.
+      pull-requests: write # Read and update the protected pull request.
     concurrency:
       group: cla-signatures-${{ github.repository }}-${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}
       cancel-in-progress: false
@@ -267,9 +270,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      contents: write
-      issues: write
-      pull-requests: write
+      contents: write # Persist signatures through the pinned CLA action.
+      issues: write # Publish the action's trusted CLA status comment.
+      pull-requests: write # Read and update the protected pull request.
     concurrency:
       group: cla-signatures-${{ github.repository }}-${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}
       cancel-in-progress: false
@@ -348,11 +351,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      actions: write
-      checks: read
-      contents: read
-      issues: read
-      pull-requests: read
+      actions: write # Rerun only the validated failed Actions job.
+      checks: read # Read the exact required check and its job binding.
+      contents: read # Read only the trusted workflow helper revision.
+      issues: read # Revalidate the triggering issue and comment.
+      pull-requests: read # Revalidate the live pull-request head and base.
     concurrency:
       group: cla-refresh-${{ github.repository }}-${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}
       cancel-in-progress: false
@@ -435,9 +438,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: read
-      issues: write
-      pull-requests: write
+      contents: read # Read the protected signature ledger for lock validation.
+      issues: write # Lock the merged pull request conversation.
+      pull-requests: write # Lock the merged pull request conversation.
     concurrency:
       group: cla-lock-${{ github.repository }}-${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}
       cancel-in-progress: false
