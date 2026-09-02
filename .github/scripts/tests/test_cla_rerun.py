@@ -706,6 +706,28 @@ class RefreshWorkerTests(unittest.TestCase):
             self.execute(api, cla.SIGN_PHRASE)
         self.assertEqual(api.posts, [])
 
+    def test_nonstandard_json_number_in_ledger_fails_closed(self):
+        class NonstandardLedgerApi(FakeApi):
+            def get(self, endpoint, query=None):
+                if endpoint.endswith("/contents/signatures/version2/cla.json"):
+                    raw = (
+                        b'{"signedContributors": [{"name": "alice", "id": 77,'
+                        b' "comment_id": 9001, "created_at": "2026-08-31T12:00:00Z",'
+                        b' "repoId": 123, "pullRequestNo": 17}], "unexpected": NaN}'
+                    )
+                    return {
+                        "type": "file",
+                        "encoding": "base64",
+                        "content": base64.b64encode(raw).decode(),
+                    }
+                return super().get(endpoint, query)
+
+        api = NonstandardLedgerApi()
+        api.comment["body"] = cla.SIGN_PHRASE
+        with self.assertRaises(cla.Rejected):
+            self.execute(api, cla.SIGN_PHRASE)
+        self.assertEqual(api.posts, [])
+
     def test_api_stdout_is_bounded(self):
         api = cla.GhApi({"GH_TOKEN": "test-token"})
         result = api._run_bounded(
