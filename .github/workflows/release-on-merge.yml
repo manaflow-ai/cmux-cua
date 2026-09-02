@@ -143,28 +143,29 @@ jobs:
               return;
             }
 
-            const workflowId = 'release-bump-version.yml';
+            const requestWorkflowId = 'release-bump-request.yml';
+            const consumerWorkflowId = 'release-bump-version.yml';
             const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
             const runTimeoutMs = 30 * 60 * 1000;
 
-            async function listRuns(headSha) {
+            async function listRuns(workflowId, event, headSha) {
               const { data } = await github.rest.actions.listWorkflowRuns({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 workflow_id: workflowId,
-                event: 'workflow_dispatch',
+                event,
                 branch: 'main',
                 head_sha: headSha,
                 per_page: 100
               });
-              return data.workflow_runs;
+              return data.workflow_runs.filter((run) => run.event === event);
             }
 
-            async function waitForRun(headSha, knownRunIds, startedAt) {
+            async function waitForRun(workflowId, event, headSha, knownRunIds, startedAt) {
               const deadline = Date.now() + runTimeoutMs;
               let delayMs = 2000;
               while (Date.now() < deadline) {
-                const run = (await listRuns(headSha))
+                const run = (await listRuns(workflowId, event, headSha))
                   .filter((candidate) => !knownRunIds.has(candidate.id))
                   // The API timestamp has second precision. Keep a small
                   // overlap so a dispatch near a second boundary is not lost.
@@ -173,11 +174,11 @@ jobs:
                 if (run) {
                   return run;
                 }
-                core.info(`Waiting for ${workflowId} to appear (next poll in ${delayMs / 1000}s)`);
+                core.info(`Waiting for ${workflowId} (${event}) to appear (next poll in ${delayMs / 1000}s)`);
                 await wait(delayMs);
                 delayMs = Math.min(delayMs * 2, 30_000);
               }
-              throw new Error(`Timed out waiting for ${workflowId} to start`);
+              throw new Error(`Timed out waiting for ${workflowId} (${event}) to start`);
             }
 
             async function waitForCompletion(run) {
@@ -228,14 +229,21 @@ jobs:
                 branch: 'main'
               });
               const previousSha = branch.commit.sha;
-              const knownRuns = new Set(await listRuns(previousSha).then((runs) => runs.map((run) => run.id)));
+              const knownRequestRuns = new Set(
+                await listRuns(requestWorkflowId, 'workflow_dispatch', previousSha)
+                  .then((runs) => runs.map((run) => run.id))
+              );
+              const knownConsumerRuns = new Set(
+                await listRuns(consumerWorkflowId, 'workflow_run', previousSha)
+                  .then((runs) => runs.map((run) => run.id))
+              );
               const startedAt = Date.now();
 
               core.info(`Dispatching ${service} (${process.env.BUMP_TYPE}) from main ${previousSha}`);
               await github.rest.actions.createWorkflowDispatch({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                workflow_id: workflowId,
+                workflow_id: requestWorkflowId,
                 ref: 'main',
                 inputs: {
                   service,
@@ -243,9 +251,25 @@ jobs:
                 }
               });
 
-              const run = await waitForRun(previousSha, knownRuns, startedAt);
-              core.info(`Release workflow for ${service} started as run ${run.id}`);
-              await waitForCompletion(run);
+              const requestRun = await waitForRun(
+                requestWorkflowId,
+                'workflow_dispatch',
+                previousSha,
+                knownRequestRuns,
+                startedAt
+              );
+              core.info(`Release request for ${service} started as run ${requestRun.id}`);
+              await waitForCompletion(requestRun);
+
+              const consumerRun = await waitForRun(
+                consumerWorkflowId,
+                'workflow_run',
+                previousSha,
+                knownConsumerRuns,
+                startedAt
+              );
+              core.info(`Release consumer for ${service} started as run ${consumerRun.id}`);
+              await waitForCompletion(consumerRun);
               const nextSha = await waitForMainAdvance(previousSha);
               core.info(`Completed ${service}; main advanced to ${nextSha}`);
             }

@@ -1,5 +1,6 @@
 """Regression tests for cua-cloud release automation wiring."""
 
+import re
 from pathlib import Path
 import unittest
 
@@ -20,10 +21,14 @@ class TestCuaCloudReleaseWiring(unittest.TestCase):
 
     def test_release_bump_version_supports_cua_cloud(self) -> None:
         workflow = self.read(".github/workflows/release-bump-version.yml")
+        request_workflow = self.read(".github/workflows/release-bump-request.yml")
 
-        self.assertIn("- pypi/cloud", workflow)
+        self.assertIn("- pypi/cloud", request_workflow)
         self.assertIn('"pypi/cloud")', workflow)
-        self.assertIn('echo "directory=libs/python/cua-cloud" >> $GITHUB_OUTPUT', workflow)
+        self.assertRegex(
+            workflow,
+            r'echo "directory=libs/python/cua-cloud" >> "?\$GITHUB_OUTPUT"?',
+        )
 
     def test_unreleased_digest_tracks_cua_cloud(self) -> None:
         workflow = self.read(".github/workflows/release-unreleased-digest.yml")
