@@ -173,6 +173,21 @@ class TestReleaseProvenance(unittest.TestCase):
         self.assertEqual(set(manifest["artifacts"]), set(validator.PLATFORM_ARTIFACTS))
         self.assertIn(_paths()["run"], api.calls)
 
+    def test_environment_payload_uses_workflow_run_field_names(self) -> None:
+        payload = validator._env_payload(
+            {
+                "WORKFLOW_RUN_ID": str(RUN_ID),
+                "WORKFLOW_RUN_ATTEMPT": str(RUN_ATTEMPT),
+                "WORKFLOW_RUN_WORKFLOW_ID": str(validator.SOURCE_WORKFLOW_ID),
+                "WORKFLOW_RUN_EVENT": "push",
+                "WORKFLOW_RUN_STATUS": "completed",
+                "WORKFLOW_RUN_CONCLUSION": "success",
+                "WORKFLOW_RUN_HEAD_SHA": HEAD_SHA,
+                "WORKFLOW_RUN_HEAD_BRANCH": TAG,
+            }
+        )
+        self.assertEqual(payload, _payload())
+
     def test_rejects_unsuccessful_source_run(self) -> None:
         responses = _responses()
         responses[_paths()["run"]]["conclusion"] = "failure"

@@ -403,17 +403,17 @@ def validate(
 
 
 def _env_payload(env: Mapping[str, str]) -> dict[str, str]:
-    fields = (
-        "run_id",
-        "run_attempt",
-        "workflow_id",
-        "event",
-        "status",
-        "conclusion",
-        "head_sha",
-        "head_branch",
-    )
-    return {field: env.get(f"WORKFLOW_RUN_{field.upper()}", "") for field in fields}
+    env_names = {
+        "run_id": "WORKFLOW_RUN_ID",
+        "run_attempt": "WORKFLOW_RUN_ATTEMPT",
+        "workflow_id": "WORKFLOW_RUN_WORKFLOW_ID",
+        "event": "WORKFLOW_RUN_EVENT",
+        "status": "WORKFLOW_RUN_STATUS",
+        "conclusion": "WORKFLOW_RUN_CONCLUSION",
+        "head_sha": "WORKFLOW_RUN_HEAD_SHA",
+        "head_branch": "WORKFLOW_RUN_HEAD_BRANCH",
+    }
+    return {field: env.get(name, "") for field, name in env_names.items()}
 
 
 def _write_output(manifest: Mapping[str, Any], output_path: str) -> None:

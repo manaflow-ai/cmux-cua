@@ -37,7 +37,7 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
             "--require-hashes -r .github/scripts/cua-driver-build-requirements.txt",
             workflow,
         )
-        self.assertEqual(workflow.count("persist-credentials: false"), 3)
+        self.assertEqual(workflow.count("persist-credentials: false"), 2)
         self.assertIn(
             "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33",
             workflow,
@@ -49,9 +49,12 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
     def test_python_publish_checks_source_commit_and_run_artifacts(self) -> None:
         workflow = self.read(".github/workflows/cd-py-cua-driver.yml")
 
-        self.assertIn("ref: ${{ needs.validate-provenance.outputs.source_head_sha }}", workflow)
+        self.assertIn("source_head_sha:", workflow)
+        self.assertIn("source_head_sha", self.read(".github/scripts/verify_cua_driver_release.py"))
         self.assertIn("artifact-ids: ${{ steps.source-artifact.outputs.id }}", workflow)
         self.assertIn("run-id: ${{ needs.validate-provenance.outputs.source_run_id }}", workflow)
+        self.assertNotIn("path: source\n", workflow)
+        self.assertIn("--destination libs/cua-driver/python/src/cua_driver/bin", workflow)
         self.assertIn(
             "target commit",
             self.read(".github/scripts/verify_cua_driver_release.py"),
