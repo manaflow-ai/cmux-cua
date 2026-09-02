@@ -239,6 +239,8 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
             "ci-container-xfce.yml",
         ):
             source = text(WORKFLOWS / filename)
+            self.assertIn("permissions: {}", source, filename)
+            self.assertIn("    permissions:\n      contents: read", source, filename)
             self.assertIn("skip_arm64: true", source, filename)
 
     def test_manual_build_paths_have_no_credentials(self) -> None:
