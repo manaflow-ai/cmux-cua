@@ -23,6 +23,8 @@ TAG_PREFIX_PATTERN = re.compile(r"[A-Za-z0-9._/-]+-v\Z")
 VERSION_PATTERN = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z"
 )
+MAX_ARCHIVE_MEMBERS = 4096
+MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 
 
 class IdentityError(ArtifactError):
@@ -115,14 +117,33 @@ def package_json_from_artifact(artifact_directory: Path) -> dict[str, object]:
 
 def _package_json_member(archive: tarfile.TarFile) -> tarfile.TarInfo:
     matches: list[tarfile.TarInfo] = []
+    seen: set[str] = set()
+    total_size = 0
     for member in archive.getmembers():
+        directory = member.isdir()
+        name = member.name[:-1] if directory and member.name.endswith("/") else member.name
         if (
-            member.name.startswith("/")
-            or "\\" in member.name
-            or posixpath.normpath(member.name) != member.name
-            or ".." in member.name.split("/")
+            not name
+            or name.startswith("/")
+            or "\\" in name
+            or posixpath.normpath(name) != name
+            or ".." in name.split("/")
         ):
             raise IdentityError("npm artifact contains an unsafe archive path")
+        if name in seen:
+            raise IdentityError(f"npm artifact contains a duplicate archive path: {member.name}")
+        seen.add(name)
+        if len(seen) > MAX_ARCHIVE_MEMBERS:
+            raise IdentityError("npm artifact contains too many archive members")
+        if member.issym() or member.islnk() or not (directory or member.isreg()):
+            raise IdentityError(
+                f"npm artifact contains a symlink or non-regular member: {member.name}"
+            )
+        if member.size < 0:
+            raise IdentityError("npm artifact contains a negative member size")
+        total_size += member.size
+        if total_size > MAX_ARCHIVE_BYTES:
+            raise IdentityError("npm artifact is larger than the safety limit")
         if member.name == "package/package.json":
             if not member.isreg():
                 raise IdentityError("npm artifact package.json is not a regular file")

@@ -207,6 +207,75 @@ class NpmPublishIdentityTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unsafe archive path", result.stderr)
 
+    def test_symlink_member_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_directory = Path(directory)
+            with tarfile.open(artifact_directory / "package.tgz", "w:gz") as archive:
+                payload = json.dumps(self.valid_package()).encode()
+                package_json = tarfile.TarInfo("package/package.json")
+                package_json.size = len(payload)
+                archive.addfile(package_json, io.BytesIO(payload))
+                link = tarfile.TarInfo("package/link")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "package/package.json"
+                archive.addfile(link)
+            environment = os.environ.copy()
+            environment.update(BASE_ENV)
+            result = subprocess.run(
+                ["python3", str(SCRIPT), str(artifact_directory)],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symlink or non-regular", result.stderr)
+
+    def test_non_regular_member_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_directory = Path(directory)
+            with tarfile.open(artifact_directory / "package.tgz", "w:gz") as archive:
+                payload = json.dumps(self.valid_package()).encode()
+                package_json = tarfile.TarInfo("package/package.json")
+                package_json.size = len(payload)
+                archive.addfile(package_json, io.BytesIO(payload))
+                fifo = tarfile.TarInfo("package/fifo")
+                fifo.type = tarfile.FIFOTYPE
+                archive.addfile(fifo)
+            environment = os.environ.copy()
+            environment.update(BASE_ENV)
+            result = subprocess.run(
+                ["python3", str(SCRIPT), str(artifact_directory)],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symlink or non-regular", result.stderr)
+
+    def test_directory_member_is_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_directory = Path(directory)
+            with tarfile.open(artifact_directory / "package.tgz", "w:gz") as archive:
+                package_directory = tarfile.TarInfo("package/")
+                package_directory.type = tarfile.DIRTYPE
+                archive.addfile(package_directory)
+                payload = json.dumps(self.valid_package()).encode()
+                package_json = tarfile.TarInfo("package/package.json")
+                package_json.size = len(payload)
+                archive.addfile(package_json, io.BytesIO(payload))
+            environment = os.environ.copy()
+            environment.update(BASE_ENV)
+            result = subprocess.run(
+                ["python3", str(SCRIPT), str(artifact_directory)],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_missing_allowlist_fails_closed(self) -> None:
         result = self.run_gate(self.valid_package(), TRUSTED_PUBLISHER_REPOSITORY="")
         self.assertNotEqual(result.returncode, 0)
