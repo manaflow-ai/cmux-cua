@@ -94,9 +94,6 @@ jobs:
           node-version: "24.x"
           package-manager-cache: false
 
-      - name: Install the trusted-publishing npm CLI
-        run: npm install --global --ignore-scripts npm@11.5.1
-
       - name: Setup pnpm
         if: inputs.package_manager == 'pnpm'
         uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
@@ -260,25 +257,63 @@ jobs:
       needs.validate-publisher-identity.result == 'success'
     permissions:
       actions: read
+      contents: read
       id-token: write
     runs-on: ubuntu-latest
     environment:
       name: npm
     steps:
+      - name: Checkout trusted release gate scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/scripts/validate-npm-publish-identity.py
+            .github/scripts/validate_publish_artifacts.py
+            .github/scripts/validate_publisher_repository.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Require canonical publisher repository
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 trusted-release/.github/scripts/validate_publisher_repository.py
+
       - name: Use Node.js 24.x
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24.x"
           package-manager-cache: false
 
-      - name: Install the pinned npm CLI
-        run: npm install --global --ignore-scripts npm@11.5.1
-
       - name: Download package artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: npm-${{ inputs.package_name }}
           path: npm-dist
+
+      - name: Revalidate package identity before OIDC use
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          TRUSTED_PUBLISHER_REPOSITORY: ${{ inputs.trusted_publisher_repository }}
+          TRUSTED_PACKAGE_NAME: ${{ inputs.trusted_package_name }}
+          TRUSTED_PUBLISHER_WORKFLOW: ${{ inputs.trusted_publisher_workflow }}
+          TRUSTED_TAG_PREFIX: ${{ inputs.trusted_tag_prefix }}
+          EXPECTED_TAG: ${{ inputs.expected_tag }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: python trusted-release/.github/scripts/validate-npm-publish-identity.py npm-dist
+
+      - name: Install the pinned npm CLI
+        run: npm install --global --ignore-scripts npm@12.0.2
 
       - name: Publish with npm trusted publishing
         working-directory: npm-dist
@@ -351,6 +386,9 @@ jobs:
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: python3 trusted-release/.github/scripts/validate_publisher_repository.py
+
+      - name: Install the pinned npm CLI
+        run: npm install --global --ignore-scripts npm@12.0.2
 
       # Do not expose the registry token to the gate until the artifact and
       # repository identity checks have passed in this credentialed job.
