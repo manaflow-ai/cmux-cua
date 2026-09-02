@@ -1,5 +1,9 @@
 name: Reusable NPM Package Publish Workflow
 
+# Build jobs never receive registry credentials. Only the publisher can mint
+# an OIDC token or read the optional legacy npm token.
+permissions: {}
+
 on:
   workflow_call:
     inputs:
@@ -21,43 +25,49 @@ on:
         type: string
         default: ""
     secrets:
+      # Existing callers may continue using a token while npm trusted
+      # publishers are configured. New callers should omit this secret.
       NPM_TOKEN:
-        required: true
+        required: false
 
 jobs:
-  publish:
+  build:
     permissions:
-      id-token: write
       contents: read
     runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.publish-decision.outputs.should_publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: main
 
       - name: Use Node.js 24.x
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24.x"
-          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
 
       - name: Setup pnpm
         if: inputs.package_manager == 'pnpm'
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: ${{ inputs.package_dir }}/package.json
 
       - name: Setup Bun
         if: inputs.package_manager == 'bun'
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: latest
 
       - name: Verify version consistency
         if: inputs.version != ''
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+          PACKAGE_DIR: ${{ inputs.package_dir }}
         run: |
-          EXPECTED_VERSION="${{ inputs.version }}"
-          ACTUAL_VERSION=$(node -p "require('./${{ inputs.package_dir }}/package.json').version")
+          set -euo pipefail
+          ACTUAL_VERSION=$(node -p "require('./' + process.env.PACKAGE_DIR + '/package.json').version")
 
           if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
             echo "ERROR: Version mismatch!"
@@ -67,33 +77,50 @@ jobs:
           fi
 
           echo "Version validation passed: $ACTUAL_VERSION"
-          echo "should_publish=true" >> $GITHUB_OUTPUT
+          echo "should_publish=true" >> "$GITHUB_OUTPUT"
         id: verify-version
 
       - name: Check if version changed
         if: steps.verify-version.outputs.should_publish != 'true'
         id: check-version
-        uses: EndBug/version-check@v2
+        uses: EndBug/version-check@d17247dd94ca7b39d0b0691399be8d7c510622c9 # v2
         with:
           file-name: ${{ inputs.package_dir }}/package.json
           diff-search: true
 
-      - name: Install dependencies
-        if: steps.verify-version.outputs.should_publish == 'true' || steps.check-version.outputs.changed == 'true'
-        working-directory: ./${{ inputs.package_dir }}
+      - name: Decide whether to publish
+        id: publish-decision
+        shell: bash
         run: |
-          if [ "${{ inputs.package_manager }}" = "bun" ]; then
+          set -euo pipefail
+          if [[ "${{ steps.verify-version.outputs.should_publish }}" == "true" || \
+                "${{ steps.check-version.outputs.changed }}" == "true" ]]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.publish-decision.outputs.should_publish == 'true'
+        working-directory: ./${{ inputs.package_dir }}
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package_manager }}
+        run: |
+          set -euo pipefail
+          if [ "$PACKAGE_MANAGER" = "bun" ]; then
             bun install --frozen-lockfile
           else
             pnpm install --frozen-lockfile
           fi
 
       - name: Build package
-        if: steps.verify-version.outputs.should_publish == 'true' || steps.check-version.outputs.changed == 'true'
+        if: steps.publish-decision.outputs.should_publish == 'true'
         working-directory: ./${{ inputs.package_dir }}
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package_manager }}
         run: |
-          if [ "${{ inputs.package_manager }}" = "bun" ]; then
-            # Bun doesn't support --if-present, check if build script exists
+          set -euo pipefail
+          if [ "$PACKAGE_MANAGER" = "bun" ]; then
             if grep -q '"build"' package.json; then
               bun run build
             fi
@@ -101,9 +128,79 @@ jobs:
             pnpm run --if-present build
           fi
 
-      - name: Publish to npm
-        if: steps.verify-version.outputs.should_publish == 'true' || steps.check-version.outputs.changed == 'true'
+      - name: Pack package
+        if: steps.publish-decision.outputs.should_publish == 'true'
         working-directory: ./${{ inputs.package_dir }}
-        run: npm publish --access public --provenance
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/npm-dist"
+          npm pack --pack-destination "$RUNNER_TEMP/npm-dist"
+
+      - name: Upload package artifact
+        if: steps.publish-decision.outputs.should_publish == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-${{ inputs.package_name }}
+          path: ${{ runner.temp }}/npm-dist/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    permissions:
+      actions: read
+      id-token: write
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ needs.build.outputs.should_publish }}
+    steps:
+      - name: Use Node.js 24.x
+        if: needs.build.outputs.should_publish == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24.x"
+          package-manager-cache: false
+      - name: Download package artifact
+        if: needs.build.outputs.should_publish == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-${{ inputs.package_name }}
+          path: npm-dist
+
+      - name: Select publish authentication
+        if: needs.build.outputs.should_publish == 'true'
+        id: auth
+        shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$NPM_TOKEN" ]]; then
+            echo "mode=token" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=oidc" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish with npm trusted publishing
+        if: needs.build.outputs.should_publish == 'true' && steps.auth.outputs.mode == 'oidc'
+        working-directory: npm-dist
+        run: npm publish ./*.tgz --access public --provenance --ignore-scripts
+
+      - name: Publish with npm token (legacy fallback)
+        if: needs.build.outputs.should_publish == 'true' && steps.auth.outputs.mode == 'token'
+        working-directory: npm-dist
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm_config_userconfig="$RUNNER_TEMP/npmrc"
+          export npm_config_userconfig
+          umask 077
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > "$npm_config_userconfig"
+          trap 'rm -f "$npm_config_userconfig"' EXIT
+          npm publish ./*.tgz --access public --provenance --ignore-scripts
+
+      - name: Skip unchanged package
+        if: needs.build.outputs.should_publish != 'true'
+        run: echo "Package version is unchanged; nothing to publish."

@@ -21,19 +21,19 @@ on:
         description: "The version that was published"
         value: ${{ jobs.prepare.outputs.version }}
 
-# Adding permissions at workflow level
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   prepare:
+    permissions:
+      contents: read
     runs-on: macos-latest
     outputs:
       version: ${{ steps.get-version.outputs.version }}
       agent_version: ${{ steps.update-deps.outputs.agent_version }}
       computer_version: ${{ steps.update-deps.outputs.computer_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Determine version
         id: get-version
@@ -60,7 +60,7 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
         with:
           python-version: "3.11"
 
@@ -140,6 +140,10 @@ jobs:
 
   publish:
     needs: prepare
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     uses: ./.github/workflows/py-reusable-publish.yml
     with:
       package_name: "mcp-server"
@@ -160,6 +164,8 @@ jobs:
 
   create-release:
     needs: [prepare, publish]
+    permissions:
+      contents: write
     uses: ./.github/workflows/release-github-reusable.yml
     with:
       tag_name: "mcp-server-v${{ needs.prepare.outputs.version }}"

@@ -21,17 +21,17 @@ on:
         description: "The version that was published"
         value: ${{ jobs.prepare.outputs.version }}
 
-# Adding permissions at workflow level
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   prepare:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Determine version
         id: get-version
@@ -58,12 +58,16 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
         with:
           python-version: "3.10"
 
   publish:
     needs: prepare
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     uses: ./.github/workflows/py-reusable-publish.yml
     with:
       package_name: "computer-server"
@@ -75,6 +79,8 @@ jobs:
 
   build-binaries:
     needs: prepare
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -88,10 +94,10 @@ jobs:
             dir_name: cua-computer-server
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
@@ -118,7 +124,7 @@ jobs:
           7z a "${{ matrix.zip_name }}" "${{ matrix.dir_name }}/"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.artifact_name }}
           path: libs/python/computer-server/dist/${{ matrix.zip_name }}
@@ -133,6 +139,9 @@ jobs:
 
   create-release:
     needs: [prepare, publish, build-binaries]
+    permissions:
+      actions: read
+      contents: write
     uses: ./.github/workflows/release-github-reusable.yml
     with:
       tag_name: "computer-server-v${{ needs.prepare.outputs.version }}"

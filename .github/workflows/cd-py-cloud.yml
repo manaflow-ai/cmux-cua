@@ -17,16 +17,17 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   prepare:
+    permissions:
+      contents: read
     runs-on: macos-latest
     outputs:
       version: ${{ steps.get-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Determine version
         id: get-version
@@ -50,6 +51,10 @@ jobs:
 
   publish:
     needs: prepare
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     uses: ./.github/workflows/py-reusable-publish.yml
     with:
       package_name: "cloud"
@@ -61,6 +66,8 @@ jobs:
 
   create-release:
     needs: [prepare, publish]
+    permissions:
+      contents: write
     uses: ./.github/workflows/release-github-reusable.yml
     with:
       tag_name: "cloud-v${{ needs.prepare.outputs.version }}"

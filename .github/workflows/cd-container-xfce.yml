@@ -6,8 +6,13 @@ on:
       - "docker-xfce-v*.*.*"
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   publish:
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/docker-reusable-publish.yml
     with:
       image_name: cua-xfce
