@@ -131,6 +131,7 @@ class TestReleaseBumpRequestValidator(unittest.TestCase):
         )
         self.assertEqual(result["service"], "lume")
         self.assertEqual(result["bump_type"], "patch")
+        self.assertEqual(result["tag_prefix"], "lume-v")
         self.assertEqual(result["commit"], values["SOURCE_SHA"])
         self.assertEqual(result["source_commit"], values["SOURCE_SHA"])
 
@@ -162,6 +163,43 @@ class TestReleaseBumpRequestValidator(unittest.TestCase):
                 values,
                 Path(request_dir.name) / "request.json",
             )
+
+    def test_service_tag_prefixes_are_explicit_and_complete(self) -> None:
+        validator = self.validator()
+        expected = {
+            "pypi/cua": "cua-v",
+            "pypi/agent": "agent-v",
+            "pypi/auto": "auto-v",
+            "pypi/bench": "bench-v",
+            "pypi/bench-ui": "bench-ui-v",
+            "pypi/cli": "cli-v",
+            "pypi/computer": "computer-v",
+            "pypi/computer-server": "computer-server-v",
+            "pypi/cloud": "cloud-v",
+            "pypi/core": "core-v",
+            "pypi/mcp-server": "mcp-server-v",
+            "pypi/sandbox": "sandbox-v",
+            "pypi/sandbox-apps": "sandbox-apps-v",
+            "pypi/som": "som-v",
+            "pypi/train": "train-v",
+            "npm/cli": "npm-cli-v",
+            "npm/computer": "npm-computer-v",
+            "npm/core": "npm-core-v",
+            "npm/playground": "npm-playground-v",
+            "npm/cuabot": "cuabot-v",
+            "lume": "lume-v",
+            "cua-driver": "cua-driver-v",
+            "cua-driver-rs": "cua-driver-rs-v",
+            "docker/cuabot": "docker-cuabot-v",
+            "docker/kasm": "docker-kasm-v",
+            "docker/xfce": "docker-xfce-v",
+            "docker/lumier": "docker-lumier-v",
+            "docker/qemu-android": "docker-cua-qemu-android-v",
+            "docker/qemu-linux": "docker-cua-qemu-linux-v",
+            "docker/qemu-windows": "docker-cua-qemu-windows-v",
+        }
+        self.assertEqual(validator.SERVICE_TAG_PREFIXES, expected)
+        self.assertEqual(set(validator.SERVICE_TAG_PREFIXES), validator.ALLOWED_SERVICES)
 
     def test_accepts_older_main_request_and_rejects_non_ancestor(self) -> None:
         validator = self.validator()
@@ -216,6 +254,9 @@ class TestReleaseBumpWorkflowContracts(unittest.TestCase):
         self.assertIn("ref: ${{ needs.validate-request.outputs.commit }}", workflow)
         self.assertIn("group: release-bump-service-${{ needs.validate-request.outputs.service }}", workflow)
         self.assertIn("git merge-base --is-ancestor \"$REQUEST_COMMIT\" origin/main", workflow)
+        self.assertIn("TAG_PREFIX: ${{ needs.validate-request.outputs.tag_prefix }}", workflow)
+        self.assertIn('EXPECTED_TAG="${TAG_PREFIX}${NEW_VERSION}"', workflow)
+        self.assertIn('[[ "$TAG_NAME" == "$EXPECTED_TAG" ]]', workflow)
 
     def test_auto_release_dispatches_request_then_waits_for_consumer(self) -> None:
         workflow = self.read(".github/workflows/release-on-merge.yml")
