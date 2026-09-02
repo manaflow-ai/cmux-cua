@@ -79,7 +79,11 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
             "ts-reusable-publish.yml": {
                 "build": {"contents": "read"},
                 "validate-publisher-identity": {"actions": "read", "contents": "read"},
-                "publish-oidc": {"actions": "read", "id-token": "write"},
+                "publish-oidc": {
+                    "actions": "read",
+                    "contents": "read",
+                    "id-token": "write",
+                },
                 "publish-legacy-token": {"actions": "read", "contents": "read"},
             },
         }
