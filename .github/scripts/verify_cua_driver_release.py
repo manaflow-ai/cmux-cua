@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the immutable inputs to the cua-driver PyPI publisher.
+"""Validate the bound inputs to the cua-driver PyPI publisher.
 
 The publisher is triggered by ``workflow_run``.  The event payload is useful
 for routing, but it is not an artifact manifest and it does not prove that the
@@ -34,7 +34,6 @@ TAG_PREFIX = "cua-driver-rs-v"
 # far below this limit, while a pathological response cannot exhaust a runner.
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
-MAX_RUN_PAGES = 5
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # The release workflow accepts SemVer-like prereleases and build metadata.  A
@@ -45,6 +44,20 @@ VERSION_RE = re.compile(
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
+PEP440_LABELS = {
+    "a": "a",
+    "alpha": "a",
+    "b": "b",
+    "beta": "b",
+    "c": "rc",
+    "pre": "rc",
+    "preview": "rc",
+    "rc": "rc",
+    "dev": ".dev",
+    "post": ".post",
+    "rev": ".post",
+    "r": ".post",
+}
 
 PLATFORM_ARTIFACTS: dict[str, str] = {
     "darwin-universal": "cua-driver-rs-darwin",
@@ -94,7 +107,7 @@ class GitHubApi:
         try:
             with self._opener(request, timeout=30) as response:
                 body = response.read(MAX_RESPONSE_BYTES + 1)
-        except (HTTPError, URLError) as exc:
+        except (HTTPError, URLError, OSError, TimeoutError) as exc:
             raise ReleaseValidationError(f"GitHub API request failed for {path}: {exc}") from exc
         if len(body) > MAX_RESPONSE_BYTES:
             raise ReleaseValidationError(f"GitHub API response exceeded {MAX_RESPONSE_BYTES} bytes")
@@ -137,7 +150,40 @@ def _version_from_tag(tag: str) -> str:
     version = tag[len(TAG_PREFIX) :]
     if not VERSION_RE.fullmatch(version):
         raise ReleaseValidationError(f"tag has an invalid release version: {tag!r}")
+    _pep440_version(version)
     return version
+
+
+def _pep440_version(version: str) -> str:
+    """Return the PEP 440 spelling emitted by Hatchling for a release tag."""
+
+    if not VERSION_RE.fullmatch(version):
+        raise ReleaseValidationError(f"invalid release version: {version!r}")
+    base, _, local = version.partition("+")
+    core, _, suffix = base.partition("-")
+    if local:
+        local_parts = local.replace("-", ".").replace("_", ".").split(".")
+        normalized_local: list[str] = []
+        for part in local_parts:
+            if not part or not part.isalnum():
+                raise ReleaseValidationError(f"invalid local version segment: {part!r}")
+            normalized_local.append(str(int(part)) if part.isdigit() else part.lower())
+        local = "+" + ".".join(normalized_local)
+    if not suffix:
+        return core + local
+
+    parts = suffix.replace("-", ".").split(".")
+    if len(parts) == 1 and parts[0].isdigit():
+        return f"{core}.post{int(parts[0])}{local}"
+    label_match = re.fullmatch(r"([A-Za-z]+)([0-9]*)", parts[0])
+    if label_match is None or len(parts) > 2 or (len(parts) == 2 and not parts[1].isdigit()):
+        raise ReleaseValidationError(f"release version is not PEP 440 compatible: {version!r}")
+    label = label_match.group(1).lower()
+    number_text = parts[1] if len(parts) == 2 else label_match.group(2) or "0"
+    normalized_label = PEP440_LABELS.get(label)
+    if normalized_label is None:
+        raise ReleaseValidationError(f"release version has an unknown suffix: {version!r}")
+    return f"{core}{normalized_label}{int(number_text)}{local}"
 
 
 def _api_path(repository: str, suffix: str) -> str:
@@ -212,45 +258,6 @@ def _validate_run(
     return run_id, run_attempt, head_sha, version
 
 
-def _find_manual_run(api: Api, repository: str, tag: str, tag_sha: str) -> Mapping[str, Any]:
-    for page in range(1, MAX_RUN_PAGES + 1):
-        runs = api.get(
-            _api_path(
-                repository,
-                f"/actions/workflows/{SOURCE_WORKFLOW_ID}/runs?event=push&per_page=100&page={page}",
-            )
-        ).get("workflow_runs")
-        if not isinstance(runs, list):
-            raise ReleaseValidationError("source workflow runs response has no list")
-        matches: list[Mapping[str, Any]] = []
-        for run in runs:
-            if not isinstance(run, Mapping):
-                continue
-            if run.get("head_branch") != tag or run.get("head_sha") != tag_sha:
-                continue
-            try:
-                _run_identity(run, "candidate source run")
-                _run_repository(run, "repository", "candidate source run")
-                _run_repository(run, "head_repository", "candidate source run head")
-            except ReleaseValidationError:
-                continue
-            matches.append(run)
-        if matches:
-            # A rerun is represented by one run with a higher run_attempt.  If
-            # GitHub ever returns multiple run records, use the newest run ID
-            # while retaining the exact tag SHA binding.
-            return max(
-                matches,
-                key=lambda item: (
-                    _int(item.get("id"), "candidate run ID"),
-                    _int(item.get("run_attempt"), "candidate run attempt"),
-                ),
-            )
-        if len(runs) < 100:
-            break
-    raise ReleaseValidationError(f"no successful source run found for {tag}")
-
-
 def _release_assets(
     release: Mapping[str, Any], version: str, head_sha: str
 ) -> dict[str, dict[str, Any]]:
@@ -259,8 +266,13 @@ def _release_assets(
     _same(release.get("tag_name"), expected_tag, "release tag")
     _same(release.get("draft"), False, "release draft flag")
     _text(release.get("published_at"), "release published timestamp")
-    target = _text(release.get("target_commitish"), "release target commit")
-    _same(target.lower(), head_sha, "release target commit")
+    target = _text(release.get("target_commitish"), "release target commit or branch")
+    # GitHub returns either the tag's commit SHA or the branch used to create
+    # the release.  The tag ref above is the authoritative binding.  When the
+    # API gives us a SHA, still require it to match that binding; a branch name
+    # carries no independent provenance and is accepted for compatibility.
+    if re.fullmatch(r"[0-9a-f]{40}", target.lower()):
+        _same(target.lower(), head_sha, "release target commit")
     assets = release.get("assets")
     if not isinstance(assets, list):
         raise ReleaseValidationError("release has no asset list")
@@ -345,52 +357,28 @@ def _source_artifacts(
     return result
 
 
-def _default_version(path_value: str) -> str:
-    path = Path(path_value)
-    try:
-        content = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise ReleaseValidationError(f"cannot read default version file {path}") from exc
-    match = re.search(r'^version\s*=\s*["\']([^"\']+)["\']\s*$', content, re.MULTILINE)
-    if not match:
-        raise ReleaseValidationError(f"no Cargo version found in {path}")
-    version = match.group(1)
-    if not VERSION_RE.fullmatch(version):
-        raise ReleaseValidationError(f"default version is invalid: {version!r}")
-    return version
-
-
 def validate(
     api: Api,
     event_name: str,
     repository: str,
     payload: Mapping[str, str] | None = None,
-    manual_version: str = "",
-    default_version_file: str = "",
-    workflow_ref: str = "",
 ) -> dict[str, Any]:
     """Return a compact provenance manifest or raise ``ReleaseValidationError``."""
 
     _same(repository, SOURCE_REPOSITORY, "publisher repository")
-    if event_name == "workflow_run":
-        if payload is None:
-            raise ReleaseValidationError("workflow_run payload is required")
-        run_id = _int(int(payload.get("run_id", "0")), "workflow_run ID")
-        live_run = api.get(_api_path(repository, f"/actions/runs/{run_id}"))
-        run_id, run_attempt, head_sha, version = _validate_run(live_run, repository, payload)
-        tag = f"{TAG_PREFIX}{version}"
-    elif event_name == "workflow_dispatch":
-        _same(workflow_ref, "refs/heads/main", "manual dispatch ref")
-        version = manual_version or _default_version(default_version_file)
-        if not VERSION_RE.fullmatch(version):
-            raise ReleaseValidationError(f"manual version is invalid: {version!r}")
-        tag = f"{TAG_PREFIX}{version}"
-        tag_sha = _tag_commit(api, repository, tag)
-        live_run = _find_manual_run(api, repository, tag, tag_sha)
-        run_id, run_attempt, head_sha, resolved_version = _validate_run(live_run, repository)
-        _same(resolved_version, version, "manual source version")
-    else:
+    if event_name != "workflow_run":
         raise ReleaseValidationError(f"unsupported event {event_name!r}")
+    if payload is None:
+        raise ReleaseValidationError("workflow_run payload is required")
+    try:
+        payload_run_id = int(payload.get("run_id", "0"))
+    except (TypeError, ValueError) as exc:
+        raise ReleaseValidationError("workflow_run ID is not an integer") from exc
+    run_id = _int(payload_run_id, "workflow_run ID")
+    live_run = api.get(_api_path(repository, f"/actions/runs/{run_id}"))
+    run_id, run_attempt, head_sha, version = _validate_run(live_run, repository, payload)
+    normalized_version = _pep440_version(version)
+    tag = f"{TAG_PREFIX}{version}"
 
     tag_sha = _tag_commit(api, repository, tag)
     _same(tag_sha, head_sha, "tag commit")
@@ -407,6 +395,7 @@ def validate(
         "source_head_sha": head_sha,
         "tag": tag,
         "version": version,
+        "normalized_version": normalized_version,
         "release_id": _int(release.get("id"), "release ID"),
         "assets": assets,
         "artifacts": artifacts,
@@ -435,6 +424,7 @@ def _write_output(manifest: Mapping[str, Any], output_path: str) -> None:
             output.write(f"source_run_id={manifest['source_run_id']}\n")
             output.write(f"source_head_sha={manifest['source_head_sha']}\n")
             output.write(f"version={manifest['version']}\n")
+            output.write(f"normalized_version={manifest['normalized_version']}\n")
             output.write(f"tag={manifest['tag']}\n")
     else:
         print(serialized)
@@ -451,9 +441,6 @@ def main() -> int:
             event_name,
             repository,
             payload=payload,
-            manual_version=env.get("MANUAL_VERSION", ""),
-            default_version_file=env.get("DEFAULT_VERSION_FILE", ""),
-            workflow_ref=env.get("WORKFLOW_REF", ""),
         )
         _write_output(manifest, env.get("GITHUB_OUTPUT", ""))
         return 0

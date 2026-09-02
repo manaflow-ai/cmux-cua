@@ -3,16 +3,9 @@ name: "CD: Python cua-driver"
 # Build the Python wrapper only from a verified cua-driver-rs release.  The
 # workflow_run event starts a new, privileged workflow, so every value from the
 # event is treated as untrusted until verify_cua_driver_release.py binds it to
-# a successful source run, an immutable tag, a release, and that run's
-# artifacts.
+# a successful source run, its tag, release assets, and that run's artifacts.
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "cua-driver-rs version to package (without v prefix)"
-        required: false
-        default: ""
   workflow_run: # zizmor: ignore[dangerous-triggers] -- live provenance validation below
     workflows: ["CD: Cua Driver (cross-platform)"]
     types: [completed]
@@ -34,17 +27,18 @@ jobs:
     # This expression is only an early filter.  The validator repeats every
     # check against the live GitHub API before any artifact is downloaded.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.workflow_id == 311952875 &&
-       github.event.workflow_run.name == 'CD: Cua Driver (cross-platform)' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.status == 'completed' &&
-       github.event.workflow_run.conclusion == 'success')
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.workflow_id == 311952875 &&
+      github.event.workflow_run.name == 'CD: Cua Driver (cross-platform)' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.status == 'completed' &&
+      github.event.workflow_run.conclusion == 'success'
     outputs:
       provenance: ${{ steps.validate.outputs.provenance }}
       source_run_id: ${{ steps.validate.outputs.source_run_id }}
       source_head_sha: ${{ steps.validate.outputs.source_head_sha }}
       version: ${{ steps.validate.outputs.version }}
+      normalized_version: ${{ steps.validate.outputs.normalized_version }}
       tag: ${{ steps.validate.outputs.tag }}
     steps:
       # This checkout is the trusted publisher code from the default branch.
@@ -61,9 +55,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           REPOSITORY: ${{ github.repository }}
-          WORKFLOW_REF: ${{ github.ref }}
-          MANUAL_VERSION: ${{ inputs.version }}
-          DEFAULT_VERSION_FILE: libs/cua-driver/rust/Cargo.toml
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
           WORKFLOW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           WORKFLOW_RUN_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
@@ -247,6 +238,30 @@ jobs:
           # Use the hash-locked host toolchain.  Isolated PEP 517 builds would
           # download an unpinned hatchling from pyproject.toml again.
           python -m build --wheel --no-isolation
+          python - <<'PY'
+          import os
+          import zipfile
+          from pathlib import Path
+
+          expected_tag = os.environ["CUA_DRIVER_WHEEL_TAG"]
+          wheels = sorted(Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one wheel, found {len(wheels)}")
+          wheel = wheels[0]
+          with zipfile.ZipFile(wheel) as archive:
+              wheel_metadata = [
+                  name for name in archive.namelist() if name.endswith(".dist-info/WHEEL")
+              ]
+              if len(wheel_metadata) != 1:
+                  raise SystemExit(f"{wheel.name} has invalid WHEEL metadata")
+              tags = {
+                  line.removeprefix("Tag: ")
+                  for line in archive.read(wheel_metadata[0]).decode().splitlines()
+                  if line.startswith("Tag: ")
+              }
+          if expected_tag not in tags:
+              raise SystemExit(f"{wheel.name} has tags {sorted(tags)}, expected {expected_tag}")
+          PY
 
       - name: List built artifacts
         working-directory: source
@@ -279,7 +294,7 @@ jobs:
 
       - name: Verify the complete wheel set
         env:
-          VERSION: ${{ needs.validate-provenance.outputs.version }}
+          NORMALIZED_VERSION: ${{ needs.validate-provenance.outputs.normalized_version }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -290,7 +305,7 @@ jobs:
           wheels = sorted(Path("dist").glob("*.whl"))
           if len(wheels) != 5:
               raise SystemExit(f"expected five wheels, found {len(wheels)}")
-          expected_version = os.environ["VERSION"]
+          expected_version = os.environ["NORMALIZED_VERSION"]
           seen_platforms = set()
           platform_tokens = {
               "macosx_": "macos",
@@ -310,14 +325,19 @@ jobs:
                   if len(metadata_names) != 1:
                       raise SystemExit(f"{wheel.name} has invalid metadata layout")
                   metadata = archive.read(metadata_names[0]).decode("utf-8")
-              fields = dict(
-                  line.split(": ", 1)
-                  for line in metadata.splitlines()
-                  if ": " in line and line.split(": ", 1)[0] in {"Name", "Version"}
-              )
+              fields = {}
+              for line in metadata.splitlines():
+                  if ": " not in line:
+                      continue
+                  key, value = line.split(": ", 1)
+                  if key not in {"Name", "Version"}:
+                      continue
+                  if key in fields:
+                      raise SystemExit(f"{wheel.name} has duplicate {key} metadata")
+                  fields[key] = value
               if fields.get("Name") != "cua-driver":
                   raise SystemExit(f"{wheel.name} has unexpected package name")
-              if fields.get("Version") not in {expected_version, expected_version.replace("-", ".")}:
+              if fields.get("Version") != expected_version:
                   raise SystemExit(f"{wheel.name} has unexpected package version")
               matches = [
                   value for token, value in platform_tokens.items() if token in wheel.name

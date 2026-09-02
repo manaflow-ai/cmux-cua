@@ -70,5 +70,5 @@ Publishing uses PyPI Trusted Publishing through the `pypa/gh-action-pypi-publish
 action. The repository must have a PyPI trusted publisher configured for
 `manaflow-ai/cmux-cua`, `.github/workflows/cd-py-cua-driver.yml`, and the
 `pypi` GitHub environment. The workflow does not use a long-lived PyPI token.
-Manual dispatch remains available from `main`; an empty version uses the
-checked-in Rust version, then resolves the corresponding successful source run.
+It has no manual dispatch path. A successful tag push in the Rust workflow is
+the only input, which keeps the publisher's OIDC identity tied to that run.

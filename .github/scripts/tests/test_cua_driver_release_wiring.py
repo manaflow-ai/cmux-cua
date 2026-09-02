@@ -16,12 +16,16 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
     def test_python_publish_follows_rust_workflow_run(self) -> None:
         workflow = self.read(".github/workflows/cd-py-cua-driver.yml")
 
+        self.assertIn("workflow_run:", workflow)
+        self.assertNotIn("workflow_dispatch:", workflow)
         self.assertIn('workflows: ["CD: Cua Driver (cross-platform)"]', workflow)
         self.assertIn("workflow_id == 311952875", workflow)
         self.assertIn("github.event.workflow_run.conclusion == 'success'", workflow)
         self.assertIn("verify_cua_driver_release.py", workflow)
         self.assertIn("prepare_cua_driver_binary.py", workflow)
         self.assertIn("python -m build --wheel --no-isolation", workflow)
+        self.assertIn('line.startswith("Tag: ")', workflow)
+        self.assertIn("normalized_version:", workflow)
 
     def test_python_publish_is_tokenless_and_actions_are_pinned(self) -> None:
         workflow = self.read(".github/workflows/cd-py-cua-driver.yml")
@@ -53,12 +57,16 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
             self.read(".github/scripts/verify_cua_driver_release.py"),
         )
 
-    def test_python_publish_defaults_to_current_rust_version(self) -> None:
+    def test_python_publish_uses_source_release_version(self) -> None:
         workflow = self.read(".github/workflows/cd-py-cua-driver.yml")
 
-        self.assertIn("required: false", workflow)
-        self.assertIn('default: ""', workflow)
-        self.assertIn("libs/cua-driver/rust/Cargo.toml", workflow)
+        self.assertIn("WORKFLOW_RUN_HEAD_BRANCH", workflow)
+        self.assertIn(
+            'TAG_PREFIX = "cua-driver-rs-v"',
+            self.read(".github/scripts/verify_cua_driver_release.py"),
+        )
+        self.assertNotIn("MANUAL_VERSION", workflow)
+        self.assertNotIn("DEFAULT_VERSION_FILE", workflow)
 
     def test_python_publish_builds_linux_arm64_wheel(self) -> None:
         workflow = self.read(".github/workflows/cd-py-cua-driver.yml")
