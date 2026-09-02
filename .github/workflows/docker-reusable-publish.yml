@@ -1,251 +1,281 @@
 name: Reusable Docker Publish Workflow
 
 on:
-  workflow_dispatch: # Prevents phantom runs on push, allows manual testing
   workflow_call:
     inputs:
       image_name:
-        description: "Name of the Docker image (e.g. cua-ubuntu, cua-xfce)"
+        description: "Docker image name"
         required: true
         type: string
       context_dir:
-        description: "Directory containing the Dockerfile relative to workspace root (e.g. libs/kasm, libs/xfce)"
+        description: "Directory containing the Dockerfile"
         required: true
         type: string
       dockerfile_path:
-        description: "Path to Dockerfile relative to context_dir (e.g. Dockerfile)"
+        description: "Dockerfile path relative to context_dir"
         required: false
         type: string
-        default: "Dockerfile"
+        default: Dockerfile
       tag_prefix:
-        description: "Prefix for semantic version tags (e.g. docker-kasm-v, docker-xfce-v)"
+        description: "Semantic-version tag prefix"
         required: true
         type: string
       docker_hub_org:
-        description: "Docker Hub organization name"
+        description: "Docker Hub organization"
         required: false
         type: string
-        default: "trycua"
+        default: trycua
       skip_arm64:
-        description: "Skip arm64 build (for images that don't support arm64)"
+        description: "Do not build an arm64 image"
         required: false
         type: boolean
         default: false
-    secrets:
-      DOCKER_HUB_TOKEN:
-        required: true
+permissions: {}
 
 jobs:
+  # Reusable callers can change over time. Verify again inside this credentialed
+  # workflow so a future caller cannot publish an arbitrary branch or tag.
+  verify-tag:
+    if: >-
+      github.event_name == 'push' &&
+      github.ref_type == 'tag' &&
+      github.ref_protected == true
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify-release-tag.yml
+    with:
+      tag_prefix: ${{ inputs.tag_prefix }}
+
   build-and-push:
+    name: Build and publish ${{ matrix.platform }}
+    needs: verify-tag
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      github.ref_type == 'tag' &&
+      github.ref_protected == true &&
+      needs.verify-tag.result == 'success'
+    permissions:
+      actions: read # Read registry cache metadata.
+      contents: read # Check out the verified source commit.
+    environment: docker-release
+    timeout-minutes: 120
     runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - linux/amd64
-          - linux/arm64
-        exclude:
-          - platform: ${{ inputs.skip_arm64 && 'linux/arm64' || 'none' }}
+        platform: ${{ fromJSON(inputs.skip_arm64 && '["linux/amd64"]' || '["linux/amd64", "linux/arm64"]') }}
     steps:
+      - name: Check out the verified tag commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out the trusted release verifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Keep Docker build inputs on the tag, but load the credential gate
+          # from protected main so historical tags cannot replace it.
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: .github/scripts/verify_release_tag.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Recheck release tag provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          RELEASE_BASE_BRANCH: main
+          RELEASE_TAG_PREFIX: ${{ inputs.tag_prefix }}
+          RELEASE_TRUSTED_REPOSITORY: trycua/cua
+        run: python3 trusted-release/.github/scripts/verify_release_tag.py
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
-          sudo docker system prune -af
+          sudo docker system prune --all --force
           df -h /
 
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Prepare platform tag
+      - name: Set platform artifact name
         id: platform
-        run: |
-          TAG=$(echo "${{ matrix.platform }}" | sed 's/\//-/g')
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "name=${PLATFORM//\//-}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ inputs.docker_hub_org }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
-
-      - name: Build only (PR) - validate Dockerfile without pushing
-        if: github.event_name == 'pull_request'
-        id: build-pr
-        uses: docker/build-push-action@v5
-        with:
-          context: ./${{ inputs.context_dir }}
-          file: ./${{ inputs.context_dir }}/${{ inputs.dockerfile_path }}
-          push: false
-          platforms: ${{ matrix.platform }}
-          cache-from: |
-            type=registry,ref=${{ inputs.docker_hub_org }}/${{ inputs.image_name }}:buildcache-${{ steps.platform.outputs.tag }}
-
-      - name: Extract metadata (main)
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        id: meta-main
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ inputs.docker_hub_org }}/${{ inputs.image_name }}
-          tags: |
-            type=raw,value=latest
-
-      - name: Build & push digest (main)
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        id: build-main
-        continue-on-error: true
-        uses: docker/build-push-action@v5
-        with:
-          context: ./${{ inputs.context_dir }}
-          file: ./${{ inputs.context_dir }}/${{ inputs.dockerfile_path }}
-          push: true
-          platforms: ${{ matrix.platform }}
-          outputs: type=registry,name=${{ inputs.docker_hub_org }}/${{ inputs.image_name }},push-by-digest=true
-          labels: ${{ steps.meta-main.outputs.labels }}
-          cache-from: |
-            type=registry,ref=${{ inputs.docker_hub_org }}/${{ inputs.image_name }}:buildcache-${{ steps.platform.outputs.tag }}
-          cache-to: type=registry,ref=${{ inputs.docker_hub_org }}/${{ inputs.image_name }}:buildcache-${{ steps.platform.outputs.tag }},mode=max
-
-      - name: Extract metadata (semver)
-        if: startsWith(github.ref, format('refs/tags/{0}', inputs.tag_prefix))
-        id: meta-semver
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ inputs.docker_hub_org }}/${{ inputs.image_name }}
-          tags: |
-            type=match,pattern=${{ inputs.tag_prefix }}(\d+\.\d+\.\d+),group=1
-            type=match,pattern=${{ inputs.tag_prefix }}(\d+\.\d+),group=1
-            type=match,pattern=${{ inputs.tag_prefix }}(\d+),group=1
-            type=raw,value=latest
-
-      - name: Build & push digest (semver)
-        if: startsWith(github.ref, format('refs/tags/{0}', inputs.tag_prefix))
-        id: build-semver
-        continue-on-error: true
-        uses: docker/build-push-action@v5
-        with:
-          context: ./${{ inputs.context_dir }}
-          file: ./${{ inputs.context_dir }}/${{ inputs.dockerfile_path }}
-          push: true
-          platforms: ${{ matrix.platform }}
-          outputs: type=registry,name=${{ inputs.docker_hub_org }}/${{ inputs.image_name }},push-by-digest=true
-          labels: ${{ steps.meta-semver.outputs.labels }}
-          cache-from: |
-            type=registry,ref=${{ inputs.docker_hub_org }}/${{ inputs.image_name }}:buildcache-${{ steps.platform.outputs.tag }}
-          cache-to: type=registry,ref=${{ inputs.docker_hub_org }}/${{ inputs.image_name }}:buildcache-${{ steps.platform.outputs.tag }},mode=max
-
-      - name: Export digest
-        id: export-digest
-        if: |
-          github.event_name != 'pull_request' &&
-          ((steps.build-main.outcome == 'success') ||
-          (steps.build-semver.outcome == 'success'))
+      - name: Require the protected Docker Hub credential
+        env:
+          DOCKER_HUB_RELEASE_TOKEN: ${{ secrets.DOCKER_HUB_RELEASE_TOKEN }}
         run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build-main.outputs.digest || steps.build-semver.outputs.digest }}"
-          if [ -n "$digest" ]; then
-            echo "$digest" > "/tmp/digests/${{ steps.platform.outputs.tag }}.txt"
-            echo "Digest exported for platform ${{ matrix.platform }}: $digest"
-          else
-            echo "No digest to export for platform ${{ matrix.platform }}"
+          if [[ -z "$DOCKER_HUB_RELEASE_TOKEN" ]]; then
+            echo "docker-release environment is missing DOCKER_HUB_RELEASE_TOKEN" >&2
             exit 1
           fi
 
-      - name: Upload digest artifact (unique per platform)
-        if: steps.export-digest.outcome == 'success'
-        uses: actions/upload-artifact@v4
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
-          name: digests-${{ steps.platform.outputs.tag }}
+          username: ${{ inputs.docker_hub_org }}
+          password: ${{ secrets.DOCKER_HUB_RELEASE_TOKEN }}
+
+      - name: Build and push image digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ./${{ inputs.context_dir }}
+          file: ./${{ inputs.context_dir }}/${{ inputs.dockerfile_path }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ inputs.docker_hub_org }}/${{ inputs.image_name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ inputs.docker_hub_org }}/${{ inputs.image_name }}:buildcache-${{ steps.platform.outputs.name }}
+          cache-to: type=registry,ref=${{ inputs.docker_hub_org }}/${{ inputs.image_name }}:buildcache-${{ steps.platform.outputs.name }},mode=max
+
+      - name: Record image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          SOURCE_SHA: ${{ github.sha }}
+          PLATFORM_NAME: ${{ steps.platform.outputs.name }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Build returned an invalid image digest" >&2
+            exit 1
+          fi
+          mkdir -p /tmp/digests
+          printf '%s\n' "$DIGEST" > "/tmp/digests/${PLATFORM_NAME}-${SOURCE_SHA}.txt"
+
+      - name: Upload platform digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digest-${{ steps.platform.outputs.name }}
           path: /tmp/digests/*.txt
+          if-no-files-found: error
           retention-days: 1
 
   publish-manifest-list:
+    name: Publish multi-platform manifest
+    needs: [verify-tag, build-and-push]
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      github.ref_type == 'tag' &&
+      github.ref_protected == true &&
+      needs.verify-tag.result == 'success' &&
+      needs.build-and-push.result == 'success'
+    permissions:
+      actions: read # Download platform digest artifacts.
+      contents: read # Check out the verifier script.
+    environment: docker-release
+    timeout-minutes: 20
     runs-on: ubuntu-latest
-    needs:
-      - build-and-push
-    if: github.event_name != 'pull_request' && (success() || failure()) # Skip on PRs, run on push/tag even if some builds failed
-
     steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      - name: Check out the trusted provenance verifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          username: ${{ inputs.docker_hub_org }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+          # Load credential-gating code from protected main, never from an
+          # older release tag.
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: .github/scripts/verify_release_tag.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
 
-      - name: Extract final metadata (main)
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ inputs.docker_hub_org }}/${{ inputs.image_name }}
-          tags: |
-            type=raw,value=latest
+      - name: Recheck release tag provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          RELEASE_BASE_BRANCH: main
+          RELEASE_TAG_PREFIX: ${{ inputs.tag_prefix }}
+          RELEASE_TRUSTED_REPOSITORY: trycua/cua
+        run: python3 trusted-release/.github/scripts/verify_release_tag.py
 
-      - name: Extract final metadata (semver)
-        if: startsWith(github.ref, format('refs/tags/{0}', inputs.tag_prefix))
-        uses: docker/metadata-action@v5
+      - name: Download platform digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          images: ${{ inputs.docker_hub_org }}/${{ inputs.image_name }}
-          tags: |
-            type=match,pattern=${{ inputs.tag_prefix }}(\d+\.\d+\.\d+),group=1
-            type=match,pattern=${{ inputs.tag_prefix }}(\d+\.\d+),group=1
-            type=match,pattern=${{ inputs.tag_prefix }}(\d+),group=1
-            type=raw,value=latest
-
-      - name: Download all digest artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: digests-*
+          pattern: digest-*
           path: /tmp/digests
           merge-multiple: true
 
-      - name: Check available digests
-        id: check-digests
+      - name: Validate platform digests
+        env:
+          SKIP_ARM64: ${{ inputs.skip_arm64 }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
-          DIGEST_COUNT=$(find /tmp/digests -type f -name "*.txt" | wc -l)
-          echo "digest_count=$DIGEST_COUNT" >> $GITHUB_OUTPUT
+          expected=("linux-amd64-${SOURCE_SHA}.txt")
+          if [[ "$SKIP_ARM64" != "true" ]]; then
+            expected+=("linux-arm64-${SOURCE_SHA}.txt")
+          fi
 
-          if [ "$DIGEST_COUNT" -eq 0 ]; then
-            echo "Error: No platform builds succeeded!"
+          mapfile -t actual < <(find /tmp/digests -maxdepth 1 -type f -name '*.txt' -printf '%f\n' | sort)
+          if [[ "${#actual[@]}" -ne "${#expected[@]}" ]]; then
+            echo "Expected ${#expected[@]} digest files, found ${#actual[@]}" >&2
             exit 1
           fi
 
-          echo "Found $DIGEST_COUNT platform digest(s)"
-          for f in $(find /tmp/digests -type f -name "*.txt"); do
-            platform=$(basename "$f" .txt)
-            echo "  - $platform"
+          for file in "${expected[@]}"; do
+            if [[ ! -f "/tmp/digests/$file" ]]; then
+              echo "Missing digest artifact: $file" >&2
+              exit 1
+            fi
+            digest=$(<"/tmp/digests/$file")
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "Invalid digest in $file" >&2
+              exit 1
+            fi
           done
 
-      - name: Create & push multi-arch manifest
+          if find /tmp/digests -maxdepth 1 -type l -print -quit | grep -q .; then
+            echo "Digest artifacts must not contain symlinks" >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Require the protected Docker Hub credential
+        env:
+          DOCKER_HUB_RELEASE_TOKEN: ${{ secrets.DOCKER_HUB_RELEASE_TOKEN }}
         run: |
-          IMAGE="${{ inputs.docker_hub_org }}/${{ inputs.image_name }}"
+          if [[ -z "$DOCKER_HUB_RELEASE_TOKEN" ]]; then
+            echo "docker-release environment is missing DOCKER_HUB_RELEASE_TOKEN" >&2
+            exit 1
+          fi
 
-          DIGEST_ARGS=""
-          for f in $(find /tmp/digests -type f -name "*.txt"); do
-            d=$(cat "$f")
-            DIGEST_ARGS="$DIGEST_ARGS ${IMAGE}@${d}"
-          done
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ inputs.docker_hub_org }}
+          password: ${{ secrets.DOCKER_HUB_RELEASE_TOKEN }}
 
-          echo "Using digests:"
-          echo "$DIGEST_ARGS"
-
-          # Create manifest for each tag produced by metadata-action
-          echo "${DOCKER_METADATA_OUTPUT_JSON}" | jq -r '.tags[]' | while read FULL_TAG; do
-            echo "Creating manifest: $FULL_TAG"
-            docker buildx imagetools create --tag "$FULL_TAG" $DIGEST_ARGS
-          done
-
-      - name: Inspect pushed manifests
+      - name: Create and inspect multi-platform manifests
+        env:
+          IMAGE: ${{ inputs.docker_hub_org }}/${{ inputs.image_name }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.verify-tag.outputs.version }}
         run: |
-          IMAGE="${{ inputs.docker_hub_org }}/${{ inputs.image_name }}"
-          echo "Inspecting manifests:"
+          IFS=. read -r major minor patch <<< "$VERSION"
+          if [[ -z "$major" || -z "$minor" || -z "$patch" ]]; then
+            echo "Verifier returned an invalid semantic version" >&2
+            exit 1
+          fi
 
-          echo "${DOCKER_METADATA_OUTPUT_JSON}" | jq -r '.tags[]' | while read FULL_TAG; do
-            echo ""
-            echo "Inspecting: $FULL_TAG"
-            docker buildx imagetools inspect "$FULL_TAG"
+          mapfile -t digest_files < <(find /tmp/digests -maxdepth 1 -type f -name "*-${SOURCE_SHA}.txt" | sort)
+          digest_args=()
+          for file in "${digest_files[@]}"; do
+            digest=$(<"$file")
+            digest_args+=("${IMAGE}@${digest}")
+          done
+
+          tags=("$VERSION" "$major.$minor" "$major" latest)
+          for tag in "${tags[@]}"; do
+            full_tag="${IMAGE}:${tag}"
+            docker buildx imagetools create --tag "$full_tag" "${digest_args[@]}"
+            docker buildx imagetools inspect "$full_tag"
           done

@@ -1,0 +1,60 @@
+name: Verify protected release tag
+
+on:
+  workflow_call:
+    inputs:
+      tag_prefix:
+        description: Release tag prefix, for example cli-v
+        required: true
+        type: string
+    outputs:
+      tag:
+        description: Verified release tag
+        value: ${{ jobs.verify.outputs.tag }}
+      version:
+        description: Verified release version
+        value: ${{ jobs.verify.outputs.version }}
+      tag_sha:
+        description: Commit addressed by the release tag
+        value: ${{ jobs.verify.outputs.tag_sha }}
+      main_sha:
+        description: Main branch commit used for the ancestry check
+        value: ${{ jobs.verify.outputs.main_sha }}
+
+permissions: {}
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.provenance.outputs.tag }}
+      version: ${{ steps.provenance.outputs.version }}
+      tag_sha: ${{ steps.provenance.outputs.tag_sha }}
+      main_sha: ${{ steps.provenance.outputs.main_sha }}
+    steps:
+      - name: Checkout the trusted release verifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Tag-triggered workflows are loaded from the tag commit. Load this
+          # credential-gating helper from the canonical protected main branch
+          # so an old tag cannot replace the provenance logic.
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: .github/scripts/verify_release_tag.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Check release tag provenance
+        id: provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          RELEASE_TAG_PREFIX: ${{ inputs.tag_prefix }}
+          RELEASE_BASE_BRANCH: main
+        # Keep context values in env so an event field cannot become shell
+        # code. The script path is fixed and comes from trusted main above.
+        run: python3 trusted-release/.github/scripts/verify_release_tag.py

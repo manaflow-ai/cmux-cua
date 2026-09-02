@@ -7,71 +7,109 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to publish (default: from package.json)"
+        description: "Version to build without publishing"
         required: false
-        default: ""
-  workflow_call:
-    inputs:
-      version:
-        description: "Version to publish (default: from package.json)"
-        required: false
-        type: string
         default: ""
 
-permissions:
-  id-token: write
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
+  # Read-only provenance check. It is skipped for manual unsigned builds.
+  verify-tag:
+    if: github.event_name == 'push' && github.ref_protected == true
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify-release-tag.yml
+    with:
+      tag_prefix: npm-core-v
+
+  # Independent check immediately gates registry credentials.
+  verify-publish:
+    if: github.event_name == 'push' && github.ref_protected == true
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify-release-tag.yml
+    with:
+      tag_prefix: npm-core-v
+
   prepare:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get-version.outputs.version }}
       tag: ${{ steps.get-version.outputs.tag }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Determine version
+      - name: Resolve release version
         id: get-version
-        run: |
-          # Check inputs.version first (works for workflow_call)
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
-          elif [ "${{ github.event_name }}" == "push" ]; then
-            # Extract version from tag
-            if [[ "${{ github.ref }}" =~ ^refs/tags/npm-core-v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-              VERSION=${BASH_REMATCH[1]}
-            else
-              echo "ERROR: Invalid tag format for npm-core"
-              exit 1
-            fi
-          elif [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            # Read from package.json
-            VERSION=$(node -p "require('./libs/typescript/core/package.json').version")
-          fi
-
-          echo "Core version: $VERSION"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=npm-core-v${VERSION}" >> $GITHUB_OUTPUT
-
-  publish:
-    needs: prepare
-    uses: ./.github/workflows/ts-reusable-publish.yml
+        env:
+          RELEASE_EVENT_NAME: ${{ github.event_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_VERSION_INPUT: ${{ inputs.version }}
+          RELEASE_TAG_PREFIX: npm-core-v
+          RELEASE_PACKAGE_JSON: libs/typescript/core/package.json
+        run: python3 "${GITHUB_WORKSPACE}/.github/scripts/resolve_release_version.py"
+  manual-build:
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ts-reusable-build.yml
     with:
       package_name: "core"
       package_dir: "libs/typescript/core"
       package_manager: "pnpm"
-      version: ${{ needs.prepare.outputs.version }}
-    secrets:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+  publish:
+    if: >-
+      always() &&
+      github.event_name == 'push' && github.ref_type == 'tag' && github.ref_protected == true &&
+      needs.prepare.result == 'success' &&
+      needs.verify-publish.result == 'success'
+    needs: [prepare, verify-publish]
+    permissions:
+      actions: read # Read the package artifact in the reusable publisher.
+      contents: read # Check out and verify the release source.
+      id-token: write # Mint the npm Trusted Publishing identity.
+    uses: ./.github/workflows/ts-reusable-publish.yml
+    with:
+      allow_legacy_token: false
+      trusted_publisher_repository: "trycua/cua"
+      trusted_package_name: "@trycua/core"
+      trusted_publisher_workflow: "cd-ts-core.yml"
+      trusted_tag_prefix: "npm-core-v"
+      expected_tag: ${{ needs.prepare.outputs.tag }}
+      expected_version: ${{ needs.prepare.outputs.version }}
+      package_name: "core"
+      package_dir: "libs/typescript/core"
+      package_manager: "pnpm"
+      version: ${{ needs.prepare.outputs.version }}
   create-release:
-    needs: [prepare, publish]
+    if: >-
+      always() &&
+      github.event_name == 'push' && github.ref_type == 'tag' &&
+      github.ref_protected == true &&
+      needs.verify-tag.result == 'success' &&
+      needs.verify-publish.result == 'success' &&
+      needs.publish.result == 'success'
+    needs: [prepare, verify-tag, verify-publish, publish]
+    permissions:
+      actions: read # Download release artifacts.
+      contents: write # Create the GitHub release after publication.
     uses: ./.github/workflows/release-github-reusable.yml
     with:
+      tag_prefix: npm-core-v
       tag_name: ${{ needs.prepare.outputs.tag }}
       release_name: "@trycua/core v${{ needs.prepare.outputs.version }}"
       module_path: "libs/typescript/core"

@@ -1,0 +1,59 @@
+# Release workflow contract
+
+The reusable npm publisher requires three explicit identity inputs on every
+caller:
+
+```yaml
+with:
+  trusted_publisher_repository: trycua/cua
+  trusted_package_name: "@trycua/core"
+  trusted_publisher_workflow: cd-ts-core.yml
+  trusted_tag_prefix: npm-core-v
+  expected_tag: ${{ needs.prepare.outputs.tag }}
+  expected_version: ${{ needs.prepare.outputs.version }}
+```
+
+These values must match the npm Trusted Publishing configuration. The caller
+must also grant `id-token: write` to the reusable job. The build creates an
+artifact without registry credentials. The identity job checks the artifact's
+package name, GitHub repository URL, current repository, and exact caller
+workflow, protected tag, and package version before either publisher can run.
+
+The normal path uses npm Trusted Publishing and the protected `npm`
+environment, and publishes only to `https://registry.npmjs.org/`. The legacy
+token path is disabled by default. It requires an explicit
+`allow_legacy_token: true`, the protected `npm-token-fallback` environment,
+and its enablement secret. It is still subject to the same identity check,
+publishes only to `https://registry.npmjs.org/`, and never receives an OIDC
+token.
+
+The legacy PyPI reusable workflow is also disabled by default. Its protected
+fallback requires four explicit identity inputs on every caller:
+
+```yaml
+with:
+  trusted_publisher_repository: trycua/cua
+  trusted_package_name: cua-agent
+  trusted_publisher_workflow: cd-py-agent.yml
+  trusted_tag_prefix: agent-v
+```
+
+The fallback checks the current repository, exact protected tag and caller
+workflow, then validates the wheel and source archive metadata (package name,
+version, archive paths, regular files, and a two-file maximum) before the token
+is exposed to Twine. It uploads only to
+`https://upload.pypi.org/legacy/`. Normal PyPI Trusted Publishing remains in
+each top-level caller because PyPI binds OIDC to that caller's workflow file.
+
+The check fails closed when an input is missing, a package or repository does
+not match, a run comes from a fork, or the ref is not a protected tag. Do not
+configure the canonical `trycua/cua` publisher to run from
+`manaflow-ai/cmux-cua`; update the npm trusted-publisher owner and workflow
+configuration together before changing these allowlisted values.
+
+Tag-triggered workflows are loaded from the tag commit. Credential-bearing
+jobs therefore load their verifier, artifact validator, and legacy-token gate
+from the executing repository's protected `main` branch in a separate
+`trusted-release` checkout. Release source remains checked out at the tag.
+Keep `main` protected and reviewed; a tag-local helper is not a trusted
+credential gate.

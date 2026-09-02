@@ -37,10 +37,14 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
         self.assertIn("id-token: write", workflow)
         self.assertIn("environment: pypi", workflow)
         self.assertIn(
-            "--require-hashes -r .github/scripts/cua-driver-build-requirements.txt",
+            "--require-hashes -r trusted-release/.github/scripts/"
+            "cua-driver-build-requirements.txt",
             workflow,
         )
-        self.assertEqual(workflow.count("persist-credentials: false"), 3)
+        # The provenance check runs once before the build and once again in
+        # the credentialed publish job. Each of the four checkouts must keep
+        # its token out of the working tree.
+        self.assertEqual(workflow.count("persist-credentials: false"), 4)
         self.assertIn(
             "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33",
             workflow,
@@ -76,6 +80,53 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
         )
         self.assertNotIn("MANUAL_VERSION", workflow)
         self.assertNotIn("DEFAULT_VERSION_FILE", workflow)
+
+    def test_credential_jobs_use_the_protected_main_verifier(self) -> None:
+        workflow = self.read(".github/workflows/cd-py-cua-driver.yml")
+
+        # A workflow_run payload can point at a historical source revision.
+        # Both the initial gate and the last gate before OIDC must therefore
+        # load the verifier from this repository's protected main branch.
+        trusted_checkouts = workflow.count(
+            "repository: ${{ github.repository }}\n"
+            "          ref: main\n"
+            "          path: trusted-release"
+        )
+        self.assertEqual(trusted_checkouts, 3)
+        self.assertEqual(
+            workflow.count("python3 trusted-release/.github/scripts/verify_cua_driver_release.py"),
+            2,
+        )
+        self.assertIn("Recheck source provenance before PyPI OIDC", workflow)
+
+        build = workflow[workflow.index("  build-wheels:") : workflow.index("  publish-pypi:")]
+        self.assertIn("path: trusted-release", build)
+        self.assertIn(
+            "--require-hashes -r trusted-release/.github/scripts/"
+            "cua-driver-build-requirements.txt",
+            build,
+        )
+        self.assertIn(
+            "python trusted-release/.github/scripts/prepare_cua_driver_binary.py",
+            build,
+        )
+
+        # No verifier may execute from the tag/source checkout. This catches
+        # a missing trusted checkout or a path silently changed back to the
+        # event-associated workspace.
+        self.assertNotIn("python3 .github/scripts/verify_cua_driver_release.py", workflow)
+        self.assertNotIn("python3 source/.github/scripts/verify_cua_driver_release.py", workflow)
+        self.assertNotIn("python .github/scripts/prepare_cua_driver_binary.py", workflow)
+
+    def test_trusted_verifier_contract_fails_closed_when_checkout_is_changed(self) -> None:
+        workflow = self.read(".github/workflows/cd-py-cua-driver.yml")
+
+        # Keep the contract explicit so a future edit cannot substitute a
+        # caller-controlled ref or a different repository without review.
+        self.assertNotIn("repository: trycua/cua", workflow)
+        self.assertNotIn("ref: ${{ github.event.workflow_run.head_sha }}", workflow)
+        self.assertNotIn("ref: ${{ github.event.workflow_run.head_branch }}", workflow)
+        self.assertNotIn("path: source/.github/scripts", workflow)
 
     def test_python_publish_builds_linux_arm64_wheel(self) -> None:
         workflow = self.read(".github/workflows/cd-py-cua-driver.yml")

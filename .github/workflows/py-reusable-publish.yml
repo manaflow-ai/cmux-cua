@@ -1,4 +1,10 @@
-name: Reusable Package Publish Workflow
+name: Reusable Legacy PyPI Token Publish Workflow
+
+# This workflow is an emergency compatibility path only. PyPI Trusted
+# Publishing is implemented in each top-level cd-py-*.yml caller because PyPI
+# does not support OIDC claims from reusable workflows. The normal callers do
+# not use this workflow and never receive a registry token.
+permissions: {}
 
 on:
   workflow_call:
@@ -8,101 +14,180 @@ on:
         required: true
         type: string
       package_dir:
-        description: "Directory containing the package relative to workspace root (e.g. libs/python/computer)"
+        description: "Directory containing the package relative to workspace root"
         required: true
         type: string
       version:
         description: "Version to publish"
         required: true
         type: string
+      # Kept for callers of the former workflow contract. The value is not
+      # used for authentication or package selection.
       base_package_name:
-        description: "PyPI package name (e.g. cua-agent)"
+        description: "Deprecated package name compatibility input"
+        required: false
+        type: string
+        default: ""
+      trusted_publisher_repository:
+        description: "Exact owner/repository permitted to publish this package"
         required: true
         type: string
+      trusted_package_name:
+        description: "Exact PyPI package name permitted for this publisher"
+        required: true
+        type: string
+      trusted_publisher_workflow:
+        description: "Exact top-level caller workflow filename permitted to publish"
+        required: true
+        type: string
+      trusted_tag_prefix:
+        description: "Exact release-tag prefix for this package (for example agent-v)"
+        required: true
+        type: string
+      allow_legacy_token:
+        description: "Required opt-in for the protected emergency token path"
+        required: false
+        type: boolean
+        default: false
     secrets:
       PYPI_TOKEN:
-        required: true
+        description: "Short-lived or rotated PyPI token from the protected environment"
+        required: false
+      PYPI_LEGACY_TOKEN_FALLBACK_ENABLED:
+        description: "Environment gate that explicitly enables token publishing"
+        required: false
     outputs:
       version:
         description: "The version that was published"
-        value: ${{ jobs.build-and-publish.outputs.version }}
+        value: ${{ jobs.build-package.outputs.version }}
 
 jobs:
-  build-and-publish:
-    runs-on: macos-latest
+  reject-unless-enabled:
+    if: inputs.allow_legacy_token != true
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Reject unapproved token publishing
+        run: |
+          echo "::error::Legacy token publishing is disabled. Use the top-level PyPI Trusted Publishing job." >&2
+          exit 1
+
+  build-package:
+    if: inputs.allow_legacy_token == true
+    uses: ./.github/workflows/py-reusable-build.yml
     permissions:
       contents: read
-    outputs:
-      version: ${{ steps.set-version.outputs.version }}
+    with:
+      # `base_package_name` is retained as the artifact label for old callers.
+      # The required trusted name is the fallback for new callers. Neither
+      # value selects source code or grants registry access.
+      package_name: ${{ inputs.base_package_name || inputs.trusted_package_name }}
+      package_dir: ${{ inputs.package_dir }}
+      version: ${{ inputs.version }}
+
+  validate-publisher-identity:
+    if: inputs.allow_legacy_token == true && needs.build-package.result == 'success'
+    needs: build-package
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout trusted release identity validator
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # A tag-triggered caller can contain an older workflow file. Load
+          # credential-gating code from the protected default branch instead.
+          repository: ${{ github.repository }}
           ref: main
-          fetch-depth: 0 # Full history for release creation
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/scripts/validate-pypi-publish-identity.py
+            .github/scripts/validate_publish_artifacts.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
 
-      - name: Ensure latest main branch
-        run: |
-          git fetch origin main
-          git reset --hard origin/main
-          echo "Current HEAD commit:"
-          git log -1 --oneline
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Download package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          python-version: "3.11"
+          name: pypi-${{ inputs.base_package_name || inputs.trusted_package_name }}
+          path: dist
 
-      - name: Create root pdm.lock file
-        run: |
-          # Create an empty pdm.lock file in the root
-          touch pdm.lock
-
-      - name: Install PDM
-        uses: pdm-project/setup-pdm@v3
-        with:
-          python-version: "3.11"
-          cache: true
-
-      - name: Set version
-        id: set-version
-        run: |
-          echo "VERSION=${{ inputs.version }}" >> $GITHUB_ENV
-          echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
-
-      - name: Verify version consistency
-        run: |
-          # Install toml parser
-          pip install toml
-
-          # Verify version matches using script (exits with error if mismatch)
-          python ${GITHUB_WORKSPACE}/.github/scripts/get_pyproject_version.py \
-            ${GITHUB_WORKSPACE}/${{ inputs.package_dir }}/pyproject.toml \
-            ${{ inputs.version }}
-
-      - name: Initialize PDM in package directory
-        run: |
-          # Make sure we're working with a properly initialized PDM project
-          cd ${{ inputs.package_dir }}
-
-          # Create pdm.lock if it doesn't exist
-          if [ ! -f "pdm.lock" ]; then
-            echo "No pdm.lock found, initializing PDM project..."
-            pdm lock
-          fi
-
-      - name: Build and publish
+      - name: Verify release identity and package metadata
         env:
-          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          TRUSTED_PUBLISHER_REPOSITORY: ${{ inputs.trusted_publisher_repository }}
+          TRUSTED_PACKAGE_NAME: ${{ inputs.trusted_package_name }}
+          TRUSTED_PUBLISHER_WORKFLOW: ${{ inputs.trusted_publisher_workflow }}
+          TRUSTED_TAG_PREFIX: ${{ inputs.trusted_tag_prefix }}
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: python3 trusted-release/.github/scripts/validate-pypi-publish-identity.py dist
+
+  publish-legacy-token:
+    if: >-
+      inputs.allow_legacy_token == true &&
+      needs.build-package.result == 'success' &&
+      needs.validate-publisher-identity.result == 'success'
+    needs: [build-package, validate-publisher-identity]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-token-fallback
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout trusted release gate scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Keep the gate and artifact validator on protected main. A
+          # historical tag must not choose credential-gating code.
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          sparse-checkout: |
+            .github/scripts/validate-legacy-publish-gate.sh
+            .github/scripts/validate_publish_artifacts.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Download package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pypi-${{ inputs.base_package_name || inputs.trusted_package_name }}
+          path: dist
+
+      - name: Reject unsafe package artifacts
+        env:
+          EXPECTED_PACKAGE: ${{ inputs.trusted_package_name }}
+          EXPECTED_VERSION: ${{ inputs.version }}
         run: |
-          cd ${{ inputs.package_dir }}
-          # Build with PDM
-          pdm build
+          set -euo pipefail
+          python trusted-release/.github/scripts/validate_publish_artifacts.py dist \
+            --suffix .whl --suffix .tar.gz \
+            --expected-package "$EXPECTED_PACKAGE" \
+            --expected-version "$EXPECTED_VERSION" \
+            --max-files 2
 
-          echo "Publishing ${{ inputs.base_package_name }} ${VERSION}"
+      - name: Verify protected legacy token gate
+        env:
+          ALLOW_LEGACY_TOKEN: ${{ inputs.allow_legacy_token }}
+          LEGACY_TOKEN_GATE: ${{ secrets.PYPI_LEGACY_TOKEN_FALLBACK_ENABLED }}
+          REGISTRY_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: bash "${GITHUB_WORKSPACE}/trusted-release/.github/scripts/validate-legacy-publish-gate.sh"
 
-          # Install and use twine directly instead of PDM publish
-          echo "Installing twine for direct publishing..."
-          pip install twine
+      - name: Install Twine
+        run: python -m pip install --disable-pip-version-check --no-input twine
 
-          echo "Publishing to PyPI using twine..."
-          TWINE_USERNAME="__token__" TWINE_PASSWORD="$PYPI_TOKEN" python -m twine upload dist/*
+      - name: Publish with PyPI token (emergency fallback)
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          set -euo pipefail
+          python -m twine upload --non-interactive \
+            --repository-url https://upload.pypi.org/legacy/ dist/*
