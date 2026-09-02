@@ -583,6 +583,7 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
         for job in ("publish-build", "publish-manifest"):
             block = job_block(source, job)
             self.assertIn("github.event_name == 'workflow_run'", block)
+            self.assertIn("environment: docs-release", block)
             self.assertIn("validate_main_workflow_run.py", block)
             self.assertIn("validate_publisher_repository.py", block)
             self.assertIn("source_sha", block)
