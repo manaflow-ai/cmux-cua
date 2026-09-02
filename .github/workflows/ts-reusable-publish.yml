@@ -30,6 +30,18 @@ on:
         required: false
         type: boolean
         default: false
+      trusted_publisher_repository:
+        description: "Exact owner/repository configured in npm Trusted Publishing"
+        required: true
+        type: string
+      trusted_package_name:
+        description: "Exact npm package name configured for this publisher"
+        required: true
+        type: string
+      trusted_publisher_workflow:
+        description: "Exact top-level caller workflow filename configured in npm Trusted Publishing"
+        required: true
+        type: string
     secrets:
       # Only a protected emergency dispatcher should pass this secret.
       NPM_TOKEN:
@@ -159,13 +171,55 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  publish-oidc:
+  validate-publisher-identity:
     needs: build
-    if: inputs.allow_legacy_token == false && needs.build.outputs.should_publish == 'true'
+    if: needs.build.outputs.should_publish == 'true'
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout identity validator
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Validate the same immutable source commit that produced the artifact.
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/scripts/validate-npm-publish-identity.py
+            .github/scripts/validate_publish_artifacts.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Download package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-${{ inputs.package_name }}
+          path: npm-dist
+
+      - name: Validate trusted publisher identity
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          TRUSTED_PUBLISHER_REPOSITORY: ${{ inputs.trusted_publisher_repository }}
+          TRUSTED_PACKAGE_NAME: ${{ inputs.trusted_package_name }}
+          TRUSTED_PUBLISHER_WORKFLOW: ${{ inputs.trusted_publisher_workflow }}
+        run: python .github/scripts/validate-npm-publish-identity.py npm-dist
+
+  publish-oidc:
+    needs: [build, validate-publisher-identity]
+    if: >-
+      inputs.allow_legacy_token == false &&
+      needs.build.outputs.should_publish == 'true' &&
+      needs.validate-publisher-identity.result == 'success'
     permissions:
       actions: read
       id-token: write
     runs-on: ubuntu-latest
+    environment:
+      name: npm
     steps:
       - name: Use Node.js 24.x
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -181,11 +235,16 @@ jobs:
 
       - name: Publish with npm trusted publishing
         working-directory: npm-dist
-        run: npm publish ./*.tgz --access public --provenance --ignore-scripts
+        run: >-
+          npm publish ./*.tgz --access public --provenance --ignore-scripts
+          --registry=https://registry.npmjs.org/
 
   publish-legacy-token:
-    needs: build
-    if: inputs.allow_legacy_token == true && needs.build.outputs.should_publish == 'true'
+    needs: [build, validate-publisher-identity]
+    if: >-
+      inputs.allow_legacy_token == true &&
+      needs.build.outputs.should_publish == 'true' &&
+      needs.validate-publisher-identity.result == 'success'
     runs-on: ubuntu-latest
     environment:
       name: npm-token-fallback
@@ -238,4 +297,5 @@ jobs:
           umask 077
           printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > "$npm_config_userconfig"
           trap 'rm -f "$npm_config_userconfig"' EXIT
-          npm publish ./*.tgz --access public --ignore-scripts
+          npm publish ./*.tgz --access public --ignore-scripts \
+            --registry=https://registry.npmjs.org/

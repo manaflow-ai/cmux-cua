@@ -81,7 +81,9 @@ jobs:
         with:
           # Use the caller commit, never a mutable branch, for the gate code.
           ref: ${{ github.sha }}
-          sparse-checkout: .github/scripts/validate-legacy-publish-gate.sh
+          sparse-checkout: |
+            .github/scripts/validate-legacy-publish-gate.sh
+            .github/scripts/validate_publish_artifacts.py
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -98,12 +100,19 @@ jobs:
           name: pypi-${{ inputs.package_name }}
           path: dist
 
+      - name: Reject unsafe package artifacts
+        run: >-
+          python .github/scripts/validate_publish_artifacts.py dist
+          --suffix .whl --suffix .tar.gz
+
+      - name: Install Twine
+        run: python -m pip install --disable-pip-version-check --no-input twine
+
       - name: Publish with PyPI token (emergency fallback)
-        shell: bash
         env:
-          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: |
           set -euo pipefail
-          python -m pip install --disable-pip-version-check --no-input twine
-          TWINE_USERNAME="__token__" TWINE_PASSWORD="$PYPI_TOKEN" \
-            python -m twine upload --non-interactive dist/*
+          python -m twine upload --non-interactive \
+            --repository-url https://upload.pypi.org/legacy/ dist/*
