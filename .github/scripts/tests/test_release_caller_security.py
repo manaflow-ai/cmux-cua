@@ -605,6 +605,8 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
         self.assertIn("environment: github-release", source)
         self.assertIn("Recheck release provenance before write operations", source)
         self.assertIn("persist-credentials: false", source)
+        self.assertIn("SOURCE_TAG: ${{ inputs.source_tag }}", source)
+        self.assertNotIn('"${{ inputs.source_tag }}"', source)
         self.assertNotIn("uses: actions/checkout@v", source)
         self.assertNotIn("uses: actions/download-artifact@v", source)
         self.assertIn("Create release with GitHub CLI", source)
