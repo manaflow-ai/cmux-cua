@@ -590,6 +590,19 @@ class TestWorkflowContracts(unittest.TestCase):
                 path,
             )
 
+    def test_workflow_run_consumers_use_validated_tag_for_release_metadata(self) -> None:
+        for path in (
+            ".github/workflows/cd-swift-lume.yml",
+            ".github/workflows/cd-rust-cua-driver.yml",
+        ):
+            text = self.workflow_text(path)
+            self.assertIn("tag_name: ${{ needs.validate-release.outputs.tag }}", text, path)
+            self.assertIn(
+                "CURRENT_TAG: ${{ needs.validate-release.outputs.tag }}",
+                text,
+                path,
+            )
+
     def test_all_action_refs_are_immutable_commits(self) -> None:
         for path in (
             ".github/workflows/cd-swift-lume.yml",

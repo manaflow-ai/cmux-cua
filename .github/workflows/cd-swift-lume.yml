@@ -319,6 +319,7 @@ jobs:
         # zizmor: ignore[superfluous-actions] -- the action handles multiline release bodies and symlink assets.
         uses: softprops/action-gh-release@a6c7483a42ee9d5daced968f6c217562cd680f7f # v2.0.0
         with:
+          tag_name: ${{ needs.validate-release.outputs.tag }}
           files: |
             ./libs/lume/${{ steps.build_notarize.outputs.tarball_path }}
             ./libs/lume/${{ steps.build_notarize.outputs.pkg_path }}

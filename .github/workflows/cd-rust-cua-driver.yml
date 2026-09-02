@@ -600,9 +600,10 @@ jobs:
 
       - name: Generate path-filtered release notes
         id: notes
+        env:
+          CURRENT_TAG: ${{ needs.validate-release.outputs.tag }}
         run: |
           set -euo pipefail
-          CURRENT_TAG="${GITHUB_REF_NAME}"
           PREV_TAG="$(git tag -l 'cua-driver-rs-v*' --sort=-v:refname \
             | grep -Fvx "$CURRENT_TAG" \
             | head -n 1 || true)"
@@ -627,6 +628,7 @@ jobs:
         # zizmor: ignore[superfluous-actions] -- the action handles multiline release bodies and symlink assets.
         uses: softprops/action-gh-release@a6c7483a42ee9d5daced968f6c217562cd680f7f # v2.0.0
         with:
+          tag_name: ${{ needs.validate-release.outputs.tag }}
           files: release-upload/*
           prerelease: true
           body: |
