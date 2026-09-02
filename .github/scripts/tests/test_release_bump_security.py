@@ -173,6 +173,14 @@ class TestReleaseBumpWorkflowContracts(unittest.TestCase):
         self.assertIn("environment: release-bump", workflow)
         self.assertIn("ref: ${{ needs.validate-request.outputs.commit }}", workflow)
 
+    def test_auto_release_dispatches_request_then_waits_for_consumer(self) -> None:
+        workflow = self.read(".github/workflows/release-on-merge.yml")
+        self.assertIn("const requestWorkflowId = 'release-bump-request.yml';", workflow)
+        self.assertIn("const consumerWorkflowId = 'release-bump-version.yml';", workflow)
+        self.assertIn("workflow_id: requestWorkflowId", workflow)
+        self.assertIn("'workflow_run'", workflow)
+        self.assertIn("await waitForCompletion(consumerRun)", workflow)
+
     def test_tag_creation_is_immutable(self) -> None:
         workflow = self.read(".github/workflows/release-bump-version.yml")
         self.assertNotIn("git tag -d", workflow)
