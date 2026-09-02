@@ -400,6 +400,21 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
             block.index("Generate GitHub App token"),
         )
 
+    def test_version_bump_has_no_branch_selectable_write_path(self) -> None:
+        bump_source = text(WORKFLOWS / "release-bump-version.yml")
+        self.assertIn("  repository_dispatch:", bump_source)
+        self.assertIn("types: [release-bump]", bump_source)
+        self.assertNotIn("  workflow_dispatch:", bump_source)
+
+        bump = job_block(bump_source, "bump-version")
+        self.assertIn("environment: release-control", bump)
+
+        dispatch = job_block(text(WORKFLOWS / "release-on-merge.yml"), "dispatch")
+        self.assertIn("permissions: {}", dispatch)
+        self.assertIn("environment: release-control", dispatch)
+        self.assertIn("github.rest.repos.createDispatchEvent", dispatch)
+        self.assertIn("event_type: 'release-bump'", dispatch)
+
     def test_every_credentialed_release_path_has_canonical_owner_gate(self) -> None:
         """Keep registry ownership checks on every write-capable release job."""
 
