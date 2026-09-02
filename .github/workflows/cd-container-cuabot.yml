@@ -1,18 +1,73 @@
 name: "CD: Container CuaBot"
 
 on:
-  push:
-    tags:
-      - "docker-cuabot-v*.*.*"
+  workflow_run:
+    workflows:
+      - "Release tag request"
+    types: [completed]
   workflow_dispatch:
 
+permissions: {}
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
+  # Read-only provenance check. It is skipped for manual unsigned builds.
+  verify-tag:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'docker-cuabot-v')
+    permissions:
+      contents: read
+    uses: ./.github/workflows/validate-release-request.yml
+    with:
+      tag_prefix: docker-cuabot-v
+
+  # Independent check immediately gates registry credentials.
+  verify-publish:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'docker-cuabot-v')
+    permissions:
+      contents: read
+    uses: ./.github/workflows/validate-release-request.yml
+    with:
+      tag_prefix: docker-cuabot-v
+
+  manual-build:
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-reusable-build.yml
+    with:
+      image_name: cuabot
+      context_dir: libs/cuabot
+      dockerfile_path: Dockerfile
+      # The Ubuntu arm64 runner installs an unsupported xpra package version.
+      # Re-enable it after the upstream repository publishes a supported arm64
+      # package.
+      skip_arm64: true
+
   publish:
+    if: >-
+      github.repository == 'trycua/cua' &&
+      always() &&
+      github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+      needs.verify-publish.result == 'success'
+    needs: [verify-tag, verify-publish]
+    permissions:
+      actions: read # Read the build and digest artifacts.
+      contents: read # Allow the reusable publisher to verify source.
     uses: ./.github/workflows/docker-reusable-publish.yml
     with:
       image_name: cuabot
       context_dir: libs/cuabot
       tag_prefix: docker-cuabot-v
+      source_sha: ${{ needs.verify-tag.outputs.commit }}
+      source_tag: ${{ needs.verify-tag.outputs.tag }}
       docker_hub_org: trycua
-    secrets:
-      DOCKER_HUB_TOKEN: ${{ secrets.DOCKER_HUB_TOKEN }}
+      skip_arm64: true

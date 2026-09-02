@@ -98,10 +98,37 @@ jobs:
             core.info(`Affected services: ${JSON.stringify([...affected].sort())}`);
             core.info(`Release services: ${JSON.stringify(services)}`);
 
-  dispatch:
-    name: Dispatch approved release workflows
+  validate-publisher-repository:
+    name: Verify canonical release repository
     needs: plan
     if: needs.plan.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the protected release gate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: .github/scripts/validate_publisher_repository.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Require canonical publisher repository
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 trusted-release/.github/scripts/validate_publisher_repository.py
+
+  dispatch:
+    name: Dispatch approved release workflows
+    needs: [plan, validate-publisher-repository]
+    if: >-
+      github.repository == 'trycua/cua' &&
+      needs.plan.outputs.should_release == 'true' &&
+      needs.validate-publisher-repository.result == 'success'
     runs-on: ubuntu-24.04
     permissions:
       actions: write # Dispatch the already-reviewed release workflow only.

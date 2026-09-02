@@ -1,18 +1,72 @@
 name: "CD: Container XFCE"
 
 on:
-  push:
-    tags:
-      - "docker-xfce-v*.*.*"
+  workflow_run:
+    workflows:
+      - "Release tag request"
+    types: [completed]
   workflow_dispatch:
 
+permissions: {}
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
+  # Read-only provenance check. It is skipped for manual unsigned builds.
+  verify-tag:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'docker-xfce-v')
+    permissions:
+      contents: read
+    uses: ./.github/workflows/validate-release-request.yml
+    with:
+      tag_prefix: docker-xfce-v
+
+  # Independent check immediately gates registry credentials.
+  verify-publish:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'docker-xfce-v')
+    permissions:
+      contents: read
+    uses: ./.github/workflows/validate-release-request.yml
+    with:
+      tag_prefix: docker-xfce-v
+
+  manual-build:
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-reusable-build.yml
+    with:
+      image_name: cua-xfce
+      context_dir: libs/xfce
+      dockerfile_path: Dockerfile
+      # kicad/kicad:9.0 is amd64-only, so manual validation uses the same
+      # supported platform set as the release publisher.
+      skip_arm64: true
+
   publish:
+    if: >-
+      github.repository == 'trycua/cua' &&
+      always() &&
+      github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+      needs.verify-publish.result == 'success'
+    needs: [verify-tag, verify-publish]
+    permissions:
+      actions: read # Read the build and digest artifacts.
+      contents: read # Allow the reusable publisher to verify source.
     uses: ./.github/workflows/docker-reusable-publish.yml
     with:
       image_name: cua-xfce
       context_dir: libs/xfce
       tag_prefix: docker-xfce-v
+      source_sha: ${{ needs.verify-tag.outputs.commit }}
+      source_tag: ${{ needs.verify-tag.outputs.tag }}
       docker_hub_org: trycua
-    secrets:
-      DOCKER_HUB_TOKEN: ${{ secrets.DOCKER_HUB_TOKEN }}
+      skip_arm64: true
