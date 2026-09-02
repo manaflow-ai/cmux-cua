@@ -1,22 +1,89 @@
 name: "CI: Cold Start Benchmark"
 
+# This consumer has the benchmark API key and Slack webhook. The request
+# workflow has no secrets; this workflow_run path accepts only its successful
+# run from the current protected main commit.
 on:
-  workflow_dispatch:
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- source is validated below
+    workflows: ["CI: Cold Start Benchmark (request)"]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: cold-start-benchmark-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
+  validate-source:
+    name: Validate protected benchmark source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read # Read the source request run for provenance validation.
+      contents: read # Read the protected main branch metadata.
+    outputs:
+      commit: ${{ steps.validate.outputs.commit }}
+    steps:
+      - name: Check out trusted validator
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: .github/scripts/validate_trusted_main_run.py
+          sparse-checkout-cone-mode: false
+
+      - name: Bind request to protected main
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          TRUSTED_REF: ${{ github.ref }}
+          TRUSTED_REF_TYPE: ${{ github.ref_type }}
+          TRUSTED_REF_PROTECTED: ${{ github.ref_protected }}
+          TRUSTED_SHA: ${{ github.sha }}
+          REQUEST_KIND: cold-start-benchmark
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_STATUS: ${{ github.event.workflow_run.status }}
+          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          SOURCE_WORKFLOW_PATH: ${{ github.event.workflow_run.path }}
+          SOURCE_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
+          SOURCE_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: python3 .github/scripts/validate_trusted_main_run.py
+
   benchmark:
+    name: Run cold start benchmark
+    needs: validate-source
+    if: >-
+      github.repository == 'manaflow-ai/cmux-cua' &&
+      needs.validate-source.result == 'success'
+    environment: cold-start-benchmark
+    permissions:
+      contents: read # Checkout and run the validated benchmark source.
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout protected source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.validate-source.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Set up uv and Python
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v4
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: |
+          set -euo pipefail
           rm -rf .venv
           uv venv --python 3.12
           uv pip install -e libs/python/core -e libs/python/computer -e libs/python/cua-sandbox
@@ -24,14 +91,13 @@ jobs:
       - name: Run cold start benchmark
         id: benchmark
         timeout-minutes: 10
-        run: uv run python tests/cold_start_benchmark.py
         env:
           CUA_API_KEY: ${{ secrets.CUA_API_KEY }}
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: uv run python tests/cold_start_benchmark.py
 
       - name: Send results to Slack
         if: always()
-        uses: rtCamp/action-slack-notify@v2
+        uses: rtCamp/action-slack-notify@33ca3be66c6f378fe1610fd1d5258632dbed5e58 # v2.4.0
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           SLACK_CHANNEL: ${{ vars.SLACK_CHANNEL }}

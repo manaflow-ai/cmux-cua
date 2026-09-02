@@ -37,6 +37,16 @@ class FakeApi:
             raise AssertionError(f"unexpected API request: {path}") from error
 
 
+class MovingMainApi(FakeApi):
+    """Change main after the first read to model a concurrent fast-forward."""
+
+    def get(self, path: str) -> dict[str, Any]:
+        value = super().get(path)
+        if path.endswith("/branches/main") and self.calls.count(path) == 1:
+            self.responses[path] = {"protected": True, "commit": {"sha": "b" * 40}}
+        return value
+
+
 def valid_fixture(
     *,
     kind: str = "model-tests",
@@ -112,6 +122,13 @@ class TestTrustedMainRunValidation(unittest.TestCase):
 
         self.assertEqual(validator.validate(api, values), "a" * 40)
 
+    def test_rejects_schedule_for_manual_only_benchmark(self) -> None:
+        validator = load_validator()
+        values, api = valid_fixture(kind="cold-start-benchmark", source_event="schedule")
+
+        with self.assertRaisesRegex(validator.ValidationError, "allowed request"):
+            validator.validate(api, values)
+
     def test_rejects_feature_branch_even_when_sha_matches_main(self) -> None:
         validator = load_validator()
         values, api = valid_fixture()
@@ -157,6 +174,14 @@ class TestTrustedMainRunValidation(unittest.TestCase):
         api.responses["/repos/manaflow-ai/cmux-cua/branches/main"]["protected"] = False
         with self.assertRaisesRegex(validator.ValidationError, "protected"):
             validator.validate(api, values)
+
+    def test_rejects_main_moving_during_validation(self) -> None:
+        validator = load_validator()
+        values, api = valid_fixture()
+        moving_api = MovingMainApi(api.responses)
+
+        with self.assertRaisesRegex(validator.ValidationError, "moved"):
+            validator.validate(moving_api, values)
 
 
 class TestWorkflowContracts(unittest.TestCase):

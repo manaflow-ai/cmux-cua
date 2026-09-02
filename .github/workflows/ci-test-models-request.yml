@@ -1,0 +1,48 @@
+name: "CI: Test Models (request)"
+
+# This workflow is intentionally credential-free. It may be selected from any
+# branch, but the privileged consumer accepts only a successful run from the
+# current protected main commit.
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Every Monday at 09:00 UTC.
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: test-models-request-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  request:
+    name: Record model-test request
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout-minutes: 2
+    steps:
+      - name: Check request metadata
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" == "manaflow-ai/cmux-cua" ]] || {
+            echo "Requests are accepted only in manaflow-ai/cmux-cua" >&2
+            exit 1
+          }
+          [[ "$REF" == "refs/heads/main" ]] || {
+            echo "Select the protected main branch before requesting model tests" >&2
+            exit 1
+          }
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "The selected main branch is not protected" >&2
+            exit 1
+          }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "The request SHA is not a full commit SHA" >&2
+            exit 1
+          }
