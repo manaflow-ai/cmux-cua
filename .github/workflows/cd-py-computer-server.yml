@@ -4,20 +4,37 @@ on:
   push:
     tags:
       - "computer-server-v*"
-  workflow_call:
+  workflow_dispatch:
     inputs:
       version:
-        description: "Version to publish"
+        description: "Version to build without publishing"
         required: true
-        type: string
-    outputs:
-      version:
-        description: "The version that was published"
-        value: ${{ jobs.prepare.outputs.version }}
 
 permissions: {}
 
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
+  # Read-only provenance check. It is skipped for manual unsigned builds.
+  verify-tag:
+    if: github.event_name == 'push' && github.ref_protected == true
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify-release-tag.yml
+    with:
+      tag_prefix: computer-server-v
+
+  # Independent check immediately gates registry credentials.
+  verify-publish:
+    if: github.event_name == 'push' && github.ref_protected == true
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify-release-tag.yml
+    with:
+      tag_prefix: computer-server-v
+
   prepare:
     permissions:
       contents: read
@@ -26,35 +43,26 @@ jobs:
       version: ${{ steps.get-version.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Determine version
-        id: get-version
-        run: |
-          # Check inputs.version first (set by workflow_call)
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION=${{ inputs.version }}
-          elif [ "${{ github.event_name }}" == "push" ]; then
-            # Extract version from tag (for package-specific tags)
-            if [[ "${{ github.ref }}" =~ ^refs/tags/computer-server-v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-              VERSION=${BASH_REMATCH[1]}
-            else
-              echo "Invalid tag format for computer-server"
-              exit 1
-            fi
-          else
-            echo "No version provided"
-            exit 1
-          fi
-          echo "VERSION=$VERSION"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Set up Python
-        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
         with:
-          python-version: "3.10"
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
+      - name: Resolve release version
+        id: get-version
+        env:
+          RELEASE_EVENT_NAME: ${{ github.event_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_VERSION_INPUT: ${{ inputs.version }}
+          RELEASE_TAG_PREFIX: computer-server-v
+        run: python3 "${GITHUB_WORKSPACE}/.github/scripts/resolve_release_version.py"
   build-package:
-    needs: prepare
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' || needs.verify-tag.result == 'success') &&
+      needs.prepare.result == 'success'
+    needs: [prepare, verify-tag]
     permissions:
       contents: read
     uses: ./.github/workflows/py-reusable-build.yml
@@ -64,25 +72,67 @@ jobs:
       version: ${{ needs.prepare.outputs.version }}
 
   publish:
-    needs: [prepare, build-package]
+    if: >-
+      always() &&
+      github.event_name == 'push' && github.ref_type == 'tag' && github.ref_protected == true &&
+      needs.prepare.result == 'success' &&
+      needs.build-package.result == 'success' &&
+      needs.verify-publish.result == 'success'
+    needs: [prepare, build-package, verify-publish]
     permissions:
-      contents: read
-      actions: read
-      id-token: write
+      contents: read # Check out and verify the release source.
+      actions: read # Download the built package artifact.
+      id-token: write # Mint the PyPI Trusted Publishing identity.
     runs-on: ubuntu-latest
+    environment: pypi-release
     steps:
+      - name: Check tag provenance before requesting PyPI OIDC
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/scripts/verify_release_tag.py
+            .github/scripts/validate_publish_artifacts.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Recheck release tag provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          RELEASE_TAG_PREFIX: computer-server-v
+          RELEASE_BASE_BRANCH: main
+          RELEASE_TRUSTED_REPOSITORY: trycua/cua
+        run: python3 "${GITHUB_WORKSPACE}/.github/scripts/verify_release_tag.py"
+
       - name: Download package artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pypi-computer-server
           path: dist
 
+      - name: Reject unsafe or mismatched package artifacts
+        env:
+          EXPECTED_PACKAGE: cua-computer-server
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+        run: >-
+          python3 .github/scripts/validate_publish_artifacts.py dist
+          --suffix .whl --suffix .tar.gz
+          --expected-package "$EXPECTED_PACKAGE"
+          --expected-version "$EXPECTED_VERSION"
+          --max-files 2
+
       - name: Publish with PyPI trusted publishing
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist/
   build-binaries:
-    needs: prepare
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' || needs.verify-tag.result == 'success') &&
+      needs.prepare.result == 'success'
+    needs: [prepare, verify-tag]
     permissions:
       contents: read
     strategy:
@@ -99,6 +149,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -111,21 +165,32 @@ jobs:
           pip install -e libs/python/computer-server
 
       - name: Build binary with PyInstaller (onedir — fast startup)
+        shell: bash
+        env:
+          DIR_NAME: ${{ matrix.dir_name }}
         run: |
           cd libs/python/computer-server
-          pyinstaller --onedir --name "${{ matrix.dir_name }}" --console --noconfirm --clean --collect-all computer_server --hidden-import uvicorn.logging --hidden-import uvicorn.protocols.http --hidden-import uvicorn.protocols.http.auto --hidden-import uvicorn.protocols.http.h11_impl --hidden-import uvicorn.protocols.websockets --hidden-import uvicorn.protocols.websockets.auto --hidden-import uvicorn.lifespan --hidden-import uvicorn.lifespan.on --hidden-import PIL._tkinter_finder run_server.py
+          pyinstaller --onedir --name "$DIR_NAME" --console --noconfirm --clean --collect-all computer_server --hidden-import uvicorn.logging --hidden-import uvicorn.protocols.http --hidden-import uvicorn.protocols.http.auto --hidden-import uvicorn.protocols.http.h11_impl --hidden-import uvicorn.protocols.websockets --hidden-import uvicorn.protocols.websockets.auto --hidden-import uvicorn.lifespan --hidden-import uvicorn.lifespan.on --hidden-import PIL._tkinter_finder run_server.py
 
       - name: Create archive (Linux)
         if: runner.os == 'Linux'
+        shell: bash
+        env:
+          DIR_NAME: ${{ matrix.dir_name }}
+          ZIP_NAME: ${{ matrix.zip_name }}
         run: |
           cd libs/python/computer-server/dist
-          tar czf "${{ matrix.zip_name }}" "${{ matrix.dir_name }}"/
+          tar czf "$ZIP_NAME" "$DIR_NAME"/
 
       - name: Create archive (Windows)
         if: runner.os == 'Windows'
+        shell: bash
+        env:
+          DIR_NAME: ${{ matrix.dir_name }}
+          ZIP_NAME: ${{ matrix.zip_name }}
         run: |
           cd libs/python/computer-server/dist
-          7z a "${{ matrix.zip_name }}" "${{ matrix.dir_name }}/"
+          7z a "$ZIP_NAME" "$DIR_NAME/"
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -133,21 +198,22 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: libs/python/computer-server/dist/${{ matrix.zip_name }}
 
-  set-env-variables:
-    needs: [prepare, publish]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Set environment variables for use in other jobs
-        run: |
-          echo "COMPUTER_VERSION=${{ needs.prepare.outputs.version }}" >> $GITHUB_ENV
-
   create-release:
-    needs: [prepare, publish, build-binaries]
+    if: >-
+      always() &&
+      github.event_name == 'push' && github.ref_type == 'tag' &&
+      github.ref_protected == true &&
+      needs.verify-tag.result == 'success' &&
+      needs.verify-publish.result == 'success' &&
+      needs.publish.result == 'success' &&
+      needs.build-binaries.result == 'success'
+    needs: [prepare, verify-tag, verify-publish, publish, build-binaries]
     permissions:
-      actions: read
-      contents: write
+      actions: read # Download binary artifacts for the release.
+      contents: write # Create the GitHub release.
     uses: ./.github/workflows/release-github-reusable.yml
     with:
+      tag_prefix: computer-server-v
       tag_name: "computer-server-v${{ needs.prepare.outputs.version }}"
       release_name: "cua-computer-server v${{ needs.prepare.outputs.version }}"
       module_path: "libs/python/computer-server"
