@@ -95,6 +95,14 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
         self.assertIn("environment:\n      name: pypi-token-fallback", legacy)
         self.assertIn("PYPI_LEGACY_TOKEN_FALLBACK_ENABLED", legacy)
 
+    def test_python_build_keeps_ci_callers_compatible(self) -> None:
+        build = "\n".join(workflow_lines("py-reusable-build.yml"))
+        self.assertRegex(
+            build,
+            r"version:\n\s+description: .*\n\s+required: false\n\s+type: string\n\s+default: \"\"",
+        )
+        self.assertIn("if: inputs.version != ''", build)
+
     def test_registry_credentials_are_not_available_to_build_jobs(self) -> None:
         for name, job in (
             ("py-reusable-build.yml", "build"),
