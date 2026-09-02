@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "agent-v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (without v prefix)"
-        required: true
-        default: "0.1.0"
   workflow_call:
     inputs:
       version:
@@ -17,12 +11,12 @@ on:
         required: true
         type: string
 
-# Adding permissions at workflow level
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   prepare:
+    permissions:
+      contents: read
     runs-on: macos-latest
     outputs:
       version: ${{ steps.get-version.outputs.version }}
@@ -30,7 +24,7 @@ jobs:
       som_version: ${{ steps.update-deps.outputs.som_version }}
       core_version: ${{ steps.update-deps.outputs.core_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: main
           fetch-depth: 0
@@ -56,10 +50,8 @@ jobs:
               echo "ERROR: Invalid tag format for agent"
               exit 1
             fi
-          elif [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION=${{ github.event.inputs.version }}
           else
-            echo "ERROR: No version found (inputs.version, event.inputs.version, and tag all empty)"
+            echo "ERROR: No version found in workflow input or release tag"
             exit 1
           fi
 
@@ -67,7 +59,7 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
         with:
           python-version: "3.11"
 
@@ -152,17 +144,34 @@ jobs:
           echo "Updated dependencies in pyproject.toml:"
           grep -E "cua-computer|cua-som|cua-core" pyproject.toml
 
-  publish:
+  build-package:
     needs: prepare
-    uses: ./.github/workflows/py-reusable-publish.yml
+    permissions:
+      contents: read
+    uses: ./.github/workflows/py-reusable-build.yml
     with:
       package_name: "agent"
       package_dir: "libs/python/agent"
       version: ${{ needs.prepare.outputs.version }}
-      base_package_name: "cua-agent"
-    secrets:
-      PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
 
+  publish:
+    needs: [prepare, build-package]
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pypi-agent
+          path: dist
+
+      - name: Publish with PyPI trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/
   set-env-variables:
     needs: [prepare, publish]
     runs-on: macos-latest
@@ -175,6 +184,8 @@ jobs:
 
   create-release:
     needs: [prepare, publish]
+    permissions:
+      contents: write
     uses: ./.github/workflows/release-github-reusable.yml
     with:
       tag_name: "agent-v${{ needs.prepare.outputs.version }}"
