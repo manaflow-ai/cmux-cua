@@ -5,8 +5,13 @@ on:
     tags:
       - "docker-cua-qemu-windows-v*.*.*"
 
+permissions: {}
+
 jobs:
   publish:
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/docker-reusable-publish.yml
     with:
       image_name: cua-qemu-windows

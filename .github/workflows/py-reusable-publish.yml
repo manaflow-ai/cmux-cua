@@ -1,5 +1,10 @@
 name: Reusable Package Publish Workflow
 
+# No token is inherited by default. The build job only reads source and uploads
+# an artifact; the publish job is the only job that can mint an OIDC token or
+# read the optional legacy PyPI token.
+permissions: {}
+
 on:
   workflow_call:
     inputs:
@@ -20,22 +25,24 @@ on:
         required: true
         type: string
     secrets:
+      # Existing callers may continue using a token while PyPI trusted
+      # publishers are configured. New callers should omit this secret.
       PYPI_TOKEN:
-        required: true
+        required: false
     outputs:
       version:
         description: "The version that was published"
-        value: ${{ jobs.build-and-publish.outputs.version }}
+        value: ${{ jobs.publish.outputs.version }}
 
 jobs:
-  build-and-publish:
+  build:
     runs-on: macos-latest
     permissions:
       contents: read
     outputs:
       version: ${{ steps.set-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: main
           fetch-depth: 0 # Full history for release creation
@@ -48,7 +55,7 @@ jobs:
           git log -1 --oneline
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
         with:
           python-version: "3.11"
 
@@ -58,31 +65,38 @@ jobs:
           touch pdm.lock
 
       - name: Install PDM
-        uses: pdm-project/setup-pdm@v3
+        uses: pdm-project/setup-pdm@ddc33ca746b5716353581f988b29464200212702 # v3
         with:
           python-version: "3.11"
           cache: true
 
       - name: Set version
         id: set-version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          echo "VERSION=${{ inputs.version }}" >> $GITHUB_ENV
-          echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          printf 'VERSION=%s\n' "$RELEASE_VERSION" >> "$GITHUB_ENV"
+          printf 'version=%s\n' "$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Verify version consistency
+        env:
+          PACKAGE_DIR: ${{ inputs.package_dir }}
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          # Install toml parser
-          pip install toml
-
+          set -euo pipefail
           # Verify version matches using script (exits with error if mismatch)
-          python ${GITHUB_WORKSPACE}/.github/scripts/get_pyproject_version.py \
-            ${GITHUB_WORKSPACE}/${{ inputs.package_dir }}/pyproject.toml \
-            ${{ inputs.version }}
+          python "${GITHUB_WORKSPACE}/.github/scripts/get_pyproject_version.py" \
+            "${GITHUB_WORKSPACE}/${PACKAGE_DIR}/pyproject.toml" \
+            "$RELEASE_VERSION"
 
       - name: Initialize PDM in package directory
+        env:
+          PACKAGE_DIR: ${{ inputs.package_dir }}
         run: |
+          set -euo pipefail
           # Make sure we're working with a properly initialized PDM project
-          cd ${{ inputs.package_dir }}
+          cd "$PACKAGE_DIR"
 
           # Create pdm.lock if it doesn't exist
           if [ ! -f "pdm.lock" ]; then
@@ -90,19 +104,63 @@ jobs:
             pdm lock
           fi
 
-      - name: Build and publish
+      - name: Build package
+        env:
+          PACKAGE_DIR: ${{ inputs.package_dir }}
+        run: |
+          set -euo pipefail
+          cd "$PACKAGE_DIR"
+          pdm build
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pypi-${{ inputs.package_name }}
+          path: ${{ inputs.package_dir }}/dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      id-token: write
+    outputs:
+      version: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pypi-${{ inputs.package_name }}
+          path: dist
+
+      - name: Select publish authentication
+        id: auth
+        shell: bash
         env:
           PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
         run: |
-          cd ${{ inputs.package_dir }}
-          # Build with PDM
-          pdm build
+          set -euo pipefail
+          if [[ -n "$PYPI_TOKEN" ]]; then
+            echo "mode=token" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=oidc" >> "$GITHUB_OUTPUT"
+          fi
 
-          echo "Publishing ${{ inputs.base_package_name }} ${VERSION}"
+      - name: Publish with PyPI trusted publishing
+        if: steps.auth.outputs.mode == 'oidc'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/
 
-          # Install and use twine directly instead of PDM publish
-          echo "Installing twine for direct publishing..."
-          pip install twine
-
-          echo "Publishing to PyPI using twine..."
-          TWINE_USERNAME="__token__" TWINE_PASSWORD="$PYPI_TOKEN" python -m twine upload dist/*
+      - name: Publish with PyPI token (legacy fallback)
+        if: steps.auth.outputs.mode == 'token'
+        shell: bash
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --no-input twine
+          TWINE_USERNAME="__token__" TWINE_PASSWORD="$PYPI_TOKEN" \
+            python -m twine upload --non-interactive dist/*

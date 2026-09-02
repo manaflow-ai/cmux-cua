@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "npm-computer-v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (default: from package.json)"
-        required: false
-        default: ""
   workflow_call:
     inputs:
       version:
@@ -18,19 +12,19 @@ on:
         type: string
         default: ""
 
-permissions:
-  id-token: write
-  contents: write
+permissions: {}
 
 jobs:
   prepare:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get-version.outputs.version }}
       tag: ${{ steps.get-version.outputs.tag }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Determine version
         id: get-version
@@ -46,8 +40,6 @@ jobs:
               echo "ERROR: Invalid tag format for npm-computer"
               exit 1
             fi
-          elif [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
           else
             # Read from package.json
             VERSION=$(node -p "require('./libs/typescript/computer/package.json').version")
@@ -59,6 +51,10 @@ jobs:
 
   publish:
     needs: prepare
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     uses: ./.github/workflows/ts-reusable-publish.yml
     with:
       package_name: "computer"
@@ -70,6 +66,8 @@ jobs:
 
   create-release:
     needs: [prepare, publish]
+    permissions:
+      contents: write
     uses: ./.github/workflows/release-github-reusable.yml
     with:
       tag_name: ${{ needs.prepare.outputs.tag }}

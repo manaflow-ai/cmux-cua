@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "npm-cli-v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (default: from package.json)"
-        required: false
-        default: ""
   workflow_call:
     inputs:
       version:
@@ -18,20 +12,19 @@ on:
         type: string
         default: ""
 
-permissions:
-  id-token: write
-  contents: write
-  packages: write
+permissions: {}
 
 jobs:
   prepare:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get-version.outputs.version }}
       tag: ${{ steps.get-version.outputs.tag }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Determine version
         id: get-version
@@ -47,8 +40,6 @@ jobs:
               echo "ERROR: Invalid tag format for npm-cli"
               exit 1
             fi
-          elif [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
           else
             # Read from package.json
             VERSION=$(node -p "require('./libs/typescript/cua-cli/package.json').version")
@@ -59,6 +50,8 @@ jobs:
           echo "tag=npm-cli-v${VERSION}" >> $GITHUB_OUTPUT
 
   build-binaries:
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -79,12 +72,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: latest
 
@@ -100,7 +93,7 @@ jobs:
           mv ${{ matrix.binary_name }}${{ matrix.ext }}* ../../../dist/
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cua-binary-${{ matrix.target }}
           path: dist/
@@ -109,6 +102,10 @@ jobs:
 
   publish-npm:
     needs: prepare
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     uses: ./.github/workflows/ts-reusable-publish.yml
     with:
       package_name: "cli"
@@ -120,6 +117,9 @@ jobs:
 
   create-release:
     needs: [prepare, publish-npm, build-binaries]
+    permissions:
+      actions: read
+      contents: write
     uses: ./.github/workflows/release-github-reusable.yml
     with:
       tag_name: ${{ needs.prepare.outputs.tag }}

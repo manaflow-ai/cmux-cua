@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "som-v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (without v prefix)"
-        required: true
-        default: "0.1.0"
   workflow_call:
     inputs:
       version:
@@ -21,17 +15,17 @@ on:
         description: "The version that was published"
         value: ${{ jobs.determine-version.outputs.version }}
 
-# Adding permissions at workflow level
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   determine-version:
+    permissions:
+      contents: read
     runs-on: macos-latest
     outputs:
       version: ${{ steps.get-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Determine version
         id: get-version
@@ -47,9 +41,6 @@ jobs:
               echo "Invalid tag format for som"
               exit 1
             fi
-          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # Use version from workflow dispatch
-            VERSION=${{ github.event.inputs.version }}
           else
             echo "No version provided"
             exit 1
@@ -59,6 +50,10 @@ jobs:
 
   publish:
     needs: determine-version
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     uses: ./.github/workflows/py-reusable-publish.yml
     with:
       package_name: "som"
@@ -70,6 +65,8 @@ jobs:
 
   create-release:
     needs: [determine-version, publish]
+    permissions:
+      contents: write
     uses: ./.github/workflows/release-github-reusable.yml
     with:
       tag_name: "som-v${{ needs.determine-version.outputs.version }}"
