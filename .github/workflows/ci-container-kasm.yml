@@ -7,9 +7,14 @@ on:
       - ".github/workflows/ci-container-kasm.yml"
       - ".github/workflows/docker-reusable-build.yml"
 
+permissions:
+  contents: read
+
 jobs:
   build:
     uses: ./.github/workflows/docker-reusable-build.yml
     with:
       image_name: cua-ubuntu
       context_dir: libs/kasm
+      # Firefox installation under arm64 QEMU segfaults.
+      skip_arm64: true

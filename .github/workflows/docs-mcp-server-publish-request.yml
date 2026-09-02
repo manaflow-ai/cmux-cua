@@ -1,0 +1,27 @@
+name: "Docs MCP Server publish request"
+
+# This observer carries no credentials or checkout. The privileged consumer
+# validates the run and source SHA through the GitHub API before ECR access.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/scripts/docs-mcp-server/**"
+
+permissions: {}
+
+jobs:
+  observe:
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Confirm protected source ref
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" == "trycua/cua" ]]
+          [[ "$REF" == "refs/heads/main" ]]
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]

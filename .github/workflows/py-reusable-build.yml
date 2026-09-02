@@ -1,4 +1,9 @@
-name: Reusable Package Build Workflow
+name: Reusable Python Package Build Workflow
+
+# Building needs source read access only. Publishing is intentionally kept in
+# each caller workflow so PyPI can bind Trusted Publishing to that workflow's
+# filename. PyPI does not support OIDC claims from reusable workflows.
+permissions: {}
 
 on:
   workflow_call:
@@ -11,15 +16,39 @@ on:
         description: "Directory containing the package relative to workspace root (e.g. libs/python/computer)"
         required: true
         type: string
+      version:
+        description: "Optional version to verify against the package metadata"
+        required: false
+        type: string
+        default: ""
+      source_sha:
+        description: "Optional exact source commit for protected workflow_run consumers"
+        required: false
+        type: string
+        default: ""
+    outputs:
+      version:
+        description: "The version in the built package"
+        value: ${{ jobs.build.outputs.version }}
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.set-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Build the exact commit that triggered the caller. A mutable main
+          # checkout could replace the tagged source between prepare and build.
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@7f4fc3e22c37d6ff65e88745f38bd3157c663f7c # v4
         with:
           python-version: "3.11"
 
@@ -27,27 +56,54 @@ jobs:
         run: touch pdm.lock
 
       - name: Install PDM
-        uses: pdm-project/setup-pdm@v3
+        uses: pdm-project/setup-pdm@ddc33ca746b5716353581f988b29464200212702 # v3
         with:
           python-version: "3.11"
           cache: true
 
-      - name: Initialize PDM in package directory
+      - name: Set version
+        id: set-version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          cd ${{ inputs.package_dir }}
+          set -euo pipefail
+          printf 'VERSION=%s\n' "$RELEASE_VERSION" >> "$GITHUB_ENV"
+          printf 'version=%s\n' "$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Verify version consistency
+        if: inputs.version != ''
+        env:
+          PACKAGE_DIR: ${{ inputs.package_dir }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          python "${GITHUB_WORKSPACE}/.github/scripts/get_pyproject_version.py" \
+            "${GITHUB_WORKSPACE}/${PACKAGE_DIR}/pyproject.toml" \
+            "$RELEASE_VERSION"
+
+      - name: Initialize PDM in package directory
+        env:
+          PACKAGE_DIR: ${{ inputs.package_dir }}
+        run: |
+          set -euo pipefail
+          cd "$PACKAGE_DIR"
           if [ ! -f "pdm.lock" ]; then
             echo "No pdm.lock found, initializing PDM project..."
             pdm lock
           fi
 
       - name: Build package
+        env:
+          PACKAGE_DIR: ${{ inputs.package_dir }}
         run: |
-          cd ${{ inputs.package_dir }}
+          set -euo pipefail
+          cd "$PACKAGE_DIR"
           pdm build
-          echo "Successfully built ${{ inputs.package_name }}"
 
-      - name: Verify build artifacts
-        run: |
-          cd ${{ inputs.package_dir }}
-          ls -la dist/
-          echo "Build artifacts created successfully"
+      - name: Upload package artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pypi-${{ inputs.package_name }}
+          path: ${{ inputs.package_dir }}/dist/*
+          if-no-files-found: error
+          retention-days: 1

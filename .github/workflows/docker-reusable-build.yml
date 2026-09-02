@@ -1,70 +1,85 @@
 name: Reusable Docker Build Workflow
 
 on:
-  workflow_dispatch: # Prevents phantom runs on push, allows manual testing
   workflow_call:
     inputs:
       image_name:
-        description: "Name of the Docker image (e.g. cua-ubuntu, cua-xfce)"
+        description: "Docker image name"
         required: true
         type: string
       context_dir:
-        description: "Directory containing the Dockerfile relative to workspace root (e.g. libs/kasm, libs/xfce)"
+        description: "Directory containing the Dockerfile"
         required: true
         type: string
       dockerfile_path:
-        description: "Path to Dockerfile relative to context_dir (e.g. Dockerfile)"
+        description: "Dockerfile path relative to context_dir"
         required: false
         type: string
-        default: "Dockerfile"
+        default: Dockerfile
       skip_arm64:
-        description: "Skip arm64 build (for images that don't support arm64)"
+        description: "Do not build an arm64 image"
         required: false
         type: boolean
         default: false
+      source_sha:
+        description: "Optional exact source commit from a protected workflow_run consumer"
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
 
 jobs:
-  setup:
+  select-platforms:
+    name: Select build platforms
+    permissions: {}
     runs-on: ubuntu-latest
     outputs:
-      platforms: ${{ steps.set-platforms.outputs.platforms }}
+      platforms: ${{ steps.platforms.outputs.value }}
     steps:
-      - id: set-platforms
+      - name: Select target platforms
+        id: platforms
+        env:
+          SKIP_ARM64: ${{ inputs.skip_arm64 }}
         run: |
-          if [ "${{ inputs.skip_arm64 }}" == "true" ]; then
-            echo 'platforms=["linux/amd64"]' >> $GITHUB_OUTPUT
+          if [[ "$SKIP_ARM64" == "true" ]]; then
+            echo 'value=["linux/amd64"]' >> "$GITHUB_OUTPUT"
           else
-            echo 'platforms=["linux/amd64", "linux/arm64"]' >> $GITHUB_OUTPUT
+            echo 'value=["linux/amd64", "linux/arm64"]' >> "$GITHUB_OUTPUT"
           fi
 
   build:
-    needs: setup
+    name: Build ${{ matrix.platform }}
+    needs: select-platforms
+    permissions:
+      contents: read
+    timeout-minutes: 120
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        platform: ${{ fromJSON(needs.setup.outputs.platforms) }}
+        platform: ${{ fromJSON(needs.select-platforms.outputs.platforms) }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Prepare platform tag
-        id: platform
-        run: |
-          TAG=$(echo "${{ matrix.platform }}" | sed 's/\//-/g')
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+      - name: Check out the selected commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
+      - name: Build Docker image without publishing
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ./${{ inputs.context_dir }}
           file: ./${{ inputs.context_dir }}/${{ inputs.dockerfile_path }}
           push: false
           platforms: ${{ matrix.platform }}
 
-      - name: Verify build
-        run: |
-          echo "Successfully built ${{ inputs.image_name }} for ${{ matrix.platform }}"
+      - name: Confirm successful build
+        env:
+          IMAGE_NAME: ${{ inputs.image_name }}
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "Built ${IMAGE_NAME} for ${PLATFORM} without publishing"

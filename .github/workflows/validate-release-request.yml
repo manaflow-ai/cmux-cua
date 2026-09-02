@@ -1,0 +1,88 @@
+name: Validate release tag request
+
+# Called only by protected-main workflow_run consumers. The caller workflow
+# must still grant read access to actions and contents for the API recheck.
+on:
+  workflow_call:
+    inputs:
+      tag_prefix:
+        description: Exact release tag prefix, for example npm-core-v
+        required: true
+        type: string
+      expected_tag:
+        description: Optional exact tag expected by the caller
+        required: false
+        type: string
+        default: ""
+      expected_sha:
+        description: Optional exact source SHA expected by the caller
+        required: false
+        type: string
+        default: ""
+    outputs:
+      tag:
+        description: Validated release tag
+        value: ${{ jobs.validate.outputs.tag }}
+      version:
+        description: Validated release version
+        value: ${{ jobs.validate.outputs.version }}
+      commit:
+        description: Commit addressed by the release tag
+        value: ${{ jobs.validate.outputs.commit }}
+      main_commit:
+        description: Protected main commit used for ancestry validation
+        value: ${{ jobs.validate.outputs.main_commit }}
+      source_run_id:
+        description: Validated observer workflow run ID
+        value: ${{ jobs.validate.outputs.source_run_id }}
+
+permissions: {}
+
+jobs:
+  validate:
+    name: Validate protected release source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      tag: ${{ steps.provenance.outputs.tag }}
+      version: ${{ steps.provenance.outputs.version }}
+      commit: ${{ steps.provenance.outputs.commit }}
+      main_commit: ${{ steps.provenance.outputs.main_commit }}
+      source_run_id: ${{ steps.provenance.outputs.source_run_id }}
+    steps:
+      - name: Check out protected-main validator
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # workflow_run consumers are resolved from main. Keep the explicit
+          # ref and credentialless checkout so a moving tag cannot select code.
+          ref: ${{ github.workflow_sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate observer run, tag, and ancestry
+        id: provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          TRUSTED_REF: ${{ github.ref }}
+          TRUSTED_REF_TYPE: ${{ github.ref_type }}
+          TRUSTED_REF_NAME: ${{ github.ref_name }}
+          TRUSTED_REF_PROTECTED: ${{ github.ref_protected }}
+          TRUSTED_SHA: ${{ github.workflow_sha || github.sha }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_STATUS: ${{ github.event.workflow_run.status }}
+          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
+          SOURCE_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_TAG: ${{ inputs.expected_tag }}
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: python3 .github/scripts/validate_release_request.py

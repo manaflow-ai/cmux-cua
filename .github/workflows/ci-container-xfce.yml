@@ -7,9 +7,14 @@ on:
       - ".github/workflows/ci-container-xfce.yml"
       - ".github/workflows/docker-reusable-build.yml"
 
+permissions:
+  contents: read
+
 jobs:
   build:
     uses: ./.github/workflows/docker-reusable-build.yml
     with:
       image_name: cua-xfce
       context_dir: libs/xfce
+      # kicad/kicad:9.0 has no arm64 manifest.
+      skip_arm64: true

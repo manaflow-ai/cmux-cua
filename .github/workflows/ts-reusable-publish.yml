@@ -1,5 +1,10 @@
 name: Reusable NPM Package Publish Workflow
 
+# Build jobs never receive registry credentials. The normal publisher uses npm
+# trusted publishing; the optional legacy token path requires an explicit input
+# and a protected environment.
+permissions: {}
+
 on:
   workflow_call:
     inputs:
@@ -20,44 +25,97 @@ on:
         required: false
         type: string
         default: ""
-    secrets:
-      NPM_TOKEN:
+      source_sha:
+        description: "Exact source commit returned by a protected workflow_run consumer"
         required: true
+        type: string
+      source_tag:
+        description: "Exact source release tag returned by a protected workflow_run consumer"
+        required: true
+        type: string
+      allow_legacy_token:
+        description: "Allow the protected legacy token fallback (OIDC is the default)"
+        required: false
+        type: boolean
+        default: false
+      trusted_publisher_repository:
+        description: "Exact owner/repository configured in npm Trusted Publishing"
+        required: true
+        type: string
+      trusted_package_name:
+        description: "Exact npm package name configured for this publisher"
+        required: true
+        type: string
+      trusted_publisher_workflow:
+        description: "Exact top-level caller workflow filename configured in npm Trusted Publishing"
+        required: true
+        type: string
+      trusted_tag_prefix:
+        description: "Exact protected release tag prefix for this package"
+        required: true
+        type: string
+      expected_tag:
+        description: "Exact protected release tag for this publish"
+        required: true
+        type: string
+      expected_version:
+        description: "Exact package version encoded by the release tag"
+        required: true
+        type: string
+    secrets:
+      # Only a protected emergency dispatcher should pass this secret.
+      NPM_TOKEN:
+        required: false
+      # This secret is read from the protected npm-token-fallback environment
+      # when the emergency job runs. The environment value overrides any
+      # caller-provided value.
+      NPM_LEGACY_TOKEN_FALLBACK_ENABLED:
+        required: false
 
 jobs:
-  publish:
+  build:
     permissions:
-      id-token: write
       contents: read
     runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.publish-decision.outputs.should_publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: main
+          # Build the exact commit that triggered the caller, rather than a
+          # mutable branch that could change during a release run.
+          ref: ${{ inputs.source_sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Use Node.js 24.x
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24.x"
-          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
 
       - name: Setup pnpm
         if: inputs.package_manager == 'pnpm'
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: ${{ inputs.package_dir }}/package.json
 
       - name: Setup Bun
         if: inputs.package_manager == 'bun'
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: latest
+          # Keep the release toolchain reproducible. This matches the
+          # packageManager declaration in the CLI package.
+          bun-version: "1.1.38"
 
       - name: Verify version consistency
         if: inputs.version != ''
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+          PACKAGE_DIR: ${{ inputs.package_dir }}
         run: |
-          EXPECTED_VERSION="${{ inputs.version }}"
-          ACTUAL_VERSION=$(node -p "require('./${{ inputs.package_dir }}/package.json').version")
+          set -euo pipefail
+          ACTUAL_VERSION=$(node -p "require('./' + process.env.PACKAGE_DIR + '/package.json').version")
 
           if [ "$ACTUAL_VERSION" != "$EXPECTED_VERSION" ]; then
             echo "ERROR: Version mismatch!"
@@ -67,33 +125,52 @@ jobs:
           fi
 
           echo "Version validation passed: $ACTUAL_VERSION"
-          echo "should_publish=true" >> $GITHUB_OUTPUT
+          echo "should_publish=true" >> "$GITHUB_OUTPUT"
         id: verify-version
 
       - name: Check if version changed
         if: steps.verify-version.outputs.should_publish != 'true'
         id: check-version
-        uses: EndBug/version-check@v2
+        uses: EndBug/version-check@d17247dd94ca7b39d0b0691399be8d7c510622c9 # v2
         with:
           file-name: ${{ inputs.package_dir }}/package.json
           diff-search: true
 
-      - name: Install dependencies
-        if: steps.verify-version.outputs.should_publish == 'true' || steps.check-version.outputs.changed == 'true'
-        working-directory: ./${{ inputs.package_dir }}
+      - name: Decide whether to publish
+        id: publish-decision
+        shell: bash
+        env:
+          VERSION_CHECK_PASSED: ${{ steps.verify-version.outputs.should_publish }}
+          VERSION_CHANGED: ${{ steps.check-version.outputs.changed }}
         run: |
-          if [ "${{ inputs.package_manager }}" = "bun" ]; then
+          set -euo pipefail
+          if [[ "$VERSION_CHECK_PASSED" == "true" || "$VERSION_CHANGED" == "true" ]]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.publish-decision.outputs.should_publish == 'true'
+        working-directory: ./${{ inputs.package_dir }}
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package_manager }}
+        run: |
+          set -euo pipefail
+          if [ "$PACKAGE_MANAGER" = "bun" ]; then
             bun install --frozen-lockfile
           else
             pnpm install --frozen-lockfile
           fi
 
       - name: Build package
-        if: steps.verify-version.outputs.should_publish == 'true' || steps.check-version.outputs.changed == 'true'
+        if: steps.publish-decision.outputs.should_publish == 'true'
         working-directory: ./${{ inputs.package_dir }}
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package_manager }}
         run: |
-          if [ "${{ inputs.package_manager }}" = "bun" ]; then
-            # Bun doesn't support --if-present, check if build script exists
+          set -euo pipefail
+          if [ "$PACKAGE_MANAGER" = "bun" ]; then
             if grep -q '"build"' package.json; then
               bun run build
             fi
@@ -101,9 +178,242 @@ jobs:
             pnpm run --if-present build
           fi
 
-      - name: Publish to npm
-        if: steps.verify-version.outputs.should_publish == 'true' || steps.check-version.outputs.changed == 'true'
+      - name: Pack package
+        if: steps.publish-decision.outputs.should_publish == 'true'
         working-directory: ./${{ inputs.package_dir }}
-        run: npm publish --access public --provenance
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/npm-dist"
+          npm pack --pack-destination "$RUNNER_TEMP/npm-dist"
+
+      - name: Upload package artifact
+        if: steps.publish-decision.outputs.should_publish == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: npm-${{ inputs.package_name }}
+          path: ${{ runner.temp }}/npm-dist/*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  validate-publisher-identity:
+    needs: build
+    if: needs.build.outputs.should_publish == 'true'
+    permissions:
+      actions: read
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout trusted release identity validator
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The caller can be an older tag. Load credential-gating code from
+          # the protected default branch instead of that tag.
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/scripts/validate-npm-publish-identity.py
+            .github/scripts/validate_publish_artifacts.py
+            .github/scripts/validate_publisher_repository.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Download package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-${{ inputs.package_name }}
+          path: npm-dist
+
+      - name: Validate trusted publisher identity
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          TRUSTED_PUBLISHER_REPOSITORY: ${{ inputs.trusted_publisher_repository }}
+          TRUSTED_PACKAGE_NAME: ${{ inputs.trusted_package_name }}
+          TRUSTED_PUBLISHER_WORKFLOW: ${{ inputs.trusted_publisher_workflow }}
+          TRUSTED_TAG_PREFIX: ${{ inputs.trusted_tag_prefix }}
+          EXPECTED_TAG: ${{ inputs.expected_tag }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: python trusted-release/.github/scripts/validate-npm-publish-identity.py npm-dist
+
+      - name: Require canonical publisher repository
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 trusted-release/.github/scripts/validate_publisher_repository.py
+
+  publish-oidc:
+    needs: [build, validate-publisher-identity]
+    if: >-
+      github.repository == 'trycua/cua' &&
+      inputs.allow_legacy_token == false &&
+      needs.build.outputs.should_publish == 'true' &&
+      needs.validate-publisher-identity.result == 'success'
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+    steps:
+      - name: Checkout trusted release gate scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/scripts/validate-npm-publish-identity.py
+            .github/scripts/validate_publish_artifacts.py
+            .github/scripts/validate_publisher_repository.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Require canonical publisher repository
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 trusted-release/.github/scripts/validate_publisher_repository.py
+
+      - name: Use Node.js 24.x
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24.x"
+          package-manager-cache: false
+
+      - name: Download package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-${{ inputs.package_name }}
+          path: npm-dist
+
+      - name: Revalidate package identity before OIDC use
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          TRUSTED_PUBLISHER_REPOSITORY: ${{ inputs.trusted_publisher_repository }}
+          TRUSTED_PACKAGE_NAME: ${{ inputs.trusted_package_name }}
+          TRUSTED_PUBLISHER_WORKFLOW: ${{ inputs.trusted_publisher_workflow }}
+          TRUSTED_TAG_PREFIX: ${{ inputs.trusted_tag_prefix }}
+          EXPECTED_TAG: ${{ inputs.expected_tag }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: python trusted-release/.github/scripts/validate-npm-publish-identity.py npm-dist
+
+      - name: Install the pinned npm CLI
+        run: npm install --global --ignore-scripts npm@12.0.2
+
+      - name: Publish with npm trusted publishing
+        working-directory: npm-dist
+        run: >-
+          npm publish ./*.tgz --access public --provenance --ignore-scripts
+          --registry=https://registry.npmjs.org/
+
+  publish-legacy-token:
+    needs: [build, validate-publisher-identity]
+    if: >-
+      github.repository == 'trycua/cua' &&
+      inputs.allow_legacy_token == true &&
+      needs.build.outputs.should_publish == 'true' &&
+      needs.validate-publisher-identity.result == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: npm-token-fallback
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout trusted release gate script
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Keep the gate and artifact validator on protected main. A
+          # historical tag must not choose credential-gating code.
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/scripts/validate-legacy-publish-gate.sh
+            .github/scripts/validate-npm-publish-identity.py
+            .github/scripts/validate_publish_artifacts.py
+            .github/scripts/validate_publisher_repository.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Use Node.js 24.x
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24.x"
+          package-manager-cache: false
+
+      - name: Download package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-${{ inputs.package_name }}
+          path: npm-dist
+
+      - name: Revalidate package identity before token use
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          TRUSTED_PUBLISHER_REPOSITORY: ${{ inputs.trusted_publisher_repository }}
+          TRUSTED_PACKAGE_NAME: ${{ inputs.trusted_package_name }}
+          TRUSTED_PUBLISHER_WORKFLOW: ${{ inputs.trusted_publisher_workflow }}
+          TRUSTED_TAG_PREFIX: ${{ inputs.trusted_tag_prefix }}
+          EXPECTED_TAG: ${{ inputs.expected_tag }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: python trusted-release/.github/scripts/validate-npm-publish-identity.py npm-dist
+
+      - name: Require canonical publisher repository
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 trusted-release/.github/scripts/validate_publisher_repository.py
+
+      - name: Install the pinned npm CLI
+        run: npm install --global --ignore-scripts npm@12.0.2
+
+      # Do not expose the registry token to the gate until the artifact and
+      # repository identity checks have passed in this credentialed job.
+      - name: Verify protected legacy token gate
+        env:
+          ALLOW_LEGACY_TOKEN: ${{ inputs.allow_legacy_token }}
+          LEGACY_TOKEN_GATE: ${{ secrets.NPM_LEGACY_TOKEN_FALLBACK_ENABLED }}
+          REGISTRY_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: bash "${GITHUB_WORKSPACE}/trusted-release/.github/scripts/validate-legacy-publish-gate.sh"
+
+      - name: Publish with npm token (emergency fallback)
+        working-directory: npm-dist
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Token publishing cannot mint the OIDC token required for
+          # provenance. Keep this path explicit and independent of package
+          # defaults that might request provenance.
+          NPM_CONFIG_PROVENANCE: "false"
+        run: |
+          set -euo pipefail
+          npm_config_userconfig="$RUNNER_TEMP/npmrc"
+          export npm_config_userconfig
+          umask 077
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > "$npm_config_userconfig"
+          trap 'rm -f "$npm_config_userconfig"' EXIT
+          npm publish ./*.tgz --access public --ignore-scripts \
+            --registry=https://registry.npmjs.org/

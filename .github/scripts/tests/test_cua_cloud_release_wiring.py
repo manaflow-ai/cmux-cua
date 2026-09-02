@@ -21,7 +21,8 @@ class TestCuaCloudReleaseWiring(unittest.TestCase):
     def test_release_bump_version_supports_cua_cloud(self) -> None:
         workflow = self.read(".github/workflows/release-bump-version.yml")
 
-        self.assertIn("- pypi/cloud", workflow)
+        self.assertIn("repository_dispatch:", workflow)
+        self.assertNotIn("workflow_dispatch:", workflow)
         self.assertIn('"pypi/cloud")', workflow)
         self.assertIn('echo "directory=libs/python/cua-cloud" >> $GITHUB_OUTPUT', workflow)
 

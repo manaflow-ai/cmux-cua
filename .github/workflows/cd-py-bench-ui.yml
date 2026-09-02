@@ -1,73 +1,192 @@
 name: "CD: cua-bench-ui (PyPI)"
 
 on:
-  push:
-    tags:
-      - "bench-ui-v*"
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- protected-main validator binds the exact source run
+    workflows:
+      - "Release tag request"
+    types: [completed]
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to publish (without v prefix)"
+        description: "Version to build without publishing"
         required: true
-        default: "0.1.0"
-  workflow_call:
-    inputs:
-      version:
-        description: "Version to publish"
-        required: true
-        type: string
 
-# Adding permissions at workflow level
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
+  # Read-only provenance check. It is skipped for manual unsigned builds.
+  verify-tag:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'bench-ui-v')
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/validate-release-request.yml
+    with:
+      tag_prefix: bench-ui-v
+
+  # Independent check immediately gates registry credentials.
+  verify-publish:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'bench-ui-v')
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/validate-release-request.yml
+    with:
+      tag_prefix: bench-ui-v
+
   prepare:
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' || needs.verify-tag.result == 'success')
+    needs: verify-tag
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get-version.outputs.version }}
+      tag: ${{ steps.get-version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Release runs build the exact commit validated by the observer.
+          # Manual dispatch falls back to the immutable workflow revision.
+          ref: ${{ github.event_name == 'workflow_run' && needs.verify-tag.outputs.commit || github.workflow_sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Determine version
+      - name: Resolve release version
         id: get-version
-        run: |
-          # Check if version was provided via workflow_call first
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION=${{ inputs.version }}
-          elif [ "${{ github.event_name }}" == "push" ]; then
-            # Extract version from tag (for package-specific tags)
-            if [[ "${{ github.ref }}" =~ ^refs/tags/bench-ui-v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-              VERSION=${BASH_REMATCH[1]}
-            else
-              echo "Invalid tag format for bench-ui"
-              exit 1
-            fi
-          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # Use version from workflow dispatch (direct trigger)
-            VERSION=${{ github.event.inputs.version }}
-          else
-            echo "Unable to determine version"
-            exit 1
-          fi
-          echo "VERSION=$VERSION"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-  publish:
-    needs: prepare
-    uses: ./.github/workflows/py-reusable-publish.yml
+        env:
+          RELEASE_EVENT_NAME: ${{ github.event_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_VERSION_INPUT: ${{ inputs.version }}
+          RELEASE_TAG_PREFIX: bench-ui-v
+          RELEASE_SOURCE_TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: python3 "${GITHUB_WORKSPACE}/.github/scripts/resolve_release_version.py"
+  build-package:
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' || needs.verify-tag.result == 'success') &&
+      needs.prepare.result == 'success'
+    needs: [prepare, verify-tag]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/py-reusable-build.yml
     with:
       package_name: "bench-ui"
       package_dir: "libs/python/bench-ui"
       version: ${{ needs.prepare.outputs.version }}
-      base_package_name: "cua-bench-ui"
-    secrets:
-      PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+      source_sha: ${{ needs.verify-tag.outputs.commit }}
 
+  publish:
+    if: >-
+      github.repository == 'trycua/cua' &&
+      always() &&
+      github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+      needs.prepare.result == 'success' &&
+      needs.build-package.result == 'success' &&
+      needs.verify-publish.result == 'success'
+    needs: [prepare, build-package, verify-tag, verify-publish]
+    permissions:
+      contents: read # Check out and verify the release source.
+      actions: read # Download the built package artifact.
+      id-token: write # Mint the PyPI Trusted Publishing identity.
+    runs-on: ubuntu-latest
+    environment: pypi-release
+    steps:
+      - name: Check out trusted release validators
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/scripts/validate_release_request.py
+            .github/scripts/validate_publish_artifacts.py
+            .github/scripts/validate_publisher_repository.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Recheck release request provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          TRUSTED_REF: ${{ github.ref }}
+          TRUSTED_REF_TYPE: ${{ github.ref_type }}
+          TRUSTED_REF_NAME: ${{ github.ref_name }}
+          TRUSTED_REF_PROTECTED: ${{ github.ref_protected }}
+          TRUSTED_SHA: ${{ github.workflow_sha || github.sha }}
+          TAG_PREFIX: bench-ui-v
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_STATUS: ${{ github.event.workflow_run.status }}
+          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
+          SOURCE_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_TAG: ${{ needs.prepare.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.verify-tag.outputs.commit }}
+        run: python3 trusted-release/.github/scripts/validate_release_request.py
+
+      - name: Download package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pypi-bench-ui
+          path: dist
+
+      - name: Reject unsafe or mismatched package artifacts
+        env:
+          EXPECTED_PACKAGE: cua-bench-ui
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+        run: >-
+          python3 trusted-release/.github/scripts/validate_publish_artifacts.py dist
+          --suffix .whl --suffix .tar.gz
+          --expected-package "$EXPECTED_PACKAGE"
+          --expected-version "$EXPECTED_VERSION"
+          --max-files 2
+
+      - name: Require canonical publisher repository
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 trusted-release/.github/scripts/validate_publisher_repository.py
+
+      - name: Publish with PyPI trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/
+          repository-url: https://upload.pypi.org/legacy/
   create-release:
-    needs: [prepare, publish]
+    if: >-
+      github.repository == 'trycua/cua' &&
+      always() &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      needs.verify-tag.result == 'success' &&
+      needs.verify-publish.result == 'success' &&
+      needs.publish.result == 'success'
+    needs: [prepare, verify-tag, verify-publish, publish]
+    permissions:
+      contents: write # Create the GitHub release after publication.
     uses: ./.github/workflows/release-github-reusable.yml
     with:
+      tag_prefix: bench-ui-v
       tag_name: "bench-ui-v${{ needs.prepare.outputs.version }}"
+      source_sha: ${{ needs.verify-tag.outputs.commit }}
+      source_tag: ${{ needs.verify-tag.outputs.tag }}
       release_name: "cua-bench-ui v${{ needs.prepare.outputs.version }}"
       body: ""

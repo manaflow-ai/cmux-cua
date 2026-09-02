@@ -1,12 +1,12 @@
 name: "CD: Docs MCP Server"
 
-# Pull requests build the image without credentials or shared cache writes.
-# Only trusted main-branch commits can assume the ECR publishing role.
+# Pull requests and manual runs build the image without credentials or shared
+# cache writes. The publish consumer starts only from the credential-free main
+# observer and validates its source commit from protected main.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "docs/scripts/docs-mcp-server/**"
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- protected-main validator binds the exact source run
+    workflows: ["Docs MCP Server publish request"]
+    types: [completed]
   pull_request:
     branches: [main]
     paths:
@@ -24,8 +24,7 @@ concurrency:
   group: docs-mcp-server-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   pull-request-build:
@@ -38,7 +37,7 @@ jobs:
         platform: [linux/amd64, linux/arm64]
     steps:
       - name: Checkout pull request
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -55,13 +54,91 @@ jobs:
           push: false
           no-cache: true
 
+  manual-build:
+    name: Build ${{ matrix.platform }} (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - name: Checkout selected source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@18ce135bb5112fa8ce4ed6c17ab05699d7f3a5e0 # v3.11.0
+
+      - name: Build image without credentials
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: ./${{ env.SERVICE_DIR }}
+          file: ./${{ env.SERVICE_DIR }}/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          no-cache: true
+
+  validate-provenance:
+    name: Validate main publish request
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source_sha: ${{ steps.validate.outputs.commit }}
+      source_run_id: ${{ steps.validate.outputs.source_run_id }}
+    steps:
+      - name: Checkout the protected release validators
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/scripts/validate_main_workflow_run.py
+            .github/scripts/validate_release_request.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Validate source workflow run
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          TRUSTED_REF: ${{ github.ref }}
+          TRUSTED_REF_TYPE: ${{ github.ref_type }}
+          TRUSTED_REF_NAME: ${{ github.ref_name }}
+          TRUSTED_REF_PROTECTED: ${{ github.ref_protected }}
+          TRUSTED_SHA: ${{ github.workflow_sha || github.sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_STATUS: ${{ github.event.workflow_run.status }}
+          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
+          SOURCE_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: python3 trusted-release/.github/scripts/validate_main_workflow_run.py
+
   publish-metadata:
     name: Prepare trusted publish metadata
     if: >-
-      github.repository == 'manaflow-ai/cmux-cua' &&
-      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      needs.validate-provenance.result == 'success'
+    needs: validate-provenance
     runs-on: ubuntu-24.04
+    permissions: {}
     outputs:
       timestamp: ${{ steps.timestamp.outputs.value }}
     steps:
@@ -71,11 +148,14 @@ jobs:
 
   publish-build:
     name: Build and push ${{ matrix.platform }}
-    needs: publish-metadata
+    needs: [validate-provenance, publish-metadata]
     if: >-
-      github.repository == 'manaflow-ai/cmux-cua' &&
-      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+      github.repository == 'trycua/cua' &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      needs.validate-provenance.result == 'success' &&
+      needs.publish-metadata.result == 'success'
+    environment: docs-release
     permissions:
       contents: read
       id-token: write # OIDC is available only after the canonical-main event guard.
@@ -85,11 +165,53 @@ jobs:
       matrix:
         platform: [linux/amd64, linux/arm64]
     steps:
-      - name: Checkout main
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Checkout the validated source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ needs.validate-provenance.outputs.source_sha }}
+          path: source
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Checkout the protected release validators
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/scripts/validate_main_workflow_run.py
+            .github/scripts/validate_release_request.py
+            .github/scripts/validate_publisher_repository.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Recheck source provenance before ECR credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          TRUSTED_REF: ${{ github.ref }}
+          TRUSTED_REF_TYPE: ${{ github.ref_type }}
+          TRUSTED_REF_NAME: ${{ github.ref_name }}
+          TRUSTED_REF_PROTECTED: ${{ github.ref_protected }}
+          TRUSTED_SHA: ${{ github.workflow_sha || github.sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_STATUS: ${{ github.event.workflow_run.status }}
+          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
+          SOURCE_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_SHA: ${{ needs.validate-provenance.outputs.source_sha }}
+        run: python3 trusted-release/.github/scripts/validate_main_workflow_run.py
+
+      - name: Require canonical publisher repository
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 trusted-release/.github/scripts/validate_publisher_repository.py
 
       - name: Prepare platform tag
         id: platform
@@ -125,8 +247,8 @@ jobs:
         id: build
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
-          context: ./${{ env.SERVICE_DIR }}
-          file: ./${{ env.SERVICE_DIR }}/Dockerfile
+          context: ./source/${{ env.SERVICE_DIR }}
+          file: ./source/${{ env.SERVICE_DIR }}/Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
           outputs: type=image,name=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }},push-by-digest=true,name-canonical=true
@@ -157,18 +279,61 @@ jobs:
 
   publish-manifest:
     name: Publish multi-architecture manifest
-    needs: [publish-metadata, publish-build]
+    needs: [validate-provenance, publish-metadata, publish-build]
     if: >-
+      github.repository == 'trycua/cua' &&
       needs.publish-build.result == 'success' &&
-      github.repository == 'manaflow-ai/cmux-cua' &&
-      ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      needs.validate-provenance.result == 'success' &&
+      needs.publish-metadata.result == 'success'
+    environment: docs-release
     permissions:
       actions: read # Download artifacts from this trusted run.
       contents: read # Read the trusted main checkout.
       id-token: write # Assume the ECR role only for this trusted job.
     runs-on: ubuntu-24.04
     steps:
+      - name: Checkout the protected release validators
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/scripts/validate_main_workflow_run.py
+            .github/scripts/validate_release_request.py
+            .github/scripts/validate_publisher_repository.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Recheck source provenance before ECR credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          TRUSTED_REF: ${{ github.ref }}
+          TRUSTED_REF_TYPE: ${{ github.ref_type }}
+          TRUSTED_REF_NAME: ${{ github.ref_name }}
+          TRUSTED_REF_PROTECTED: ${{ github.ref_protected }}
+          TRUSTED_SHA: ${{ github.workflow_sha || github.sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_STATUS: ${{ github.event.workflow_run.status }}
+          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
+          SOURCE_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_SHA: ${{ needs.validate-provenance.outputs.source_sha }}
+        run: python3 trusted-release/.github/scripts/validate_main_workflow_run.py
+
+      - name: Require canonical publisher repository
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 trusted-release/.github/scripts/validate_publisher_repository.py
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:

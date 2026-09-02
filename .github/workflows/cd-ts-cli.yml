@@ -1,64 +1,90 @@
 name: "CD: @trycua/cli (npm)"
 
 on:
-  push:
-    tags:
-      - "npm-cli-v*"
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- protected-main validator binds the exact source run
+    workflows:
+      - "Release tag request"
+    types: [completed]
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to publish (default: from package.json)"
+        description: "Version to build without publishing"
         required: false
-        default: ""
-  workflow_call:
-    inputs:
-      version:
-        description: "Version to publish (default: from package.json)"
-        required: false
-        type: string
         default: ""
 
-permissions:
-  id-token: write
-  contents: write
-  packages: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.event.workflow_run.id || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
+  # Read-only provenance check. It is skipped for manual unsigned builds.
+  verify-tag:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'npm-cli-v')
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/validate-release-request.yml
+    with:
+      tag_prefix: npm-cli-v
+
+  # Independent check immediately gates registry credentials.
+  verify-publish:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'npm-cli-v')
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/validate-release-request.yml
+    with:
+      tag_prefix: npm-cli-v
+
   prepare:
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' || needs.verify-tag.result == 'success')
+    needs: verify-tag
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get-version.outputs.version }}
       tag: ${{ steps.get-version.outputs.tag }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Release runs build the exact commit validated by the observer.
+          # Manual dispatch falls back to the immutable workflow revision.
+          ref: ${{ github.event_name == 'workflow_run' && needs.verify-tag.outputs.commit || github.workflow_sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Determine version
+      - name: Resolve release version
         id: get-version
-        run: |
-          # Check inputs.version first (works for workflow_call)
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
-          elif [ "${{ github.event_name }}" == "push" ]; then
-            # Extract version from tag
-            if [[ "${{ github.ref }}" =~ ^refs/tags/npm-cli-v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-              VERSION=${BASH_REMATCH[1]}
-            else
-              echo "ERROR: Invalid tag format for npm-cli"
-              exit 1
-            fi
-          elif [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            # Read from package.json
-            VERSION=$(node -p "require('./libs/typescript/cua-cli/package.json').version")
-          fi
-
-          echo "CLI version: $VERSION"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=npm-cli-v${VERSION}" >> $GITHUB_OUTPUT
-
+        env:
+          RELEASE_EVENT_NAME: ${{ github.event_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_VERSION_INPUT: ${{ inputs.version }}
+          RELEASE_TAG_PREFIX: npm-cli-v
+          RELEASE_SOURCE_TAG: ${{ needs.verify-tag.outputs.tag }}
+          RELEASE_PACKAGE_JSON: libs/typescript/cua-cli/package.json
+        run: python3 "${GITHUB_WORKSPACE}/.github/scripts/resolve_release_version.py"
   build-binaries:
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' || needs.verify-tag.result == 'success') &&
+      needs.prepare.result == 'success'
+    needs: [prepare, verify-tag]
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
@@ -79,14 +105,17 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 0
+          ref: ${{ needs.verify-tag.outputs.commit || github.workflow_sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: latest
+          bun-version: "1.1.38"
+          no-cache: true
 
       - name: Install dependencies
         working-directory: ./libs/typescript/cua-cli
@@ -94,35 +123,80 @@ jobs:
 
       - name: Build binary
         working-directory: ./libs/typescript/cua-cli
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY_NAME: ${{ matrix.binary_name }}
+          BINARY_EXT: ${{ matrix.ext }}
         run: |
-          bun build --compile --minify --sourcemap --target=${{ matrix.target }} index.ts --outfile ${{ matrix.binary_name }}${{ matrix.ext }}
+          bun build --compile --minify --sourcemap --target="$TARGET" index.ts --outfile "$BINARY_NAME$BINARY_EXT"
           mkdir -p ../../../dist
-          mv ${{ matrix.binary_name }}${{ matrix.ext }}* ../../../dist/
+          mv "$BINARY_NAME$BINARY_EXT"* ../../../dist/
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cua-binary-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
           retention-days: 1
 
-  publish-npm:
-    needs: prepare
-    uses: ./.github/workflows/ts-reusable-publish.yml
+  manual-build:
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ts-reusable-build.yml
     with:
       package_name: "cli"
       package_dir: "libs/typescript/cua-cli"
       package_manager: "bun"
-      version: ${{ needs.prepare.outputs.version }}
-    secrets:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+  publish-npm:
+    if: >-
+      github.repository == 'trycua/cua' &&
+      always() &&
+      github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+      needs.prepare.result == 'success' &&
+      needs.verify-publish.result == 'success'
+    needs: [prepare, verify-tag, verify-publish]
+    permissions:
+      actions: read # Download the package artifact.
+      contents: read # Check out the verified source.
+      id-token: write # Mint npm Trusted Publishing identity.
+    uses: ./.github/workflows/ts-reusable-publish.yml
+    with:
+      allow_legacy_token: false
+      trusted_publisher_repository: "trycua/cua"
+      trusted_package_name: "@trycua/cli"
+      trusted_publisher_workflow: "cd-ts-cli.yml"
+      trusted_tag_prefix: "npm-cli-v"
+      expected_tag: ${{ needs.prepare.outputs.tag }}
+      expected_version: ${{ needs.prepare.outputs.version }}
+      source_sha: ${{ needs.verify-tag.outputs.commit }}
+      source_tag: ${{ needs.verify-tag.outputs.tag }}
+      package_name: "cli"
+      package_dir: "libs/typescript/cua-cli"
+      package_manager: "bun"
+      version: ${{ needs.prepare.outputs.version }}
   create-release:
-    needs: [prepare, publish-npm, build-binaries]
+    if: >-
+      github.repository == 'trycua/cua' &&
+      always() &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      needs.verify-tag.result == 'success' &&
+      needs.verify-publish.result == 'success' &&
+      needs.publish-npm.result == 'success' &&
+      needs.build-binaries.result == 'success'
+    needs: [prepare, verify-tag, verify-publish, publish-npm, build-binaries]
+    permissions:
+      actions: read # Download release binary artifacts.
+      contents: write # Create the GitHub release.
     uses: ./.github/workflows/release-github-reusable.yml
     with:
+      tag_prefix: npm-cli-v
       tag_name: ${{ needs.prepare.outputs.tag }}
+      source_sha: ${{ needs.verify-tag.outputs.commit }}
+      source_tag: ${{ needs.verify-tag.outputs.tag }}
       release_name: "cua-cli v${{ needs.prepare.outputs.version }}"
       module_path: "libs/typescript/cua-cli"
       attach_artifacts: true
