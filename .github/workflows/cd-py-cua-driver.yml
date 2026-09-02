@@ -225,6 +225,9 @@ jobs:
           if [[ -n "${PYTHON_HOST_PLATFORM:-}" ]]; then
             export _PYTHON_HOST_PLATFORM="$PYTHON_HOST_PLATFORM"
           fi
+          # The trusted checkout's Hatch hook is the supported tag override.
+          # Fail before building if a future hook no longer consumes it.
+          grep -Fq 'build_data["tag"] = wheel_tag' hatch_build.py
           # Use the hash-locked host toolchain.  Isolated PEP 517 builds would
           # download an unpinned hatchling from pyproject.toml again.
           python -m build --wheel --no-isolation
