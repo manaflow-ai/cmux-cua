@@ -224,10 +224,10 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
             block = "\n".join(job_block(name, "publish-legacy-token"))
             self.assertIn("inputs.allow_legacy_token == true", block)
             self.assertIn("validate-legacy-publish-gate.sh", block)
-            self.assertLess(
-                block.index("Verify protected legacy token gate"),
-                block.index("Publish with"),
-            )
+        self.assertLess(
+            block.index("Verify protected legacy token gate"),
+            block.index("Publish with"),
+        )
         py_legacy = "\n".join(job_block("py-reusable-publish.yml", "publish-legacy-token"))
         py_workflow = "\n".join(workflow_lines("py-reusable-publish.yml"))
         self.assertIn("validate_publish_artifacts.py", py_legacy)
@@ -248,6 +248,10 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
         self.assertIn("needs.validate-publisher-identity.result == 'success'", py_legacy)
         self.assertIn("base_package_name || inputs.trusted_package_name", py_workflow)
         ts_legacy = "\n".join(job_block("ts-reusable-publish.yml", "publish-legacy-token"))
+        self.assertLess(
+            ts_legacy.index("Revalidate package identity before token use"),
+            ts_legacy.index("Verify protected legacy token gate"),
+        )
         self.assertIn("NPM_CONFIG_PROVENANCE: \"false\"", ts_legacy)
         self.assertIn("--registry=https://registry.npmjs.org/", ts_legacy)
         self.assertNotIn("--provenance", ts_legacy)

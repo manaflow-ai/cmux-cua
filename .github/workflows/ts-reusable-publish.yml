@@ -291,13 +291,6 @@ jobs:
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
-      - name: Verify protected legacy token gate
-        env:
-          ALLOW_LEGACY_TOKEN: ${{ inputs.allow_legacy_token }}
-          LEGACY_TOKEN_GATE: ${{ secrets.NPM_LEGACY_TOKEN_FALLBACK_ENABLED }}
-          REGISTRY_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: bash "${GITHUB_WORKSPACE}/trusted-release/.github/scripts/validate-legacy-publish-gate.sh"
-
       - name: Use Node.js 24.x
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -324,6 +317,15 @@ jobs:
           EXPECTED_TAG: ${{ inputs.expected_tag }}
           EXPECTED_VERSION: ${{ inputs.expected_version }}
         run: python trusted-release/.github/scripts/validate-npm-publish-identity.py npm-dist
+
+      # Do not expose the registry token to the gate until the artifact and
+      # repository identity checks have passed in this credentialed job.
+      - name: Verify protected legacy token gate
+        env:
+          ALLOW_LEGACY_TOKEN: ${{ inputs.allow_legacy_token }}
+          LEGACY_TOKEN_GATE: ${{ secrets.NPM_LEGACY_TOKEN_FALLBACK_ENABLED }}
+          REGISTRY_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: bash "${GITHUB_WORKSPACE}/trusted-release/.github/scripts/validate-legacy-publish-gate.sh"
 
       - name: Publish with npm token (emergency fallback)
         working-directory: npm-dist
