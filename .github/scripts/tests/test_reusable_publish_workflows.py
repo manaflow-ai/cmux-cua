@@ -72,6 +72,7 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
             },
             "ts-reusable-publish.yml": {
                 "build": {"contents": "read"},
+                "validate-publisher-identity": {"actions": "read", "contents": "read"},
                 "publish-oidc": {"actions": "read", "id-token": "write"},
                 "publish-legacy-token": {"actions": "read", "contents": "read"},
             },
@@ -95,6 +96,32 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
         self.assertIn("environment:\n      name: pypi-token-fallback", legacy)
         self.assertIn("PYPI_LEGACY_TOKEN_FALLBACK_ENABLED", legacy)
 
+        ts = "\n".join(workflow_lines("ts-reusable-publish.yml"))
+        for input_name in (
+            "trusted_publisher_repository:",
+            "trusted_package_name:",
+            "trusted_publisher_workflow:",
+        ):
+            self.assertIn(input_name, ts)
+        for input_name in (
+            "trusted_publisher_repository",
+            "trusted_package_name",
+            "trusted_publisher_workflow",
+        ):
+            self.assertRegex(
+                ts,
+                rf"{input_name}:\n\s+description:.*\n\s+required: true",
+            )
+        self.assertIn("environment:\n      name: npm", ts)
+        self.assertIn("validate-publisher-identity", ts)
+        validator = "\n".join(job_block("ts-reusable-publish.yml", "validate-publisher-identity"))
+        self.assertIn("needs.build.outputs.should_publish == 'true'", validator)
+        self.assertIn("validate-npm-publish-identity.py", validator)
+        self.assertIn("validate_publish_artifacts.py", validator)
+        self.assertIn("TRUSTED_PUBLISHER_REPOSITORY", validator)
+        self.assertIn("GITHUB_REF_TYPE: ${{ github.ref_type }}", validator)
+        self.assertIn("GITHUB_REF_PROTECTED: ${{ github.ref_protected }}", validator)
+
     def test_python_build_keeps_ci_callers_compatible(self) -> None:
         build = "\n".join(workflow_lines("py-reusable-build.yml"))
         self.assertRegex(
@@ -108,6 +135,7 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
             ("py-reusable-build.yml", "build"),
             ("py-reusable-publish.yml", "build-package"),
             ("ts-reusable-publish.yml", "build"),
+            ("ts-reusable-publish.yml", "validate-publisher-identity"),
         ):
             text = "\n".join(job_block(name, job))
             self.assertNotIn("PYPI_TOKEN", text)
@@ -119,16 +147,34 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
     def test_legacy_publish_requires_gate_before_upload(self) -> None:
         for name in ("py-reusable-publish.yml", "ts-reusable-publish.yml"):
             block = "\n".join(job_block(name, "publish-legacy-token"))
-            self.assertIn("if: inputs.allow_legacy_token == true", block)
+            self.assertIn("inputs.allow_legacy_token == true", block)
             self.assertIn("validate-legacy-publish-gate.sh", block)
-            self.assertLess(block.index("Verify protected legacy token gate"), block.index("Publish with"))
+            self.assertLess(
+                block.index("Verify protected legacy token gate"),
+                block.index("Publish with"),
+            )
+        py_legacy = "\n".join(job_block("py-reusable-publish.yml", "publish-legacy-token"))
+        self.assertIn("validate_publish_artifacts.py", py_legacy)
+        self.assertIn("--suffix .whl --suffix .tar.gz", py_legacy)
+        self.assertIn("--repository-url https://upload.pypi.org/legacy/", py_legacy)
+        self.assertIn("TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}", py_legacy)
+        self.assertLess(py_legacy.index("Install Twine"), py_legacy.index("Publish with"))
         ts_legacy = "\n".join(job_block("ts-reusable-publish.yml", "publish-legacy-token"))
         self.assertIn("NPM_CONFIG_PROVENANCE: \"false\"", ts_legacy)
+        self.assertIn("--registry=https://registry.npmjs.org/", ts_legacy)
         self.assertNotIn("--provenance", ts_legacy)
         ts_oidc = "\n".join(job_block("ts-reusable-publish.yml", "publish-oidc"))
         self.assertIn("id-token: write", ts_oidc)
         self.assertIn("inputs.allow_legacy_token == false", ts_oidc)
+        self.assertIn("needs.validate-publisher-identity.result == 'success'", ts_oidc)
+        self.assertIn("--registry=https://registry.npmjs.org/", ts_oidc)
+        self.assertIn(
+            "environment:\n      name: npm",
+            "\n".join(workflow_lines("ts-reusable-publish.yml")),
+        )
         self.assertNotIn("NPM_TOKEN", ts_oidc)
+        ts_legacy = "\n".join(job_block("ts-reusable-publish.yml", "publish-legacy-token"))
+        self.assertIn("needs.validate-publisher-identity.result == 'success'", ts_legacy)
 
 
 if __name__ == "__main__":
