@@ -21,11 +21,12 @@ tag restrictions:
 | `pypi-release` | PyPI Trusted Publishing (OIDC) | Python package callers |
 | `npm` | npm Trusted Publishing (OIDC) | TypeScript reusable publisher |
 | `docker-release` | `DOCKER_HUB_RELEASE_TOKEN` | Docker reusable publisher |
+| `docs-release` | AWS OIDC | Documentation container publisher |
 | `release-app` | `RELEASE_APP_ID`, `RELEASE_APP_PRIVATE_KEY` | Cua Driver docs PR |
 | `github-release` | GitHub Actions token (environment-scoped) | GitHub release reusable workflow |
 | `lume-release` | Apple signing, notarization, and release App secrets | Lume release |
 | `cua-driver-release` | Apple signing, notarization, and release App secrets | Rust Cua Driver release |
-| `benchmark-secrets` | model and Slack keys | Scheduled model benchmarks |
+| `release-control` | Release App secrets and repository writes | Release dispatch and version bump |
 
 Do not create repository-level fallbacks for these credentials. In particular,
 the Docker callers intentionally pass no secret. The called publisher reads
@@ -53,10 +54,12 @@ validator or failed recheck stops the job before a credential is requested. The
 source provenance gate and the canonical registry-owner gate are independent,
 so passing a source check cannot authorize a fork to publish.
 Manual package, container, and documentation dispatch is limited to read-only
-build jobs. The release-bump dispatcher accepts only protected `main` and its
-write job is canonical-repository gated. Do not restore direct tag triggers for
-credential-bearing consumers, because historical tag workflow code would
-become executable again.
+build jobs. Version bumps accept only `repository_dispatch`, which GitHub loads
+from the default branch. The protected release-on-merge job is the supported
+request producer. Direct manual version bumps are unavailable because a
+branch-selectable workflow could replace its own safety checks. Do not restore
+direct tag triggers for credential-bearing consumers, because historical tag
+workflow code would become executable again.
 
 The Lume and Rust Cua Driver release workflows also consume the generic tag
 observer from protected `main`. Their old branch-selectable manual release
@@ -65,10 +68,10 @@ entrypoints are replaced by `ci-swift-lume-manual.yml` and
 read-only repository access and cannot sign, notarize, publish, or update a
 branch.
 
-The CuaBot, Kasm, and XFCE CI and release container callers set
-`skip_arm64: true` because their current upstream base or package repositories
-do not provide a supported arm64 build. The reusable Docker workflow still
-builds arm64 for every other caller and fails if that platform cannot build.
+The CuaBot, Kasm, and XFCE release container callers set `skip_arm64: true`
+because their current upstream base or package repositories do not provide a
+supported arm64 build. The reusable Docker workflow still builds arm64 for
+every other caller and fails if that platform cannot build.
 
 ## Workflow invariants
 

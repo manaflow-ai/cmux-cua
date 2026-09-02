@@ -77,10 +77,12 @@ before requesting credentials. Credentialed jobs then run the canonical
 publisher gate from protected `main`. The source checkout uses the validated
 SHA.
 Manual package, container, and documentation dispatch remains build-only and
-has no registry or release credentials. The release-bump dispatcher still
-accepts only protected `main` in the canonical repository, and its write job is
-skipped in this fork. This split prevents workflow code stored in a historical
-tag from selecting a credentialed path.
+has no registry or release credentials. Version bumps accept only a
+`repository_dispatch` request from the protected release-on-merge path, so
+GitHub loads the write workflow from the default branch. Both jobs use the
+protected `release-control` environment and skip in this fork. Direct manual
+version bumps are intentionally unavailable. This split prevents workflow code
+stored in a historical tag or branch from selecting a credentialed path.
 
 Lume and Rust Cua Driver use the same observer. Their branch-selectable build
 entrypoints are separate unsigned CI workflows with read-only repository

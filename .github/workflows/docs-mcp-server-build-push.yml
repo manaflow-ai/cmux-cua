@@ -155,6 +155,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       needs.validate-provenance.result == 'success' &&
       needs.publish-metadata.result == 'success'
+    environment: docs-release
     permissions:
       contents: read
       id-token: write # OIDC is available only after the canonical-main event guard.
@@ -286,6 +287,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       needs.validate-provenance.result == 'success' &&
       needs.publish-metadata.result == 'success'
+    environment: docs-release
     permissions:
       actions: read # Download artifacts from this trusted run.
       contents: read # Read the trusted main checkout.
