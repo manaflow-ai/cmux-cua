@@ -72,7 +72,7 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
             },
             "ts-reusable-publish.yml": {
                 "build": {"contents": "read"},
-                "publish": {"actions": "read", "id-token": "write"},
+                "publish-oidc": {"actions": "read", "id-token": "write"},
                 "publish-legacy-token": {"actions": "read", "contents": "read"},
             },
         }
@@ -88,6 +88,7 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
         self.assertNotIn("pypa/gh-action-pypi-publish", build)
         self.assertNotIn("pypa/gh-action-pypi-publish", legacy)
         self.assertIn("ref: ${{ github.sha }}", build)
+        self.assertIn("persist-credentials: false", build)
         self.assertIn("allow_legacy_token:", legacy)
         self.assertRegex(legacy, r"allow_legacy_token:\n(?:.*\n){0,5}\s+default: false")
         self.assertIn("reject-unless-enabled:", legacy)
@@ -104,6 +105,8 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
             self.assertNotIn("PYPI_TOKEN", text)
             self.assertNotIn("NPM_TOKEN", text)
             self.assertNotIn("id-token", text)
+            if job == "build":
+                self.assertIn("persist-credentials: false", text)
 
     def test_legacy_publish_requires_gate_before_upload(self) -> None:
         for name in ("py-reusable-publish.yml", "ts-reusable-publish.yml"):
@@ -114,6 +117,10 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
         ts_legacy = "\n".join(job_block("ts-reusable-publish.yml", "publish-legacy-token"))
         self.assertIn("NPM_CONFIG_PROVENANCE: \"false\"", ts_legacy)
         self.assertNotIn("--provenance", ts_legacy)
+        ts_oidc = "\n".join(job_block("ts-reusable-publish.yml", "publish-oidc"))
+        self.assertIn("id-token: write", ts_oidc)
+        self.assertIn("inputs.allow_legacy_token == false", ts_oidc)
+        self.assertNotIn("NPM_TOKEN", ts_oidc)
 
 
 if __name__ == "__main__":
