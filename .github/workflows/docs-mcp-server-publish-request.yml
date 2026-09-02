@@ -22,6 +22,6 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          [[ "$REPOSITORY" == "manaflow-ai/cmux-cua" ]]
+          [[ "$REPOSITORY" == "trycua/cua" ]]
           [[ "$REF" == "refs/heads/main" ]]
           [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]

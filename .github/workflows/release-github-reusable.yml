@@ -72,6 +72,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       inputs.source_tag == inputs.tag_name
     permissions:
+      actions: read
       contents: read
     uses: ./.github/workflows/validate-release-request.yml
     with:

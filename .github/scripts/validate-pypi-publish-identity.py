@@ -14,7 +14,7 @@ from validate_publish_artifacts import ArtifactError, validate_python_artifacts
 
 REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 WORKFLOW_PATTERN = re.compile(r"[^/]+\.(?:yml|yaml)\Z")
-TAG_PREFIX_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+TAG_PREFIX_PATTERN = re.compile(r"[A-Za-z0-9._/-]+-v\Z")
 VERSION_PATTERN = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z"
 )

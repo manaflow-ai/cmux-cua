@@ -19,6 +19,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       startsWith(github.event.workflow_run.head_branch, 'lume-v')
     permissions:
+      actions: read
       contents: read
     uses: ./.github/workflows/validate-release-request.yml
     with:

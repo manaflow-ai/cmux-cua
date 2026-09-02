@@ -21,6 +21,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       startsWith(github.event.workflow_run.head_branch, 'docker-kasm-v')
     permissions:
+      actions: read
       contents: read
     uses: ./.github/workflows/validate-release-request.yml
     with:
@@ -33,6 +34,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       startsWith(github.event.workflow_run.head_branch, 'docker-kasm-v')
     permissions:
+      actions: read
       contents: read
     uses: ./.github/workflows/validate-release-request.yml
     with:
@@ -55,6 +57,7 @@ jobs:
       github.repository == 'trycua/cua' &&
       always() &&
       github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+      needs.verify-tag.result == 'success' &&
       needs.verify-publish.result == 'success'
     needs: [verify-tag, verify-publish]
     permissions:

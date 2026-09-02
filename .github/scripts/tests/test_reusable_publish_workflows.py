@@ -220,12 +220,6 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
                 self.assertIn("ref: main", block, f"{name}:{job}")
                 self.assertIn("path: trusted-release", block, f"{name}:{job}")
 
-        verifier = workflow_text("verify-release-tag.yml")
-        self.assertIn("repository: ${{ github.repository }}", verifier)
-        self.assertIn("ref: main", verifier)
-        self.assertIn("path: trusted-release", verifier)
-        self.assertIn("trusted-release/.github/scripts/verify_release_tag.py", verifier)
-
     def test_legacy_publish_requires_gate_before_upload(self) -> None:
         for name in ("py-reusable-publish.yml", "ts-reusable-publish.yml"):
             block = "\n".join(job_block(name, "publish-legacy-token"))

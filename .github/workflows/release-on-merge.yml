@@ -18,7 +18,7 @@ jobs:
   plan:
     name: Determine release targets
     if: >-
-      github.repository == 'manaflow-ai/cmux-cua' &&
+      github.repository == 'trycua/cua' &&
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.base.repo.full_name == github.repository

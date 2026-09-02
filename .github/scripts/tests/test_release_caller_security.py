@@ -396,7 +396,6 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
         self.assertIn("trusted-release/.github/scripts/validate_release_request.py", release_block)
 
         for workflow, jobs in (
-            (WORKFLOWS / "verify-release-tag.yml", ("verify",)),
             (WORKFLOWS / "py-reusable-publish.yml", ("validate-publisher-identity", "publish-legacy-token")),
             (WORKFLOWS / "ts-reusable-publish.yml", ("validate-publisher-identity", "publish-legacy-token")),
             (DOCKER_PUBLISH, ("build-and-push", "publish-manifest-list")),
@@ -424,7 +423,8 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
             block.index("Generate GitHub App token"),
         )
         self.assertIn("${{ runner.temp }}/cua-driver-reference-docs", block)
-        self.assertIn("credential.helper=", block)
+        self.assertIn("credential.helper", block)
+        self.assertIn("trap 'git config --local --unset-all credential.helper", block)
         self.assertNotIn("x-access-token:${GH_TOKEN}", block)
 
     def test_version_bump_has_no_branch_selectable_write_path(self) -> None:

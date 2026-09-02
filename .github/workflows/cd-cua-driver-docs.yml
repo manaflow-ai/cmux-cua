@@ -22,6 +22,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       startsWith(github.event.workflow_run.head_branch, 'cua-driver-rs-v')
     permissions:
+      actions: read
       contents: read
     uses: ./.github/workflows/validate-release-request.yml
     with:
@@ -33,6 +34,7 @@ jobs:
       github.event.workflow_run.conclusion == 'success' &&
       startsWith(github.event.workflow_run.head_branch, 'cua-driver-rs-v')
     permissions:
+      actions: read
       contents: read
     uses: ./.github/workflows/validate-release-request.yml
     with:
@@ -158,11 +160,11 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: cua-driver-reference-docs
-          path: "$RUNNER_TEMP/cua-driver-reference-docs"
+          path: ${{ runner.temp }}/cua-driver-reference-docs
 
       - name: Apply generated reference docs
         env:
-          GENERATED_DOCS: "$RUNNER_TEMP/cua-driver-reference-docs"
+          GENERATED_DOCS: ${{ runner.temp }}/cua-driver-reference-docs
         run: cp "$GENERATED_DOCS"/*.mdx docs/content/docs/reference/cua-driver/
 
       - name: Generate GitHub App token
@@ -194,7 +196,9 @@ jobs:
           git checkout -B "$branch"
           git add docs/content/docs/reference/cua-driver
           git commit -m "docs(cua-driver): regenerate reference for ${RELEASE_TAG}"
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git"
+          git remote set-url origin "https://github.com/${REPOSITORY}.git"
+          git config --local credential.helper '!gh auth git-credential'
+          trap 'git config --local --unset-all credential.helper >/dev/null 2>&1 || true' EXIT
           git push -u origin "$branch" --force-with-lease
           gh pr create --repo "$REPOSITORY" --base main --head "$branch" \
             --title "docs(cua-driver): regenerate reference for ${RELEASE_TAG}" \
