@@ -43,7 +43,7 @@ jobs:
       tag: ${{ steps.validate.outputs.tag }}
     steps:
       # This checkout is the trusted publisher code from the default branch.
-      # The source release is consumed only as a verified binary artifact.
+      # The validated source commit is checked out separately for wheel code.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
         with:
           ref: ${{ github.sha }}
@@ -159,26 +159,36 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ needs.validate-provenance.outputs.source_run_id }}
 
-      - name: Verify the source artifact and extract its binary
+      - name: Check out the exact source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        with:
+          ref: ${{ needs.validate-provenance.outputs.source_head_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the source checkout and extract its binary
         env:
           PROVENANCE_JSON: ${{ needs.validate-provenance.outputs.provenance }}
           PROVENANCE_KEY: ${{ matrix.provenance_key }}
           VERSION: ${{ needs.validate-provenance.outputs.version }}
           ARCHIVE_SUFFIX: ${{ matrix.archive_suffix }}
           PLATFORM_KEY: ${{ matrix.provenance_key }}
+          SOURCE_HEAD_SHA: ${{ needs.validate-provenance.outputs.source_head_sha }}
         shell: bash
         run: |
           set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_HEAD_SHA"
           printf '%s' "$PROVENANCE_JSON" > "$RUNNER_TEMP/cua-driver-provenance.json"
           python .github/scripts/prepare_cua_driver_binary.py \
             --artifact-dir source-artifact \
             --archive-name "cua-driver-rs-${VERSION}-${ARCHIVE_SUFFIX}" \
             --platform "$PLATFORM_KEY" \
             --provenance "$RUNNER_TEMP/cua-driver-provenance.json" \
-            --destination libs/cua-driver/python/src/cua_driver/bin
+            --destination source/libs/cua-driver/python/src/cua_driver/bin
 
       - name: Set the package version
-        working-directory: libs/cua-driver/python
+        working-directory: source/libs/cua-driver/python
         env:
           VERSION: ${{ needs.validate-provenance.outputs.version }}
         shell: bash
@@ -211,7 +221,7 @@ jobs:
           PY
 
       - name: Build wheel with the verified binary
-        working-directory: libs/cua-driver/python
+        working-directory: source/libs/cua-driver/python
         env:
           CUA_DRIVER_WHEEL_TAG: ${{ matrix.wheel_tag }}
           PYTHON_HOST_PLATFORM: ${{ matrix.python_host_platform }}
@@ -258,14 +268,14 @@ jobs:
           PY
 
       - name: List built artifacts
-        working-directory: libs/cua-driver/python
+        working-directory: source/libs/cua-driver/python
         shell: bash
         run: ls -lh dist/
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheel-${{ matrix.platform }}-${{ matrix.arch }}
-          path: libs/cua-driver/python/dist/*.whl
+          path: source/libs/cua-driver/python/dist/*.whl
           if-no-files-found: error
 
   publish-pypi:
