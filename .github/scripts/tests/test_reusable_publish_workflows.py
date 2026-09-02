@@ -179,7 +179,27 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
         publish = "\n".join(workflow_lines("ts-reusable-publish.yml"))
         self.assertIn('bun-version: "1.1.38"', publish)
         self.assertNotIn("bun-version: latest", publish)
-        self.assertEqual(publish.count("npm@11.5.1"), 2)
+        self.assertEqual(publish.count("npm@12.0.2"), 2)
+
+    def test_npm_oidc_job_rechecks_identity_before_publish_tools(self) -> None:
+        block = "\n".join(job_block("ts-reusable-publish.yml", "publish-oidc"))
+        self.assertEqual(
+            permissions("ts-reusable-publish.yml", "publish-oidc"),
+            {"actions": "read", "contents": "read", "id-token": "write"},
+        )
+        self.assertIn("path: trusted-release", block)
+        self.assertIn("ref: main", block)
+        self.assertIn("validate_publisher_repository.py", block)
+        self.assertIn("validate-npm-publish-identity.py", block)
+        self.assertLess(
+            block.index("Require canonical publisher repository"),
+            block.index("Download package artifact"),
+        )
+        self.assertLess(
+            block.index("Revalidate package identity before OIDC use"),
+            block.index("npm install --global"),
+        )
+        self.assertLess(block.index("npm install --global"), block.index("npm publish"))
 
     def test_typescript_identity_contract_is_documented(self) -> None:
         readme = WORKFLOW_README.read_text(encoding="utf-8")
