@@ -4,18 +4,55 @@ on:
   pull_request:
     types: [opened, synchronize, labeled, unlabeled]
 
+# Do not inherit repository-wide token permissions. The job grants only the
+# permission needed to update a pull request comment.
+permissions: {}
+
+concurrency:
+  # A label or commit update supersedes an older reminder calculation.
+  group: release-reminder-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   release-reminder:
-    runs-on: ubuntu-latest
+    name: Release reminder
+    runs-on: ubuntu-24.04
     permissions:
-      pull-requests: write
+      contents: none # No checkout or repository contents are needed.
+      pull-requests: write # Read the PR and update its reminder comment.
     steps:
       - name: Check for publishable changes and remind
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          # Actions writes this event data as an environment value, not shell source.
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-          REPO="${{ github.repository }}"
+          set -euo pipefail
+
+          if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::The pull request number is invalid." >&2
+            exit 1
+          fi
+          if [[ ! "$REPO" =~ ^[[:alnum:]_.-]+/[[:alnum:]_.-]+$ ]]; then
+            echo "::error::The repository name is invalid." >&2
+            exit 1
+          fi
+
+          LABELS_JSON="${LABELS_JSON:-[]}"
+          if ! jq -e 'type == "array" and all(.[]; type == "string")' \
+            <<<"$LABELS_JSON" >/dev/null; then
+            echo "::error::The pull request labels payload is invalid." >&2
+            exit 1
+          fi
+
+          has_label() {
+            local wanted="$1"
+            jq -e --arg wanted "$wanted" \
+              'any(.[]; . == $wanted)' <<<"$LABELS_JSON" >/dev/null
+          }
 
           # Get changed files in this PR
           CHANGED_FILES=$(gh pr diff "$PR_NUMBER" --repo "$REPO" --name-only 2>/dev/null || true)
@@ -53,31 +90,37 @@ jobs:
 
           # Find affected services
           AFFECTED=()
-          for path_prefix in "${!PATH_TO_SERVICE[@]}"; do
-            if echo "$CHANGED_FILES" | grep -q "^${path_prefix}"; then
-              AFFECTED+=("${PATH_TO_SERVICE[$path_prefix]}")
-            fi
-          done
+          while IFS= read -r changed_path; do
+            [[ -n "$changed_path" ]] || continue
+            for path_prefix in "${!PATH_TO_SERVICE[@]}"; do
+              if [[ "$changed_path" == "$path_prefix"* ]]; then
+                AFFECTED+=("${PATH_TO_SERVICE[$path_prefix]}")
+              fi
+            done
+          done <<<"$CHANGED_FILES"
 
           # Deduplicate and sort
-          IFS=$'\n' AFFECTED=($(printf '%s\n' "${AFFECTED[@]}" | sort -u)); unset IFS
+          if [ "${#AFFECTED[@]}" -gt 0 ]; then
+            mapfile -t AFFECTED < <(printf '%s\n' "${AFFECTED[@]}" | sort -u)
+          else
+            AFFECTED=()
+          fi
 
-          if [ ${#AFFECTED[@]} -eq 0 ]; then
+          if [ "${#AFFECTED[@]}" -eq 0 ]; then
             echo "No publishable packages affected."
             exit 0
           fi
 
           # Check which ones already have release labels
-          LABELS='${{ toJSON(github.event.pull_request.labels.*.name) }}'
           HAS_NO_RELEASE=false
-          if echo "$LABELS" | grep -q '"no-release"'; then
+          if has_label "no-release"; then
             HAS_NO_RELEASE=true
           fi
 
           LABELED=()
           UNLABELED=()
           for svc in "${AFFECTED[@]}"; do
-            if echo "$LABELS" | grep -q "\"release:${svc}\""; then
+            if has_label "release:${svc}"; then
               LABELED+=("$svc")
             else
               UNLABELED+=("$svc")
@@ -123,10 +166,15 @@ jobs:
 
           # Delete previous reminder comment if exists, then post new one
           EXISTING_COMMENT_ID=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
-            --jq ".[] | select(.body | contains(\"${COMMENT_MARKER}\")) | .id" 2>/dev/null | head -1)
+            2>/dev/null | jq -r --arg marker "$COMMENT_MARKER" \
+              '[.[] | select((.body // "") | contains($marker)) | .id][0] // empty')
 
           if [ -n "$EXISTING_COMMENT_ID" ]; then
+            if [[ ! "$EXISTING_COMMENT_ID" =~ ^[0-9]+$ ]]; then
+              echo "::error::The existing reminder comment ID is invalid." >&2
+              exit 1
+            fi
             gh api -X DELETE "repos/${REPO}/issues/${PR_NUMBER}/comments/${EXISTING_COMMENT_ID}" 2>/dev/null || true
           fi
 
-          echo -e "$BODY" | gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file -
+          printf '%b' "$BODY" | gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file -
