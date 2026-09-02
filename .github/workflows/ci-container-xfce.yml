@@ -7,7 +7,8 @@ on:
       - ".github/workflows/ci-container-xfce.yml"
       - ".github/workflows/docker-reusable-build.yml"
 
-permissions: {}
+permissions:
+  contents: read
 
 jobs:
   build:
