@@ -1,0 +1,45 @@
+name: "CI: Cold Start Benchmark (request)"
+
+# This workflow can be selected from any branch, but it never checks out code
+# or receives API, signing, publishing, or Slack credentials. The privileged
+# workflow_run consumer accepts only successful requests from protected main.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: cold-start-benchmark-request-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  request:
+    name: Request benchmark on main
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Require protected main
+        env:
+          REF: ${{ github.ref }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$REPOSITORY" == "manaflow-ai/cmux-cua" ]] || {
+            echo "Requests are accepted only in manaflow-ai/cmux-cua" >&2
+            exit 1
+          }
+          [[ "$REF" == "refs/heads/main" ]] || {
+            echo "Select the protected main branch before requesting the benchmark" >&2
+            exit 1
+          }
+          [[ "$REF_PROTECTED" == "true" ]] || {
+            echo "The selected main branch is not protected" >&2
+            exit 1
+          }
+          [[ "$SHA" =~ ^[0-9a-fA-F]{40}$ ]] || {
+            echo "The dispatch SHA is not a full commit" >&2
+            exit 1
+          }

@@ -1,0 +1,39 @@
+name: "CD: Lume (tag request)"
+
+# A tag can change the workflow file that GitHub evaluates for this push.
+# Keep this request workflow deliberately harmless.  The protected consumer
+# (cd-swift-lume.yml) is loaded from main and owns every signing credential.
+on:
+  push:
+    tags:
+      - "lume-v*"
+
+permissions: {}
+
+concurrency:
+  group: lume-tag-request-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  request:
+    name: Record Lume tag request
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+      - name: Check request metadata
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY" = "manaflow-ai/cmux-cua"
+          case "$REF" in
+            refs/tags/lume-v*) ;;
+            *) echo "unexpected release ref: $REF" >&2; exit 1 ;;
+          esac
+          test "$REF_PROTECTED" = "true"
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          echo "Requested protected Lume release for ${REF#refs/tags/} at $SHA"

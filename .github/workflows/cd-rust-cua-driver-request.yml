@@ -1,0 +1,38 @@
+name: "CD: Cua Driver (tag request)"
+
+# This tag-side workflow is intentionally read-only and credential-free.
+# cd-rust-cua-driver.yml is the protected-main workflow_run consumer.
+on:
+  push:
+    tags:
+      - "cua-driver-rs-v*"
+
+permissions: {}
+
+concurrency:
+  group: cua-driver-rs-tag-request-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  request:
+    name: Record Cua Driver tag request
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+      - name: Check request metadata
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REF: ${{ github.ref }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$REPOSITORY" = "manaflow-ai/cmux-cua"
+          case "$REF" in
+            refs/tags/cua-driver-rs-v*) ;;
+            *) echo "unexpected release ref: $REF" >&2; exit 1 ;;
+          esac
+          test "$REF_PROTECTED" = "true"
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          echo "Requested protected Cua Driver release for ${REF#refs/tags/} at $SHA"
