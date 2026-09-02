@@ -237,6 +237,10 @@ jobs:
         shell: bash
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Token publishing cannot mint the OIDC token required for
+          # provenance. Keep this path explicit and independent of package
+          # defaults that might request provenance.
+          NPM_CONFIG_PROVENANCE: "false"
         run: |
           set -euo pipefail
           npm_config_userconfig="$RUNNER_TEMP/npmrc"
@@ -244,4 +248,4 @@ jobs:
           umask 077
           printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > "$npm_config_userconfig"
           trap 'rm -f "$npm_config_userconfig"' EXIT
-          npm publish ./*.tgz --access public --provenance --ignore-scripts
+          npm publish ./*.tgz --access public --ignore-scripts

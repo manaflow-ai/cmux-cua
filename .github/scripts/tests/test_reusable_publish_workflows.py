@@ -111,6 +111,9 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
             self.assertIn("if: inputs.allow_legacy_token == true", block)
             self.assertIn("validate-legacy-publish-gate.sh", block)
             self.assertLess(block.index("Verify protected legacy token gate"), block.index("Publish with"))
+        ts_legacy = "\n".join(job_block("ts-reusable-publish.yml", "publish-legacy-token"))
+        self.assertIn("NPM_CONFIG_PROVENANCE: \"false\"", ts_legacy)
+        self.assertNotIn("--provenance", ts_legacy)
 
 
 if __name__ == "__main__":
