@@ -105,6 +105,69 @@ def _resolve_tag_target(api_get: ApiGet, repository: str, tag: str) -> str:
     return _require_sha(target.get("sha"), "annotated tag target SHA")
 
 
+def _branch_sha(
+    api_get: ApiGet,
+    repository: str,
+    base_branch: str,
+    *,
+    recheck: bool = False,
+) -> str:
+    branch = api_get(f"/repos/{repository}/branches/{quote(base_branch, safe='')}")
+    label = "base branch on recheck" if recheck else "base branch"
+    if not isinstance(branch, dict) or not isinstance(branch.get("commit"), dict):
+        raise VerificationError(f"GitHub returned an invalid {label}")
+    suffix = " on recheck" if recheck else ""
+    return _require_sha(
+        branch["commit"].get("sha"), f"{base_branch} branch SHA{suffix}"
+    )
+
+
+def _comparison_sha(comparison: dict[str, Any], key: str, label: str) -> str:
+    commit = comparison.get(key)
+    if not isinstance(commit, dict):
+        raise VerificationError(f"ancestry comparison has no {label}")
+    return _require_sha(commit.get("sha"), f"comparison {label} SHA")
+
+
+def _validate_ancestry(
+    api_get: ApiGet,
+    repository: str,
+    base_branch: str,
+    tag_sha: str,
+    main_sha: str,
+) -> None:
+    comparison = api_get(f"/repos/{repository}/compare/{tag_sha}...{main_sha}")
+    if not isinstance(comparison, dict):
+        raise VerificationError("GitHub returned an invalid ancestry comparison")
+    status = comparison.get("status")
+    if status not in {"ahead", "identical"}:
+        raise VerificationError(
+            f"release tag commit is not an ancestor of {base_branch} (status={status!r})"
+        )
+    if _comparison_sha(comparison, "base_commit", "base") != tag_sha:
+        raise VerificationError("ancestry comparison base does not match the tag SHA")
+    if _comparison_sha(comparison, "head_commit", "head") != main_sha:
+        raise VerificationError("ancestry comparison head does not match main")
+    if _comparison_sha(comparison, "merge_base_commit", "merge base") != tag_sha:
+        raise VerificationError(
+            "ancestry comparison merge base does not equal the release tag commit"
+        )
+
+
+def _validate_stable_refs(
+    api_get: ApiGet,
+    repository: str,
+    base_branch: str,
+    tag: str,
+    expected_tag_sha: str,
+    expected_main_sha: str,
+) -> None:
+    if _branch_sha(api_get, repository, base_branch, recheck=True) != expected_main_sha:
+        raise VerificationError(f"{base_branch} moved while provenance was checked")
+    if _resolve_tag_target(api_get, repository, tag) != expected_tag_sha:
+        raise VerificationError("release tag moved while provenance was checked")
+
+
 def verify_release_tag(
     *,
     tag_prefix: str,
@@ -133,60 +196,22 @@ def verify_release_tag(
             f"tag target {first_target} does not match event SHA {expected_sha}"
         )
 
-    branch = api_get(f"/repos/{repository}/branches/{quote(base_branch, safe='')}")
-    if not isinstance(branch, dict) or not isinstance(branch.get("commit"), dict):
-        raise VerificationError("GitHub returned an invalid base branch")
-    main_sha = _require_sha(branch["commit"].get("sha"), f"{base_branch} branch SHA")
-
-    comparison = api_get(
-        f"/repos/{repository}/compare/{expected_sha}...{main_sha}"
+    main_sha = _branch_sha(api_get, repository, base_branch)
+    _validate_ancestry(
+        api_get,
+        repository,
+        base_branch,
+        expected_sha,
+        main_sha,
     )
-    if not isinstance(comparison, dict):
-        raise VerificationError("GitHub returned an invalid ancestry comparison")
-    status = comparison.get("status")
-    if status not in {"ahead", "identical"}:
-        raise VerificationError(
-            f"release tag commit is not an ancestor of {base_branch} (status={status!r})"
-        )
-    # Bind the comparison to the same base SHA returned above.  This prevents a
-    # moving main branch from silently changing the release decision.
-    compared_base = comparison.get("base_commit")
-    if not isinstance(compared_base, dict) or _require_sha(
-        compared_base.get("sha"), "comparison base SHA"
-    ) != expected_sha:
-        raise VerificationError("ancestry comparison base does not match the tag SHA")
-    compared_head = comparison.get("head_commit")
-    if not isinstance(compared_head, dict) or _require_sha(
-        compared_head.get("sha"), "comparison head SHA"
-    ) != main_sha:
-        raise VerificationError("ancestry comparison head does not match main")
-    merge_base = comparison.get("merge_base_commit")
-    if not isinstance(merge_base, dict):
-        raise VerificationError("ancestry comparison has no merge base")
-    if _require_sha(merge_base.get("sha"), "comparison merge-base SHA") != expected_sha:
-        raise VerificationError(
-            "ancestry comparison merge base does not equal the release tag commit"
-        )
-
-    # Read the base branch again. A protected branch should not move during a
-    # release check; rejecting a change also covers a protection outage or a
-    # force-update that happens between the comparison and the write job.
-    second_branch = api_get(f"/repos/{repository}/branches/{quote(base_branch, safe='')}")
-    if not isinstance(second_branch, dict) or not isinstance(
-        second_branch.get("commit"), dict
-    ):
-        raise VerificationError("GitHub returned an invalid base branch on recheck")
-    second_main_sha = _require_sha(
-        second_branch["commit"].get("sha"), f"{base_branch} branch SHA on recheck"
+    _validate_stable_refs(
+        api_get,
+        repository,
+        base_branch,
+        tag,
+        expected_sha,
+        main_sha,
     )
-    if second_main_sha != main_sha:
-        raise VerificationError(f"{base_branch} moved while provenance was checked")
-
-    # Read the ref again.  A force-moved tag during the API calls must never
-    # pass the check with the identity observed at the beginning.
-    second_target = _resolve_tag_target(api_get, repository, tag)
-    if second_target != expected_sha:
-        raise VerificationError("release tag moved while provenance was checked")
 
     return VerificationResult(
         tag=tag,
