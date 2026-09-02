@@ -24,6 +24,7 @@ jobs:
     outputs:
       service: ${{ steps.validate.outputs.service }}
       bump_type: ${{ steps.validate.outputs.bump_type }}
+      tag_prefix: ${{ steps.validate.outputs.tag_prefix }}
       commit: ${{ steps.validate.outputs.commit }}
       source_commit: ${{ steps.validate.outputs.source_commit }}
       source_run_id: ${{ steps.validate.outputs.source_run_id }}
@@ -286,6 +287,7 @@ jobs:
         env:
           PACKAGE_DIRECTORY: ${{ steps.package.outputs.directory }}
           CONFIG_FILE: ${{ steps.package.outputs.bumpversion_config }}
+          TAG_PREFIX: ${{ needs.validate-request.outputs.tag_prefix }}
         run: |
           set -euo pipefail
           cd "$PACKAGE_DIRECTORY"
@@ -307,6 +309,11 @@ jobs:
             exit 1
           }
           TAG_NAME=${TAG_TEMPLATE//\{new_version\}/$NEW_VERSION}
+          EXPECTED_TAG="${TAG_PREFIX}${NEW_VERSION}"
+          [[ "$TAG_NAME" == "$EXPECTED_TAG" ]] || {
+            echo "::error::bumpversion config tag ($TAG_NAME) does not match the allowlisted service prefix ($TAG_PREFIX)" >&2
+            exit 1
+          }
           git check-ref-format "refs/tags/$TAG_NAME"
           printf 'version=%s\n' "$NEW_VERSION" >> "$GITHUB_OUTPUT"
           printf 'tag=%s\n' "$TAG_NAME" >> "$GITHUB_OUTPUT"

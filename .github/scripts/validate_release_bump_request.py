@@ -59,6 +59,38 @@ ALLOWED_SERVICES = frozenset(
         "docker/qemu-windows",
     }
 )
+SERVICE_TAG_PREFIXES = {
+    "pypi/cua": "cua-v",
+    "pypi/agent": "agent-v",
+    "pypi/auto": "auto-v",
+    "pypi/bench": "bench-v",
+    "pypi/bench-ui": "bench-ui-v",
+    "pypi/cli": "cli-v",
+    "pypi/computer": "computer-v",
+    "pypi/computer-server": "computer-server-v",
+    "pypi/cloud": "cloud-v",
+    "pypi/core": "core-v",
+    "pypi/mcp-server": "mcp-server-v",
+    "pypi/sandbox": "sandbox-v",
+    "pypi/sandbox-apps": "sandbox-apps-v",
+    "pypi/som": "som-v",
+    "pypi/train": "train-v",
+    "npm/cli": "npm-cli-v",
+    "npm/computer": "npm-computer-v",
+    "npm/core": "npm-core-v",
+    "npm/playground": "npm-playground-v",
+    "npm/cuabot": "cuabot-v",
+    "lume": "lume-v",
+    "cua-driver": "cua-driver-v",
+    "cua-driver-rs": "cua-driver-rs-v",
+    "docker/cuabot": "docker-cuabot-v",
+    "docker/kasm": "docker-kasm-v",
+    "docker/xfce": "docker-xfce-v",
+    "docker/lumier": "docker-lumier-v",
+    "docker/qemu-android": "docker-cua-qemu-android-v",
+    "docker/qemu-linux": "docker-cua-qemu-linux-v",
+    "docker/qemu-windows": "docker-cua-qemu-windows-v",
+}
 BUMP_TYPES = frozenset({"patch", "minor", "major"})
 
 
@@ -259,7 +291,11 @@ def _read_request(path: Path) -> dict[str, str]:
         raise ValidationError("request service is not allowlisted")
     if not isinstance(bump_type, str) or bump_type not in BUMP_TYPES:
         raise ValidationError("request bump_type is not allowlisted")
-    return {"service": service, "bump_type": bump_type}
+    return {
+        "service": service,
+        "bump_type": bump_type,
+        "tag_prefix": SERVICE_TAG_PREFIXES[service],
+    }
 
 
 def validate(api: Api, values: Mapping[str, str], request_path: Path) -> dict[str, str]:
@@ -301,7 +337,14 @@ def write_outputs(values: Mapping[str, str], output_path: str) -> None:
     if not output_path:
         return
     with Path(output_path).open("a", encoding="utf-8") as output:
-        for key in ("service", "bump_type", "commit", "source_commit", "source_run_id"):
+        for key in (
+            "service",
+            "bump_type",
+            "tag_prefix",
+            "commit",
+            "source_commit",
+            "source_run_id",
+        ):
             output.write(f"{key}={values[key]}\n")
 
 
