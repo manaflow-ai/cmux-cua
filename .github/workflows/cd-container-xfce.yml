@@ -47,8 +47,7 @@ jobs:
       image_name: cua-xfce
       context_dir: libs/xfce
       dockerfile_path: Dockerfile
-      # kicad/kicad:9.0 is amd64-only, so manual validation uses the same
-      # supported platform set as the release publisher.
+      # kicad/kicad:9.0 has no arm64 manifest.
       skip_arm64: true
 
   publish:

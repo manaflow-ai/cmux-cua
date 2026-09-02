@@ -14,3 +14,5 @@ jobs:
     with:
       image_name: cuabot
       context_dir: libs/cuabot
+      # xpra arm64 resolves to v3.1 and requires v5 or later.
+      skip_arm64: true

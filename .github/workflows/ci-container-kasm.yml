@@ -13,3 +13,5 @@ jobs:
     with:
       image_name: cua-ubuntu
       context_dir: libs/kasm
+      # Firefox installation under arm64 QEMU segfaults.
+      skip_arm64: true

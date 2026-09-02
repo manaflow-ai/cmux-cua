@@ -47,8 +47,7 @@ jobs:
       image_name: cua-ubuntu
       context_dir: libs/kasm
       dockerfile_path: Dockerfile
-      # The Kasm Firefox setup is not stable on arm64. Keep release and manual
-      # validation on the supported amd64 base image.
+      # Firefox installation under arm64 QEMU segfaults.
       skip_arm64: true
 
   publish:

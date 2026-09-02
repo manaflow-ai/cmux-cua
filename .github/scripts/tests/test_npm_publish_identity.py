@@ -16,6 +16,7 @@ from unittest.mock import patch
 SCRIPT = Path(__file__).resolve().parents[1] / "validate-npm-publish-identity.py"
 WORKFLOW_REF = "trycua/cua/.github/workflows/cd-ts-core.yml@refs/tags/npm-core-v1.2.3"
 BASE_ENV = {
+    "GITHUB_EVENT_NAME": "push",
     "GITHUB_REPOSITORY": "trycua/cua",
     "GITHUB_REF_TYPE": "tag",
     "GITHUB_REF_PROTECTED": "true",

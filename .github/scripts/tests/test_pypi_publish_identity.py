@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / "validate-pypi-publish-identity.py"
 BASE_ENV = {
+    "GITHUB_EVENT_NAME": "push",
     "GITHUB_REPOSITORY": "trycua/cua",
     "GITHUB_REF_TYPE": "tag",
     "GITHUB_REF_PROTECTED": "true",
