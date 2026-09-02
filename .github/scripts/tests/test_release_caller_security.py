@@ -184,6 +184,17 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
                 path.name,
             )
             self.assertIn(f"trusted_publisher_workflow: \"{path.name}\"", block, path.name)
+            self.assertRegex(
+                block,
+                r'trusted_tag_prefix: "(?:npm-[a-z-]+|cuabot)-v"',
+                path.name,
+            )
+            self.assertIn("expected_tag: ${{ needs.prepare.outputs.tag }}", block, path.name)
+            self.assertIn(
+                "expected_version: ${{ needs.prepare.outputs.version }}",
+                block,
+                path.name,
+            )
             self.assertNotIn("secrets.", block, path.name)
 
         for path in CONTAINER_CALLERS:
@@ -204,6 +215,14 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
         self.assertIn("DOCKER_HUB_RELEASE_TOKEN", publisher)
         self.assertNotIn("DOCKER_HUB_TOKEN", publisher)
         self.assertEqual(publisher.count("Require the protected Docker Hub credential"), 2)
+
+    def test_xfce_skips_unsupported_arm64_base_image(self) -> None:
+        source = text(WORKFLOWS / "cd-container-xfce.yml")
+        manual = job_block(source, "manual-build")
+        publish = job_block(source, "publish")
+        self.assertIn("skip_arm64: true", manual)
+        self.assertIn("skip_arm64: true", publish)
+        self.assertIn("kicad/kicad:9.0", source)
 
     def test_manual_build_paths_have_no_credentials(self) -> None:
         for path in PY_CALLERS + TS_CALLERS + CONTAINER_CALLERS:

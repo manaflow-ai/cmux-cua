@@ -88,6 +88,9 @@ jobs:
       trusted_publisher_repository: "trycua/cua"
       trusted_package_name: "@trycua/playground"
       trusted_publisher_workflow: "cd-ts-playground.yml"
+      trusted_tag_prefix: "npm-playground-v"
+      expected_tag: ${{ needs.prepare.outputs.tag }}
+      expected_version: ${{ needs.prepare.outputs.version }}
       package_name: "playground"
       package_dir: "libs/typescript/playground"
       package_manager: "pnpm"

@@ -88,6 +88,9 @@ jobs:
       trusted_publisher_repository: "trycua/cua"
       trusted_package_name: "@trycua/computer"
       trusted_publisher_workflow: "cd-ts-computer.yml"
+      trusted_tag_prefix: "npm-computer-v"
+      expected_tag: ${{ needs.prepare.outputs.tag }}
+      expected_version: ${{ needs.prepare.outputs.version }}
       package_name: "computer"
       package_dir: "libs/typescript/computer"
       package_manager: "pnpm"

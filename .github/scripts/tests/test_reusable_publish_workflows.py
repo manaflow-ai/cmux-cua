@@ -68,6 +68,7 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
             "py-reusable-publish.yml": {
                 "reject-unless-enabled": {},
                 "build-package": {"contents": "read"},
+                "validate-publisher-identity": {"actions": "read", "contents": "read"},
                 "publish-legacy-token": {"actions": "read", "contents": "read"},
             },
             "ts-reusable-publish.yml": {
@@ -95,18 +96,47 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
         self.assertIn("reject-unless-enabled:", legacy)
         self.assertIn("environment:\n      name: pypi-token-fallback", legacy)
         self.assertIn("PYPI_LEGACY_TOKEN_FALLBACK_ENABLED", legacy)
+        for input_name in (
+            "trusted_publisher_repository:",
+            "trusted_package_name:",
+            "trusted_publisher_workflow:",
+            "trusted_tag_prefix:",
+        ):
+            self.assertIn(input_name, legacy)
+        for input_name in (
+            "trusted_publisher_repository",
+            "trusted_package_name",
+            "trusted_publisher_workflow",
+            "trusted_tag_prefix",
+        ):
+            self.assertRegex(
+                legacy,
+                rf"{input_name}:\n\s+description:.*\n\s+required: true",
+            )
+        identity = "\n".join(job_block("py-reusable-publish.yml", "validate-publisher-identity"))
+        self.assertIn("validate-pypi-publish-identity.py", identity)
+        self.assertIn("GITHUB_REF_NAME: ${{ github.ref_name }}", identity)
+        self.assertIn("TRUSTED_TAG_PREFIX", identity)
+        self.assertIn("EXPECTED_VERSION", identity)
+        self.assertNotIn("PYPI_TOKEN", identity)
 
         ts = "\n".join(workflow_lines("ts-reusable-publish.yml"))
         for input_name in (
             "trusted_publisher_repository:",
             "trusted_package_name:",
             "trusted_publisher_workflow:",
+            "trusted_tag_prefix:",
+            "expected_tag:",
+            "expected_version:",
         ):
             self.assertIn(input_name, ts)
         for input_name in (
             "trusted_publisher_repository",
             "trusted_package_name",
             "trusted_publisher_workflow",
+            "trusted_tag_prefix",
+            "expected_tag",
+            "expected_version",
         ):
             self.assertRegex(
                 ts,
@@ -121,6 +151,10 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
         self.assertIn("TRUSTED_PUBLISHER_REPOSITORY", validator)
         self.assertIn("GITHUB_REF_TYPE: ${{ github.ref_type }}", validator)
         self.assertIn("GITHUB_REF_PROTECTED: ${{ github.ref_protected }}", validator)
+        self.assertIn("GITHUB_REF_NAME: ${{ github.ref_name }}", validator)
+        self.assertIn("TRUSTED_TAG_PREFIX", validator)
+        self.assertIn("EXPECTED_TAG", validator)
+        self.assertIn("EXPECTED_VERSION", validator)
 
     def test_python_build_keeps_ci_callers_compatible(self) -> None:
         build = "\n".join(workflow_lines("py-reusable-build.yml"))
@@ -129,6 +163,11 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
             r"version:\n\s+description: .*\n\s+required: false\n\s+type: string\n\s+default: \"\"",
         )
         self.assertIn("if: inputs.version != ''", build)
+
+    def test_typescript_release_toolchain_is_pinned(self) -> None:
+        publish = "\n".join(workflow_lines("ts-reusable-publish.yml"))
+        self.assertIn('bun-version: "1.1.38"', publish)
+        self.assertNotIn("bun-version: latest", publish)
 
     def test_registry_credentials_are_not_available_to_build_jobs(self) -> None:
         for name, job in (
@@ -154,11 +193,24 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
                 block.index("Publish with"),
             )
         py_legacy = "\n".join(job_block("py-reusable-publish.yml", "publish-legacy-token"))
+        py_workflow = "\n".join(workflow_lines("py-reusable-publish.yml"))
         self.assertIn("validate_publish_artifacts.py", py_legacy)
         self.assertIn("--suffix .whl --suffix .tar.gz", py_legacy)
+        self.assertIn("--expected-package", py_legacy)
+        self.assertIn("--expected-version", py_legacy)
+        self.assertIn("--max-files 2", py_legacy)
         self.assertIn("--repository-url https://upload.pypi.org/legacy/", py_legacy)
         self.assertIn("TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}", py_legacy)
-        self.assertLess(py_legacy.index("Install Twine"), py_legacy.index("Publish with"))
+        self.assertLess(
+            py_legacy.index("Reject unsafe package artifacts"),
+            py_legacy.index("Verify protected legacy token gate"),
+        )
+        self.assertLess(
+            py_legacy.index("Verify protected legacy token gate"),
+            py_legacy.index("Publish with"),
+        )
+        self.assertIn("needs.validate-publisher-identity.result == 'success'", py_legacy)
+        self.assertIn("base_package_name || inputs.trusted_package_name", py_workflow)
         ts_legacy = "\n".join(job_block("ts-reusable-publish.yml", "publish-legacy-token"))
         self.assertIn("NPM_CONFIG_PROVENANCE: \"false\"", ts_legacy)
         self.assertIn("--registry=https://registry.npmjs.org/", ts_legacy)

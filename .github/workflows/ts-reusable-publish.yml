@@ -42,6 +42,18 @@ on:
         description: "Exact top-level caller workflow filename configured in npm Trusted Publishing"
         required: true
         type: string
+      trusted_tag_prefix:
+        description: "Exact protected release tag prefix for this package"
+        required: true
+        type: string
+      expected_tag:
+        description: "Exact protected release tag for this publish"
+        required: true
+        type: string
+      expected_version:
+        description: "Exact package version encoded by the release tag"
+        required: true
+        type: string
     secrets:
       # Only a protected emergency dispatcher should pass this secret.
       NPM_TOKEN:
@@ -84,7 +96,9 @@ jobs:
         if: inputs.package_manager == 'bun'
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: latest
+          # Keep the release toolchain reproducible. This matches the
+          # packageManager declaration in the CLI package.
+          bun-version: "1.1.38"
 
       - name: Verify version consistency
         if: inputs.version != ''
@@ -117,10 +131,12 @@ jobs:
       - name: Decide whether to publish
         id: publish-decision
         shell: bash
+        env:
+          VERSION_CHECK_PASSED: ${{ steps.verify-version.outputs.should_publish }}
+          VERSION_CHANGED: ${{ steps.check-version.outputs.changed }}
         run: |
           set -euo pipefail
-          if [[ "${{ steps.verify-version.outputs.should_publish }}" == "true" || \
-                "${{ steps.check-version.outputs.changed }}" == "true" ]]; then
+          if [[ "$VERSION_CHECK_PASSED" == "true" || "$VERSION_CHANGED" == "true" ]]; then
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
           else
             echo "should_publish=false" >> "$GITHUB_OUTPUT"
@@ -202,10 +218,14 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REF_TYPE: ${{ github.ref_type }}
           GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
           GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
           TRUSTED_PUBLISHER_REPOSITORY: ${{ inputs.trusted_publisher_repository }}
           TRUSTED_PACKAGE_NAME: ${{ inputs.trusted_package_name }}
           TRUSTED_PUBLISHER_WORKFLOW: ${{ inputs.trusted_publisher_workflow }}
+          TRUSTED_TAG_PREFIX: ${{ inputs.trusted_tag_prefix }}
+          EXPECTED_TAG: ${{ inputs.expected_tag }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
         run: python .github/scripts/validate-npm-publish-identity.py npm-dist
 
   publish-oidc:

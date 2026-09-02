@@ -25,10 +25,22 @@ publishes only to `https://registry.npmjs.org/`, and never receives an OIDC
 token.
 
 The legacy PyPI reusable workflow is also disabled by default. Its protected
-fallback checks that every downloaded wheel or source archive is a regular
-file, then uploads only to `https://upload.pypi.org/legacy/`. Normal PyPI
-Trusted Publishing remains in each top-level caller because PyPI binds OIDC
-to that caller's workflow file.
+fallback requires four explicit identity inputs on every caller:
+
+```yaml
+with:
+  trusted_publisher_repository: trycua/cua
+  trusted_package_name: cua-agent
+  trusted_publisher_workflow: cd-py-agent.yml
+  trusted_tag_prefix: agent-v
+```
+
+The fallback checks the current repository, exact protected tag and caller
+workflow, then validates the wheel and source archive metadata (package name,
+version, archive paths, regular files, and a two-file maximum) before the token
+is exposed to Twine. It uploads only to
+`https://upload.pypi.org/legacy/`. Normal PyPI Trusted Publishing remains in
+each top-level caller because PyPI binds OIDC to that caller's workflow file.
 
 The check fails closed when an input is missing, a package or repository does
 not match, a run comes from a fork, or the ref is not a protected tag. Do not

@@ -13,15 +13,19 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "validate-npm-publish-identity.py"
-WORKFLOW_REF = "trycua/cua/.github/workflows/cd-ts-core.yml@refs/tags/ts-core-v1.2.3"
+WORKFLOW_REF = "trycua/cua/.github/workflows/cd-ts-core.yml@refs/tags/npm-core-v1.2.3"
 BASE_ENV = {
     "GITHUB_REPOSITORY": "trycua/cua",
     "GITHUB_REF_TYPE": "tag",
     "GITHUB_REF_PROTECTED": "true",
+    "GITHUB_REF_NAME": "npm-core-v1.2.3",
     "GITHUB_WORKFLOW_REF": WORKFLOW_REF,
     "TRUSTED_PUBLISHER_REPOSITORY": "trycua/cua",
     "TRUSTED_PACKAGE_NAME": "@trycua/core",
     "TRUSTED_PUBLISHER_WORKFLOW": "cd-ts-core.yml",
+    "TRUSTED_TAG_PREFIX": "npm-core-v",
+    "EXPECTED_TAG": "npm-core-v1.2.3",
+    "EXPECTED_VERSION": "1.2.3",
 }
 
 
@@ -82,9 +86,12 @@ class NpmPublishIdentityTests(unittest.TestCase):
             package,
             TRUSTED_PACKAGE_NAME="cuabot",
             TRUSTED_PUBLISHER_WORKFLOW="cd-ts-cuabot.yml",
+            TRUSTED_TAG_PREFIX="cuabot-v",
+            EXPECTED_TAG="cuabot-v1.2.3",
             GITHUB_WORKFLOW_REF=(
-                "trycua/cua/.github/workflows/cd-ts-cuabot.yml@refs/tags/ts-cuabot-v1.2.3"
+                "trycua/cua/.github/workflows/cd-ts-cuabot.yml@refs/tags/cuabot-v1.2.3"
             ),
+            GITHUB_REF_NAME="cuabot-v1.2.3",
             PUBLISH_PATH="legacy-token",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -112,6 +119,38 @@ class NpmPublishIdentityTests(unittest.TestCase):
         result = self.run_gate(self.valid_package(), GITHUB_REF_PROTECTED="false")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("protected tag", result.stderr)
+
+    def test_wrong_tag_fails_closed(self) -> None:
+        result = self.run_gate(self.valid_package(), GITHUB_REF_NAME="npm-core-v9.9.9")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be exactly", result.stderr)
+
+    def test_wrong_workflow_tag_ref_fails_closed(self) -> None:
+        result = self.run_gate(
+            self.valid_package(),
+            GITHUB_WORKFLOW_REF=(
+                "trycua/cua/.github/workflows/cd-ts-core.yml@refs/heads/main"
+            ),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("protected release tag", result.stderr)
+
+    def test_mismatched_tag_allowlist_fails_closed(self) -> None:
+        result = self.run_gate(self.valid_package(), EXPECTED_TAG="npm-core-v9.9.9")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tag does not match", result.stderr)
+
+    def test_invalid_expected_version_fails_closed(self) -> None:
+        result = self.run_gate(self.valid_package(), EXPECTED_VERSION="1.2.3-rc.1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exact SemVer", result.stderr)
+
+    def test_artifact_version_mismatch_fails_closed(self) -> None:
+        package = self.valid_package()
+        package["version"] = "9.9.9"
+        result = self.run_gate(package)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("package version", result.stderr)
 
     def test_package_repository_mismatch_fails_closed(self) -> None:
         package = self.valid_package()
@@ -172,6 +211,11 @@ class NpmPublishIdentityTests(unittest.TestCase):
         result = self.run_gate(self.valid_package(), TRUSTED_PUBLISHER_REPOSITORY="")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("trusted publisher repository", result.stderr)
+
+    def test_missing_tag_allowlist_fails_closed(self) -> None:
+        result = self.run_gate(self.valid_package(), TRUSTED_TAG_PREFIX="")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("trusted release tag prefix", result.stderr)
 
 
 if __name__ == "__main__":
