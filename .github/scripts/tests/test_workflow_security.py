@@ -240,6 +240,60 @@ class TestTrustedMainValidation(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("protected main", result.stderr)
 
+    def test_accepts_successful_manual_request_from_current_main(self) -> None:
+        temporary_directory, work, commit = fixture_repository()
+        self.addCleanup(temporary_directory.cleanup)
+
+        result = self.run_validator(
+            work,
+            EVENT_NAME="workflow_run",
+            SOURCE_EVENT="workflow_dispatch",
+            SOURCE_CONCLUSION="success",
+            SOURCE_BRANCH="main",
+            SOURCE_REPOSITORY="manaflow-ai/cmux-cua",
+            SOURCE_SHA=commit,
+            TRUSTED_SHA=commit,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"commit={commit}", (work / "outputs.txt").read_text(encoding="utf-8"))
+
+    def test_rejects_failed_manual_request(self) -> None:
+        temporary_directory, work, commit = fixture_repository()
+        self.addCleanup(temporary_directory.cleanup)
+
+        result = self.run_validator(
+            work,
+            EVENT_NAME="workflow_run",
+            SOURCE_EVENT="workflow_dispatch",
+            SOURCE_CONCLUSION="failure",
+            SOURCE_BRANCH="main",
+            SOURCE_REPOSITORY="manaflow-ai/cmux-cua",
+            SOURCE_SHA=commit,
+            TRUSTED_SHA=commit,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not complete successfully", result.stderr)
+
+    def test_rejects_manual_request_from_another_repository(self) -> None:
+        temporary_directory, work, commit = fixture_repository()
+        self.addCleanup(temporary_directory.cleanup)
+
+        result = self.run_validator(
+            work,
+            EVENT_NAME="workflow_run",
+            SOURCE_EVENT="workflow_dispatch",
+            SOURCE_CONCLUSION="success",
+            SOURCE_BRANCH="main",
+            SOURCE_REPOSITORY="attacker/example",
+            SOURCE_SHA=commit,
+            TRUSTED_SHA=commit,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("another repository", result.stderr)
+
     def test_rejects_unprotected_schedule(self) -> None:
         temporary_directory, work, commit = fixture_repository()
         self.addCleanup(temporary_directory.cleanup)
@@ -268,6 +322,16 @@ class TestWorkflowContracts(unittest.TestCase):
     def assert_no_manual_trigger(self, text: str, path: str) -> None:
         self.assertNotRegex(text, r"(?m)^  workflow_dispatch:", path)
 
+    @staticmethod
+    def job_block(text: str, job_id: str) -> str:
+        match = re.search(
+            rf"(?ms)^  {re.escape(job_id)}:\n(?:(?!^  [A-Za-z0-9_-]+:).)*",
+            text,
+        )
+        if match is None:
+            raise AssertionError(f"workflow job {job_id!r} is missing")
+        return match.group(0)
+
     def test_privileged_workflows_have_no_manual_trigger_or_global_secrets(self) -> None:
         for path in (
             ".github/workflows/cd-swift-lume.yml",
@@ -293,6 +357,51 @@ class TestWorkflowContracts(unittest.TestCase):
             )
             self.assertIsNotNone(validator_job, path)
             self.assertRegex(validator_job.group(0), r"ref: refs/heads/main", path)
+
+    def test_privileged_jobs_require_named_environments(self) -> None:
+        expected = {
+            ".github/workflows/cd-swift-lume.yml": {
+                "notarize": "lume-release",
+            },
+            ".github/workflows/cd-rust-cua-driver.yml": {
+                "build-macos-universal": "cua-driver-release",
+                "release": "cua-driver-release",
+            },
+            ".github/workflows/ci-test-models.yml": {
+                "test-all-models": "model-tests",
+                "test-summary": "model-tests",
+            },
+            ".github/workflows/ci-cold-start-benchmark.yml": {
+                "benchmark": "cold-start-benchmark",
+            },
+        }
+        for path, jobs in expected.items():
+            text = self.workflow_text(path)
+            for job_id, environment in jobs.items():
+                block = self.job_block(text, job_id)
+                self.assertRegex(block, rf"(?m)^    environment: {re.escape(environment)}$", path)
+
+    def test_privileged_checkouts_use_validated_commit(self) -> None:
+        for path in (
+            ".github/workflows/cd-swift-lume.yml",
+            ".github/workflows/cd-rust-cua-driver.yml",
+        ):
+            text = self.workflow_text(path)
+            self.assertRegex(
+                text,
+                r"ref: \$\{\{ needs\.validate-release\.outputs\.commit \}\}",
+                path,
+            )
+        for path in (
+            ".github/workflows/ci-test-models.yml",
+            ".github/workflows/ci-cold-start-benchmark.yml",
+        ):
+            text = self.workflow_text(path)
+            self.assertRegex(
+                text,
+                r"ref: \$\{\{ needs\.validate-source\.outputs\.commit \}\}",
+                path,
+            )
 
     def test_all_action_refs_are_immutable_commits(self) -> None:
         for path in (
