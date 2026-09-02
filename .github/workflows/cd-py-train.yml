@@ -4,16 +4,37 @@ on:
   push:
     tags:
       - "train-v*"
-  workflow_call:
+  workflow_dispatch:
     inputs:
       version:
-        description: "Version to publish"
+        description: "Version to build without publishing"
         required: true
-        type: string
 
 permissions: {}
 
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
+  # Read-only provenance check. It is skipped for manual unsigned builds.
+  verify-tag:
+    if: github.event_name == 'push' && github.ref_protected == true
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify-release-tag.yml
+    with:
+      tag_prefix: train-v
+
+  # Independent check immediately gates registry credentials.
+  verify-publish:
+    if: github.event_name == 'push' && github.ref_protected == true
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify-release-tag.yml
+    with:
+      tag_prefix: train-v
+
   prepare:
     permissions:
       contents: read
@@ -22,27 +43,26 @@ jobs:
       version: ${{ steps.get-version.outputs.version }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Determine version
+      - name: Resolve release version
         id: get-version
-        run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION=${{ inputs.version }}
-          elif [ "${{ github.event_name }}" == "push" ]; then
-            if [[ "${{ github.ref }}" =~ ^refs/tags/train-v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-              VERSION=${BASH_REMATCH[1]}
-            else
-              echo "Invalid tag format for train"
-              exit 1
-            fi
-          else
-            echo "ERROR: No version found!"
-            exit 1
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
+        env:
+          RELEASE_EVENT_NAME: ${{ github.event_name }}
+          RELEASE_REF_TYPE: ${{ github.ref_type }}
+          RELEASE_REF_NAME: ${{ github.ref_name }}
+          RELEASE_VERSION_INPUT: ${{ inputs.version }}
+          RELEASE_TAG_PREFIX: train-v
+        run: python3 "${GITHUB_WORKSPACE}/.github/scripts/resolve_release_version.py"
   build-package:
-    needs: prepare
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' || needs.verify-tag.result == 'success') &&
+      needs.prepare.result == 'success'
+    needs: [prepare, verify-tag]
     permissions:
       contents: read
     uses: ./.github/workflows/py-reusable-build.yml
@@ -52,29 +72,75 @@ jobs:
       version: ${{ needs.prepare.outputs.version }}
 
   publish:
-    needs: [prepare, build-package]
+    if: >-
+      always() &&
+      github.event_name == 'push' && github.ref_type == 'tag' && github.ref_protected == true &&
+      needs.prepare.result == 'success' &&
+      needs.build-package.result == 'success' &&
+      needs.verify-publish.result == 'success'
+    needs: [prepare, build-package, verify-publish]
     permissions:
-      contents: read
-      actions: read
-      id-token: write
+      contents: read # Check out and verify the release source.
+      actions: read # Download the built package artifact.
+      id-token: write # Mint the PyPI Trusted Publishing identity.
     runs-on: ubuntu-latest
+    environment: pypi-release
     steps:
+      - name: Check tag provenance before requesting PyPI OIDC
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/scripts/verify_release_tag.py
+            .github/scripts/validate_publish_artifacts.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Recheck release tag provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          RELEASE_TAG_PREFIX: train-v
+          RELEASE_BASE_BRANCH: main
+          RELEASE_TRUSTED_REPOSITORY: trycua/cua
+        run: python3 "${GITHUB_WORKSPACE}/.github/scripts/verify_release_tag.py"
+
       - name: Download package artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: pypi-train
           path: dist
 
+      - name: Reject unsafe or mismatched package artifacts
+        env:
+          EXPECTED_PACKAGE: cua-train
+          EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
+        run: >-
+          python3 .github/scripts/validate_publish_artifacts.py dist
+          --suffix .whl --suffix .tar.gz
+          --expected-package "$EXPECTED_PACKAGE"
+          --expected-version "$EXPECTED_VERSION"
+          --max-files 2
+
       - name: Publish with PyPI trusted publishing
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist/
   create-release:
-    needs: [prepare, publish]
+    if: >-
+      always() &&
+      github.event_name == 'push' && github.ref_type == 'tag' &&
+      github.ref_protected == true &&
+      needs.verify-tag.result == 'success' &&
+      needs.verify-publish.result == 'success' &&
+      needs.publish.result == 'success'
+    needs: [prepare, verify-tag, verify-publish, publish]
     permissions:
-      contents: write
+      contents: write # Create the GitHub release after publication.
     uses: ./.github/workflows/release-github-reusable.yml
     with:
+      tag_prefix: train-v
       tag_name: "train-v${{ needs.prepare.outputs.version }}"
       release_name: "cua-train v${{ needs.prepare.outputs.version }}"
       module_path: "libs/python/cua-train"

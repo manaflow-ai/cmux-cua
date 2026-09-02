@@ -1,22 +1,43 @@
 name: "CI: Cold Start Benchmark"
 
+# Scheduled runs execute the default-branch workflow with cloud credentials.
+# Manual runs are deliberately limited to a no-credential syntax check because
+# workflow_dispatch can otherwise execute attacker-controlled branch YAML.
 on:
+  schedule:
+    - cron: "30 9 * * 1"
   workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-cold-start-benchmark-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   benchmark:
+    name: Run scheduled benchmark
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment: benchmark-secrets
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout the scheduled revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Set up uv and Python
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@e4db8464a088ece1b920f60402e813ea4de65b8f # v4
         with:
           python-version: "3.12"
 
       - name: Install dependencies
         run: |
+          set -euo pipefail
           rm -rf .venv
           uv venv --python 3.12
           uv pip install -e libs/python/core -e libs/python/computer -e libs/python/cua-sandbox
@@ -31,7 +52,7 @@ jobs:
 
       - name: Send results to Slack
         if: always()
-        uses: rtCamp/action-slack-notify@v2
+        uses: rtCamp/action-slack-notify@33fa0808da52e41c8dcec3cc101c0027442ed173 # v2
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
           SLACK_CHANNEL: ${{ vars.SLACK_CHANNEL }}
@@ -39,3 +60,20 @@ jobs:
           SLACK_COLOR: ${{ env.SLACK_COLOR }}
           SLACK_MESSAGE: |
             ${{ env.SLACK_MESSAGE }}
+
+  manual-validation:
+    name: Validate manual revision
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the selected revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Compile benchmark without credentials
+        run: python3 -m compileall -q tests/cold_start_benchmark.py

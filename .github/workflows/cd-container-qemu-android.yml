@@ -4,9 +4,53 @@ on:
   push:
     tags:
       - "docker-cua-qemu-android-v*.*.*"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
+  # Read-only provenance check. It is skipped for manual unsigned builds.
+  verify-tag:
+    if: github.event_name == 'push' && github.ref_protected == true
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify-release-tag.yml
+    with:
+      tag_prefix: docker-cua-qemu-android-v
+
+  # Independent check immediately gates registry credentials.
+  verify-publish:
+    if: github.event_name == 'push' && github.ref_protected == true
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify-release-tag.yml
+    with:
+      tag_prefix: docker-cua-qemu-android-v
+
+  manual-build:
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/docker-reusable-build.yml
+    with:
+      image_name: cua-qemu-android
+      context_dir: libs/qemu-docker/android
+      dockerfile_path: Dockerfile
+      skip_arm64: true # Android QEMU image is not buildable on arm64
+
   publish:
+    if: >-
+      always() &&
+      github.event_name == 'push' && github.ref_type == 'tag' && github.ref_protected == true &&
+      needs.verify-publish.result == 'success'
+    needs: [verify-publish]
+    permissions:
+      actions: read # Read the build and digest artifacts.
+      contents: read # Allow the reusable publisher to verify source.
     uses: ./.github/workflows/docker-reusable-publish.yml
     with:
       image_name: cua-qemu-android
@@ -14,5 +58,3 @@ jobs:
       tag_prefix: docker-cua-qemu-android-v
       docker_hub_org: trycua
       skip_arm64: true # Android QEMU image is not buildable on arm64
-    secrets:
-      DOCKER_HUB_TOKEN: ${{ secrets.DOCKER_HUB_TOKEN }}
