@@ -147,6 +147,11 @@ class PublishWorkflowPermissionsTests(unittest.TestCase):
     def test_all_publish_callers_clear_workflow_defaults(self) -> None:
         for path in [*PY_CALLERS, *TS_CALLERS, *CONTAINER_CALLERS]:
             self.assert_empty_workflow_permissions(path)
+            self.assertNotIn(
+                "workflow_dispatch:",
+                "\n".join(lines(path)),
+                f"{path.name} must not expose a branch-selectable secret publisher",
+            )
 
         for path in PY_CALLERS:
             calls = caller_jobs(path, "py-reusable-publish.yml")
@@ -183,6 +188,7 @@ class PublishWorkflowPermissionsTests(unittest.TestCase):
 
     def test_docker_login_is_not_run_for_pull_requests(self) -> None:
         source = (WORKFLOWS / "docker-reusable-publish.yml").read_text(encoding="utf-8")
+        self.assertNotIn("workflow_dispatch:", source)
         login_blocks = re.findall(
             r"(?ms)^      - name: Login to Docker Hub\n(.*?)(?=^      - name:|^  [A-Za-z0-9_-]+:|\Z)",
             source,

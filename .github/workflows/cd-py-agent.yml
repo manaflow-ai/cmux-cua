@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "agent-v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (without v prefix)"
-        required: true
-        default: "0.1.0"
   workflow_call:
     inputs:
       version:
@@ -56,10 +50,8 @@ jobs:
               echo "ERROR: Invalid tag format for agent"
               exit 1
             fi
-          elif [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION=${{ github.event.inputs.version }}
           else
-            echo "ERROR: No version found (inputs.version, event.inputs.version, and tag all empty)"
+            echo "ERROR: No version found in workflow input or release tag"
             exit 1
           fi
 

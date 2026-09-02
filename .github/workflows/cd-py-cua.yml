@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "cua-v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (without v prefix)"
-        required: true
-        default: "0.1.0"
   workflow_call:
     inputs:
       version:
@@ -41,8 +35,6 @@ jobs:
               echo "Invalid tag format for cua"
               exit 1
             fi
-          elif [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION=${{ github.event.inputs.version }}
           else
             echo "ERROR: No version found!"
             exit 1

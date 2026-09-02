@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - "docker-cuabot-v*.*.*"
-  workflow_dispatch:
 
 permissions: {}
 

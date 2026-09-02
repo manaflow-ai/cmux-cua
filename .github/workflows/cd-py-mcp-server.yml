@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "mcp-server-v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (without v prefix)"
-        required: true
-        default: "0.1.0"
   workflow_call:
     inputs:
       version:
@@ -49,9 +43,6 @@ jobs:
               echo "Invalid tag format for mcp-server"
               exit 1
             fi
-          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # Use version from workflow dispatch
-            VERSION=${{ github.event.inputs.version }}
           else
             echo "No version provided"
             exit 1

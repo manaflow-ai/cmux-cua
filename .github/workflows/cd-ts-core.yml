@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "npm-core-v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (default: from package.json)"
-        required: false
-        default: ""
   workflow_call:
     inputs:
       version:
@@ -46,8 +40,6 @@ jobs:
               echo "ERROR: Invalid tag format for npm-core"
               exit 1
             fi
-          elif [ -n "${{ github.event.inputs.version }}" ]; then
-            VERSION="${{ github.event.inputs.version }}"
           else
             # Read from package.json
             VERSION=$(node -p "require('./libs/typescript/core/package.json').version")

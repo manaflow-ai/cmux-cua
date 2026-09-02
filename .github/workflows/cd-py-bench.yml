@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "bench-v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (without v prefix)"
-        required: true
-        default: "0.1.0"
   workflow_call:
     inputs:
       version:
@@ -43,9 +37,6 @@ jobs:
               echo "Invalid tag format for bench"
               exit 1
             fi
-          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # Use version from workflow dispatch (direct trigger)
-            VERSION=${{ github.event.inputs.version }}
           else
             echo "Unable to determine version"
             exit 1

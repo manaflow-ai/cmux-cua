@@ -3,7 +3,6 @@ name: Reusable Docker Publish Workflow
 permissions: {}
 
 on:
-  workflow_dispatch: # Prevents phantom runs on push, allows manual testing
   workflow_call:
     inputs:
       image_name:

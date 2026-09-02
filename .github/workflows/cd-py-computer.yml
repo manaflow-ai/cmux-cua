@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "computer-v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (without v prefix)"
-        required: true
-        default: "0.1.0"
   workflow_call:
     inputs:
       version:
@@ -36,12 +30,11 @@ jobs:
           echo "=== Version Detection Debug ==="
           echo "Event name: ${{ github.event_name }}"
           echo "Workflow call version: ${{ inputs.version }}"
-          echo "Workflow dispatch version: ${{ github.event.inputs.version }}"
           echo "GitHub ref: ${{ github.ref }}"
 
           # Check inputs.version first (works for workflow_call regardless of event_name)
           if [ -n "${{ inputs.version }}" ]; then
-            # Version provided via workflow_call or workflow_dispatch with version input
+            # Version provided via workflow_call input
             VERSION=${{ inputs.version }}
             echo "Using inputs.version: $VERSION"
           elif [ "${{ github.event_name }}" == "push" ]; then
@@ -53,14 +46,9 @@ jobs:
               echo "Invalid tag format for computer"
               exit 1
             fi
-          elif [ -n "${{ github.event.inputs.version }}" ]; then
-            # Use version from workflow_dispatch event inputs
-            VERSION=${{ github.event.inputs.version }}
-            echo "Using event.inputs.version: $VERSION"
           else
             echo "ERROR: No version found!"
             echo "  - inputs.version is empty"
-            echo "  - event.inputs.version is empty"
             echo "  - Not a tag push event"
             exit 1
           fi

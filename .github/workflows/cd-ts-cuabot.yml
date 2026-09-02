@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "cuabot-v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (default: from package.json)"
-        required: false
-        default: ""
   workflow_call:
     inputs:
       version:
