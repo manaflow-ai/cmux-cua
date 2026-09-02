@@ -115,9 +115,6 @@ jobs:
       package_dir: "libs/typescript/cua-cli"
       package_manager: "bun"
       version: ${{ needs.prepare.outputs.version }}
-    secrets:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-
   create-release:
     needs: [prepare, publish-npm, build-binaries]
     uses: ./.github/workflows/release-github-reusable.yml

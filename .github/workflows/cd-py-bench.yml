@@ -4,12 +4,6 @@ on:
   push:
     tags:
       - "bench-v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (without v prefix)"
-        required: true
-        default: "0.1.0"
   workflow_call:
     inputs:
       version:
@@ -17,17 +11,17 @@ on:
         required: true
         type: string
 
-# Adding permissions at workflow level
-permissions:
-  contents: write
+permissions: {}
 
 jobs:
   prepare:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Determine version
         id: get-version
@@ -43,9 +37,6 @@ jobs:
               echo "Invalid tag format for bench"
               exit 1
             fi
-          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # Use version from workflow dispatch (direct trigger)
-            VERSION=${{ github.event.inputs.version }}
           else
             echo "Unable to determine version"
             exit 1
@@ -53,19 +44,38 @@ jobs:
           echo "VERSION=$VERSION"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-  publish:
+  build-package:
     needs: prepare
-    uses: ./.github/workflows/py-reusable-publish.yml
+    permissions:
+      contents: read
+    uses: ./.github/workflows/py-reusable-build.yml
     with:
       package_name: "bench"
       package_dir: "libs/cua-bench"
       version: ${{ needs.prepare.outputs.version }}
-      base_package_name: "cua-bench"
-    secrets:
-      PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
 
+  publish:
+    needs: [prepare, build-package]
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pypi-bench
+          path: dist
+
+      - name: Publish with PyPI trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/
   create-release:
     needs: [prepare, publish]
+    permissions:
+      contents: write
     uses: ./.github/workflows/release-github-reusable.yml
     with:
       tag_name: "bench-v${{ needs.prepare.outputs.version }}"

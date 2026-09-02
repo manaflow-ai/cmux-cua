@@ -65,9 +65,6 @@ jobs:
       package_dir: "libs/typescript/playground"
       package_manager: "pnpm"
       version: ${{ needs.prepare.outputs.version }}
-    secrets:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-
   create-release:
     needs: [prepare, publish]
     uses: ./.github/workflows/release-github-reusable.yml
