@@ -16,7 +16,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout the protected release gate
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ github.repository }}
           ref: main
@@ -78,7 +78,7 @@ jobs:
       contents: read
     steps:
       - name: Check out the protected release gate
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ github.repository }}
           ref: main
@@ -226,7 +226,7 @@ jobs:
           esac
 
       - name: Checkout repository
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           # The preflight rejects any other target. Keep this literal so a

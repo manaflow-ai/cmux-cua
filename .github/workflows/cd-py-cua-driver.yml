@@ -44,7 +44,7 @@ jobs:
     steps:
       # This checkout is the trusted publisher code from the default branch.
       # The validated source commit is checked out separately for wheel code.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ github.repository }}
           ref: main
@@ -116,7 +116,7 @@ jobs:
       # Build helpers are trusted release code, not source-tag code. The
       # source checkout below is kept separate and is used only to build the
       # package after its commit and artifacts have been validated.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ github.repository }}
           ref: main
@@ -167,7 +167,7 @@ jobs:
           run-id: ${{ needs.validate-provenance.outputs.source_run_id }}
 
       - name: Check out the exact source commit
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.validate-provenance.outputs.source_head_sha }}
           path: source
@@ -302,7 +302,7 @@ jobs:
       # requesting PyPI OIDC. The source wheels remain bound to the validated
       # workflow_run artifacts below.
       - name: Check out the trusted release verifier
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.3.1
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ github.repository }}
           ref: main
