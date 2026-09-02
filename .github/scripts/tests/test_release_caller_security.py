@@ -292,12 +292,24 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
         self.assertIn("kicad/kicad:9.0", source)
 
     def test_known_container_arm64_gaps_are_explicit(self) -> None:
-        for filename in ("cd-container-cuabot.yml", "cd-container-kasm.yml"):
+        unsupported = {
+            "cuabot": "xpra arm64 resolves to v3.1 and requires v5 or later",
+            "kasm": "Firefox installation under arm64 QEMU segfaults",
+            "xfce": "kicad/kicad:9.0 has no arm64 manifest",
+        }
+        for container, reason in unsupported.items():
+            filename = f"cd-container-{container}.yml"
             source = text(WORKFLOWS / filename)
             manual = job_block(source, "manual-build")
             publish = job_block(source, "publish")
             self.assertIn("skip_arm64: true", manual, filename)
             self.assertIn("skip_arm64: true", publish, filename)
+            self.assertIn(reason, source, filename)
+
+            ci_filename = f"ci-container-{container}.yml"
+            ci_source = text(WORKFLOWS / ci_filename)
+            self.assertIn("skip_arm64: true", ci_source, ci_filename)
+            self.assertIn(reason, ci_source, ci_filename)
 
     def test_manual_build_paths_have_no_credentials(self) -> None:
         for path in PY_CALLERS + TS_CALLERS + CONTAINER_CALLERS:

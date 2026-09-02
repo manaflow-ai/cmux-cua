@@ -10,6 +10,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "validate-pypi-publish-identity.py"
@@ -64,6 +65,11 @@ class PypiPublishIdentityTests(unittest.TestCase):
 
     def test_matching_release_passes(self) -> None:
         result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fixture_does_not_inherit_the_host_event(self) -> None:
+        with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}):
+            result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_fork_fails_closed(self) -> None:
