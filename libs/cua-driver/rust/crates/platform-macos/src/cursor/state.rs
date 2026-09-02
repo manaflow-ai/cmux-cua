@@ -9,7 +9,7 @@ use std::sync::Mutex;
 pub struct CursorConfig {
     /// Instance identifier for multi-cursor use cases. Default: "default".
     pub cursor_id: String,
-    /// Built-in icon name ("arrow", "crosshair", "hand") or path to PNG/SVG.
+    /// Built-in icon name ("arrow", "teardrop", "cmux") or path to PNG/SVG.
     pub cursor_icon: Option<String>,
     /// Hex color (e.g. "#00FFFF") or CSS name for the glow/indicator.
     pub cursor_color: Option<String>,
@@ -54,20 +54,32 @@ pub struct CursorState {
 /// Global registry of cursor instances, keyed by `cursor_id`.
 pub struct CursorRegistry {
     inner: Mutex<HashMap<String, CursorState>>,
+    default_config: CursorConfig,
 }
 
 impl CursorRegistry {
     pub fn new() -> Self {
+        let mut default_config = CursorConfig::default();
+        default_config.cursor_label = cursor_overlay::AgentCursorDefaults::from_env().cursor_label;
+        Self::with_default_config(default_config)
+    }
+
+    pub(crate) fn with_default_config(default_config: CursorConfig) -> Self {
         let mut map = HashMap::new();
         let default = CursorState {
-            config: CursorConfig::default(),
+            config: default_config.clone(),
             position: None,
         };
         map.insert("default".into(), default);
-        Self { inner: Mutex::new(map) }
+        Self { inner: Mutex::new(map), default_config }
+    }
+
+    fn config_for(&self, cursor_id: &str) -> CursorConfig {
+        CursorConfig { cursor_id: cursor_id.to_owned(), ..self.default_config.clone() }
     }
 
     pub fn get_or_create(&self, cursor_id: &str) -> CursorState {
+        let config = self.config_for(cursor_id);
         let mut inner = self.inner.lock().unwrap();
         // Write-boundary resurrection guard: a per-session cursor keys on the
         // session_id, so an in-flight call that lands AFTER session_end (a slow
@@ -81,12 +93,12 @@ impl CursorRegistry {
         // else a transient default so callers get a sane value without a write.
         if cua_driver_core::session::is_session_ended(cursor_id) {
             return inner.get(cursor_id).cloned().unwrap_or_else(|| CursorState {
-                config: CursorConfig { cursor_id: cursor_id.to_owned(), ..Default::default() },
+                config: config.clone(),
                 position: None,
             });
         }
         inner.entry(cursor_id.to_owned()).or_insert_with(|| CursorState {
-            config: CursorConfig { cursor_id: cursor_id.to_owned(), ..Default::default() },
+            config,
             position: None,
         }).clone()
     }
@@ -122,11 +134,12 @@ impl CursorRegistry {
         if cursor_id.is_empty() || cua_driver_core::session::is_session_ended(cursor_id) {
             return;
         }
+        let config = self.config_for(cursor_id);
         let mut inner = self.inner.lock().unwrap();
         // Get-or-create so a per-session cursor that moves before any explicit
         // enable/style call still shows up in get_agent_cursor_state.
         let state = inner.entry(cursor_id.to_owned()).or_insert_with(|| CursorState {
-            config: CursorConfig { cursor_id: cursor_id.to_owned(), ..Default::default() },
+            config,
             position: None,
         });
         state.position = Some(CursorPosition { x, y });
@@ -139,9 +152,10 @@ impl CursorRegistry {
         if cursor_id.is_empty() || cua_driver_core::session::is_session_ended(cursor_id) {
             return;
         }
+        let config = self.config_for(cursor_id);
         let mut inner = self.inner.lock().unwrap();
         let state = inner.entry(cursor_id.to_owned()).or_insert_with(|| CursorState {
-            config: CursorConfig { cursor_id: cursor_id.to_owned(), ..Default::default() },
+            config,
             position: None,
         });
         state.config.enabled = enabled;
@@ -173,6 +187,81 @@ impl Default for CursorRegistry {
 mod tests {
     use super::*;
     use cua_driver_core::session::fire_session_end;
+
+    #[test]
+    fn cursor_branding_env_values_parse_valid_invalid_empty_and_missing() {
+        let (valid, warnings) = cursor_overlay::AgentCursorDefaults::parse_values(
+            Some("#12c7f5,#2d8cff,#6c5cff"),
+            Some("#abc"),
+            Some("Codex"),
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(valid.gradient_colors, vec![
+            [0x12, 0xc7, 0xf5, 255],
+            [0x2d, 0x8c, 0xff, 255],
+            [0x6c, 0x5c, 0xff, 255],
+        ]);
+        assert_eq!(valid.bloom_color, Some([0xaa, 0xbb, 0xcc, 255]));
+        assert_eq!(valid.cursor_label.as_deref(), Some("Codex"));
+
+        let (invalid, warnings) = cursor_overlay::AgentCursorDefaults::parse_values(
+            Some("#12c7f5,#nothex"),
+            Some("#xyzxyz"),
+            Some(""),
+        );
+        assert_eq!(invalid, cursor_overlay::AgentCursorDefaults::default());
+        assert_eq!(warnings.len(), 3);
+
+        let (empty, warnings) = cursor_overlay::AgentCursorDefaults::parse_values(
+            Some(""),
+            Some(""),
+            Some("   "),
+        );
+        assert_eq!(empty, cursor_overlay::AgentCursorDefaults::default());
+        assert_eq!(warnings.len(), 3);
+
+        let (missing, warnings) =
+            cursor_overlay::AgentCursorDefaults::parse_values(None, None, None);
+        assert_eq!(missing, cursor_overlay::AgentCursorDefaults::default());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn env_defaults_seed_every_instance_and_render_style_overrides_win() {
+        let defaults = cursor_overlay::AgentCursorDefaults::parse_values(
+            Some("#112233,#445566"),
+            Some("#778899"),
+            Some("cmux"),
+        ).0;
+        let mut runtime_default = CursorConfig::default();
+        runtime_default.cursor_label = defaults.cursor_label.clone();
+        let registry = CursorRegistry::with_default_config(runtime_default);
+        assert_eq!(
+            registry.get_or_create("session-a").config.cursor_label.as_deref(),
+            Some("cmux"),
+        );
+        assert_eq!(
+            registry.get_or_create("session-b").config.cursor_label.as_deref(),
+            Some("cmux"),
+        );
+
+        let mut launch = cursor_overlay::CursorConfig::default();
+        launch.gradient_colors = defaults.gradient_colors;
+        launch.bloom_color = defaults.bloom_color;
+        let mut render = cursor_overlay::RenderStateCore::new(launch);
+        assert_eq!(render.gradient_colors, vec![[0x11, 0x22, 0x33, 255], [0x44, 0x55, 0x66, 255]]);
+        assert_eq!(render.bloom_override, Some([0x77, 0x88, 0x99, 255]));
+        render.apply_command_base(
+            cursor_overlay::OverlayCommand::SetGradient {
+                gradient_colors: vec![[0xaa, 0xbb, 0xcc, 255]],
+                bloom_color: Some([0xdd, 0xee, 0xff, 255]),
+            },
+            false,
+            false,
+        );
+        assert_eq!(render.gradient_colors, vec![[0xaa, 0xbb, 0xcc, 255]]);
+        assert_eq!(render.bloom_override, Some([0xdd, 0xee, 0xff, 255]));
+    }
 
     // Each test uses a unique session id so the process-global ENDED_SESSIONS
     // set never collides across tests running in the same process.

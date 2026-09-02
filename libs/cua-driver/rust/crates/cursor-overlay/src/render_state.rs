@@ -22,8 +22,8 @@
 //!   Returns `false` for variants the core doesn't handle so platforms can
 //!   layer their own behaviour on top (e.g. macOS ShowFocusRect).
 //! - [`render_frame`] — the tiny-skia paint of bloom + click-pulse + arrow.
-//!   Parametrised by pixmap dimensions and an origin offset so Windows can
-//!   pass `(virt_x, virt_y)` while macOS / Linux pass `(0, 0)`.
+//!   Parametrised by pixmap dimensions and an origin offset so Windows and
+//!   macOS can pass their virtual-desktop origins while Linux passes `(0, 0)`.
 //! - [`draw_default_arrow`] — gradient-arrow rasteriser.
 //!
 //! ## What stays per-platform
@@ -56,6 +56,10 @@ pub struct RenderStateCore {
     pub motion: MotionConfig,
     /// Current rendered position in screen / overlay-window coordinates.
     pub pos: (f64, f64),
+    /// Whether the cursor has ever been assigned a real screen position.
+    /// Kept separately from `pos` because negative coordinates are valid on
+    /// displays arranged above or to the left of the primary display.
+    placed: bool,
     /// Visual heading in radians (tip direction = motion_dir + π).
     pub heading: f64,
     /// In-flight planned path; `None` = at rest.
@@ -70,7 +74,7 @@ pub struct RenderStateCore {
     pub click_t: Option<f64>,
     /// Whether a button is currently being held for this cursor.
     pub pressed: bool,
-    /// Custom cursor shape; `None` = built-in gradient arrow.
+    /// Custom cursor shape; `None` = the configured built-in silhouette.
     pub shape: Option<CursorShape>,
     /// User-controlled visibility.
     pub visible: bool,
@@ -96,14 +100,17 @@ impl RenderStateCore {
         let palette = cfg.palette();
         let motion = cfg.motion.clone();
         let shape = cfg.shape.clone();
+        let gradient_colors = cfg.gradient_colors.clone();
+        let bloom_override = cfg.bloom_color;
         Self {
             cfg,
             palette,
             motion,
             shape,
-            gradient_colors: vec![],
-            bloom_override: None,
+            gradient_colors,
+            bloom_override,
             pos: (-200.0, -200.0),
+            placed: false,
             heading: std::f64::consts::FRAC_PI_4,
             path: None,
             dist: 0.0,
@@ -116,6 +123,17 @@ impl RenderStateCore {
             idle_alpha: 1.0,
             pinned_wid: None,
         }
+    }
+
+    /// True until the cursor receives its first real screen position.
+    pub fn is_unplaced(&self) -> bool {
+        !self.placed
+    }
+
+    /// Assign a real global screen position to the cursor.
+    pub fn place_at(&mut self, x: f64, y: f64) {
+        self.pos = (x, y);
+        self.placed = true;
     }
 
     /// Advance the animation by `dt` seconds using runtime [`MotionConfig`]
@@ -138,8 +156,7 @@ impl RenderStateCore {
         if let Some(ref p) = self.path {
             let path_len = p.length.max(1.0);
             let path_frac = (self.dist / path_len).clamp(0.0, 1.0);
-            let profile =
-                16.0 * path_frac * path_frac * (1.0 - path_frac) * (1.0 - path_frac);
+            let profile = 16.0 * path_frac * path_frac * (1.0 - path_frac) * (1.0 - path_frac);
             let floor = if path_frac < 0.5 {
                 self.motion.min_start_speed
             } else {
@@ -251,7 +268,11 @@ impl RenderStateCore {
 
             // Smootherstep speed profile (normalised: peak = 1.0).
             let profile = (30.0 * u * u * (1.0 - u) * (1.0 - u)) / 1.875;
-            let floor_speed = if u < 0.5 { MIN_START_SPEED } else { MIN_END_SPEED };
+            let floor_speed = if u < 0.5 {
+                MIN_START_SPEED
+            } else {
+                MIN_END_SPEED
+            };
             let speed_based = floor_speed + (PEAK_SPEED - floor_speed) * profile;
             // Fixed-duration override: when `glide_duration_ms > 0` the move
             // takes exactly that long regardless of distance, so an orchestrator
@@ -337,8 +358,7 @@ impl RenderStateCore {
     fn tick_idle(&mut self, dt: f64) {
         let idle_hide_ms = self.motion.idle_hide_ms;
         if idle_hide_ms > 0.0 {
-            let moving =
-                self.path.is_some() || self.spring.is_some() || self.click_t.is_some();
+            let moving = self.path.is_some() || self.spring.is_some() || self.click_t.is_some();
             if moving {
                 self.idle_secs = 0.0;
                 self.idle_alpha = 1.0;
@@ -358,6 +378,24 @@ impl RenderStateCore {
         }
     }
 
+    fn active_shape_has_center_hotspot(&self) -> bool {
+        match self.shape.as_ref() {
+            Some(shape) => shape.has_center_hotspot(),
+            None => !matches!(
+                self.cfg.builtin_shape,
+                BuiltinShape::Sky | BuiltinShape::Cmux
+            ),
+        }
+    }
+
+    fn click_offset_points(&self) -> f64 {
+        if self.active_shape_has_center_hotspot() {
+            16.0
+        } else {
+            0.0
+        }
+    }
+
     /// Handle the OverlayCommand variants that are identical across all
     /// three platforms.  Returns `true` if the command was consumed; `false`
     /// for variants the platform must handle itself (e.g. macOS's
@@ -365,7 +403,7 @@ impl RenderStateCore {
     ///
     /// `move_to_snap_sentinel` controls macOS-only behaviour: when `true`,
     /// `MoveTo` snaps `self.pos` to the offset target if the cursor is
-    /// still at the off-screen sentinel (`pos.0 < -50.0`).  Windows/Linux
+    /// still has no real screen placement. Windows/Linux
     /// pass `false` here.
     ///
     /// `click_pulse_sentinel_only` likewise controls macOS-only behaviour:
@@ -385,30 +423,36 @@ impl RenderStateCore {
                 y,
                 end_heading_radians,
             } => {
-                // Apply click offset (16 pt along end_heading) before planning,
-                // matching Swift `moveTo(point:endAngleRadians:)`:
+                // Centre-anchored shapes keep the legacy 16 pt click offset
+                // before planning; tip-hotspot shapes like Sky and cmux land
+                // at the event coordinate. This matches Swift
+                // `moveTo(point:endAngleRadians:)` for legacy shapes:
                 //   tx = clickPoint.x + cos(endAngle) * clickOffset
                 //   ty = clickPoint.y + sin(endAngle) * clickOffset
-                const CLICK_OFFSET: f64 = 16.0;
+                let click_offset = self.click_offset_points();
                 let turn_radius = self.motion.turn_radius;
-                let tx = x + end_heading_radians.cos() * CLICK_OFFSET;
-                let ty = y + end_heading_radians.sin() * CLICK_OFFSET;
+                let tx = x + end_heading_radians.cos() * click_offset;
+                let ty = y + end_heading_radians.sin() * click_offset;
 
                 // macOS-only: if the cursor is still at the initial off-screen
                 // sentinel, snap it to the offset target so the path starts on-screen.
-                if move_to_snap_sentinel && self.pos.0 < -50.0 {
-                    self.pos = (tx, ty);
+                if move_to_snap_sentinel && self.is_unplaced() {
+                    self.place_at(tx, ty);
                 }
                 let (x0, y0) = self.pos;
-                let th0 = self.heading + std::f64::consts::PI;
-                let th1 = end_heading_radians + std::f64::consts::PI;
+                // Travel directly toward the target. The resting cursor angle
+                // is visual state, not a vehicle-like turning constraint; using
+                // it as the Dubins start/end heading can turn a short move into
+                // a full loop. The path tangent drives the cursor during the
+                // glide, while `end_heading_radians` remains its resting angle.
+                let travel_heading = (ty - y0).atan2(tx - x0);
                 let plan = PathPlanner::plan(
                     x0,
                     y0,
-                    th0,
+                    travel_heading,
                     tx,
                     ty,
-                    th1,
+                    travel_heading,
                     end_heading_radians,
                     turn_radius,
                 );
@@ -425,7 +469,7 @@ impl RenderStateCore {
                 y,
                 heading_radians,
             } => {
-                self.pos = (x, y);
+                self.place_at(x, y);
                 if let Some(heading) = heading_radians {
                     self.heading = heading;
                 }
@@ -441,17 +485,18 @@ impl RenderStateCore {
                 if click_pulse_sentinel_only {
                     // macOS: only snap position on first placement (sentinel state).
                     // After that the cursor stays where the animation landed.
-                    if self.pos.0 < -50.0 {
-                        // Apply same click offset so tip lands at click point.
-                        const CLICK_OFFSET: f64 = 16.0;
+                    if self.is_unplaced() {
+                        // Apply the same centre-anchor offset as MoveTo; the
+                        // Sky/cmux tip hotspots use zero and land on the event.
                         let angle = std::f64::consts::FRAC_PI_4;
-                        self.pos = (
-                            x + angle.cos() * CLICK_OFFSET,
-                            y + angle.sin() * CLICK_OFFSET,
+                        let click_offset = self.click_offset_points();
+                        self.place_at(
+                            x + angle.cos() * click_offset,
+                            y + angle.sin() * click_offset,
                         );
                     }
                 } else {
-                    self.pos = (x, y);
+                    self.place_at(x, y);
                 }
                 self.click_t = Some(0.0);
                 self.idle_secs = 0.0;
@@ -522,8 +567,8 @@ pub struct FocusRect {
 ///
 /// `origin_x`, `origin_y` are subtracted from the cursor `core.pos` before
 /// drawing — Windows passes the virtual-screen `(virt_x, virt_y)` so the
-/// pixmap is laid out in window-local coordinates.  macOS / Linux pass
-/// `(0.0, 0.0)`.
+/// pixmap is laid out in window-local coordinates. macOS does the same for its
+/// multi-display union; Linux passes `(0.0, 0.0)`.
 ///
 /// `backing_scale` is the destination-pixmap-pixels per logical-point ratio
 /// (e.g. 2.0 on a retina display where the pixmap is sized at physical
@@ -539,8 +584,8 @@ pub fn render_frame(
 ) -> tiny_skia::Pixmap {
     let w = width.max(1);
     let h = height.max(1);
-    let mut pm = tiny_skia::Pixmap::new(w, h)
-        .unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap());
+    let mut pm =
+        tiny_skia::Pixmap::new(w, h).unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap());
     paint_cursor(&mut pm, core, origin_x, origin_y, focus_rect, backing_scale);
     pm
 }
@@ -552,7 +597,7 @@ pub fn render_frame(
 /// render N owned cursors into one buffer / one NSWindow.
 ///
 /// `origin_x` / `origin_y` are subtracted from `core.pos` before drawing
-/// (Windows passes the virtual-screen origin; macOS / Linux pass `(0.0, 0.0)`).
+/// (Windows and macOS pass virtual-screen origins; Linux passes `(0.0, 0.0)`).
 /// Both are in **logical** screen points, just like `core.pos`.
 ///
 /// `backing_scale` is the destination-pixmap-pixels per logical-point ratio.
@@ -576,7 +621,7 @@ pub fn paint_cursor(
     focus_rect: Option<FocusRect>,
     backing_scale: f32,
 ) {
-    if !core.visible || core.pos.0 < -100.0 || core.idle_alpha < 0.004 {
+    if !core.visible || core.is_unplaced() || core.idle_alpha < 0.004 {
         return;
     }
 
@@ -588,6 +633,7 @@ pub fn paint_cursor(
     let (px, py) = ((core.pos.0 - origin_x) * s, (core.pos.1 - origin_y) * s);
     let heading = core.heading;
     let alpha_scale = core.idle_alpha as f32;
+    let sky_builtin = is_active_builtin_sky(core);
 
     // --- Bloom (radial gradient behind the arrow) ---
     let bloom_r: f32 = if core.pressed { 34.0 * sf } else { 22.0 * sf };
@@ -608,38 +654,39 @@ pub fn paint_cursor(
     let bloom_outer = tiny_skia::Color::from_rgba8(or_, og, ob, (26.0 * alpha_scale) as u8);
     let bloom_zero = tiny_skia::Color::from_rgba8(or_, og, ob, 0);
 
-    let bloom_paint = {
-        let mut p = tiny_skia::Paint::default();
-        p.shader = tiny_skia::RadialGradient::new(
-            tiny_skia::Point::from_xy(px as f32, py as f32),
-            tiny_skia::Point::from_xy(px as f32, py as f32), // focal = center
-            bloom_r,
-            vec![
-                tiny_skia::GradientStop::new(0.0, bloom_inner),
-                tiny_skia::GradientStop::new(0.5, bloom_outer),
-                tiny_skia::GradientStop::new(1.0, bloom_zero),
-            ],
-            tiny_skia::SpreadMode::Pad,
-            tiny_skia::Transform::identity(),
-        )
-        .unwrap_or(tiny_skia::Shader::SolidColor(bloom_inner));
-        p.anti_alias = true;
-        p
-    };
+    if draws_decorative_bloom(core) {
+        let bloom_paint = {
+            let mut p = tiny_skia::Paint::default();
+            p.shader = tiny_skia::RadialGradient::new(
+                tiny_skia::Point::from_xy(px as f32, py as f32),
+                tiny_skia::Point::from_xy(px as f32, py as f32), // focal = center
+                bloom_r,
+                vec![
+                    tiny_skia::GradientStop::new(0.0, bloom_inner),
+                    tiny_skia::GradientStop::new(0.5, bloom_outer),
+                    tiny_skia::GradientStop::new(1.0, bloom_zero),
+                ],
+                tiny_skia::SpreadMode::Pad,
+                tiny_skia::Transform::identity(),
+            )
+            .unwrap_or(tiny_skia::Shader::SolidColor(bloom_inner));
+            p.anti_alias = true;
+            p
+        };
 
-    if let Some(r) = tiny_skia::Rect::from_xywh(
-        (px - bloom_r as f64) as f32,
-        (py - bloom_r as f64) as f32,
-        bloom_r * 2.0,
-        bloom_r * 2.0,
-    ) {
-        pm.fill_rect(r, &bloom_paint, tiny_skia::Transform::identity(), None);
+        if let Some(r) = tiny_skia::Rect::from_xywh(
+            (px - bloom_r as f64) as f32,
+            (py - bloom_r as f64) as f32,
+            bloom_r * 2.0,
+            bloom_r * 2.0,
+        ) {
+            pm.fill_rect(r, &bloom_paint, tiny_skia::Transform::identity(), None);
+        }
     }
 
     if core.pressed {
         let [pr, pg, pb, _] = core.palette.cursor_mid;
-        let ring_color =
-            tiny_skia::Color::from_rgba8(pr, pg, pb, (210.0 * alpha_scale) as u8);
+        let ring_color = tiny_skia::Color::from_rgba8(pr, pg, pb, (210.0 * alpha_scale) as u8);
         let mut ring_paint = tiny_skia::Paint::default();
         ring_paint.shader = tiny_skia::Shader::SolidColor(ring_color);
         ring_paint.anti_alias = true;
@@ -647,8 +694,7 @@ pub fn paint_cursor(
             width: 3.0 * sf,
             ..Default::default()
         };
-        let core_fill =
-            tiny_skia::Color::from_rgba8(pr, pg, pb, (110.0 * alpha_scale) as u8);
+        let core_fill = tiny_skia::Color::from_rgba8(pr, pg, pb, (110.0 * alpha_scale) as u8);
         let mut fill_paint = tiny_skia::Paint::default();
         fill_paint.shader = tiny_skia::Shader::SolidColor(core_fill);
         fill_paint.anti_alias = true;
@@ -688,23 +734,21 @@ pub fn paint_cursor(
         let (cr, cg, cb) = (0x5Eu8, 0xC0u8, 0xE8u8);
 
         if let Some(rect) = tiny_skia::Rect::from_xywh(
-            (fx * s) as f32,
-            (fy * s) as f32,
+            ((fx - origin_x) * s) as f32,
+            ((fy - origin_y) * s) as f32,
             (fw * s) as f32,
             (fh * s) as f32,
         ) {
             // Faint fill
             let mut fill_paint = tiny_skia::Paint::default();
-            fill_paint.shader = tiny_skia::Shader::SolidColor(
-                tiny_skia::Color::from_rgba8(cr, cg, cb, fill_a),
-            );
+            fill_paint.shader =
+                tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(cr, cg, cb, fill_a));
             pm.fill_rect(rect, &fill_paint, tiny_skia::Transform::identity(), None);
 
             // Border stroke (2px glow)
             let mut border_paint = tiny_skia::Paint::default();
-            border_paint.shader = tiny_skia::Shader::SolidColor(
-                tiny_skia::Color::from_rgba8(cr, cg, cb, border_a),
-            );
+            border_paint.shader =
+                tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(cr, cg, cb, border_a));
             border_paint.anti_alias = true;
             let stroke = tiny_skia::Stroke {
                 width: 2.5 * sf,
@@ -758,18 +802,33 @@ pub fn paint_cursor(
     //   1. Per-instance custom asset loaded from `--cursor-icon <path>`
     //      (or runtime `set_agent_cursor_style.image_path`) wins.
     //   2. Else the built-in selected by `--cursor-shape`:
-    //      - `arrow` (default): call `draw_default_arrow` — procedural
+    //      - `arrow`: call `draw_default_arrow` — procedural
     //        gradient diamond, sharp at any backing scale because nothing
     //        rasterises.
     //      - `teardrop`: blit the cached `CursorShape::teardrop()` pixmap
     //        — rasterised once at 2× the display target.
-    //   3. (No other built-ins today.)
+    //      - `sky`: blit the cached `CursorShape::sky()` pixmap, anchored at
+    //        the kite tip so the event coordinate is the click point.
+    //      - `cmux`: blit Lawrence's gradient Sky kite upright, anchored at
+    //        its up-left action point.
     //
     // Teardrop is the default silhouette; `--cursor-shape arrow` (or
     // `cursor_icon: "arrow"`) selects the procedural arrow instead.
+    let scaled_sky_shape = if sky_builtin {
+        Some(CursorShape::sky_for_backing_scale(sf))
+    } else {
+        None
+    };
+    let scaled_cmux_shape = if core.cfg.builtin_shape == BuiltinShape::Cmux {
+        Some(CursorShape::cmux_for_backing_scale(sf))
+    } else {
+        None
+    };
     let shape: Option<&CursorShape> = match (core.shape.as_ref(), core.cfg.builtin_shape) {
         (Some(custom), _) => Some(custom),
         (None, BuiltinShape::Teardrop) => Some(CursorShape::teardrop()),
+        (None, BuiltinShape::Sky) => scaled_sky_shape.as_ref(),
+        (None, BuiltinShape::Cmux) => scaled_cmux_shape.as_ref(),
         (None, BuiltinShape::Arrow) => {
             let grad_override = if core.gradient_colors.is_empty() {
                 None
@@ -800,32 +859,61 @@ pub fn paint_cursor(
     // rasterises at the destination pixmap's native resolution (e.g. 52 px
     // on a 2× retina display) — Core Animation then maps 1:1 to the screen
     // instead of upsampling a logical-pixel pixmap.
-    let display_size = 26.0_f32 * sf;
+    let display_size = shape.display_points * sf;
     let scale = display_size / shape.width as f32;
-    if let Some(pix) =
-        tiny_skia::PixmapRef::from_bytes(&shape.pixels, shape.width, shape.height)
-    {
-        // T = Translate(px, py) * Rotate(angle) * Scale(s) * Translate(-w/2, -h/2)
-        // Centres the source on its own origin, scales to display_size, rotates
-        // around the scaled centre, lands the centre at (px, py).
+    if let Some(pix) = tiny_skia::PixmapRef::from_bytes(&shape.pixels, shape.width, shape.height) {
+        // T = Translate(px, py) * Rotate(angle) * Scale(s) * Translate(-hotspot)
+        // Moves the source hotspot to its own origin, scales to display_size,
+        // rotates around that hotspot, then lands the hotspot at (px, py).
+        // Existing raster shapes use a centre hotspot; Sky stores the SVG tip.
         //
-        // +90° offset compensates for the SVG's intrinsic orientation: the
-        // cursor-up silhouette points UP at rest (CSS y-down angle -π/2),
-        // whereas the procedural arrow's rotation convention assumes the
-        // shape points RIGHT at rest (angle 0). Without the +90°, motion-
-        // right rotation would leave the tip still pointing up.
-        let rotation_deg = heading.to_degrees() as f32 + 180.0 + 90.0;
-        let transform = tiny_skia::Transform::from_translate(
-            -(shape.width as f32) / 2.0,
-            -(shape.height as f32) / 2.0,
-        )
-        .post_scale(scale, scale)
-        .post_rotate(rotation_deg)
-        .post_translate(px as f32, py as f32);
+        // The intrinsic offset compensates for heading-following raster source
+        // art: teardrop/custom rasters point up (+90°). Sky opts out of
+        // heading-following rotation entirely, so its up-left tip is static
+        // like the real macOS pointer; cmux likewise remains upright.
+        let rotation_deg = raster_rotation_degrees(heading, shape);
+        let identity_rotation = is_identity_rotation_degrees(rotation_deg);
+        let mut transform =
+            tiny_skia::Transform::from_translate(-shape.hotspot_x, -shape.hotspot_y)
+                .post_scale(scale, scale);
+        if !identity_rotation {
+            transform = transform.post_rotate(rotation_deg);
+        }
+        let (target_x, target_y) = if !shape.rotates_with_heading && identity_rotation {
+            ((px as f32).round(), (py as f32).round())
+        } else {
+            (px as f32, py as f32)
+        };
+        transform = transform.post_translate(target_x, target_y);
         let mut paint = tiny_skia::PixmapPaint::default();
         paint.opacity = alpha_scale;
         pm.draw_pixmap(0, 0, pix, &paint, transform, None);
     }
+}
+
+fn raster_rotation_degrees(heading: f64, shape: &CursorShape) -> f32 {
+    if shape.rotates_with_heading {
+        heading.to_degrees() as f32 + 180.0 + shape.intrinsic_rotation_degrees
+    } else {
+        0.0
+    }
+}
+
+fn is_active_builtin_sky(core: &RenderStateCore) -> bool {
+    core.shape.is_none() && matches!(core.cfg.builtin_shape, BuiltinShape::Sky)
+}
+
+fn draws_decorative_bloom(core: &RenderStateCore) -> bool {
+    core.shape.is_some()
+        || !matches!(
+            core.cfg.builtin_shape,
+            BuiltinShape::Sky | BuiltinShape::Cmux
+        )
+}
+
+fn is_identity_rotation_degrees(rotation: f32) -> bool {
+    let normalized = rotation.rem_euclid(360.0);
+    normalized.abs() < 0.001 || (360.0 - normalized).abs() < 0.001
 }
 
 /// Rasterise the built-in gradient arrow at `(px, py)` rotated by
@@ -850,9 +938,8 @@ pub fn draw_default_arrow(
     // Rotate by (heading + π) so tip points in the motion direction.
     let angle = heading + std::f64::consts::PI as f32;
     let (sa, ca) = (angle.sin(), angle.cos());
-    let transform_pt = |(vx, vy): (f32, f32)| -> (f32, f32) {
-        (px + ca * vx - sa * vy, py + sa * vx + ca * vy)
-    };
+    let transform_pt =
+        |(vx, vy): (f32, f32)| -> (f32, f32) { (px + ca * vx - sa * vy, py + sa * vx + ca * vy) };
 
     let pts: Vec<(f32, f32)> = verts.iter().map(|&v| transform_pt(v)).collect();
 
@@ -870,24 +957,20 @@ pub fn draw_default_arrow(
     // Gradient fill: start color at tip, end color at tail.
     // Use runtime overrides when available, otherwise fall back to palette.
     let tip = pts[0];
-    let tail = (
-        (pts[1].0 + pts[3].0) / 2.0,
-        (pts[1].1 + pts[3].1) / 2.0,
-    );
+    let tail = ((pts[1].0 + pts[3].0) / 2.0, (pts[1].1 + pts[3].1) / 2.0);
     let (r0, g0, b0) = if let Some(g) = gradient_override.and_then(|g| g.first()) {
         (g[0], g[1], g[2])
     } else {
         let [r, g, b, _] = palette.cursor_start;
         (r, g, b)
     };
-    let (r1, g1, b1) = if let Some(g) =
-        gradient_override.and_then(|g| g.get(1).or_else(|| g.first()))
-    {
-        (g[0], g[1], g[2])
-    } else {
-        let [r, g, b, _] = palette.cursor_mid;
-        (r, g, b)
-    };
+    let (r1, g1, b1) =
+        if let Some(g) = gradient_override.and_then(|g| g.get(1).or_else(|| g.first())) {
+            (g[0], g[1], g[2])
+        } else {
+            let [r, g, b, _] = palette.cursor_mid;
+            (r, g, b)
+        };
     let (r2, g2, b2) = if let Some(g) = gradient_override.and_then(|g| g.last()) {
         (g[0], g[1], g[2])
     } else {
@@ -909,9 +992,9 @@ pub fn draw_default_arrow(
             tiny_skia::SpreadMode::Pad,
             tiny_skia::Transform::identity(),
         )
-        .unwrap_or(tiny_skia::Shader::SolidColor(
-            tiny_skia::Color::from_rgba8(r1, g1, b1, a),
-        ));
+        .unwrap_or(tiny_skia::Shader::SolidColor(tiny_skia::Color::from_rgba8(
+            r1, g1, b1, a,
+        )));
         p.anti_alias = true;
         p
     };
@@ -954,16 +1037,24 @@ mod glide_duration_tests {
         let mut core = RenderStateCore::new(CursorConfig::default());
         core.motion.glide_duration_ms = glide_ms;
         core.motion.idle_hide_ms = 0.0;
-        core.pos = (0.0, 0.0);
+        core.place_at(0.0, 0.0);
         // Aligned headings → an effectively straight path of length ~dist_pts.
-        core.path = Some(PathPlanner::plan(0.0, 0.0, 0.0, dist_pts, 0.0, 0.0, 0.0, 80.0));
+        core.path = Some(PathPlanner::plan(
+            0.0, 0.0, 0.0, dist_pts, 0.0, 0.0, 0.0, 80.0,
+        ));
         core.dist = 0.0;
         let dt = 1.0 / 240.0;
         let mut t = 0.0;
         for _ in 0..200_000 {
-            let arrived = if swift { core.tick_swift_constants(dt) } else { core.tick_motion(dt) };
+            let arrived = if swift {
+                core.tick_swift_constants(dt)
+            } else {
+                core.tick_motion(dt)
+            };
             t += dt;
-            if arrived { break; }
+            if arrived {
+                break;
+            }
         }
         t
     }
@@ -986,8 +1077,113 @@ mod glide_duration_tests {
         for swift in [false, true] {
             let short = arrival_secs(0.0, 120.0, swift);
             let long = arrival_secs(0.0, 1400.0, swift);
-            assert!(long > short + 0.2, "swift={swift} short={short} long={long}");
+            assert!(
+                long > short + 0.2,
+                "swift={swift} short={short} long={long}"
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod hotspot_shape_tests {
+    use super::*;
+    use crate::{BuiltinShape, CursorConfig};
+
+    const EPS: f64 = 0.001;
+
+    fn cfg_with_shape(shape: BuiltinShape) -> CursorConfig {
+        let mut cfg = CursorConfig::default();
+        cfg.builtin_shape = shape;
+        cfg
+    }
+
+    fn assert_point_near(actual: (f64, f64), expected: (f64, f64)) {
+        assert!(
+            (actual.0 - expected.0).abs() < EPS && (actual.1 - expected.1).abs() < EPS,
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn sky_rest_heading_preserves_up_left_source_orientation() {
+        for heading in [
+            0.0,
+            std::f64::consts::FRAC_PI_4,
+            std::f64::consts::FRAC_PI_2,
+            std::f64::consts::PI,
+        ] {
+            let rotation = raster_rotation_degrees(heading, CursorShape::sky()).rem_euclid(360.0);
+            assert!(
+                rotation.abs() < 0.001,
+                "Sky should ignore heading and stay up-left; heading={heading}, got {rotation}°"
+            );
+        }
+    }
+
+    #[test]
+    fn sky_builtin_skips_decorative_bloom_only() {
+        let sky = RenderStateCore::new(cfg_with_shape(BuiltinShape::Sky));
+        let teardrop = RenderStateCore::new(cfg_with_shape(BuiltinShape::Teardrop));
+        let arrow = RenderStateCore::new(cfg_with_shape(BuiltinShape::Arrow));
+
+        assert!(!draws_decorative_bloom(&sky));
+        assert!(draws_decorative_bloom(&teardrop));
+        assert!(draws_decorative_bloom(&arrow));
+    }
+
+    #[test]
+    fn sky_skips_legacy_click_offset_but_arrow_and_teardrop_keep_it() {
+        let event = (100.0, 200.0);
+        let expected_offset = (
+            event.0 + std::f64::consts::FRAC_PI_4.cos() * 16.0,
+            event.1 + std::f64::consts::FRAC_PI_4.sin() * 16.0,
+        );
+
+        let mut sky = RenderStateCore::new(cfg_with_shape(BuiltinShape::Sky));
+        sky.apply_command_base(
+            OverlayCommand::MoveTo {
+                x: event.0,
+                y: event.1,
+                end_heading_radians: std::f64::consts::FRAC_PI_4,
+            },
+            true,
+            true,
+        );
+        assert_point_near(sky.pos, event);
+
+        let mut sky_click = RenderStateCore::new(cfg_with_shape(BuiltinShape::Sky));
+        sky_click.apply_command_base(
+            OverlayCommand::ClickPulse {
+                x: event.0,
+                y: event.1,
+            },
+            true,
+            true,
+        );
+        assert_point_near(sky_click.pos, event);
+
+        let mut teardrop = RenderStateCore::new(cfg_with_shape(BuiltinShape::Teardrop));
+        teardrop.apply_command_base(
+            OverlayCommand::ClickPulse {
+                x: event.0,
+                y: event.1,
+            },
+            true,
+            true,
+        );
+        assert_point_near(teardrop.pos, expected_offset);
+
+        let mut arrow = RenderStateCore::new(cfg_with_shape(BuiltinShape::Arrow));
+        arrow.apply_command_base(
+            OverlayCommand::ClickPulse {
+                x: event.0,
+                y: event.1,
+            },
+            true,
+            true,
+        );
+        assert_point_near(arrow.pos, expected_offset);
     }
 }
 
@@ -999,10 +1195,7 @@ mod backing_scale_tests {
     /// Count opaque (alpha > 0) pixels in the pixmap — a proxy for the
     /// cursor's on-pixmap footprint that's independent of palette / gradient.
     fn opaque_pixel_count(pm: &tiny_skia::Pixmap) -> u32 {
-        pm.data()
-            .chunks_exact(4)
-            .filter(|px| px[3] > 0)
-            .count() as u32
+        pm.data().chunks_exact(4).filter(|px| px[3] > 0).count() as u32
     }
 
     fn render_at(backing_scale: f32, logical_size: u32) -> tiny_skia::Pixmap {
@@ -1010,7 +1203,7 @@ mod backing_scale_tests {
         // Place the cursor at the centre of the logical area and disable
         // idle-fade so the arrow paints at full alpha regardless of timing.
         let centre = logical_size as f64 / 2.0;
-        core.pos = (centre, centre);
+        core.place_at(centre, centre);
         core.idle_alpha = 1.0;
         core.visible = true;
 
@@ -1049,6 +1242,162 @@ mod backing_scale_tests {
             ratio > 3.0 && ratio < 5.0,
             "2× backing_scale should produce ~4× more opaque pixels — \
              got n_1x={n_1x}, n_2x={n_2x}, ratio={ratio:.2}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cmux_cursor_tests {
+    use super::*;
+    use crate::{BuiltinShape, CursorConfig};
+
+    fn opaque_bounds(pm: &tiny_skia::Pixmap) -> (u32, u32, u32, u32) {
+        let mut min_x = pm.width();
+        let mut min_y = pm.height();
+        let mut max_x = 0;
+        let mut max_y = 0;
+
+        for (index, pixel) in pm.data().chunks_exact(4).enumerate() {
+            if pixel[3] <= 200 {
+                continue;
+            }
+            let x = index as u32 % pm.width();
+            let y = index as u32 / pm.width();
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+
+        assert!(min_x <= max_x, "cmux cursor should render opaque pixels");
+        (min_x, min_y, max_x, max_y)
+    }
+
+    fn max_alpha_in_rect(
+        pm: &tiny_skia::Pixmap,
+        x_range: std::ops::RangeInclusive<u32>,
+        y_range: std::ops::RangeInclusive<u32>,
+    ) -> u8 {
+        let mut max_alpha = 0;
+        for y in y_range {
+            for x in x_range.clone() {
+                let offset = ((y * pm.width() + x) * 4 + 3) as usize;
+                max_alpha = max_alpha.max(pm.data()[offset]);
+            }
+        }
+        max_alpha
+    }
+
+    fn render_cmux(heading: f64) -> ((u32, u32, u32, u32), (f64, f64)) {
+        let mut cfg = CursorConfig::default();
+        cfg.builtin_shape = BuiltinShape::parse("cmux").expect("cmux should be a built-in");
+        let mut core = RenderStateCore::new(cfg);
+        core.place_at(64.0, 64.0);
+        core.heading = heading;
+        core.idle_alpha = 1.0;
+
+        let action_point = core.pos;
+        let pm = render_frame(&core, 128, 128, 0.0, 0.0, None, 1.0);
+        (opaque_bounds(&pm), action_point)
+    }
+
+    #[test]
+    fn cmux_uses_lawrence_sky_kite_with_tip_at_action_target() {
+        let ((x0, y0, x1, y1), target_right) = render_cmux(0.0);
+        let ((rx0, ry0, rx1, ry1), target_down) =
+            render_cmux(std::f64::consts::FRAC_PI_2);
+
+        let width = x1 - x0 + 1;
+        let height = y1 - y0 + 1;
+        let rotated_width = rx1 - rx0 + 1;
+        let rotated_height = ry1 - ry0 + 1;
+
+        assert!(width.abs_diff(height) <= 2, "Sky kite should be nearly square");
+        assert_eq!(width, rotated_width, "cmux mark should not rotate with motion");
+        assert_eq!(height, rotated_height, "cmux mark should not rotate with motion");
+        assert_eq!((x0, y0, x1, y1), (rx0, ry0, rx1, ry1));
+        assert!((x0 as f64 - target_right.0).abs() <= 2.0);
+        assert!((y0 as f64 - target_right.1).abs() <= 2.0);
+        assert_eq!(target_right, target_down);
+        assert!(x1 as f64 > target_right.0 + 12.0);
+        assert!(y1 as f64 > target_right.1 + 12.0);
+    }
+
+    #[test]
+    fn cmux_sky_tip_skips_the_legacy_arrow_click_offset() {
+        let event = (100.0, 200.0);
+        let mut cfg = CursorConfig::default();
+        cfg.builtin_shape = BuiltinShape::parse("cmux").expect("cmux should be a built-in");
+
+        let mut move_core = RenderStateCore::new(cfg.clone());
+        move_core.apply_command_base(
+            OverlayCommand::MoveTo {
+                x: event.0,
+                y: event.1,
+                end_heading_radians: std::f64::consts::FRAC_PI_4,
+            },
+            true,
+            true,
+        );
+        assert_eq!(move_core.pos, event);
+
+        let mut click_core = RenderStateCore::new(cfg);
+        click_core.apply_command_base(
+            OverlayCommand::ClickPulse {
+                x: event.0,
+                y: event.1,
+            },
+            true,
+            true,
+        );
+        assert_eq!(click_core.pos, event);
+    }
+
+    #[test]
+    fn cmux_cursor_glide_takes_the_direct_route_to_its_target() {
+        let mut cfg = CursorConfig::default();
+        cfg.builtin_shape = BuiltinShape::parse("cmux").expect("cmux should be a built-in");
+        let mut core = RenderStateCore::new(cfg);
+        core.place_at(100.0, 100.0);
+
+        core.apply_command_base(
+            OverlayCommand::MoveTo {
+                x: 260.0,
+                y: 100.0,
+                end_heading_radians: std::f64::consts::FRAC_PI_4,
+            },
+            true,
+            true,
+        );
+
+        let path = core.path.expect("move should create a glide path");
+        assert!(
+            path.length <= 161.0,
+            "a 160-point cursor move should slide directly, not loop for {:.1} points",
+            path.length
+        );
+    }
+
+    #[test]
+    fn cmux_sky_omits_decorative_bloom_but_keeps_click_pulse() {
+        let mut cfg = CursorConfig::default();
+        cfg.builtin_shape = BuiltinShape::parse("cmux").expect("cmux should be a built-in");
+        let mut core = RenderStateCore::new(cfg);
+        core.place_at(64.0, 64.0);
+        core.idle_alpha = 1.0;
+
+        let resting = render_frame(&core, 128, 128, 0.0, 0.0, None, 1.0);
+        assert_eq!(
+            max_alpha_in_rect(&resting, 48..=52, 62..=66),
+            0,
+            "Sky should not render the legacy decorative bloom"
+        );
+
+        core.click_t = Some(0.0);
+        let clicking = render_frame(&core, 128, 128, 0.0, 0.0, None, 1.0);
+        assert!(
+            max_alpha_in_rect(&clicking, 41..=44, 62..=66) > 0,
+            "Sky should retain the click-pulse ring"
         );
     }
 }

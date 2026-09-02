@@ -11,6 +11,12 @@ pub mod ax;
 #[cfg(target_os = "macos")]
 pub mod apps;
 #[cfg(target_os = "macos")]
+pub mod app_approval;
+#[cfg(target_os = "macos")]
+pub mod application_surface;
+#[cfg(target_os = "macos")]
+pub(crate) mod code_identity;
+#[cfg(target_os = "macos")]
 pub mod windows;
 #[cfg(target_os = "macos")]
 pub mod input;
@@ -40,6 +46,8 @@ pub mod video_sckit;
 pub mod pip;
 #[cfg(target_os = "macos")]
 pub mod session;
+#[cfg(target_os = "macos")]
+pub(crate) mod dispatch_gate;
 
 use cua_driver_core::tool::ToolRegistry;
 
@@ -63,6 +71,21 @@ pub fn register_tools_with_compat(compat: bool) -> ToolRegistry {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = compat;
+        ToolRegistry::new()
+    }
+}
+
+/// Register the opt-in Codex Computer Use compatibility surface on macOS.
+/// Native callers keep [`register_tools`] and its full tool catalog.
+pub fn register_codex_computer_use_compat_tools() -> ToolRegistry {
+    #[cfg(target_os = "macos")]
+    {
+        let mut r = ToolRegistry::new();
+        tools::register_codex_compat(&mut r);
+        r
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
         ToolRegistry::new()
     }
 }

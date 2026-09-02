@@ -44,7 +44,10 @@ embedded mode does not address.
 
 ```sh
 # env var form — set by the host on the child process
-CUA_DRIVER_EMBEDDED=1 CUA_DRIVER_HOST_BUNDLE_ID=com.yourco.yourapp cua-driver mcp
+CUA_DRIVER_EMBEDDED=1 \
+CUA_DRIVER_HOST_BUNDLE_ID=com.yourco.yourapp \
+CUA_DRIVER_DEFAULT_SESSION=my-agent-run \
+cua-driver mcp
 
 # flag form — equivalent (the flags just set the env vars)
 cua-driver mcp --embedded --host-bundle-id com.yourco.yourapp
@@ -67,7 +70,9 @@ Only the exact value `CUA_DRIVER_EMBEDDED=1` enables embedded mode; anything
 else is ignored (fail-safe). `--host-bundle-id` is an advisory label echoed
 in `check_permissions` output and logs — it is **not** a trust signal; trust
 comes from the OS responsibility chain, so there is nothing to spoof by
-setting it.
+setting it. `CUA_DRIVER_DEFAULT_SESSION` names the stable cursor owned by this
+stdio MCP process when tools omit `session` / `cursor_id`; if absent or empty,
+the driver uses `embedded-<pid>`. Explicit tool cursor identity still wins.
 
 ## What embedded mode changes (and what it doesn't)
 
@@ -79,12 +84,19 @@ setting it.
 | Permission prompts / startup gate | May prompt once                  | **Never prompts**                        |
 | Settings → Privacy & Security entries | CuaDriver                    | your app only                            |
 | `check_permissions` `source.attribution` | `driver-daemon` (or `caller`) | `host`                            |
+| Argument-less action cursor       | none                                | `CUA_DRIVER_DEFAULT_SESSION`, else `embedded-<pid>` |
 | Overlay, background input, capture, all tools | full               | full — identical                          |
 
 Everything else — the agent-cursor overlay, background (no-focus-steal)
 clicking and typing, AX tree reads, per-window screenshots — is unchanged.
 When embedded mode is off, nothing in this feature is active: standalone
 behavior is byte-for-byte what it was.
+
+Embedding does not implicitly enable watchable foregrounding. A host building
+an explicit visible-demo experience may separately set
+`CUA_DRIVER_WATCHABLE_FRONT=1`; that opt-in leaves launched/driven targets in
+front and therefore overrides the normal background/no-focus-steal contract.
+Any other value, or omitting the variable, preserves background delivery.
 
 ## The responsibility-chain requirement, exactly
 
@@ -130,7 +142,8 @@ a dialog (the `prompt` argument is ignored) and returns:
 {
   "accessibility": true,
   "screen_recording": true,
-  "screen_recording_capturable": true,
+  "screen_recording_capturable": null,
+  "screen_recording_probe_performed": false,
   "source": {
     "attribution": "host",
     "host_bundle_id": "com.yourco.yourapp",
@@ -147,10 +160,13 @@ a dialog (the `prompt` argument is ignored) and returns:
 - `accessibility` / `screen_recording` — the live TCC state *of your app's
   grant*, answered from inside the driver process (which shares your
   identity). If both are true, it is safe to drive the desktop.
-- `screen_recording_capturable` — a live ScreenCaptureKit probe
-  (`SCShareableContent`), the authoritative signal. If it disagrees with
-  `screen_recording`, the preflight boolean is stale or belongs to a
-  different identity — see troubleshooting.
+- `screen_recording_capturable` — `null` in embedded mode and on every
+  `prompt:false` check. A live ScreenCaptureKit query can itself register or
+  raise Screen Recording TCC, so silent/host-owned checks do not run it or
+  mislabel the preflight boolean as a live result.
+- `screen_recording_probe_performed` — `false` alongside that null. It is true
+  only when a non-embedded, prompt-capable check actually ran the live probe;
+  only then is `screen_recording_capturable` a boolean.
 - `source.attribution` values:
   - `host` — embedded mode; booleans reflect the host's grant. What you
     should always see when embedding.
@@ -215,11 +231,11 @@ let axOpts = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
 let ax = AXIsProcessTrustedWithOptions(axOpts)
 let sr = CGRequestScreenCaptureAccess()
 log("host grants — accessibility: \(ax), screen recording: \(sr)")
-// Keep going even without grants: the run registers BOTH rows in one pass
-// (the AX request above, plus — on newer macOS, where the app only appears
-// in the Screen Recording pane after a real ScreenCaptureKit attempt — the
-// embedded driver's live probe below, registered as THE HOST, which is the
-// point of embedding). Grant both in one Settings visit, then re-run.
+// Keep going even without grants: the host requests BOTH rows above. On newer
+// macOS versions where Screen Recording appears only after an actual capture,
+// get_window_state below performs that capture under the HOST identity. The
+// embedded check_permissions call deliberately remains a silent preflight and
+// does not run a live probe. Grant both in one Settings visit, then re-run.
 if !ax || !sr {
     log("after this run: grant the missing item(s) in System Settings, then re-run")
 }
@@ -360,15 +376,16 @@ daemon (`cua-driver stop`). To see exactly which identity macOS is charging,
 run: `log stream --debug --predicate 'subsystem == "com.apple.TCC" AND
 eventMessage BEGINSWITH "AttributionChain"'` and trigger the action again.
 
-**"Screenshots come back black (or `screen_recording: true` but
-`screen_recording_capturable: false`)."**
-The preflight boolean and the live probe disagree, which means the Screen
-Recording grant TCC found does not belong to the driver's current
-responsible identity. Either the host never actually got the grant (check
-System Settings), the grant was reset (`tccutil reset ScreenCapture`) after
-the app cached a `true`, or the driver escaped the host's chain (see the
-previous item). Restart the driver child after any grant change — TCC
-answers are cached per process.
+**"Screenshots come back black even though `screen_recording: true`."**
+Embedded status checks deliberately return `screen_recording_capturable:
+null` because probing it would no longer be a silent read. A black real
+capture means the preflight answer was stale, the host never actually got the
+grant, or the driver escaped the host's responsibility chain. Check System
+Settings and the `source` block, then restart the driver child after any grant
+change — TCC answers are cached per process. A non-embedded prompt-capable
+check may instead report an actual live disagreement as
+`screen_recording_capturable: false` with
+`screen_recording_probe_performed: true`.
 
 **"The AX tree comes back empty / clicks do nothing."**
 `AXIsProcessTrusted()` is false for the effective identity. The host hasn't

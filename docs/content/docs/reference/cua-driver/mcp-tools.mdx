@@ -61,7 +61,7 @@ Walk a running app's AX tree and return BOTH a structured `elements` array (pref
 
 INVARIANT: call get_window_state once per turn per (pid, window_id) before any element-indexed action. The index map is replaced by the next snapshot.
 
-PREFERRED CONSUMERS read `structuredContent.elements` (one entry per indexed row with `element_index`, `role`, `label`, `value` (the element's text/AXValue when present — use it to verify what a field holds), `frame: {x,y,w,h}`, `parent_index`, `depth`). The markdown `tree_markdown` stays available and unchanged in shape for existing text-parsing callers — but new fields will only be added to the structured side.
+PREFERRED CONSUMERS read `structuredContent.elements` (actionable rows carry `element_index` + `element_token`; value-bearing read-only AXStaticText/AXTextField/AXTextArea rows are also included without addressability fields). Each entry carries `role`, title-first `label`, optional `description` when distinct from the label, `value` (stringified AXValue, capped at 512 characters), `frame: {x,y,w,h}`, `parent_index`, and `depth`. Mirrored actionable AX copies with the same role + label + frame are deduplicated so label lookup is unambiguous. The markdown `tree_markdown` stays available and unchanged in shape for existing text-parsing callers — but new fields will only be added to the structured side.
 
 Always returns BOTH the element tree AND a screenshot — ground on both and cross-check (the tree lies on some surfaces: Electron echo-confirms, Catalyst null values, virtualized off-viewport rows with `h:1` frames). You choose the modality at ACTION time, not here: an element ax action (pass `element_index`/`element_token` → the accessibility rung) or an element px action (pass `x`,`y` → the pixel rung, read straight off this screenshot). `capture_mode` is deprecated and ignored. Pass `include_screenshot:false` to skip the grab and get the tree only — the cheap path when you're just re-indexing before an element ax action.
 
@@ -78,7 +78,7 @@ Optional `max_elements` / `max_depth` bound the AX walk to mitigate context-wind
 - `pid` (integer, required): Target process ID.
 - `query` (string, optional): Case-insensitive filter for tree_markdown.
 - `screenshot_out_file` (string, optional): When set, write the PNG to this file path (~ expanded) instead of embedding base64 in the response. The structured output will contain screenshot_file_path instead.
-- `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
+- `session` (string, optional): Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-&lt;pid&gt;); anonymous non-embedded calls remain cursor-less.
 - `window_id` (integer, required): Target window ID from list_windows.
 
 ```json
@@ -135,6 +135,7 @@ Return the current state of THIS session's agent cursor: position, config (color
 **Arguments:**
 
 - `cursor_id` (string, optional): Cursor instance. Default: this session's cursor.
+- `session` (string, optional): Explicit session cursor. Takes precedence over cursor_id and the embedded default.
 
 ## Action tools
 
@@ -199,7 +200,7 @@ Two addressing modes:
 
 - element_index + window_id (from last get_window_state): AX action path. Works on backgrounded/hidden windows. No cursor move, no focus steal. element_index cache is scoped per (pid, window_id) and is replaced by the next snapshot of the same window — re-snapshot every turn before clicking.
 
-- x, y (window-local screenshot pixels, top-left origin of the PNG returned by get_window_state): CGEvent path. Synthesizes mouse events and posts to pid. Use modifier for cmd/shift/option/ctrl. Needs a visible on-screen window to anchor the conversion.
+- x, y (window-local screenshot pixels, top-left origin of the PNG returned by get_window_state): CGEvent path. Synthesizes mouse events and posts to pid. Before a background post with pid+window_id, the driver checks the front-to-back WindowServer stack and returns error=`obstructed`, code=`background_occluded` without posting if another app/window owns that point. Use modifier for cmd/shift/option/ctrl. Needs a visible on-screen window to anchor the conversion.
 
 button: "left" (default), "right", or "middle". Defaults to left so the field is fully back-compat — omit it and you get the legacy left-click behaviour. Pixel path: routes through the CGEvent left/right/middle mouse-button primitives. AX path: "right" maps to AXShowMenu (same surface as the dedicated `right_click` tool); "middle" has no AX equivalent and falls back to a pixel middle-click at the element's center.
 action: press (default), show_menu, pick, confirm, cancel, open.
@@ -211,14 +212,14 @@ from_zoom: set true after a zoom call to auto-translate zoom-image pixel coordin
 - `button` (string, optional): Mouse button. Default: "left" — omit for legacy left-click behaviour. Pixel path uses the matching CGEvent primitive; AX path maps "right" to AXShowMenu and falls back to a pixel middle-click at the element's center for "middle".
 - `count` (integer, optional): Click count (pixel path only). Default 1.
 - `debug_image_out` (string, optional): Optional file path. When set on a pixel-addressed click, captures a fresh screenshot, draws a red crosshair at (x, y), and writes the PNG. Use to verify coordinate spaces. Requires window_id; incompatible with from_zoom.
-- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": perform the AX action or post the CGEvent without fronting. "foreground": briefly front the window, act, let transient UI settle, then restore the prior frontmost app. Requires window_id. A click is never driver-verifiable (no read-back), so both report verified:false — confirm the effect via screenshot. Use the agent loop: background AX (element_index) → screenshot → background pixel (x/y) → screenshot → delivery_mode:"foreground".
+- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": perform the AX action or post the CGEvent without fronting; pixel dispatch with pid+window_id fails with structured error="obstructed", code="background_occluded" when a different visible window owns the screen point. "foreground": briefly front the window, act, let transient UI settle, then restore the prior frontmost app; foreground skips the obstruction check because fronting resolves Z order. Requires window_id. A click that is dispatched remains verified:false — confirm its effect via get_window_state.
 - `element_index` (integer, optional): Element index from last get_window_state. REQUIRES `pid` and `window_id` to be passed alongside it — element_index alone (no pid) fails fast with "Missing required integer field: pid"; it is not a silent no-op.
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token` of the last get_window_state. Takes precedence over element_index when both supplied. Returns an explicit "stale" error if the snapshot has been superseded — re-snapshot in that case.
 - `from_zoom` (boolean, optional): When true, x and y are in the last zoom image for this pid; driver translates back to full-window coordinates.
 - `modifier` (array of string, optional): Modifier keys: cmd, shift, option/alt, ctrl.
 - `pid` (integer, optional): Target process ID.
 - `scope` (string, optional): Coordinate frame for a windowless screen-absolute click (default "window"). Pass "desktop" when sending x,y with NO pid/window_id — the coordinates are then true screen pixels (read from get_desktop_state with scope="desktop"). Per-call; not a setting.
-- `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
+- `session` (string, optional): Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-&lt;pid&gt;); anonymous non-embedded calls remain cursor-less.
 - `window_id` (integer, optional): Target window ID. Required for element_index. Optional when element_token is supplied (the token carries it).
 - `x` (number, optional): X in screenshot pixels, read straight off the image you were handed — no scaling math needed. With pid+window_id (capture_scope=window): window-local pixels from the get_window_state PNG (top-left origin). Windowless (no pid/window_id, capture_scope=desktop): pixels from the get_desktop_state PNG (the native full-display image). Either way, the pixel you read IS the pixel that gets clicked; the driver undoes the Retina backing scale + any downscale internally.
 - `y` (number, optional): Y in screenshot pixels (see x). Window-local from get_window_state, or full-display from get_desktop_state under capture_scope=desktop.
@@ -237,7 +238,7 @@ Pixel path (x, y provided): two down/up pairs ~80 ms apart at the given coordina
 - `element_index` (integer, optional): Element index from last get_window_state. Uses AX path. REQUIRES `pid` and `window_id` to be passed alongside it — element_index alone (no pid) fails fast with "Missing required integer field: pid"; it is not a silent no-op.
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. Takes precedence over element_index when both supplied. Returns an explicit "stale" error if the snapshot has been superseded.
 - `pid` (integer, required)
-- `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
+- `session` (string, optional): Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-&lt;pid&gt;); anonymous non-embedded calls remain cursor-less.
 - `window_id` (integer, optional): CGWindowID. Required when element_index is used. Optional when element_token is supplied (the token carries it).
 - `x` (number, optional): Screen X coordinate (pixel path).
 - `y` (number, optional): Screen Y coordinate (pixel path).
@@ -263,7 +264,7 @@ Exactly one of `element_index` or (`x` AND `y`) must be provided. `pid` always r
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. Takes precedence over element_index when both supplied. Returns an explicit "stale" error if the snapshot has been superseded.
 - `modifier` (array of string, optional): Modifier keys held during the right-click: cmd/shift/option/ctrl. Pixel path only.
 - `pid` (integer, required): Target process ID.
-- `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
+- `session` (string, optional): Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-&lt;pid&gt;); anonymous non-embedded calls remain cursor-less.
 - `window_id` (integer, optional): CGWindowID. Required when element_index is used. Optional when element_token is supplied (the token carries it).
 - `x` (number, optional): X in window-local screenshot pixels. Must be provided together with y.
 - `y` (number, optional): Y in window-local screenshot pixels. Must be provided together with x.
@@ -282,26 +283,28 @@ Use for: marquee/lasso selection, drag-and-drop, resizing via a handle, scrubbin
 
 `modifier` keys (cmd/shift/option/ctrl) are held across the entire gesture.
 
+Background drag is unavailable on macOS because pid-posted drag streams drop background CGEvents. Pass delivery_mode=`foreground` and the `window_id` whose screenshot supplied the coordinates.
+
 When `from_zoom` is true, coordinates are in the last zoom image for this pid; the driver maps them back to window coordinates before dispatching.
 
 **Arguments:**
 
 - `button` (string, optional): Mouse button used for the drag. Default: left.
-- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it.
+- `delivery_mode` (string, optional): Background drag is unavailable on macOS and returns code="background_unavailable" without posting. Pass "foreground" to front the window, perform the gesture, then restore the prior app.
 - `duration_ms` (integer, optional): Wall-clock duration of the drag path between mouseDown and mouseUp. Default: 500.
 - `from_x` (number, required): Drag-start X in window-local screenshot pixels. Top-left origin.
 - `from_y` (number, required): Drag-start Y in window-local screenshot pixels. Top-left origin.
 - `from_zoom` (boolean, optional): When true, coordinates are in the last zoom image for this pid; driver maps back to window coordinates.
 - `modifier` (array of string, optional): Modifier keys held across the entire gesture: cmd/shift/option/ctrl.
 - `pid` (integer, required): Target process ID.
-- `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
+- `session` (string, optional): Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-&lt;pid&gt;); anonymous non-embedded calls remain cursor-less.
 - `steps` (integer, optional): Number of intermediate mouseDragged events linearly interpolated along the path. Default: 20.
 - `to_x` (number, required): Drag-end X in window-local screenshot pixels.
 - `to_y` (number, required): Drag-end Y in window-local screenshot pixels.
-- `window_id` (integer, optional): CGWindowID for the window the pixel coordinates were measured against. Optional — when omitted the driver picks the frontmost window of pid.
+- `window_id` (integer, required): Required CGWindowID for the window whose screenshot supplied the pixel coordinates. Foreground drag uses it to front the exact target window before dispatch.
 
 ```json
-{"from_x":100,"from_y":200,"pid":844,"to_x":100,"to_y":200}
+{"from_x":100,"from_y":200,"pid":844,"to_x":100,"to_y":200,"window_id":10725}
 ```
 
 ### `type_text`
@@ -319,7 +322,7 @@ WEB CONTENT (Chromium/WebKit/Electron — browser tabs, Slack, VS Code, X's comp
 - `element_index` (integer, optional): Element index from last get_window_state. Directs the write to a specific field. REQUIRES `pid` and `window_id` to be passed alongside it — element_index alone (no pid) fails fast with "Missing required integer field: pid"; it is not a silent no-op.
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. Takes precedence over element_index when both supplied. Returns an explicit "stale" error if the snapshot has been superseded.
 - `pid` (integer, required): Target process ID.
-- `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
+- `session` (string, optional): Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-&lt;pid&gt;); anonymous non-embedded calls remain cursor-less.
 - `text` (string, required): Text to insert at the target's cursor.
 - `window_id` (integer, optional): CGWindowID. Required when element_index is used. Optional when element_token is supplied (the token carries it).
 - `x` (number, optional): Screenshot-pixel X of the field to type into — the element px action form. Pass x,y (no element_index) and the tool pixel-clicks there to establish real renderer focus, then types. Use for Chromium/Electron inputs the AX path can't reach. Read straight off the get_window_state PNG, same convention as click.
@@ -345,7 +348,7 @@ A key press is never driver-verifiable → effect:"unverifiable"; confirm via sc
 - `key` (string, required): Key name: return, tab, escape, up, down, etc.
 - `modifiers` (array of string, optional): Modifier keys: cmd, shift, option/alt, ctrl, fn.
 - `pid` (integer, required)
-- `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
+- `session` (string, optional): Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-&lt;pid&gt;); anonymous non-embedded calls remain cursor-less.
 - `window_id` (integer, optional): Target window. Required for delivery_mode:"foreground". Does NOT itself raise the window — raising is gated on delivery_mode.
 - `x` (number, optional): Screenshot-pixel X — the element px action form: pixel-click there to focus, then send the key. Use when the key must go to a Chromium/Electron surface the AX path can't focus. Pass with y, no element_index.
 - `y` (number, optional): Screenshot-pixel Y (see x).
@@ -369,7 +372,7 @@ Recognized modifiers: cmd/command, shift, option/alt, ctrl/control, fn. Non-modi
 - `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it.
 - `keys` (array of string, required): Modifier(s) and one non-modifier key, e.g. ["cmd", "c"].
 - `pid` (integer, required): Target process ID.
-- `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
+- `session` (string, optional): Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-&lt;pid&gt;); anonymous non-embedded calls remain cursor-less.
 - `window_id` (integer, optional): Target window. Required for delivery_mode:"foreground" (the NSMenu activation needs a window). Does NOT itself raise the window — raising is gated on delivery_mode.
 - `x` (number, optional): Screenshot-pixel X — the element px action form: pixel-click there to focus, then send the combo (so e.g. Cmd+V pastes into that field). Pass with y. Use for Chromium/Electron surfaces the background combo can't reach.
 - `y` (number, optional): Screenshot-pixel Y (see x).
@@ -393,7 +396,7 @@ For free-form text entry into web inputs, prefer `type_text_chars` which synthes
 - `element_index` (integer, optional): Element index from last get_window_state. Must be supplied unless element_token is provided. REQUIRES `pid` and `window_id` to be passed alongside it — element_index alone (no pid) fails fast with "Missing required integer field: pid"; it is not a silent no-op.
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. Takes precedence over element_index when both supplied. Returns an explicit "stale" error if the snapshot has been superseded.
 - `pid` (integer, required)
-- `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
+- `session` (string, optional): Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-&lt;pid&gt;); anonymous non-embedded calls remain cursor-less.
 - `value` (string, required): New value. AX will coerce to the element's native type.
 - `window_id` (integer, optional): CGWindowID for the window whose get_window_state produced the element_index. Required when element_index is used; optional when element_token is supplied (the token carries it).
 
@@ -405,7 +408,7 @@ For free-form text entry into web inputs, prefer `type_text_chars` which synthes
 
 Scroll the target pid. Two paths, picked by how you address the scroll:
 
-• **Targeted wheel path** — when you pass a target, either `element_index`/`element_token` (preferred) or window-local `x, y` pixels: the driver synthesizes a real mouse-wheel event (CGEventCreateScrollWheelEvent, at that screen point. The renderer hit-tests the wheel at the cursor, so the scroll lands on whatever element is under the point — exactly like physically rolling the wheel over it. This is the ONLY way to scroll a nested `overflow:auto` region (e.g. a scrollable &lt;div&gt; with no tabindex): such regions never take keyboard focus, so the keystroke path below no-ops on them. Use this for inner/nested scrollers in web views.
+• **Targeted wheel path** — when you pass a target, either `element_index`/`element_token` (preferred) or window-local `x, y` pixels: the driver synthesizes a real mouse-wheel event (CGEventCreateScrollWheelEvent) at that screen point. The renderer hit-tests the wheel at the cursor, so the scroll lands on whatever element is under the point — exactly like physically rolling the wheel over it. This is the ONLY way to scroll a nested `overflow:auto` region (e.g. a scrollable &lt;div&gt; with no tabindex): such regions never take keyboard focus, so the keystroke path below no-ops on them. Use this for inner/nested scrollers in web views. Background wheel dispatch with pid+window_id is refused with error=`obstructed`, code=`background_occluded` when another window owns the point. After dispatch the driver reads AXValue, visible range, or the first scroll-area ancestor and returns `verified` plus `observed_delta` whenever the app exposes a cheap scroll metric.
 
 • **Keystroke path (focused region)** — when you pass NO target (just pid + direction): synthesizes PageDown/PageUp (by='page') or Down/Up arrows (by='line'); horizontal uses Left/Right arrows. Drives the focused / page scroller only.
 
@@ -415,12 +418,12 @@ Mapping: by='page' → larger step; by='line' → smaller step; amount = number 
 
 - `amount` (integer, optional): Pixel-wheel path: number of wheel notches. Keystroke path: number of keystroke repetitions. Default: 3.
 - `by` (string, optional): Scroll granularity. Default: line.
-- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it.
+- `delivery_mode` (string, optional): Default background. Background targeted-wheel dispatch with pid+window_id checks WindowServer Z order and returns structured error="obstructed", code="background_occluded" without posting when another window owns the target point. Foreground fronts the target, skips that check, scrolls, then restores the prior app. Successful scrolls report verified plus observed_delta when AX exposes a readable scroll metric.
 - `direction` (string, required): Scroll direction.
 - `element_index` (integer, optional): Element from last get_window_state. Routes through the pixel-wheel path AT this element's center — use it to scroll a nested overflow region you located in the AX tree.
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. Takes precedence over element_index when both supplied. Returns an explicit "stale" error if the snapshot has been superseded. Routes through the pixel-wheel path at the element's center.
 - `pid` (integer, optional)
-- `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
+- `session` (string, optional): Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-&lt;pid&gt;); anonymous non-embedded calls remain cursor-less.
 - `window_id` (integer, optional)
 - `x` (number, optional): Window-local screenshot X (top-left origin of the PNG from get_window_state). With `y`, routes through the pixel-wheel path at this point — use for a scrollable surface that isn't in the AX tree. Requires window_id to anchor the window→screen conversion.
 - `y` (number, optional): Window-local screenshot Y. See `x`.
@@ -436,7 +439,7 @@ Move the agent cursor overlay to (x, y). Does NOT move the real mouse cursor —
 **Arguments:**
 
 - `cursor_id` (string, optional): Cursor instance to move. Default: 'default'.
-- `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
+- `session` (string, optional): Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-&lt;pid&gt;); anonymous non-embedded calls remain cursor-less.
 - `x` (number, required)
 - `y` (number, required)
 
@@ -600,12 +603,13 @@ End a session declared with `start_session`: removes its agent cursor, stops any
 
 ### `set_agent_cursor_enabled`
 
-Show or hide the agent cursor for a session. A cursor exists only for a DECLARED session: pass `session` (the same id you start_session / drive actions with) and the cursor appears on that session's first action — its color is derived from the id. Without a `session`, actions run cursor-less. Use enabled=false to hide a session's cursor, enabled=true to re-show it. (`cursor_id` is a legacy alias for `session`.)
+Show or hide the agent cursor for a session. Omitting `session` uses the daemon proxy's automatic lifecycle session when present, or the embedded process default (`CUA_DRIVER_DEFAULT_SESSION`, or `embedded-<pid>`). Truly anonymous serve/CLI actions remain cursor-less. Use enabled=false to hide that cursor and enabled=true to re-show it. An explicit `session` or legacy `cursor_id` always takes precedence.
 
 **Arguments:**
 
-- `cursor_id` (string, optional): Cursor instance. Default: 'default'.
+- `cursor_id` (string, optional): Legacy explicit cursor alias.
 - `enabled` (boolean, required): true = show, false = hide.
+- `session` (string, optional): Explicit session cursor. Takes precedence over cursor_id and the embedded default.
 
 ```json
 {"enabled":false}
@@ -617,7 +621,7 @@ Configure the visual appearance and motion curve of an agent cursor instance.
 
 Appearance (multi-cursor customization):
 - cursor_id: instance name (default='default')
-- cursor_icon: built-in ('arrow' | 'teardrop') or a path to a PNG/JPEG/SVG/ICO file; '' reverts to the default cursor
+- cursor_icon: built-in ('arrow' | 'teardrop' | 'sky' | 'cmux') or a path to a PNG/SVG/ICO file; '' reverts to the default cursor
 - cursor_color: hex color e.g. '#00FFFF' or CSS name
 - cursor_label: short text shown near the cursor
 - cursor_size: dot radius in points (default=16)
@@ -638,7 +642,7 @@ Motion curve (Bezier path shape):
 - `arc_flow` (number, optional): Asymmetry bias in [-1, 1]. Default 0.0.
 - `arc_size` (number, optional): Arc deflection as fraction of path length [0, 1]. Default 0.25.
 - `cursor_color` (string, optional): Hex color (e.g. '#00FFFF') or CSS color name.
-- `cursor_icon` (string, optional): Built-in shape ('arrow' | 'teardrop') or a path to a PNG/JPEG/SVG/ICO file. '' reverts to the default cursor.
+- `cursor_icon` (string, optional): Built-in shape ('arrow' | 'teardrop' | 'sky' | 'cmux') or a path to a PNG/SVG/ICO file. '' reverts to the default cursor.
 - `cursor_id` (string, optional): Cursor instance name. Default: 'default'.
 - `cursor_label` (string, optional): Short label near the cursor dot.
 - `cursor_opacity` (number, optional): Opacity 0.0–1.0. Default: 0.85.
@@ -647,6 +651,7 @@ Motion curve (Bezier path shape):
 - `end_handle` (number, optional): End-handle fraction in [0, 1]. Default 0.3.
 - `glide_duration_ms` (number, optional): Fixed flight duration per move in ms; omit for speed-based timing (the default).
 - `idle_hide_ms` (number, optional): Auto-hide delay in ms. 0 = never hide. Default 20000.
+- `session` (string, optional): Explicit session cursor. Takes precedence over cursor_id and the embedded default.
 - `spring` (number, optional): Settle damping in [0.3, 1.0]. Default 0.72.
 - `start_handle` (number, optional): Start-handle fraction in [0, 1]. Default 0.3.
 - `turn_radius` (number, optional): Minimum turning radius of the glide path in points; smaller = tighter curves. Default 80.
@@ -657,7 +662,7 @@ Update the visual style of the agent cursor overlay.
 
 - gradient_colors: array of CSS hex strings (e.g. ["#FF0000","#0000FF"]) used as the arrow fill gradient from tip to tail. Empty array reverts to the default palette colours.
 - bloom_color: hex string for the radial halo/bloom behind the cursor (e.g. "#00FFFF"). Empty string reverts to the default.
-- image_path: path to a PNG, JPEG, SVG, or ICO file to use as the cursor icon instead of the default silhouette. Empty string reverts to the default cursor.
+- image_path: path to a PNG, SVG, or ICO file to use as the cursor icon instead of the default silhouette. Empty string reverts to the default cursor.
 All parameters are optional; omit any you do not want to change.
 
 **Arguments:**
@@ -665,7 +670,8 @@ All parameters are optional; omit any you do not want to change.
 - `bloom_color` (string, optional): Hex bloom/halo colour (e.g. '#00FFFF'). '' = revert to default.
 - `cursor_id` (string, optional): Cursor instance. Default: 'default'.
 - `gradient_colors` (array of string, optional): CSS hex gradient stops tip→tail. [] = revert to default.
-- `image_path` (string, optional): Path to PNG/JPEG/SVG/ICO cursor image. '' = revert to the default cursor.
+- `image_path` (string, optional): Path to PNG/SVG/ICO cursor image. '' = revert to the default cursor.
+- `session` (string, optional): Explicit session cursor. Takes precedence over cursor_id and the embedded default.
 
 ## Maintenance tools
 
@@ -673,7 +679,7 @@ All parameters are optional; omit any you do not want to change.
 
 Report TCC permission status for Accessibility and Screen Recording. By default also raises the system permission dialogs for any missing grants — Apple's request APIs are no-ops when the grant is already active, so this is safe to call repeatedly. Pass &#123;"prompt": false&#125; for a purely read-only status check.
 
-Returns: `accessibility` + `screen_recording` (booleans from the TCC preflight APIs), `screen_recording_capturable` (a live ScreenCaptureKit probe — if it disagrees with `screen_recording`, the preflight grant belongs to a different process), and `source` (which TCC identity the booleans reflect: the CuaDriver daemon vs the launching terminal/IDE). macOS attributes grants to the responsible process, so a standalone call from a terminal reports the terminal's grants, not the driver's.
+Returns: `accessibility` + `screen_recording` (booleans from the TCC preflight APIs), `screen_recording_capturable` (true/false only when a live ScreenCaptureKit probe ran; null for prompt:false, embedded, or external permission flows), `screen_recording_probe_performed`, and `source` (which TCC identity the booleans reflect: the responsible daemon app vs the launching terminal/IDE). macOS attributes grants to the responsible process, so a standalone call from a terminal reports the terminal's grants, not the driver's.
 
 **Arguments:**
 

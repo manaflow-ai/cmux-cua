@@ -33,11 +33,11 @@ let axOpts = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
 let ax = AXIsProcessTrustedWithOptions(axOpts)
 let sr = CGRequestScreenCaptureAccess()
 log("host grants — accessibility: \(ax), screen recording: \(sr)")
-// Keep going even without grants: the run registers BOTH rows in one pass
-// (the AX request above, plus — on newer macOS, where the app only appears
-// in the Screen Recording pane after a real ScreenCaptureKit attempt — the
-// embedded driver's live probe below, registered as THE HOST, which is the
-// point of embedding). Grant both in one Settings visit, then re-run.
+// Keep going even without grants: the host requests BOTH rows above. On newer
+// macOS versions where Screen Recording appears only after an actual capture,
+// get_window_state below performs that capture under the HOST identity. The
+// embedded check_permissions call deliberately remains a silent preflight and
+// does not run a live probe. Grant both in one Settings visit, then re-run.
 if !ax || !sr {
     log("after this run: grant the missing item(s) in System Settings, then re-run")
 }
