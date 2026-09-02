@@ -189,11 +189,11 @@ jobs:
 
           version = os.environ["VERSION"]
           replacements = {
-              Path("libs/cua-driver/python/pyproject.toml"): (
+              Path("pyproject.toml"): (
                   'version = "',
                   'version = "' + version + '"',
               ),
-              Path("libs/cua-driver/python/src/cua_driver/__init__.py"): (
+              Path("src/cua_driver/__init__.py"): (
                   "__version__ = ",
                   '__version__ = "' + version + '"',
               ),

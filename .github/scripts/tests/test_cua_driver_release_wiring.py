@@ -26,6 +26,8 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
         self.assertIn("python -m build --wheel --no-isolation", workflow)
         self.assertIn('line.startswith("Tag: ")', workflow)
         self.assertIn("normalized_version:", workflow)
+        self.assertIn('Path("pyproject.toml")', workflow)
+        self.assertIn('Path("src/cua_driver/__init__.py")', workflow)
 
     def test_python_publish_is_tokenless_and_actions_are_pinned(self) -> None:
         workflow = self.read(".github/workflows/cd-py-cua-driver.yml")
