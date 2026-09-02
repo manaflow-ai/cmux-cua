@@ -163,9 +163,13 @@ def _require_ancestor(api: Api, repository: str, ancestor: str, descendant: str,
     base = comparison.get("base_commit")
     head = comparison.get("head_commit")
     merge_base = comparison.get("merge_base_commit")
-    if not isinstance(base, Mapping) or full_sha(base.get("sha"), "comparison base SHA") != ancestor:
+    if not isinstance(base, Mapping) or full_sha(
+        base.get("sha"), "comparison base SHA"
+    ) != ancestor:
         raise ValidationError("ancestry comparison base does not match the requested ancestor")
-    if not isinstance(head, Mapping) or full_sha(head.get("sha"), "comparison head SHA") != descendant:
+    if not isinstance(head, Mapping) or full_sha(
+        head.get("sha"), "comparison head SHA"
+    ) != descendant:
         raise ValidationError("ancestry comparison head does not match the requested descendant")
     if not isinstance(merge_base, Mapping) or full_sha(
         merge_base.get("sha"), "comparison merge-base SHA"
@@ -173,7 +177,9 @@ def _require_ancestor(api: Api, repository: str, ancestor: str, descendant: str,
         raise ValidationError("ancestry comparison merge base does not equal the ancestor")
 
 
-def _validate_source_run(api: Api, values: Mapping[str, str], repository: str) -> tuple[int, str, str]:
+def _validate_source_run(
+    api: Api, values: Mapping[str, str], repository: str
+) -> tuple[int, str, str]:
     source_run_id = positive_int(required(values, "SOURCE_RUN_ID"), "SOURCE_RUN_ID")
     run = api.get(repository_path(repository, f"/actions/runs/{source_run_id}"))
     same(run.get("id"), source_run_id, "source workflow run ID")
@@ -187,7 +193,9 @@ def _validate_source_run(api: Api, values: Mapping[str, str], repository: str) -
     same(run.get("run_attempt"), expected_attempt, "source workflow run attempt")
     source_repository = run.get("repository")
     source_head_repository = run.get("head_repository")
-    if not isinstance(source_repository, Mapping) or not isinstance(source_head_repository, Mapping):
+    if not isinstance(source_repository, Mapping) or not isinstance(
+        source_head_repository, Mapping
+    ):
         raise ValidationError("source workflow run has no repository metadata")
     same(source_repository.get("full_name"), repository, "source workflow repository")
     same(source_head_repository.get("full_name"), repository, "source workflow head repository")

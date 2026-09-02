@@ -7,7 +7,6 @@ import argparse
 from email import errors as email_errors
 from email import policy
 from email.parser import BytesParser
-import io
 import re
 import stat
 import sys

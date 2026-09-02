@@ -57,7 +57,9 @@ def validate(api: Api, values: Mapping[str, str]) -> dict[str, str]:
 
     source_repository = run.get("repository")
     source_head_repository = run.get("head_repository")
-    if not isinstance(source_repository, Mapping) or not isinstance(source_head_repository, Mapping):
+    if not isinstance(source_repository, Mapping) or not isinstance(
+        source_head_repository, Mapping
+    ):
         raise ValidationError("source workflow run has no repository metadata")
     same(source_repository.get("full_name"), repository, "source workflow repository")
     same(source_head_repository.get("full_name"), repository, "source workflow head repository")
