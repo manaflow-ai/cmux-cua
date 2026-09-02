@@ -195,11 +195,14 @@ jobs:
       contents: read
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout identity validator
+      - name: Checkout trusted release identity validator
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # Validate the same immutable source commit that produced the artifact.
-          ref: ${{ github.sha }}
+          # The caller can be an older tag. Load credential-gating code from
+          # the protected default branch instead of that tag.
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
           fetch-depth: 1
           sparse-checkout: |
             .github/scripts/validate-npm-publish-identity.py
@@ -226,7 +229,7 @@ jobs:
           TRUSTED_TAG_PREFIX: ${{ inputs.trusted_tag_prefix }}
           EXPECTED_TAG: ${{ inputs.expected_tag }}
           EXPECTED_VERSION: ${{ inputs.expected_version }}
-        run: python .github/scripts/validate-npm-publish-identity.py npm-dist
+        run: python trusted-release/.github/scripts/validate-npm-publish-identity.py npm-dist
 
   publish-oidc:
     needs: [build, validate-publisher-identity]
@@ -272,13 +275,19 @@ jobs:
       actions: read
       contents: read
     steps:
-      - name: Checkout trusted gate script
+      - name: Checkout trusted release gate script
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # Keep the gate and artifact provenance on the same caller commit.
-          ref: ${{ github.sha }}
+          # Keep the gate and artifact validator on protected main. A
+          # historical tag must not choose credential-gating code.
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
           fetch-depth: 1
-          sparse-checkout: .github/scripts/validate-legacy-publish-gate.sh
+          sparse-checkout: |
+            .github/scripts/validate-legacy-publish-gate.sh
+            .github/scripts/validate-npm-publish-identity.py
+            .github/scripts/validate_publish_artifacts.py
           sparse-checkout-cone-mode: false
           persist-credentials: false
 
@@ -287,7 +296,7 @@ jobs:
           ALLOW_LEGACY_TOKEN: ${{ inputs.allow_legacy_token }}
           LEGACY_TOKEN_GATE: ${{ secrets.NPM_LEGACY_TOKEN_FALLBACK_ENABLED }}
           REGISTRY_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: bash "${GITHUB_WORKSPACE}/.github/scripts/validate-legacy-publish-gate.sh"
+        run: bash "${GITHUB_WORKSPACE}/trusted-release/.github/scripts/validate-legacy-publish-gate.sh"
 
       - name: Use Node.js 24.x
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -300,6 +309,21 @@ jobs:
         with:
           name: npm-${{ inputs.package_name }}
           path: npm-dist
+
+      - name: Revalidate package identity before token use
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          TRUSTED_PUBLISHER_REPOSITORY: ${{ inputs.trusted_publisher_repository }}
+          TRUSTED_PACKAGE_NAME: ${{ inputs.trusted_package_name }}
+          TRUSTED_PUBLISHER_WORKFLOW: ${{ inputs.trusted_publisher_workflow }}
+          TRUSTED_TAG_PREFIX: ${{ inputs.trusted_tag_prefix }}
+          EXPECTED_TAG: ${{ inputs.expected_tag }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: python trusted-release/.github/scripts/validate-npm-publish-identity.py npm-dist
 
       - name: Publish with npm token (emergency fallback)
         working-directory: npm-dist

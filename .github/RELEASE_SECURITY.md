@@ -36,12 +36,27 @@ The package metadata and current PyPI/npm Trusted Publisher records belong to
 repository, or migrate the registry records and package metadata together
 before changing the trusted repository inputs.
 
+GitHub loads a tag-triggered workflow from the tagged commit. A historical tag
+could therefore contain an older provenance helper. Every credential-bearing
+job keeps release source and artifacts on the tag, but checks out the verifier,
+artifact validator, and legacy-token gate from the executing repository's
+protected `main` branch under `trusted-release`. A missing helper or failed
+checkout stops the job before a credential is requested. Keep `main` protected
+and reviewed; changing this checkout back to the tag reintroduces the
+historical-workflow risk.
+
+The CuaBot, Kasm, and XFCE container callers set `skip_arm64: true` because
+their current upstream base or package repositories do not provide a supported
+arm64 build. The reusable Docker workflow still builds arm64 for every other
+caller and fails if that platform cannot build.
+
 ## Workflow invariants
 
 Each credentialed caller has a tag-only publish job. It checks the protected-tag
-flag, verifies the tag target and main ancestry, checks out the triggering SHA
-with credential persistence disabled, and performs a second verification before
-requesting a credential. Build-only manual jobs have read-only contents access.
+flag, verifies the tag target and main ancestry, keeps release source bound to
+the triggering SHA, and performs a second verification with the protected-main
+helper before requesting a credential. Build-only manual jobs have read-only
+contents access.
 
 The reusable Docker publisher has no `workflow_dispatch` trigger. Its callers'
 manual dispatch paths use `docker-reusable-build.yml`, which never logs in or

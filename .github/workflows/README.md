@@ -8,13 +8,16 @@ with:
   trusted_publisher_repository: trycua/cua
   trusted_package_name: "@trycua/core"
   trusted_publisher_workflow: cd-ts-core.yml
+  trusted_tag_prefix: npm-core-v
+  expected_tag: ${{ needs.prepare.outputs.tag }}
+  expected_version: ${{ needs.prepare.outputs.version }}
 ```
 
 These values must match the npm Trusted Publishing configuration. The caller
 must also grant `id-token: write` to the reusable job. The build creates an
 artifact without registry credentials. The identity job checks the artifact's
 package name, GitHub repository URL, current repository, and exact caller
-workflow before either publisher can run.
+workflow, protected tag, and package version before either publisher can run.
 
 The normal path uses npm Trusted Publishing and the protected `npm`
 environment, and publishes only to `https://registry.npmjs.org/`. The legacy
@@ -47,3 +50,10 @@ not match, a run comes from a fork, or the ref is not a protected tag. Do not
 configure the canonical `trycua/cua` publisher to run from
 `manaflow-ai/cmux-cua`; update the npm trusted-publisher owner and workflow
 configuration together before changing these allowlisted values.
+
+Tag-triggered workflows are loaded from the tag commit. Credential-bearing
+jobs therefore load their verifier, artifact validator, and legacy-token gate
+from the executing repository's protected `main` branch in a separate
+`trusted-release` checkout. Release source remains checked out at the tag.
+Keep `main` protected and reviewed; a tag-local helper is not a trusted
+credential gate.

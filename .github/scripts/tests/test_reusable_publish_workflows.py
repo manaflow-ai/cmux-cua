@@ -13,10 +13,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 WORKFLOWS = ROOT / ".github" / "workflows"
+WORKFLOW_README = WORKFLOWS / "README.md"
 
 
 def workflow_lines(name: str) -> list[str]:
     return (WORKFLOWS / name).read_text(encoding="utf-8").splitlines()
+
+
+def workflow_text(name: str) -> str:
+    return (WORKFLOWS / name).read_text(encoding="utf-8")
 
 
 def job_block(name: str, job: str) -> list[str]:
@@ -169,6 +174,20 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
         self.assertIn('bun-version: "1.1.38"', publish)
         self.assertNotIn("bun-version: latest", publish)
 
+    def test_typescript_identity_contract_is_documented(self) -> None:
+        readme = WORKFLOW_README.read_text(encoding="utf-8")
+        for field in (
+            "trusted_publisher_repository",
+            "trusted_package_name",
+            "trusted_publisher_workflow",
+            "trusted_tag_prefix",
+            "expected_tag",
+            "expected_version",
+        ):
+            self.assertIn(field, readme)
+        self.assertIn("trycua/cua", readme)
+        self.assertIn("fails closed", readme)
+
     def test_registry_credentials_are_not_available_to_build_jobs(self) -> None:
         for name, job in (
             ("py-reusable-build.yml", "build"),
@@ -182,6 +201,23 @@ class ReusablePublishWorkflowTests(unittest.TestCase):
             self.assertNotIn("id-token", text)
             if job == "build":
                 self.assertIn("persist-credentials: false", text)
+
+    def test_credential_gates_are_loaded_from_protected_main(self) -> None:
+        for name, jobs in (
+            ("py-reusable-publish.yml", ("validate-publisher-identity", "publish-legacy-token")),
+            ("ts-reusable-publish.yml", ("validate-publisher-identity", "publish-legacy-token")),
+        ):
+            for job in jobs:
+                block = "\n".join(job_block(name, job))
+                self.assertIn("repository: ${{ github.repository }}", block, f"{name}:{job}")
+                self.assertIn("ref: main", block, f"{name}:{job}")
+                self.assertIn("path: trusted-release", block, f"{name}:{job}")
+
+        verifier = workflow_text("verify-release-tag.yml")
+        self.assertIn("repository: ${{ github.repository }}", verifier)
+        self.assertIn("ref: main", verifier)
+        self.assertIn("path: trusted-release", verifier)
+        self.assertIn("trusted-release/.github/scripts/verify_release_tag.py", verifier)
 
     def test_legacy_publish_requires_gate_before_upload(self) -> None:
         for name in ("py-reusable-publish.yml", "ts-reusable-publish.yml"):

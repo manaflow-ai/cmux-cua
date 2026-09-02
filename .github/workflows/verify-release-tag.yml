@@ -35,10 +35,15 @@ jobs:
       tag_sha: ${{ steps.provenance.outputs.tag_sha }}
       main_sha: ${{ steps.provenance.outputs.main_sha }}
     steps:
-      - name: Checkout the triggering commit
+      - name: Checkout the trusted release verifier
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.sha }}
+          # Tag-triggered workflows are loaded from the tag commit. Load this
+          # credential-gating helper from the canonical protected main branch
+          # so an old tag cannot replace the provenance logic.
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
           fetch-depth: 1
           sparse-checkout: .github/scripts/verify_release_tag.py
           sparse-checkout-cone-mode: false
@@ -50,6 +55,6 @@ jobs:
           GITHUB_REF_PROTECTED: ${{ github.ref_protected }}
           RELEASE_TAG_PREFIX: ${{ inputs.tag_prefix }}
           RELEASE_BASE_BRANCH: main
-        # The checkout is the triggering commit and the path is fixed. Keep
-        # context values in env so an event field cannot become shell code.
-        run: python3 .github/scripts/verify_release_tag.py
+        # Keep context values in env so an event field cannot become shell
+        # code. The script path is fixed and comes from trusted main above.
+        run: python3 trusted-release/.github/scripts/verify_release_tag.py

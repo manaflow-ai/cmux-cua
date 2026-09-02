@@ -224,6 +224,14 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
         self.assertIn("skip_arm64: true", publish)
         self.assertIn("kicad/kicad:9.0", source)
 
+    def test_known_container_arm64_gaps_are_explicit(self) -> None:
+        for filename in ("cd-container-cuabot.yml", "cd-container-kasm.yml"):
+            source = text(WORKFLOWS / filename)
+            manual = job_block(source, "manual-build")
+            publish = job_block(source, "publish")
+            self.assertIn("skip_arm64: true", manual, filename)
+            self.assertIn("skip_arm64: true", publish, filename)
+
     def test_manual_build_paths_have_no_credentials(self) -> None:
         for path in PY_CALLERS + TS_CALLERS + CONTAINER_CALLERS:
             source = text(path)
@@ -253,8 +261,58 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
             ):
                 if "actions/checkout@" not in block:
                     continue
+                if "path: trusted-release" in block:
+                    self.assertIn(
+                        "repository: ${{ github.repository }}", block, path.name
+                    )
+                    self.assertIn("ref: main", block, path.name)
+                    self.assertIn("persist-credentials: false", block, path.name)
+                    continue
                 self.assertIn("ref: ${{ github.sha }}", block, path.name)
                 self.assertIn("persist-credentials: false", block, path.name)
+
+    def test_credential_gates_use_protected_main_helpers(self) -> None:
+        """Historical tags must not select verifier or artifact-gate code."""
+        for path in PY_CALLERS:
+            block = job_block(text(path), "publish")
+            self.assertIn("path: trusted-release", block, path.name)
+            self.assertIn("repository: ${{ github.repository }}", block, path.name)
+            self.assertIn("ref: main", block, path.name)
+            self.assertIn("trusted-release/.github/scripts/verify_release_tag.py", block)
+            self.assertIn(
+                "trusted-release/.github/scripts/validate_publish_artifacts.py", block
+            )
+            self.assertNotIn(
+                '"${GITHUB_WORKSPACE}/.github/scripts/verify_release_tag.py"', block
+            )
+
+        docs_block = job_block(text(WORKFLOWS / "cd-cua-driver-docs.yml"), "open-reference-pr")
+        self.assertIn("path: trusted-release", docs_block)
+        self.assertIn("repository: ${{ github.repository }}", docs_block)
+        self.assertIn("ref: main", docs_block)
+        self.assertIn("trusted-release/.github/scripts/verify_release_tag.py", docs_block)
+
+        release = text(RELEASE_REUSABLE)
+        release_block = job_block(release, "create-release")
+        self.assertIn("path: trusted-release", release_block)
+        self.assertIn("repository: ${{ github.repository }}", release_block)
+        self.assertIn("ref: main", release_block)
+        self.assertIn("trusted-release/.github/scripts/verify_release_tag.py", release_block)
+
+        for workflow, jobs in (
+            (WORKFLOWS / "verify-release-tag.yml", ("verify",)),
+            (WORKFLOWS / "py-reusable-publish.yml", ("validate-publisher-identity", "publish-legacy-token")),
+            (WORKFLOWS / "ts-reusable-publish.yml", ("validate-publisher-identity", "publish-legacy-token")),
+            (DOCKER_PUBLISH, ("build-and-push", "publish-manifest-list")),
+        ):
+            source = text(workflow)
+            for job in jobs:
+                block = job_block(source, job)
+                self.assertIn("path: trusted-release", block, f"{workflow.name}:{job}")
+                self.assertIn(
+                    "repository: ${{ github.repository }}", block, f"{workflow.name}:{job}"
+                )
+                self.assertIn("ref: main", block, f"{workflow.name}:{job}")
 
     def test_ci_secret_jobs_are_schedule_only(self) -> None:
         models = text(WORKFLOWS / "ci-test-models.yml")

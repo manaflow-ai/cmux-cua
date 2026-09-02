@@ -93,6 +93,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Check out the trusted release verifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Release notes use the tag checkout, but provenance code must come
+          # from protected main so an old tag cannot replace the write gate.
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
+          fetch-depth: 1
+          sparse-checkout: .github/scripts/verify_release_tag.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Recheck tag provenance before write operations
         env:
           GH_TOKEN: ${{ github.token }}
@@ -100,7 +113,7 @@ jobs:
           RELEASE_TAG_PREFIX: ${{ inputs.tag_prefix }}
           RELEASE_BASE_BRANCH: main
           RELEASE_TRUSTED_REPOSITORY: trycua/cua
-        run: python3 .github/scripts/verify_release_tag.py
+        run: python3 trusted-release/.github/scripts/verify_release_tag.py
 
       - name: Validate release input paths
         env:

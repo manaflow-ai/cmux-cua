@@ -86,10 +86,12 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi-release
     steps:
-      - name: Check tag provenance before requesting PyPI OIDC
+      - name: Check out trusted release validators
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.sha }}
+          repository: ${{ github.repository }}
+          ref: main
+          path: trusted-release
           fetch-depth: 1
           sparse-checkout: |
             .github/scripts/verify_release_tag.py
@@ -104,7 +106,7 @@ jobs:
           RELEASE_TAG_PREFIX: som-v
           RELEASE_BASE_BRANCH: main
           RELEASE_TRUSTED_REPOSITORY: trycua/cua
-        run: python3 "${GITHUB_WORKSPACE}/.github/scripts/verify_release_tag.py"
+        run: python3 trusted-release/.github/scripts/verify_release_tag.py
 
       - name: Download package artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -117,7 +119,7 @@ jobs:
           EXPECTED_PACKAGE: cua-som
           EXPECTED_VERSION: ${{ needs.determine-version.outputs.version }}
         run: >-
-          python3 .github/scripts/validate_publish_artifacts.py dist
+          python3 trusted-release/.github/scripts/validate_publish_artifacts.py dist
           --suffix .whl --suffix .tar.gz
           --expected-package "$EXPECTED_PACKAGE"
           --expected-version "$EXPECTED_VERSION"
