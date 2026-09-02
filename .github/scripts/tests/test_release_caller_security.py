@@ -308,6 +308,7 @@ class ReleaseCallerSecurityTests(unittest.TestCase):
 
             ci_filename = f"ci-container-{container}.yml"
             ci_source = text(WORKFLOWS / ci_filename)
+            self.assertIn("permissions:\n  contents: read", ci_source, ci_filename)
             self.assertIn("skip_arm64: true", ci_source, ci_filename)
             self.assertIn(reason, ci_source, ci_filename)
 
