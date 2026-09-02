@@ -200,7 +200,9 @@ jobs:
       issues: write # Publish the action's trusted CLA status comment.
       pull-requests: write # Read and update the protected pull request.
     concurrency:
-      group: cla-signatures-${{ github.repository }}-${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}
+      # All PRs share one ledger. Serialize writers across workflow runs, then
+      # let the action's bounded optimistic retry handle a transient conflict.
+      group: cla-signatures-v3-${{ github.repository }}
       cancel-in-progress: false
     steps:
       - name: Require GitHub-hosted runner
@@ -274,7 +276,8 @@ jobs:
       issues: write # Publish the action's trusted CLA status comment.
       pull-requests: write # Read and update the protected pull request.
     concurrency:
-      group: cla-signatures-${{ github.repository }}-${{ github.workflow }}-${{ github.run_id }}-${{ github.run_attempt }}
+      # Rechecks and declarations must join the same cross-run ledger queue.
+      group: cla-signatures-v3-${{ github.repository }}
       cancel-in-progress: false
     outputs:
       signature_recorded: ${{ steps.cla_action.outputs.signature_recorded || '' }}
