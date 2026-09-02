@@ -8,11 +8,13 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PROTECTED_TAG = REPO_ROOT / ".github/scripts/validate_protected_tag.py"
 TRUSTED_MAIN = REPO_ROOT / ".github/scripts/validate_trusted_main.py"
+PROTECTED_TAG_RUN = REPO_ROOT / ".github/scripts/validate_protected_tag_run.py"
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -308,6 +310,156 @@ class TestTrustedMainValidation(unittest.TestCase):
         self.assertIn("protected branch rule", result.stderr)
 
 
+class TestProtectedTagRunValidation(unittest.TestCase):
+    """Exercise the live provenance binding used by tag release consumers."""
+
+    @staticmethod
+    def load_validator() -> Any:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "validate_protected_tag_run", PROTECTED_TAG_RUN
+        )
+        if spec is None or spec.loader is None:
+            raise AssertionError("could not load protected tag run validator")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    class FakeApi:
+        def __init__(self, values: dict[str, dict[str, Any]]) -> None:
+            self.values = values
+
+        def get(self, path: str) -> dict[str, Any]:
+            try:
+                return self.values[path]
+            except KeyError as error:
+                raise AssertionError(f"unexpected API path: {path}") from error
+
+    @staticmethod
+    def api_values(
+        commit: str,
+        main_commit: str,
+        tag: str,
+        workflow_name: str,
+        workflow_path: str,
+    ) -> dict[str, dict[str, Any]]:
+        repository = "manaflow-ai/cmux-cua"
+        base = f"/repos/{repository}"
+        return {
+            f"{base}/actions/runs/9001": {
+                "id": 9001,
+                "name": workflow_name,
+                "path": workflow_path,
+                "event": "push",
+                "status": "completed",
+                "conclusion": "success",
+                "repository": {"full_name": repository},
+                "head_repository": {"full_name": repository},
+                "head_branch": tag,
+                "head_sha": commit,
+            },
+            f"{base}/git/ref/tags/{tag}": {
+                "object": {"type": "commit", "sha": commit},
+            },
+            f"{base}/git/ref/heads/main": {
+                "object": {"type": "commit", "sha": main_commit},
+            },
+            f"{base}/compare/{main_commit}...{commit}": {
+                "status": "behind",
+                "ahead_by": 0,
+                "behind_by": 1,
+            },
+            f"{base}/compare/{main_commit}...{main_commit}": {
+                "status": "identical",
+                "ahead_by": 0,
+                "behind_by": 0,
+            },
+        }
+
+    @staticmethod
+    def validator_values(commit: str, tag: str = "lume-v1.2.3") -> dict[str, str]:
+        return {
+            "REPOSITORY": "manaflow-ai/cmux-cua",
+            "EXPECTED_REPOSITORY": "manaflow-ai/cmux-cua",
+            "SOURCE_RUN_ID": "9001",
+            "SOURCE_WORKFLOW_NAME": "CD: Lume (tag request)",
+            "SOURCE_WORKFLOW_PATH": ".github/workflows/cd-swift-lume-request.yml",
+            "SOURCE_EVENT": "push",
+            "SOURCE_STATUS": "completed",
+            "SOURCE_CONCLUSION": "success",
+            "SOURCE_REPOSITORY": "manaflow-ai/cmux-cua",
+            "SOURCE_HEAD_REPOSITORY": "manaflow-ai/cmux-cua",
+            "SOURCE_BRANCH": tag,
+            "SOURCE_SHA": commit,
+            "TRUSTED_SHA": commit,
+            "TRUSTED_REF_PROTECTED": "true",
+            "TAG_PREFIX": "lume-v",
+        }
+
+    def test_accepts_successful_tag_request_ancestor_of_main(self) -> None:
+        validator = self.load_validator()
+        commit = "a" * 40
+        values = self.validator_values(commit)
+        result = validator.validate(
+            self.FakeApi(
+                self.api_values(
+                    commit,
+                    commit,
+                    values["SOURCE_BRANCH"],
+                    values["SOURCE_WORKFLOW_NAME"],
+                    values["SOURCE_WORKFLOW_PATH"],
+                )
+            ),
+            values,
+        )
+        self.assertEqual(result["commit"], commit)
+        self.assertEqual(result["tag"], "lume-v1.2.3")
+
+    def test_rejects_failed_or_foreign_tag_request(self) -> None:
+        validator = self.load_validator()
+        commit = "b" * 40
+        values = self.validator_values(commit)
+        api = self.FakeApi(
+            self.api_values(
+                commit,
+                commit,
+                values["SOURCE_BRANCH"],
+                values["SOURCE_WORKFLOW_NAME"],
+                values["SOURCE_WORKFLOW_PATH"],
+            )
+        )
+        values["SOURCE_CONCLUSION"] = "failure"
+        with self.assertRaises(validator.ValidationError):
+            validator.validate(api, values)
+
+        values = self.validator_values(commit)
+        values["SOURCE_HEAD_REPOSITORY"] = "attacker/example"
+        with self.assertRaises(validator.ValidationError):
+            validator.validate(api, values)
+
+    def test_rejects_tag_commit_ahead_of_main(self) -> None:
+        validator = self.load_validator()
+        commit = "c" * 40
+        main_commit = "d" * 40
+        values = self.validator_values(commit)
+        api_values = self.api_values(
+            commit,
+            main_commit,
+            values["SOURCE_BRANCH"],
+            values["SOURCE_WORKFLOW_NAME"],
+            values["SOURCE_WORKFLOW_PATH"],
+        )
+        api_values[f"/repos/manaflow-ai/cmux-cua/compare/{main_commit}...{commit}"] = {
+            "status": "ahead",
+            "ahead_by": 1,
+            "behind_by": 0,
+        }
+        values["TRUSTED_SHA"] = main_commit
+        with self.assertRaises(validator.ValidationError):
+            validator.validate(self.FakeApi(api_values), values)
+
+
 class TestWorkflowContracts(unittest.TestCase):
     @staticmethod
     def workflow_text(relative_path: str) -> str:
@@ -344,6 +496,39 @@ class TestWorkflowContracts(unittest.TestCase):
             self.assert_top_level_permissions_empty(text, path)
             self.assert_no_top_level_env(text, path)
             self.assertIn("REF_PROTECTED", text, path)
+
+    def test_tag_release_workflows_are_request_only_and_consumers_use_workflow_run(self) -> None:
+        requests = {
+            ".github/workflows/cd-swift-lume-request.yml": "lume-v*",
+            ".github/workflows/cd-rust-cua-driver-request.yml": "cua-driver-rs-v*",
+        }
+        for path, tag_pattern in requests.items():
+            text = self.workflow_text(path)
+            self.assertRegex(text, r"(?m)^  push:\s*$", path)
+            self.assertIn(f'"{tag_pattern}"', text, path)
+            self.assertNotIn("secrets.", text, path)
+            self.assertNotIn("environment:", text, path)
+            self.assertNotIn("contents: write", text, path)
+            self.assert_top_level_permissions_empty(text, path)
+            self.assertNotIn("actions/checkout", text, path)
+
+        consumers = {
+            ".github/workflows/cd-swift-lume.yml": "CD: Lume (tag request)",
+            ".github/workflows/cd-rust-cua-driver.yml": "CD: Cua Driver (tag request)",
+        }
+        for path, source_name in consumers.items():
+            text = self.workflow_text(path)
+            self.assertRegex(
+                text,
+                r"(?ms)^  workflow_run:\s*.*?^    workflows:\s*\[\""
+                + re.escape(source_name)
+                + r"\"\]",
+                path,
+            )
+            self.assertNotRegex(text, r"(?m)^  push:", path)
+            self.assertNotIn("workflow_call:", text, path)
+            self.assertIn("SOURCE_RUN_ID", text, path)
+            self.assertIn("validate_protected_tag_run.py", text, path)
 
     def test_release_validators_execute_trusted_main_code(self) -> None:
         for path in (
@@ -406,8 +591,10 @@ class TestWorkflowContracts(unittest.TestCase):
     def test_all_action_refs_are_immutable_commits(self) -> None:
         for path in (
             ".github/workflows/cd-swift-lume.yml",
+            ".github/workflows/cd-swift-lume-request.yml",
             ".github/workflows/ci-swift-lume-manual.yml",
             ".github/workflows/cd-rust-cua-driver.yml",
+            ".github/workflows/cd-rust-cua-driver-request.yml",
             ".github/workflows/ci-rust-cua-driver-manual.yml",
             ".github/workflows/ci-test-models.yml",
             ".github/workflows/ci-test-models-request.yml",
