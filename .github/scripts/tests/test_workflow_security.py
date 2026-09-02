@@ -358,6 +358,7 @@ class TestProtectedTagRunValidation(unittest.TestCase):
                 "head_repository": {"full_name": repository},
                 "head_branch": tag,
                 "head_sha": commit,
+                "run_attempt": 1,
             },
             f"{base}/git/ref/tags/{tag}": {
                 "object": {"type": "commit", "sha": commit},
@@ -380,6 +381,7 @@ class TestProtectedTagRunValidation(unittest.TestCase):
     @staticmethod
     def validator_values(commit: str, tag: str = "lume-v1.2.3") -> dict[str, str]:
         return {
+            "EVENT_NAME": "workflow_run",
             "REPOSITORY": "manaflow-ai/cmux-cua",
             "EXPECTED_REPOSITORY": "manaflow-ai/cmux-cua",
             "SOURCE_RUN_ID": "9001",
@@ -541,7 +543,7 @@ class TestWorkflowContracts(unittest.TestCase):
                 text,
             )
             self.assertIsNotNone(validator_job, path)
-            self.assertRegex(validator_job.group(0), r"ref: refs/heads/main", path)
+            self.assertRegex(validator_job.group(0), r"ref: \$\{\{ github\.sha \}\}", path)
 
     def test_privileged_jobs_require_named_environments(self) -> None:
         expected = {

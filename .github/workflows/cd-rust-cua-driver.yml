@@ -11,14 +11,14 @@ name: "CD: Cua Driver (cross-platform)"
 # without needing to unpack a directory structure first.
 
 on:
-  push:
-    tags:
-      - "cua-driver-rs-v*"
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- source is validated below
+    workflows: ["CD: Cua Driver (tag request)"]
+    types: [completed]
 
 permissions: {}
 
 concurrency:
-  group: cua-driver-rs-release-${{ github.ref }}
+  group: cua-driver-rs-release-${{ github.event.workflow_run.id || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -29,33 +29,45 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      actions: read
     outputs:
       tag: ${{ steps.validate.outputs.tag }}
       version: ${{ steps.validate.outputs.version }}
       commit: ${{ steps.validate.outputs.commit }}
     steps:
-      # Never execute validation code from the tag being validated. A tag
-      # event can carry workflow files from that tag, so the validator itself
-      # must come from the protected default branch.
+      # This workflow is loaded from the default branch by workflow_run. Keep
+      # the explicit checkout so validation policy is pinned to the protected
+      # branch commit that started this run.
       - name: Checkout protected main for validation
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: refs/heads/main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify tag and main ancestry
+      - name: Verify source run, tag, and main ancestry
         id: validate
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
-          REF: ${{ github.ref }}
-          REF_PROTECTED: ${{ github.ref_protected }}
-          SHA: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}
           EXPECTED_REPOSITORY: manaflow-ai/cmux-cua
           TAG_PREFIX: cua-driver-rs-v
-          ALLOWED_EVENTS: push
-        run: python3 .github/scripts/validate_protected_tag.py
+          TRUSTED_SHA: ${{ github.sha }}
+          TRUSTED_REF_PROTECTED: ${{ github.ref_protected }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SOURCE_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_STATUS: ${{ github.event.workflow_run.status }}
+          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
+          SOURCE_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_WORKFLOW_NAME: "CD: Cua Driver (tag request)"
+          SOURCE_WORKFLOW_PATH: .github/workflows/cd-rust-cua-driver-request.yml
+        run: python3 .github/scripts/validate_protected_tag_run.py
 
   # ── Linux (x86_64 + arm64) ───────────────────────────────────────────────────
   # One matrixed job per Linux target. x86_64 builds on the standard

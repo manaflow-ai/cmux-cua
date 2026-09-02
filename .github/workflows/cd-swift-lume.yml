@@ -1,41 +1,14 @@
 name: "CD: Lume (macOS)"
 
 on:
-  push:
-    tags:
-      - "lume-v*"
-  workflow_call:
-    inputs:
-      version:
-        description: "Version to notarize"
-        required: true
-        type: string
-    secrets:
-      APPLICATION_CERT_BASE64:
-        required: true
-      INSTALLER_CERT_BASE64:
-        required: true
-      CERT_PASSWORD:
-        required: true
-      APPLE_ID:
-        required: true
-      TEAM_ID:
-        required: true
-      APP_SPECIFIC_PASSWORD:
-        required: true
-      DEVELOPER_NAME:
-        required: true
-      PROVISIONING_PROFILE_BASE64:
-        required: true
-      RELEASE_APP_ID:
-        required: false
-      RELEASE_APP_PRIVATE_KEY:
-        required: false
+  workflow_run: # zizmor: ignore[dangerous-triggers] -- source is validated below
+    workflows: ["CD: Lume (tag request)"]
+    types: [completed]
 
 permissions: {}
 
 concurrency:
-  group: lume-release-${{ github.ref }}
+  group: lume-release-${{ github.event.workflow_run.id || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -46,34 +19,45 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+      actions: read
     outputs:
       tag: ${{ steps.validate.outputs.tag }}
       version: ${{ steps.validate.outputs.version }}
       commit: ${{ steps.validate.outputs.commit }}
     steps:
-      # Never execute validation code from the tag being validated. A tag
-      # event can carry workflow files from that tag, so the validator itself
-      # must come from the protected default branch.
+      # This workflow is loaded from the default branch by workflow_run. Keep
+      # the explicit checkout so the validator and its policy stay pinned to
+      # the protected branch commit that started this run.
       - name: Checkout protected main for validation
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: refs/heads/main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify tag and main ancestry
+      - name: Verify source run, tag, and main ancestry
         id: validate
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
-          REF: ${{ github.ref }}
-          REF_PROTECTED: ${{ github.ref_protected }}
-          SHA: ${{ github.sha }}
           REPOSITORY: ${{ github.repository }}
           EXPECTED_REPOSITORY: manaflow-ai/cmux-cua
           TAG_PREFIX: lume-v
-          ALLOWED_EVENTS: push,workflow_call
-          EXPECTED_VERSION: ${{ inputs.version }}
-        run: python3 .github/scripts/validate_protected_tag.py
+          TRUSTED_SHA: ${{ github.sha }}
+          TRUSTED_REF_PROTECTED: ${{ github.ref_protected }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SOURCE_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          SOURCE_EVENT: ${{ github.event.workflow_run.event }}
+          SOURCE_STATUS: ${{ github.event.workflow_run.status }}
+          SOURCE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
+          SOURCE_HEAD_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+          SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_WORKFLOW_NAME: "CD: Lume (tag request)"
+          SOURCE_WORKFLOW_PATH: .github/workflows/cd-swift-lume-request.yml
+        run: python3 .github/scripts/validate_protected_tag_run.py
 
   notarize:
     name: Build and notarize Lume
@@ -299,7 +283,7 @@ jobs:
       - name: Generate path-filtered release notes
         id: release-notes
         env:
-          CURRENT_TAG: ${{ github.ref_name }}
+          CURRENT_TAG: ${{ needs.validate-release.outputs.tag }}
         run: |
           set -euo pipefail
           # Find previous lume tag
