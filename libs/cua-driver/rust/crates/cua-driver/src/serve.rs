@@ -2263,7 +2263,11 @@ pub async fn run_serve(
                                     }
                                 }
 
-                                let mut approval_broker_token = None;
+                                // Keep the response shape identical on every target. On
+                                // non-macOS builds the broker registration block is compiled
+                                // out, so the annotation is required to avoid unconstrained
+                                // `Option<T>` inference there.
+                                let mut approval_broker_token: Option<String> = None;
                                 if let Some(sid) = req.session_id.as_deref() {
                                     // A proxy reconnect after daemon re-exec uses the same
                                     // session id. If the old control connection died while
