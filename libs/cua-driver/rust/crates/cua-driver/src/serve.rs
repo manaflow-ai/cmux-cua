@@ -1368,6 +1368,13 @@ fn authenticate_compat_call(
         return Err("Codex Computer Use tool call broker authentication failed.".to_owned());
     }
 
+    // The compatibility boundary deliberately removes the public `session`
+    // field below and carries the authenticated lifecycle id only in
+    // `_session_id`. Refresh the idle-TTL clock here, after broker
+    // authentication, so a live hosted proxy is reclaimed only after a real
+    // period of inactivity rather than being invisible to the session sweep.
+    cua_driver_core::session::touch_session(session_id);
+
     object.remove("session");
     object.insert(
         "_session_id".to_owned(),
@@ -3939,6 +3946,39 @@ mod session_boundary_tests {
         )
         .expect_err("compat calls must have object arguments");
         assert!(error.contains("arguments must be an object"));
+    }
+
+    #[test]
+    fn compat_broker_authentication_refreshes_session_activity() {
+        let session_id = format!(
+            "compat-activity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let brokers = Mutex::new(HashMap::from([(
+            session_id.clone(),
+            "daemon-minted".to_owned(),
+        )]));
+        let mut args = json!({
+            (APPROVAL_BROKER_TOKEN_ARG): "daemon-minted",
+        });
+
+        authenticate_compat_call(
+            &mut args,
+            DaemonProfile::CodexComputerUseCompat,
+            Some(&session_id),
+            &brokers,
+        )
+        .expect("authenticated compatibility call");
+
+        assert!(
+            cua_driver_core::session::is_session_active(&session_id),
+            "an authenticated compatibility call must register activity for idle-TTL cleanup"
+        );
+        cua_driver_core::session::end_session(&session_id);
     }
 
     #[test]

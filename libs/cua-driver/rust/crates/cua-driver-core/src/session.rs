@@ -119,6 +119,12 @@ pub fn fire_session_end(session_id: &str) {
             return; // already ended — idempotent no-op.
         }
     }
+    // Remove the idle-TTL entry while the per-session lifecycle stripe is
+    // still held. This keeps connection-EOF teardown (which calls
+    // `fire_session_end` directly) consistent with explicit `end_session`,
+    // and prevents a concurrent late touch from re-inserting the id after a
+    // pre-mark activity removal.
+    activity().lock().unwrap().remove(session_id);
     for hook in hooks().lock().unwrap().iter() {
         hook(session_id);
     }
@@ -183,7 +189,14 @@ pub fn revive_session(session_id: &str) -> bool {
 /// session that has already ended (so a late in-flight call can't resurrect a
 /// reaped session's TTL entry).
 pub fn touch_session(session_id: &str) {
-    if !is_trackable(session_id) || is_session_ended(session_id) {
+    if !is_trackable(session_id) {
+        return;
+    }
+    // Use the same lifecycle stripe as `fire_session_end`. A separate
+    // check-then-insert (or an ended-only lock) lets an end remove the old
+    // activity entry and then lose the race to a late touch.
+    let _lifecycle_guard = session_lifecycle_lock(session_id).lock().unwrap();
+    if ended_sessions().lock().unwrap().contains(session_id) {
         return;
     }
     activity()
@@ -200,7 +213,8 @@ pub fn end_session(session_id: &str) {
     if !is_trackable(session_id) {
         return;
     }
-    activity().lock().unwrap().remove(session_id);
+    // Keep explicit teardown on the same atomic path as control-connection
+    // EOF teardown so activity removal and the ended tombstone cannot drift.
     fire_session_end(session_id);
 }
 
@@ -228,6 +242,21 @@ pub fn evict_idle(ttl: Duration) -> Vec<String> {
 /// Number of sessions with a live idle-TTL entry. Diagnostics only.
 pub fn active_session_count() -> usize {
     activity().lock().unwrap().len()
+}
+
+/// Whether one trackable session currently has an idle-TTL activity entry.
+/// Diagnostics and tests use this narrow query without sweeping unrelated
+/// sessions out of the process-global activity map.
+#[doc(hidden)]
+pub fn is_session_active(session_id: &str) -> bool {
+    if !is_trackable(session_id) {
+        return false;
+    }
+    let _lifecycle_guard = session_lifecycle_lock(session_id).lock().unwrap();
+    if ended_sessions().lock().unwrap().contains(session_id) {
+        return false;
+    }
+    activity().lock().unwrap().contains_key(session_id)
 }
 
 #[cfg(test)]
@@ -297,6 +326,40 @@ mod tests {
         assert!(is_session_ended(sid));
         // Its TTL entry is gone, so a later sweep doesn't re-fire for it.
         assert!(!evict_idle(Duration::ZERO).iter().any(|s| s == sid));
+    }
+
+    #[test]
+    fn touch_after_end_does_not_repopulate_idle_activity() {
+        let sid = "test-touch-after-end-session-223344";
+        touch_session(sid);
+        end_session(sid);
+        assert!(is_session_ended(sid));
+
+        // A late in-flight call must not put an ended id back into the TTL map.
+        touch_session(sid);
+        assert!(!is_session_active(sid));
+        assert!(
+            !evict_idle(Duration::ZERO).iter().any(|id| id == sid),
+            "late activity on an ended session must not recreate its idle entry"
+        );
+    }
+
+    #[test]
+    fn connection_end_removes_idle_activity_entry() {
+        let sid = "test-connection-end-activity-334455";
+        touch_session(sid);
+        assert!(is_session_active(sid));
+        assert!(!evict_idle(Duration::from_secs(3600)).iter().any(|id| id == sid));
+
+        // The daemon's control-connection EOF path calls fire_session_end
+        // directly, so it must clear the same activity entry as end_session.
+        fire_session_end(sid);
+        assert!(is_session_ended(sid));
+        assert!(!is_session_active(sid));
+        assert!(
+            !evict_idle(Duration::ZERO).iter().any(|id| id == sid),
+            "EOF teardown must remove the session from the idle sweep"
+        );
     }
 
     #[test]
