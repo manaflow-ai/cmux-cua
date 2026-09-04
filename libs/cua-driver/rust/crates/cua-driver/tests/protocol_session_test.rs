@@ -391,6 +391,7 @@ fn external_display_cursor_preserves_global_protocol_coordinates() {
     let target = windows
         .iter()
         .filter(|window| window["pid"].as_u64() != Some(driver.pid() as u64))
+        .filter(|window| window["app_name"].as_str() != Some("cua-driver"))
         .filter(|window| window["is_on_screen"].as_bool() == Some(true))
         .filter_map(|window| {
             let bounds = window["bounds"].as_object()?;
