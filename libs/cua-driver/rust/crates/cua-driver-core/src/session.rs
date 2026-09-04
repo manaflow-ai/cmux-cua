@@ -23,8 +23,10 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 type SessionEndHook = Box<dyn Fn(&str) + Send + Sync>;
+type SessionReviveHook = Box<dyn Fn(&str) + Send + Sync>;
 
 static SESSION_END_HOOKS: OnceLock<Mutex<Vec<SessionEndHook>>> = OnceLock::new();
+static SESSION_REVIVE_HOOKS: OnceLock<Mutex<Vec<SessionReviveHook>>> = OnceLock::new();
 
 /// Last-activity timestamp per live session id. A session is "touched" every
 /// time a tool call carries its explicit `session` id (see the daemon boundary
@@ -57,6 +59,10 @@ fn hooks() -> &'static Mutex<Vec<SessionEndHook>> {
     SESSION_END_HOOKS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+fn revive_hooks() -> &'static Mutex<Vec<SessionReviveHook>> {
+    SESSION_REVIVE_HOOKS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 fn ended_sessions() -> &'static Mutex<HashSet<String>> {
     ENDED_SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
 }
@@ -69,6 +75,14 @@ fn ended_sessions() -> &'static Mutex<HashSet<String>> {
 /// as a no-op.
 pub fn register_session_end_hook(hook: impl Fn(&str) + Send + Sync + 'static) {
     hooks().lock().unwrap().push(Box::new(hook));
+}
+
+/// Register a callback for an explicit reuse of an ended session id. Platform
+/// cursor overlays use this to order a `Revive` event after their prior
+/// `Remove`, preserving the late-command guard without making the tombstone
+/// permanent.
+pub fn register_session_revive_hook(hook: impl Fn(&str) + Send + Sync + 'static) {
+    revive_hooks().lock().unwrap().push(Box::new(hook));
 }
 
 /// Fan a session-end out to every registered cleanup hook. Called by the daemon
@@ -92,11 +106,28 @@ pub fn fire_session_end(session_id: &str) {
     }
 }
 
-/// Whether `fire_session_end` has already run for this `session_id`. The
-/// daemon-side authority for "this session is permanently gone"; the macOS
-/// overlay keeps its own render-side tombstone keyed on the same id.
+/// Whether `fire_session_end` has already run for this `session_id`. This is
+/// the daemon-side late-action guard until an explicit [`revive_session`] call;
+/// platform overlays keep an ordered render-side tombstone keyed on the same id.
 pub fn is_session_ended(session_id: &str) -> bool {
     ended_sessions().lock().unwrap().contains(session_id)
+}
+
+/// Run an ordered lifecycle operation only while `session_id` is live.
+///
+/// The ended-session lock stays held through `operation`, so a concurrent
+/// [`fire_session_end`] cannot mark the session and enqueue its cleanup between
+/// the live check and the operation. This is intended for short, non-blocking
+/// lifecycle queue writes such as cursor revival.
+pub fn with_live_session<R>(session_id: &str, operation: impl FnOnce() -> R) -> Option<R> {
+    if !is_trackable(session_id) {
+        return Some(operation());
+    }
+    let ended = ended_sessions().lock().unwrap();
+    if ended.contains(session_id) {
+        return None;
+    }
+    Some(operation())
 }
 
 /// Revive a previously-ended session id by clearing its tombstone, so a fresh
@@ -112,6 +143,17 @@ pub fn is_session_ended(session_id: &str) -> bool {
 pub fn revive_session(session_id: &str) -> bool {
     if !is_trackable(session_id) {
         return false;
+    }
+    // Serialize revivals through the hook lock, but do not hold the ended-set
+    // lock while invoking callbacks. The tombstone remains present while hooks
+    // enqueue their ordered lifecycle events, so concurrent actions still see
+    // the session as ended. Reentrant hooks may safely query that state.
+    let hooks = revive_hooks().lock().unwrap();
+    if !ended_sessions().lock().unwrap().contains(session_id) {
+        return false;
+    }
+    for hook in hooks.iter() {
+        hook(session_id);
     }
     ended_sessions().lock().unwrap().remove(session_id)
 }
@@ -207,10 +249,15 @@ mod tests {
         let sid = "test-ttl-session-DDEEFF";
         touch_session(sid);
         // A huge TTL leaves it alone (just touched).
-        assert!(evict_idle(Duration::from_secs(3600)).iter().all(|s| s != sid));
+        assert!(evict_idle(Duration::from_secs(3600))
+            .iter()
+            .all(|s| s != sid));
         // A zero TTL treats any prior activity as idle → evicts it.
         let evicted = evict_idle(Duration::ZERO);
-        assert!(evicted.iter().any(|s| s == sid), "zero-TTL must evict a touched session");
+        assert!(
+            evicted.iter().any(|s| s == sid),
+            "zero-TTL must evict a touched session"
+        );
         assert!(is_session_ended(sid), "evicted session is ended");
     }
 
@@ -250,9 +297,111 @@ mod tests {
     }
 
     #[test]
+    fn revive_notifies_hooks_once_after_an_actual_end() {
+        let sid = "test-revive-hook-session-A1B2C3";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_hook = calls.clone();
+        let expected = sid.to_owned();
+        register_session_revive_hook(move |got| {
+            if got == expected {
+                calls_for_hook.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        end_session(sid);
+        assert!(revive_session(sid));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(!revive_session(sid));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn revive_hook_can_reenter_session_state_while_tombstone_is_still_present() {
+        let sid = "test-revive-reentrant-session-D4E5F6";
+        let saw_ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let expected = sid.to_owned();
+        let saw_ended_for_hook = saw_ended.clone();
+        register_session_revive_hook(move |got| {
+            if got == expected {
+                saw_ended_for_hook.store(is_session_ended(got), Ordering::Relaxed);
+            }
+        });
+        end_session(sid);
+        assert!(revive_session(sid));
+        assert!(saw_ended.load(Ordering::Relaxed));
+        assert!(!is_session_ended(sid));
+    }
+
+    #[test]
+    fn concurrent_double_revive_enqueues_hooks_once() {
+        let sid = "test-double-revive-session-E5F6A7";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered_hook = Arc::new(std::sync::Barrier::new(2));
+        let release_hook = Arc::new(std::sync::Barrier::new(2));
+        let expected = sid.to_owned();
+        let calls_for_hook = calls.clone();
+        let entered_for_hook = entered_hook.clone();
+        let release_for_hook = release_hook.clone();
+        register_session_revive_hook(move |got| {
+            if got == expected {
+                calls_for_hook.fetch_add(1, Ordering::Relaxed);
+                entered_for_hook.wait();
+                release_for_hook.wait();
+            }
+        });
+        end_session(sid);
+
+        let first_sid = sid.to_owned();
+        let first = std::thread::spawn(move || revive_session(&first_sid));
+        entered_hook.wait();
+
+        let second_sid = sid.to_owned();
+        let second = std::thread::spawn(move || revive_session(&second_sid));
+
+        release_hook.wait();
+        assert!(first.join().unwrap());
+        assert!(!second.join().unwrap());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn revive_is_noop_for_anonymous_ids() {
         // The anonymous fallback is never tracked, so there is nothing to revive.
         assert!(!revive_session("default"));
         assert!(!revive_session(""));
+    }
+
+    #[test]
+    fn live_session_operation_orders_before_concurrent_end_cleanup() {
+        use std::sync::{Arc, Barrier};
+
+        let sid = "test-live-operation-order-1A2B3C";
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let hook_events = events.clone();
+        register_session_end_hook(move |ended| {
+            if ended == sid {
+                hook_events.lock().unwrap().push("remove");
+            }
+        });
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_events = events.clone();
+        let worker_entered = entered.clone();
+        let worker_release = release.clone();
+        let worker = std::thread::spawn(move || {
+            with_live_session(sid, || {
+                worker_events.lock().unwrap().push("revive");
+                worker_entered.wait();
+                worker_release.wait();
+            })
+        });
+
+        entered.wait();
+        let ender = std::thread::spawn(move || fire_session_end(sid));
+        release.wait();
+        assert!(worker.join().unwrap().is_some());
+        ender.join().unwrap();
+        assert_eq!(&*events.lock().unwrap(), &["revive", "remove"]);
     }
 }

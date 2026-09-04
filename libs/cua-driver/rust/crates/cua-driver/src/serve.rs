@@ -7,6 +7,13 @@
 //!   {"method":"list"}
 //!   {"method":"describe","name":"<tool>"}
 //!   {"method":"shutdown"}
+//!   {"method":"permissions_status"}       (private macOS operator control)
+//!   {"method":"permissions_present"}      (private macOS operator control)
+//!   {"method":"permissions_refresh"}      (private macOS operator control)
+//!   {"method":"application_windows"}      (private authenticated cmux host control)
+//!   {"method":"application_surface_start","args":{...}}
+//!   {"method":"application_surface_stop","args":{"session":"..."}}
+//!   {"method":"application_surface_event","args":{...}}
 //!
 //! Response shapes:
 //!   {"ok":true,"result":...}
@@ -17,7 +24,473 @@
 //!   Linux  — ~/.cache/cua-driver/cua-driver.sock
 //!   Windows — \\.\pipe\cua-driver  (TODO: use named pipe; stubs only for now)
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+
+/// Tool surface owned by a daemon instance. The proxy validates this value
+/// before exposing any tools so an explicit socket cannot accidentally bridge
+/// a native client to the narrower Codex Computer Use daemon, or vice versa.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DaemonProfile {
+    #[serde(rename = "native")]
+    Native,
+    #[serde(rename = "codex-computer-use-compat")]
+    CodexComputerUseCompat,
+}
+
+impl DaemonProfile {
+    pub fn for_codex_compat(enabled: bool) -> Self {
+        if enabled {
+            Self::CodexComputerUseCompat
+        } else {
+            Self::Native
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::CodexComputerUseCompat => "codex-computer-use-compat",
+        }
+    }
+}
+
+impl std::fmt::Display for DaemonProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Exact public roster for the Codex Computer Use compatibility profile.
+/// Order is part of the observed protocol contract and is checked by the MCP
+/// proxy before it advertises the daemon's tools.
+pub const CODEX_COMPUTER_USE_TOOL_NAMES: [&str; 10] = [
+    "list_apps",
+    "get_app_state",
+    "click",
+    "perform_secondary_action",
+    "set_value",
+    "select_text",
+    "scroll",
+    "drag",
+    "press_key",
+    "type_text",
+];
+
+fn http_transport_allowed(profile: DaemonProfile) -> bool {
+    profile != DaemonProfile::CodexComputerUseCompat
+}
+
+fn maybe_start_http_transport(
+    registry: std::sync::Arc<cua_driver_core::tool::ToolRegistry>,
+    profile: DaemonProfile,
+) {
+    let Some(port) = crate::mcp_http::configured_port() else {
+        return;
+    };
+    if !http_transport_allowed(profile) {
+        eprintln!(
+            "cua-driver: HTTP MCP transport on port {port} is disabled for the \
+             codex-computer-use-compat profile because that transport is not authenticated."
+        );
+        return;
+    }
+    crate::mcp_http::spawn(registry, port);
+}
+
+#[cfg(unix)]
+fn secure_runtime_directory(
+    dir: &std::path::Path,
+    repair_legacy_permissions: bool,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    if !dir.exists() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(dir)?;
+    }
+
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("runtime path is not a real directory: {}", dir.display());
+    }
+
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        anyhow::bail!(
+            "runtime directory {} is owned by uid {}, expected {}",
+            dir.display(),
+            metadata.uid(),
+            effective_uid
+        );
+    }
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        if !repair_legacy_permissions {
+            anyhow::bail!(
+                "runtime directory has unsafe permissions path={} mode={mode:o}",
+                dir.display()
+            );
+        }
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_stale_socket(socket_path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+        anyhow::bail!(
+            "refusing to replace non-socket path: {}",
+            socket_path.display()
+        );
+    }
+
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        anyhow::bail!(
+            "socket {} is owned by uid {}, expected {}",
+            socket_path.display(),
+            metadata.uid(),
+            effective_uid
+        );
+    }
+
+    if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+        anyhow::bail!("daemon is already listening on {}", socket_path.display());
+    }
+
+    std::fs::remove_file(socket_path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_socket_permissions(socket_path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_private_pid_file(pid_path: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(pid_path)?;
+    file.write_all(std::process::id().to_string().as_bytes())?;
+    file.sync_all()?;
+    std::fs::set_permissions(pid_path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+const CODEX_UNVERIFIED_CLIENT_ENV: &str = "CUA_DRIVER_CODEX_ALLOW_UNVERIFIED_CLIENT";
+const CODEX_PARENT_REQUIREMENT: &str =
+    "anchor apple generic and certificate leaf[subject.OU] = \"2DC432GLL2\" and identifier \"codex\"";
+
+#[cfg(all(unix, target_os = "macos"))]
+type SecurityCodeRef = *const libc::c_void;
+#[cfg(all(unix, target_os = "macos"))]
+type SecurityRequirementRef = *const libc::c_void;
+#[cfg(all(unix, target_os = "macos"))]
+type SecurityStatus = i32;
+#[cfg(all(unix, target_os = "macos"))]
+type SecurityFlags = u32;
+
+#[cfg(all(unix, target_os = "macos"))]
+#[link(name = "Security", kind = "framework")]
+extern "C" {
+    static kSecGuestAttributePid: core_foundation::string::CFStringRef;
+    fn SecCodeCopySelf(flags: SecurityFlags, code: *mut SecurityCodeRef) -> SecurityStatus;
+    fn SecCodeCopyDesignatedRequirement(
+        code: SecurityCodeRef,
+        flags: SecurityFlags,
+        requirement: *mut SecurityRequirementRef,
+    ) -> SecurityStatus;
+    fn SecCodeCopyGuestWithAttributes(
+        host: SecurityCodeRef,
+        attributes: core_foundation::dictionary::CFDictionaryRef,
+        flags: SecurityFlags,
+        guest: *mut SecurityCodeRef,
+    ) -> SecurityStatus;
+    fn SecRequirementCreateWithString(
+        text: core_foundation::string::CFStringRef,
+        flags: SecurityFlags,
+        requirement: *mut SecurityRequirementRef,
+    ) -> SecurityStatus;
+    fn SecCodeCheckValidity(
+        code: SecurityCodeRef,
+        flags: SecurityFlags,
+        requirement: SecurityRequirementRef,
+    ) -> SecurityStatus;
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn approval_broker_peer_pid(stream: &tokio::net::UnixStream) -> Result<libc::pid_t, String> {
+    use std::os::fd::AsRawFd;
+
+    let mut peer_pid: libc::pid_t = 0;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let peer_ok = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut peer_pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    } == 0;
+    if peer_ok && peer_pid > 0 {
+        Ok(peer_pid)
+    } else {
+        Err("could not resolve the Unix peer pid".to_owned())
+    }
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn process_path(pid: libc::pid_t) -> Result<std::path::PathBuf, String> {
+    use std::ffi::CStr;
+
+    let mut buffer = vec![0u8; 4 * 1024];
+    let written = unsafe {
+        libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32)
+    };
+    if written <= 0 {
+        return Err(format!("could not resolve executable path for pid {pid}"));
+    }
+    let path = CStr::from_bytes_until_nul(&buffer)
+        .map_err(|_| format!("pid {pid} returned an invalid executable path"))?;
+    std::fs::canonicalize(std::path::Path::new(path.to_string_lossy().as_ref()))
+        .map_err(|error| format!("could not canonicalize executable for pid {pid}: {error}"))
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn process_parent_pid(pid: libc::pid_t) -> Result<libc::pid_t, String> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let expected_size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected_size as libc::c_int,
+        )
+    };
+    if written != expected_size as libc::c_int {
+        return Err(format!("could not resolve immediate parent pid for proxy pid {pid}"));
+    }
+    let parent = unsafe { info.assume_init() }.pbi_ppid as libc::pid_t;
+    if parent > 0 {
+        Ok(parent)
+    } else {
+        Err(format!("proxy pid {pid} has no live immediate parent"))
+    }
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn unverified_codex_client_override_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn dynamic_code_for_pid(pid: libc::pid_t, label: &str) -> Result<SecurityCodeRef, String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+
+    let pid_key = unsafe { CFString::wrap_under_get_rule(kSecGuestAttributePid) };
+    let attributes = CFDictionary::from_CFType_pairs(&[(pid_key, CFNumber::from(pid as i32))]);
+    let mut code: SecurityCodeRef = std::ptr::null();
+    let status = unsafe {
+        SecCodeCopyGuestWithAttributes(
+            std::ptr::null(),
+            attributes.as_concrete_TypeRef(),
+            0,
+            &mut code,
+        )
+    };
+    if status == 0 {
+        Ok(code)
+    } else {
+        Err(format!(
+            "Security.framework could not inspect {label} pid {pid} (OSStatus {status})"
+        ))
+    }
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn validate_peer_matches_daemon_code(peer_pid: libc::pid_t) -> Result<(), String> {
+    use core_foundation::base::{CFRelease, CFTypeRef};
+
+    let mut daemon_code: SecurityCodeRef = std::ptr::null();
+    let self_status = unsafe { SecCodeCopySelf(0, &mut daemon_code) };
+    if self_status != 0 {
+        return Err(format!(
+            "Security.framework could not inspect the running daemon (OSStatus {self_status})"
+        ));
+    }
+
+    let mut daemon_requirement: SecurityRequirementRef = std::ptr::null();
+    let requirement_status = unsafe {
+        SecCodeCopyDesignatedRequirement(daemon_code, 0, &mut daemon_requirement)
+    };
+    if requirement_status != 0 {
+        unsafe { CFRelease(daemon_code as CFTypeRef) };
+        return Err(format!(
+            "Security.framework could not derive the running daemon code requirement (OSStatus {requirement_status})"
+        ));
+    }
+
+    let peer_code = match dynamic_code_for_pid(peer_pid, "broker") {
+        Ok(code) => code,
+        Err(error) => {
+            unsafe {
+                CFRelease(daemon_requirement as CFTypeRef);
+                CFRelease(daemon_code as CFTypeRef);
+            }
+            return Err(error);
+        }
+    };
+    let validity_status = unsafe { SecCodeCheckValidity(peer_code, 0, daemon_requirement) };
+    unsafe {
+        CFRelease(peer_code as CFTypeRef);
+        CFRelease(daemon_requirement as CFTypeRef);
+        CFRelease(daemon_code as CFTypeRef);
+    }
+    if validity_status == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "broker pid {peer_pid} does not match the running daemon code identity (OSStatus {validity_status})"
+        ))
+    }
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn validate_codex_dynamic_code(pid: libc::pid_t) -> Result<(), String> {
+    use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
+    use core_foundation::string::CFString;
+
+    let requirement_text = CFString::new(CODEX_PARENT_REQUIREMENT);
+    let mut requirement: SecurityRequirementRef = std::ptr::null();
+    let requirement_status = unsafe {
+        SecRequirementCreateWithString(
+            requirement_text.as_concrete_TypeRef(),
+            0,
+            &mut requirement,
+        )
+    };
+    if requirement_status != 0 {
+        return Err(format!(
+            "Security.framework could not compile the Codex code requirement (OSStatus {requirement_status})"
+        ));
+    }
+    let code = match dynamic_code_for_pid(pid, "Codex parent") {
+        Ok(code) => code,
+        Err(error) => {
+            unsafe { CFRelease(requirement as CFTypeRef) };
+            return Err(error);
+        }
+    };
+    let validity_status = unsafe { SecCodeCheckValidity(code, 0, requirement) };
+    unsafe {
+        CFRelease(code as CFTypeRef);
+        CFRelease(requirement as CFTypeRef);
+    }
+    if validity_status == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "immediate parent pid {pid} is not signed OpenAI Codex (OSStatus {validity_status})"
+        ))
+    }
+}
+
+/// Authenticate the broker process and the signed Codex process that launched
+/// it. The override skips only the Codex parent check and is intentionally
+/// exact for isolated tests or local driver development.
+#[cfg(all(unix, target_os = "macos"))]
+fn approval_broker_peer_is_trusted(peer_pid: libc::pid_t) -> Result<(), String> {
+    let peer_path = process_path(peer_pid)?;
+    let daemon_path = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| format!("could not resolve daemon executable: {error}"))?;
+    if peer_path != daemon_path {
+        return Err(format!(
+            "peer executable {} does not match daemon executable {}",
+            peer_path.display(),
+            daemon_path.display()
+        ));
+    }
+    validate_peer_matches_daemon_code(peer_pid)?;
+    if unverified_codex_client_override_enabled(
+        std::env::var_os(CODEX_UNVERIFIED_CLIENT_ENV).as_deref(),
+    ) {
+        tracing::warn!(
+            "DANGEROUS: skipping signed Codex parent validation because {CODEX_UNVERIFIED_CLIENT_ENV}=1; live broker code identity was still verified"
+        );
+        return Ok(());
+    }
+    validate_codex_dynamic_code(process_parent_pid(peer_pid)?)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn approval_broker_peer_pid(_stream: &tokio::net::UnixStream) -> Result<libc::pid_t, String> {
+    Err("Codex Computer Use approval brokers are supported only on macOS".to_owned())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn approval_broker_peer_is_trusted(_peer_pid: libc::pid_t) -> Result<(), String> {
+    Err("Codex Computer Use approval brokers are supported only on macOS".to_owned())
+}
+
+/// Optional shared secret for authenticating daemon socket requests.
+///
+/// The default standalone driver remains backward-compatible when this is
+/// unset. Embedders that expose TCC- or input-capable tools over a predictable
+/// local socket set an unguessable value in both the daemon and its trusted
+/// proxy processes.
+pub const SOCKET_AUTH_TOKEN_ENV: &str = "CUA_DRIVER_SOCKET_AUTH_TOKEN";
+
+/// Optional second capability reserved for embedding-host operations.
+///
+/// The ordinary socket token authorizes Computer Use tool calls. Embedders
+/// keep this separate token out of agent environments and attach it only to
+/// shutdown, permission, and state-authentication requests. When configured,
+/// authenticated agents may reconnect after an embedding host relaunch
+/// without gaining those host-only capabilities.
+pub const SOCKET_HOST_AUTH_TOKEN_ENV: &str = "CUA_DRIVER_SOCKET_HOST_AUTH_TOKEN";
+
+/// Optional macOS process-ancestry root for daemon socket clients.
+///
+/// Embedders set this to their own PID. Even if another same-UID process finds
+/// the bearer token, the daemon rejects its socket unless the kernel-reported
+/// peer PID is the embedder or one of its descendants. Embedders that configure
+/// a separate host capability use this identity as a lifecycle owner instead:
+/// ordinary authenticated agents may outlive and reconnect across host
+/// generations, while the daemon still exits when its current owner exits.
+pub const SOCKET_AUTHORIZED_ROOT_PID_ENV: &str = "CUA_DRIVER_SOCKET_AUTHORIZED_ROOT_PID";
+pub const SOCKET_AUTHORIZED_ROOT_START_SECONDS_ENV: &str =
+    "CUA_DRIVER_SOCKET_AUTHORIZED_ROOT_START_SECONDS";
+pub const SOCKET_AUTHORIZED_ROOT_START_MICROSECONDS_ENV: &str =
+    "CUA_DRIVER_SOCKET_AUTHORIZED_ROOT_START_MICROSECONDS";
 
 // ── Recording idle-TTL backstop (#1764) ─────────────────────────────────────────
 
@@ -207,6 +680,20 @@ fn register_recording_session_end_hook(
     });
 }
 
+/// Removes per-session activity state when the same lifecycle fan-out tears
+/// down cursor, recording, and config ownership. A weak registry avoids keeping
+/// a stopped daemon alive through the process-global hook list.
+fn register_state_file_session_end_hook(
+    registry: &std::sync::Arc<cua_driver_core::tool::ToolRegistry>,
+) {
+    let registry = std::sync::Arc::downgrade(registry);
+    cua_driver_core::session::register_session_end_hook(move |session_id| {
+        if let Some(registry) = registry.upgrade() {
+            registry.remove_session_state_file(session_id);
+        }
+    });
+}
+
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
 /// Returns the platform default socket/pipe path.
@@ -228,6 +715,22 @@ pub fn default_socket_path() -> String {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         "/tmp/cua-driver.sock".to_owned()
+    }
+}
+
+/// Program-owned endpoint for the narrow Codex Computer Use compatibility
+/// daemon. Keeping it separate prevents a running native daemon from serving
+/// the wrong catalog or cursor configuration to a compat MCP client.
+pub fn codex_compat_default_socket_path() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        r"\\.\pipe\cua-driver-codex-computer-use".to_owned()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut path = std::path::PathBuf::from(default_socket_path());
+        path.set_file_name("cua-driver-codex-computer-use.sock");
+        path.to_string_lossy().into_owned()
     }
 }
 
@@ -267,6 +770,20 @@ pub fn default_pid_file_path() -> String {
     }
 }
 
+pub fn codex_compat_default_pid_file_path() -> String {
+    let mut path = std::path::PathBuf::from(default_pid_file_path());
+    path.set_file_name("cua-driver-codex-computer-use.pid");
+    path.to_string_lossy().into_owned()
+}
+
+fn is_managed_socket_path(path: &str) -> bool {
+    path == default_socket_path() || path == codex_compat_default_socket_path()
+}
+
+fn is_managed_pid_file_path(path: &str) -> bool {
+    path == default_pid_file_path() || path == codex_compat_default_pid_file_path()
+}
+
 // ── Protocol types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -299,6 +816,429 @@ pub struct DaemonResponse {
     pub exit_code: Option<i32>,
 }
 
+#[derive(Serialize)]
+struct AuthenticatedDaemonRequest<'a> {
+    auth_token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_auth_token: Option<&'a str>,
+    request: &'a DaemonRequest,
+}
+
+#[derive(Debug)]
+struct ParsedDaemonRequest {
+    request: DaemonRequest,
+    host_authenticated: bool,
+}
+
+fn configured_socket_auth_token() -> Option<String> {
+    std::env::var(SOCKET_AUTH_TOKEN_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn configured_socket_host_auth_token() -> Option<String> {
+    std::env::var(SOCKET_HOST_AUTH_TOKEN_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn auth_tokens_match(expected: &str, provided: &str) -> bool {
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    let mut difference = expected.len() ^ provided.len();
+    for index in 0..expected.len().max(provided.len()) {
+        difference |= usize::from(
+            expected.get(index).copied().unwrap_or(0)
+                ^ provided.get(index).copied().unwrap_or(0),
+        );
+    }
+    difference == 0
+}
+
+fn socket_peer_requires_authorized_root(
+    authorized_root_configured: bool,
+    host_authority_configured: bool,
+) -> bool {
+    authorized_root_configured && !host_authority_configured
+}
+
+fn host_request_is_authorized(
+    host_authority_configured: bool,
+    host_authenticated: bool,
+    peer_is_authorized_root: bool,
+) -> bool {
+    if host_authority_configured {
+        host_authenticated
+    } else {
+        peer_is_authorized_root
+    }
+}
+
+fn state_authentication_key(args: Option<&serde_json::Value>) -> Option<Vec<u8>> {
+    let encoded = args?
+        .get("key_base64")
+        .and_then(serde_json::Value::as_str)?;
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    (key.len() == 32).then_some(key)
+}
+
+#[cfg(test)]
+fn process_descends_from(
+    mut process_id: u32,
+    root_process_id: u32,
+    parent_process_id: impl Fn(u32) -> Option<u32>,
+) -> bool {
+    if root_process_id <= 1 {
+        return false;
+    }
+    for _ in 0..128 {
+        if process_id == root_process_id {
+            return true;
+        }
+        if process_id <= 1 {
+            return false;
+        }
+        let Some(parent) = parent_process_id(process_id) else {
+            return false;
+        };
+        if parent == process_id {
+            return false;
+        }
+        process_id = parent;
+    }
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessIdentity {
+    process_id: u32,
+    parent_process_id: u32,
+    start_seconds: i64,
+    start_microseconds: i64,
+}
+
+impl ProcessIdentity {
+    fn is_same_generation_as(self, other: Self) -> bool {
+        self.process_id == other.process_id
+            && self.start_seconds == other.start_seconds
+            && self.start_microseconds == other.start_microseconds
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_identity(process_id: u32) -> Option<ProcessIdentity> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let expected_size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let result = unsafe {
+        libc::proc_pidinfo(
+            i32::try_from(process_id).ok()?,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            i32::try_from(expected_size).ok()?,
+        )
+    };
+    if usize::try_from(result).ok()? != expected_size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != process_id {
+        return None;
+    }
+    Some(ProcessIdentity {
+        process_id,
+        parent_process_id: info.pbi_ppid,
+        start_seconds: i64::try_from(info.pbi_start_tvsec).ok()?,
+        start_microseconds: i64::try_from(info.pbi_start_tvusec).ok()?,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn configured_authorized_root_identity() -> anyhow::Result<Option<ProcessIdentity>> {
+    let raw_pid = std::env::var(SOCKET_AUTHORIZED_ROOT_PID_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let raw_seconds = std::env::var(SOCKET_AUTHORIZED_ROOT_START_SECONDS_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let raw_microseconds = std::env::var(SOCKET_AUTHORIZED_ROOT_START_MICROSECONDS_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    if raw_pid.is_none() && raw_seconds.is_none() && raw_microseconds.is_none() {
+        return Ok(None);
+    }
+    let process_id = raw_pid
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 1)
+        .ok_or_else(|| anyhow::anyhow!("Invalid {SOCKET_AUTHORIZED_ROOT_PID_ENV}"))?;
+    let start_seconds = raw_seconds
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Invalid {SOCKET_AUTHORIZED_ROOT_START_SECONDS_ENV}")
+        })?;
+    let start_microseconds = raw_microseconds
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| (0..1_000_000).contains(value))
+        .ok_or_else(|| {
+            anyhow::anyhow!("Invalid {SOCKET_AUTHORIZED_ROOT_START_MICROSECONDS_ENV}")
+        })?;
+    let configured = ProcessIdentity {
+        process_id,
+        parent_process_id: 0,
+        start_seconds,
+        start_microseconds,
+    };
+    let current = macos_process_identity(process_id)
+        .filter(|identity| identity.is_same_generation_as(configured))
+        .ok_or_else(|| anyhow::anyhow!("Configured socket root process is no longer live"))?;
+    Ok(Some(current))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_peer_process_id(stream: &tokio::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+
+    let mut pid: libc::pid_t = 0;
+    let mut length = libc::socklen_t::try_from(std::mem::size_of_val(&pid)).ok()?;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 || pid <= 1 {
+        return None;
+    }
+    u32::try_from(pid).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_is_authorized(
+    peer_process_identity: Option<ProcessIdentity>,
+    root_process_identity: ProcessIdentity,
+) -> bool {
+    let Some(mut current) = peer_process_identity else {
+        return false;
+    };
+    for _ in 0..128 {
+        if current.process_id == root_process_identity.process_id {
+            return current.is_same_generation_as(root_process_identity);
+        }
+        if current.process_id <= 1 || current.parent_process_id <= 1 {
+            return false;
+        }
+        let Some(parent) = macos_process_identity(current.parent_process_id) else {
+            return false;
+        };
+        if parent.process_id == current.process_id {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// Replaces any caller-supplied state provenance with a kernel-authenticated
+/// process generation. A managed proxy may nominate its long-lived agent PID;
+/// the daemon accepts it only when that exact live process is an ancestor of
+/// the kernel-reported socket peer. This lets authenticated activity outlive a
+/// short-lived proxy without allowing a client to nominate a sibling process.
+fn attach_state_writer_identity(
+    args: &mut serde_json::Value,
+    peer_process_identity: Option<ProcessIdentity>,
+) {
+    let Some(args) = args.as_object_mut() else {
+        return;
+    };
+    let requested_owner_pid = args
+        .remove(cua_driver_core::session_state::STATE_OWNER_PID_ARG)
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 1);
+    args.remove(cua_driver_core::session_state::STATE_WRITER_PID_ARG);
+    args.remove(cua_driver_core::session_state::STATE_WRITER_START_SECONDS_ARG);
+    args.remove(cua_driver_core::session_state::STATE_WRITER_START_MICROSECONDS_ARG);
+    #[cfg(target_os = "macos")]
+    let writer_identity = requested_owner_pid
+        .and_then(macos_process_identity)
+        .filter(|owner| macos_process_is_authorized(peer_process_identity, *owner))
+        .or(peer_process_identity);
+    #[cfg(not(target_os = "macos"))]
+    let writer_identity = {
+        let _ = requested_owner_pid;
+        peer_process_identity
+    };
+    if let Some(identity) = writer_identity.filter(|identity| identity.process_id > 1) {
+        args.insert(
+            cua_driver_core::session_state::STATE_WRITER_PID_ARG.to_owned(),
+            serde_json::json!(identity.process_id),
+        );
+        args.insert(
+            cua_driver_core::session_state::STATE_WRITER_START_SECONDS_ARG.to_owned(),
+            serde_json::json!(identity.start_seconds),
+        );
+        args.insert(
+            cua_driver_core::session_state::STATE_WRITER_START_MICROSECONDS_ARG.to_owned(),
+            serde_json::json!(identity.start_microseconds),
+        );
+    }
+}
+
+/// Serialize one daemon request, adding the authenticated envelope when the
+/// embedding host configured a socket credential.
+pub fn serialize_request(req: &DaemonRequest) -> anyhow::Result<String> {
+    match configured_socket_auth_token() {
+        Some(token) => {
+            let host_token = configured_socket_host_auth_token();
+            Ok(serde_json::to_string(&AuthenticatedDaemonRequest {
+                auth_token: &token,
+                host_auth_token: host_token.as_deref(),
+                request: req,
+            })?)
+        }
+        None => Ok(serde_json::to_string(req)?),
+    }
+}
+
+fn parse_request(line: &str) -> Result<ParsedDaemonRequest, DaemonResponse> {
+    let configured_token = configured_socket_auth_token();
+    let configured_host_token = configured_socket_host_auth_token();
+    parse_request_with_tokens(
+        line,
+        configured_token.as_deref(),
+        configured_host_token.as_deref(),
+    )
+}
+
+#[cfg(test)]
+fn parse_request_with_token(
+    line: &str,
+    expected_token: Option<&str>,
+) -> Result<DaemonRequest, DaemonResponse> {
+    parse_request_with_tokens(line, expected_token, None).map(|parsed| parsed.request)
+}
+
+fn parse_request_with_tokens(
+    line: &str,
+    expected_token: Option<&str>,
+    expected_host_token: Option<&str>,
+) -> Result<ParsedDaemonRequest, DaemonResponse> {
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| DaemonResponse::err(format!("JSON parse error: {error}"), 65))?;
+    let host_authenticated = expected_host_token.is_some_and(|expected| {
+        let provided = value
+            .get("host_auth_token")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        auth_tokens_match(expected, provided)
+    });
+    let request = if let Some(expected) = expected_token {
+        let provided = value
+            .get("auth_token")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !auth_tokens_match(&expected, provided) {
+            return Err(DaemonResponse::err("Unauthorized daemon client", 77));
+        }
+        value
+            .get("request")
+            .cloned()
+            .ok_or_else(|| DaemonResponse::err("Authenticated request is missing `request`", 65))?
+    } else {
+        value
+    };
+    let request = serde_json::from_value(request)
+        .map_err(|error| DaemonResponse::err(format!("JSON parse error: {error}"), 65))?;
+    Ok(ParsedDaemonRequest {
+        request,
+        host_authenticated,
+    })
+}
+
+/// Keep permission prompting under an embedding application's explicit UX.
+///
+/// The daemon remains the permission-status authority, but an agent cannot
+/// bypass the host's onboarding by sending `check_permissions {prompt:true}`.
+fn clamp_external_permission_prompt(
+    external_permission_flow: bool,
+    tool_name: &str,
+    args: &mut serde_json::Value,
+) {
+    if !external_permission_flow || tool_name != "check_permissions" {
+        return;
+    }
+    if let Some(object) = args.as_object_mut() {
+        object.insert("prompt".to_owned(), serde_json::Value::Bool(false));
+    } else {
+        *args = serde_json::json!({ "prompt": false });
+    }
+}
+
+/// Requests one macOS TCC grant from the standalone helper process.
+///
+/// This daemon-only method is intentionally separate from the MCP tool
+/// registry. Embedding hosts can present their own explicit onboarding UI and
+/// ask the correctly attributed helper to raise one native permission request,
+/// while `check_permissions { prompt: true }` remains clamped for agents.
+fn validate_system_permission_request(permission: Option<&str>) -> DaemonResponse {
+    #[cfg(target_os = "macos")]
+    {
+        match permission {
+            Some("accessibility" | "screen_recording") => {}
+            Some(name) => {
+                return DaemonResponse::err(
+                    format!("Unknown system permission: {name}"),
+                    64,
+                );
+            }
+            None => {
+                return DaemonResponse::err(
+                    "System permission request is missing `name`",
+                    65,
+                );
+            }
+        }
+        DaemonResponse::ok(serde_json::json!({
+            "permission": permission,
+            "requested": true,
+        }))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = permission;
+        DaemonResponse::err(
+            "System permission requests are only supported on macOS",
+            64,
+        )
+    }
+}
+
+fn screen_capture_verification_response(capturable: bool) -> DaemonResponse {
+    DaemonResponse::ok(serde_json::json!({
+        "capturable": capturable,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn request_validated_system_permission(permission: &str) {
+    match permission {
+        "accessibility" => {
+            let _ = platform_macos::permissions::request_accessibility();
+        }
+        "screen_recording" => {
+            let _ = platform_macos::permissions::request_screen_recording();
+        }
+        _ => unreachable!("permission was validated before prompting"),
+    }
+}
+
 impl DaemonResponse {
     pub fn ok(result: serde_json::Value) -> Self {
         Self { ok: true, result: Some(result), error: None, exit_code: None }
@@ -306,6 +1246,147 @@ impl DaemonResponse {
     pub fn err(msg: impl Into<String>, code: i32) -> Self {
         Self { ok: false, result: None, error: Some(msg.into()), exit_code: Some(code) }
     }
+
+    pub fn tool_error(result: serde_json::Value, msg: impl Into<String>, code: i32) -> Self {
+        Self {
+            ok: false,
+            result: Some(result),
+            error: Some(msg.into()),
+            exit_code: Some(code),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_instance_id() -> &'static str {
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{}-{started}", std::process::id())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_permission_attribution() -> &'static str {
+    let inside_bundle = std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .map(|path| {
+            path.to_string_lossy()
+                .contains("/CuaDriver.app/Contents/MacOS/")
+        })
+        .unwrap_or(false);
+    let launched_by_launchd = unsafe { libc::getppid() } == 1;
+    let disclaimed =
+        std::env::var_os(cua_driver_core::RESPONSIBILITY_DISCLAIMED_ENV).is_some();
+    if inside_bundle && (launched_by_launchd || disclaimed) {
+        "driver-daemon"
+    } else {
+        "caller"
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn daemon_permission_status(profile: DaemonProfile) -> serde_json::Value {
+    let status = platform_macos::permissions::current_status();
+    let panel = platform_macos::permissions::panel::lifecycle();
+    let recovery = platform_macos::permissions::gate::recovery_lifecycle();
+    serde_json::json!({
+        "accessibility": status.accessibility,
+        "screen_recording": status.screen_recording,
+        "all_granted": status.all_granted(),
+        "profile": profile,
+        "panel": {
+            "visible": panel.visible,
+            "completion": panel.completion,
+            "last_outcome": panel.last_outcome.map(
+                platform_macos::permissions::panel::outcome_name
+            ),
+        },
+        "recovery": {
+            "generation": recovery.generation,
+            "state": recovery.state,
+        },
+        "source": {
+            "attribution": daemon_permission_attribution(),
+            "pid": std::process::id(),
+            "instance": daemon_instance_id(),
+        },
+    })
+}
+
+fn app_approval_broker_matches(
+    brokers: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    session_id: &str,
+    broker_token: &str,
+) -> bool {
+    brokers
+        .lock()
+        .unwrap()
+        .get(session_id)
+        .is_some_and(|expected| broker_tokens_equal(expected, broker_token))
+}
+
+const APPROVAL_BROKER_TOKEN_ARG: &str = "_cua_approval_broker_token";
+
+fn broker_tokens_equal(expected: &str, supplied: &str) -> bool {
+    use subtle::ConstantTimeEq;
+
+    !supplied.is_empty() && bool::from(expected.as_bytes().ct_eq(supplied.as_bytes()))
+}
+
+fn authenticate_compat_call(
+    args: &mut serde_json::Value,
+    profile: DaemonProfile,
+    session_id: Option<&str>,
+    brokers: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+) -> Result<(), String> {
+    if profile != DaemonProfile::CodexComputerUseCompat {
+        return Ok(());
+    }
+
+    let supplied_token = args
+        .as_object_mut()
+        .and_then(|object| object.remove(APPROVAL_BROKER_TOKEN_ARG))
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| {
+            "Codex Computer Use tool calls require the authenticated MCP control session."
+                .to_owned()
+        })?;
+    let session_id = session_id.filter(|value| !value.is_empty()).ok_or_else(|| {
+        "Codex Computer Use tool calls require the authenticated MCP session id.".to_owned()
+    })?;
+    if !app_approval_broker_matches(brokers, session_id, &supplied_token) {
+        return Err("Codex Computer Use tool call broker authentication failed.".to_owned());
+    }
+
+    let object = args
+        .as_object_mut()
+        .expect("broker token could only be extracted from an object");
+    object.remove("session");
+    object.insert(
+        "_session_id".to_owned(),
+        serde_json::Value::String(session_id.to_owned()),
+    );
+    Ok(())
+}
+
+fn release_approval_broker_if_owner(
+    brokers: &std::sync::Mutex<std::collections::HashMap<String, String>>,
+    session_id: &str,
+    broker_token: &str,
+) -> bool {
+    let mut brokers = brokers.lock().unwrap();
+    let owns_session = brokers
+        .get(session_id)
+        .is_some_and(|expected| broker_tokens_equal(expected, broker_token));
+    if owns_session {
+        brokers.remove(session_id);
+    }
+    owns_session
 }
 
 // ── Client ────────────────────────────────────────────────────────────────────
@@ -382,7 +1463,7 @@ pub fn send_request(socket_path: &str, req: &DaemonRequest) -> anyhow::Result<Da
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
 
     let mut w = stream.try_clone()?;
-    let line = serde_json::to_string(req)? + "\n";
+    let line = serialize_request(req)? + "\n";
     // EAGAIN-aware write: a daemon momentarily too busy to read our request
     // (backpressure under concurrent slow tools) makes the 5s SO_SNDTIMEO write
     // time out. Treat that like the read loop below does (#1997) — keep retrying
@@ -464,7 +1545,7 @@ pub fn send_request(socket_path: &str, req: &DaemonRequest) -> anyhow::Result<Da
         };
 
         let mut writer = pipe.try_clone()?;
-        let line = serde_json::to_string(req)? + "\n";
+        let line = serialize_request(req)? + "\n";
         writer.write_all(line.as_bytes())?;
         writer.flush()?;
 
@@ -494,29 +1575,47 @@ pub async fn run_serve(
     registry: std::sync::Arc<cua_driver_core::tool::ToolRegistry>,
     socket_path: &str,
     pid_file_path: Option<&str>,
+    profile: DaemonProfile,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
-    // Create parent directory.
-    if let Some(dir) = std::path::Path::new(socket_path).parent() {
-        std::fs::create_dir_all(dir)?;
+    #[cfg(target_os = "macos")]
+    let authorized_root_identity = configured_authorized_root_identity()?;
+    #[cfg(not(target_os = "macos"))]
+    let authorized_root_identity: Option<ProcessIdentity> = None;
+    let host_authority_configured = configured_socket_host_auth_token().is_some();
+    let enforce_authorized_root = socket_peer_requires_authorized_root(
+        authorized_root_identity.is_some(),
+        host_authority_configured,
+    );
+
+    let socket = std::path::Path::new(socket_path);
+
+    // The daemon socket carries live desktop-control authority. Require every
+    // socket directory to be private to the current user. The default path may
+    // repair permissions left by older releases; custom paths fail closed so a
+    // typo cannot silently chmod a caller-managed directory.
+    if let Some(dir) = socket.parent() {
+        secure_runtime_directory(dir, is_managed_socket_path(socket_path))?;
     }
 
     // Remove stale socket file (from a crashed previous daemon).
-    let _ = std::fs::remove_file(socket_path);
+    remove_stale_socket(socket)?;
 
     let listener = UnixListener::bind(socket_path)
         .map_err(|e| anyhow::anyhow!("bind {socket_path}: {e}"))?;
+    set_private_socket_permissions(socket)?;
 
     eprintln!("Cua Driver daemon listening on {socket_path}");
 
     // Write PID file.
     if let Some(pid_path) = pid_file_path {
-        if let Some(dir) = std::path::Path::new(pid_path).parent() {
-            let _ = std::fs::create_dir_all(dir);
+        let pid = std::path::Path::new(pid_path);
+        if let Some(dir) = pid.parent() {
+            secure_runtime_directory(dir, is_managed_pid_file_path(pid_path))?;
         }
-        let _ = std::fs::write(pid_path, std::process::id().to_string());
+        write_private_pid_file(pid)?;
     }
 
     // Shutdown channel.
@@ -536,18 +1635,59 @@ pub async fn run_serve(
     let last_activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_unix_secs()));
     spawn_recording_idle_backstop(registry.clone(), last_activity.clone());
     spawn_session_idle_sweep();
-    if let Some(port) = crate::mcp_http::configured_port() {
-        crate::mcp_http::spawn(registry.clone(), port);
-    }
+    maybe_start_http_transport(registry.clone(), profile);
     register_recording_session_end_hook(registry.recording.clone());
+    register_state_file_session_end_hook(&registry);
+    let mut authorized_root_health =
+        tokio::time::interval(std::time::Duration::from_secs(1));
+
+    // Session id to one-time-random broker credential. Only an authenticated
+    // long-lived control connection can populate this map. The credential is
+    // injected into get_app_state inside the daemon, so raw callers cannot
+    // self-assert approval fields in public tool arguments.
+    let approval_brokers = std::sync::Arc::new(std::sync::Mutex::new(
+        std::collections::HashMap::<String, String>::new(),
+    ));
 
     loop {
         tokio::select! {
             result = listener.accept() => {
                 let (stream, _) = result?;
+                #[cfg(target_os = "macos")]
+                let peer_process_id = macos_peer_process_id(&stream);
+                #[cfg(target_os = "macos")]
+                let peer_process_identity =
+                    peer_process_id.and_then(macos_process_identity);
+                #[cfg(not(target_os = "macos"))]
+                let peer_process_identity = None;
+                #[cfg(target_os = "macos")]
+                if enforce_authorized_root {
+                    if let Some(root_process_identity) = authorized_root_identity {
+                        if !macos_process_is_authorized(
+                            peer_process_identity,
+                            root_process_identity,
+                        ) {
+                            eprintln!("Rejected unauthorized daemon peer");
+                            continue;
+                        }
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                let peer_is_authorized_root = match (
+                    peer_process_identity,
+                    authorized_root_identity,
+                ) {
+                    (Some(peer), Some(root)) => peer.is_same_generation_as(root),
+                    (_, None) => true,
+                    _ => false,
+                };
+                #[cfg(not(target_os = "macos"))]
+                let peer_is_authorized_root = authorized_root_identity.is_none();
                 let reg = registry.clone();
                 let shutdown_tx2 = shutdown_tx.clone();
                 let last_activity = last_activity.clone();
+                let approval_peer_pid = approval_broker_peer_pid(&stream);
+                let approval_brokers = approval_brokers.clone();
 
                 tokio::spawn(async move {
                     let (reader, mut writer) = stream.into_split();
@@ -560,23 +1700,48 @@ pub async fn run_serve(
                     // connection EOFs (graceful proxy exit OR kill -9, both
                     // kernel-guaranteed), the post-loop block reaps the session.
                     let mut control_session_id: Option<String> = None;
+                    let mut control_approval_token: Option<(String, String)> = None;
 
                     while let Ok(Some(line)) = lines.next_line().await {
-                        let req: DaemonRequest = match serde_json::from_str(&line) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                let resp = DaemonResponse::err(
-                                    format!("JSON parse error: {e}"), 65
-                                );
+                        #[cfg(target_os = "macos")]
+                        if let Some(root_process_identity) = authorized_root_identity {
+                            let root_is_still_live =
+                                macos_process_identity(root_process_identity.process_id)
+                                    .is_some_and(|identity| {
+                                        identity.is_same_generation_as(root_process_identity)
+                                    });
+                            if !root_is_still_live {
+                                return;
+                            }
+                        }
+                        let parsed = match parse_request(&line) {
+                            Ok(request) => request,
+                            Err(resp) => {
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
                                 continue;
                             }
                         };
+                        let host_request_authorized = host_request_is_authorized(
+                            host_authority_configured,
+                            parsed.host_authenticated,
+                            peer_is_authorized_root,
+                        );
+                        let req = parsed.request;
 
                         match req.method.as_str() {
                             "shutdown" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
                                 let resp = DaemonResponse::ok(serde_json::json!({"shutdown": true}));
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -586,6 +1751,414 @@ pub async fn run_serve(
                                     let _ = tx.send(());
                                 }
                                 return;
+                            }
+                            "permissions_status" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = DaemonResponse::ok(daemon_permission_status(profile));
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "permissions_status is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "permissions_present" => {
+                                #[cfg(target_os = "macos")]
+                                {
+                                    let prepared =
+                                        platform_macos::permissions::gate::prepare_interactive_recovery();
+                                    match prepared {
+                                        Ok(request) => {
+                                            let resp = DaemonResponse::ok(serde_json::json!({
+                                                "presentation": request.state(),
+                                                "generation": request.generation(),
+                                                "profile": profile,
+                                            }));
+                                            let _ = writer.write_all(
+                                                (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                            ).await;
+                                            let _ = writer.flush().await;
+                                            platform_macos::permissions::gate::dispatch_prepared_interactive_recovery(
+                                                request,
+                                            );
+                                        }
+                                        Err(error) => {
+                                            let resp = DaemonResponse::err(error.to_string(), 1);
+                                            let _ = writer.write_all(
+                                                (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                            ).await;
+                                        }
+                                    }
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                {
+                                    let resp = DaemonResponse::err(
+                                        "permissions_present is available only on macOS",
+                                        64,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                }
+                            }
+                            "permissions_refresh" => {
+                                #[cfg(target_os = "macos")]
+                                {
+                                    let available =
+                                        platform_macos::permissions::gate::ensure_process_refresh_available();
+                                    match available {
+                                        Ok(()) => {
+                                            let resp = DaemonResponse::ok(serde_json::json!({
+                                                "refresh": "scheduled",
+                                                "profile": profile,
+                                                "pid": std::process::id(),
+                                            }));
+                                            let _ = writer.write_all(
+                                                (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                            ).await;
+                                            let _ = writer.flush().await;
+                                            platform_macos::permissions::gate::dispatch_process_refresh();
+                                        }
+                                        Err(error) => {
+                                            let resp = DaemonResponse::err(error.to_string(), 1);
+                                            let _ = writer.write_all(
+                                                (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                            ).await;
+                                        }
+                                    }
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                {
+                                    let resp = DaemonResponse::err(
+                                        "permissions_refresh is available only on macOS",
+                                        64,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                }
+                            }
+                            "request_system_permission" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
+                                let resp = validate_system_permission_request(req.name.as_deref());
+                                let response_sent = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await.is_ok();
+                                #[cfg(target_os = "macos")]
+                                if resp.ok && response_sent {
+                                    request_validated_system_permission(
+                                        req.name.as_deref().expect("validated permission has a name")
+                                    );
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                let _ = response_sent;
+                            }
+                            "application_windows" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    match tokio::task::spawn_blocking(
+                                        platform_macos::application_surface::list_windows,
+                                    ).await {
+                                        Ok(Ok(windows)) => DaemonResponse::ok(
+                                            serde_json::json!({"windows": windows}),
+                                        ),
+                                        Ok(Err(error)) => {
+                                            DaemonResponse::err(format!("{error:#}"), 1)
+                                        }
+                                        Err(error) => DaemonResponse::err(
+                                            format!("Application-window task failed: {error}"),
+                                            1,
+                                        ),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_windows is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "application_surface_start" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    let request = req.args
+                                        .ok_or("Missing application-surface arguments")
+                                        .and_then(|args| {
+                                            serde_json::from_value::<
+                                                platform_macos::application_surface::
+                                                    ApplicationSurfaceStartRequest,
+                                            >(args)
+                                            .map_err(|_| {
+                                                "Invalid application-surface arguments"
+                                            })
+                                        });
+                                    match request {
+                                        Ok(request) => match tokio::task::spawn_blocking(
+                                            move || {
+                                                platform_macos::application_surface::start(request)
+                                            },
+                                        ).await {
+                                            Ok(Ok(result)) => DaemonResponse::ok(
+                                                serde_json::to_value(result).expect(
+                                                    "application start result is serializable"
+                                                ),
+                                            ),
+                                            Ok(Err(error)) => {
+                                                DaemonResponse::err(format!("{error:#}"), 1)
+                                            }
+                                            Err(error) => DaemonResponse::err(
+                                                format!(
+                                                    "Application-capture task failed: {error}"
+                                                ),
+                                                1,
+                                            ),
+                                        },
+                                        Err(error) => DaemonResponse::err(error, 64),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_surface_start is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "application_surface_stop" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    let session = req.args.as_ref()
+                                        .and_then(|args| args.get("session"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|value| {
+                                            !value.is_empty() && value.len() <= 128
+                                        })
+                                        .map(str::to_owned);
+                                    match session {
+                                        Some(session) => {
+                                            let stopped = tokio::task::spawn_blocking(
+                                                move || {
+                                                    platform_macos::application_surface::stop(
+                                                        &session,
+                                                    )
+                                                },
+                                            ).await.unwrap_or(false);
+                                            DaemonResponse::ok(
+                                                serde_json::json!({"stopped": stopped}),
+                                            )
+                                        }
+                                        None => DaemonResponse::err(
+                                            "application_surface_stop requires a session",
+                                            64,
+                                        ),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_surface_stop is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "application_surface_event" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if !host_request_authorized
+                                    || profile != DaemonProfile::Native
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only application-surface request",
+                                        77,
+                                    )
+                                } else {
+                                    let event = req.args
+                                        .ok_or("Missing application-surface event")
+                                        .and_then(|args| {
+                                            serde_json::from_value::<
+                                                platform_macos::application_surface::
+                                                    ApplicationSurfaceEvent,
+                                            >(args)
+                                            .map_err(|_| "Invalid application-surface event")
+                                        });
+                                    match event {
+                                        Ok(event) => match tokio::task::spawn_blocking(
+                                            move || {
+                                                platform_macos::application_surface::send_event(
+                                                    event,
+                                                )
+                                            },
+                                        ).await {
+                                            Ok(Ok(())) => DaemonResponse::ok(
+                                                serde_json::json!({"sent": true}),
+                                            ),
+                                            Ok(Err(error)) => {
+                                                DaemonResponse::err(format!("{error:#}"), 1)
+                                            }
+                                            Err(error) => DaemonResponse::err(
+                                                format!(
+                                                    "Application-input task failed: {error}"
+                                                ),
+                                                1,
+                                            ),
+                                        },
+                                        Err(error) => DaemonResponse::err(error, 64),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "application_surface_event is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "verify_screen_capture" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
+                                #[cfg(target_os = "macos")]
+                                let resp = {
+                                    let capturable = tokio::task::spawn_blocking(
+                                        platform_macos::tools::verify_screen_capture_ready,
+                                    )
+                                    .await
+                                    .unwrap_or(false);
+                                    screen_capture_verification_response(capturable)
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "Screen capture verification is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "configure_state_authentication" => {
+                                let response = if !host_request_authorized
+                                    || (!host_authority_configured
+                                        && authorized_root_identity.is_none())
+                                {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    )
+                                } else if let Some(key) =
+                                    state_authentication_key(req.args.as_ref())
+                                {
+                                    if reg.set_state_authentication_key(key) {
+                                        DaemonResponse::ok(serde_json::json!({
+                                            "state_authentication": true
+                                        }))
+                                    } else {
+                                        DaemonResponse::err(
+                                            "State authentication is unavailable".to_owned(),
+                                            1,
+                                        )
+                                    }
+                                } else {
+                                    DaemonResponse::err(
+                                        "Invalid state authentication key".to_owned(),
+                                        64,
+                                    )
+                                };
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&response).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "set_cursor_enabled" => {
+                                #[cfg(target_os = "macos")]
+                                let response = if !host_request_authorized {
+                                    DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    )
+                                } else {
+                                    let session = req
+                                        .args
+                                        .as_ref()
+                                        .and_then(|args| args.get("session"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|value| {
+                                            !value.is_empty() && value.len() <= 1_024
+                                        });
+                                    let enabled = req
+                                        .args
+                                        .as_ref()
+                                        .and_then(|args| args.get("enabled"))
+                                        .and_then(serde_json::Value::as_bool);
+                                    match (session, enabled) {
+                                        (Some(session), Some(enabled)) => {
+                                            platform_macos::cursor::overlay::
+                                                set_enabled_for_host_session(
+                                                    session.to_owned(),
+                                                    enabled,
+                                                );
+                                            DaemonResponse::ok(serde_json::json!({
+                                                "session": session,
+                                                "cursor_enabled": enabled,
+                                            }))
+                                        }
+                                        _ => DaemonResponse::err(
+                                            "set_cursor_enabled requires a non-empty `session` and boolean `enabled`",
+                                            64,
+                                        ),
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let response = DaemonResponse::err(
+                                    "set_cursor_enabled is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&response).unwrap() + "\n").as_bytes()
+                                ).await;
                             }
                             "list" => {
                                 // Include full ToolDef (input_schema + annotation
@@ -622,6 +2195,7 @@ pub async fn run_serve(
                                     "tools": tools,
                                     "capability_version": cua_driver_core::tool::CAPABILITY_VERSION,
                                     "schema_version": "1",
+                                    "profile": profile,
                                 }));
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -650,13 +2224,90 @@ pub async fn run_serve(
                                     }
                                 }
                             }
-                            "call" => {
-                                // Recording idle-TTL liveness: any serviced tool
-                                // call counts as activity (#1764).
-                                last_activity.store(
-                                    now_unix_secs(),
-                                    std::sync::atomic::Ordering::Relaxed,
+                            "app_approval_resolve" => {
+                                #[cfg(target_os = "macos")]
+                                let resp = if profile != DaemonProfile::CodexComputerUseCompat {
+                                    DaemonResponse::err(
+                                        "app approval resolution is available only for the Codex Computer Use compatibility profile",
+                                        64,
+                                    )
+                                } else {
+                                    let args = req.args.as_ref();
+                                    let session_id = req.session_id.as_deref().unwrap_or("");
+                                    let broker_token = args
+                                        .and_then(|value| value.get("broker_token"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("");
+                                    let authenticated = app_approval_broker_matches(
+                                        &approval_brokers,
+                                        session_id,
+                                        broker_token,
+                                    );
+                                    if !authenticated {
+                                        DaemonResponse::err(
+                                            "Computer Use approval resolution requires the authenticated MCP control session.",
+                                            77,
+                                        )
+                                    } else {
+                                        let challenge = args
+                                            .and_then(|value| value.get("challenge"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .unwrap_or("");
+                                        let action = args
+                                            .and_then(|value| value.get("action"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .and_then(platform_macos::app_approval::ApprovalAction::parse);
+                                        let persistence = platform_macos::app_approval::ApprovalPersistence::parse(
+                                            args.and_then(|value| value.get("persist"))
+                                                .and_then(serde_json::Value::as_str),
+                                        );
+                                        match (action, persistence) {
+                                            (Some(action), Ok(persistence)) if !challenge.is_empty() => {
+                                                match platform_macos::app_approval::global().resolve(
+                                                    session_id,
+                                                    broker_token,
+                                                    challenge,
+                                                    action,
+                                                    persistence,
+                                                ) {
+                                                    Ok(platform_macos::app_approval::ApprovalResolution::Approved { persistent }) => {
+                                                        DaemonResponse::ok(serde_json::json!({
+                                                            "resolution": "approved",
+                                                            "persistent": persistent,
+                                                        }))
+                                                    }
+                                                    Ok(platform_macos::app_approval::ApprovalResolution::Declined { message }) => {
+                                                        DaemonResponse::ok(serde_json::json!({
+                                                            "resolution": "declined",
+                                                            "message": message,
+                                                        }))
+                                                    }
+                                                    Ok(platform_macos::app_approval::ApprovalResolution::Canceled { message }) => {
+                                                        DaemonResponse::ok(serde_json::json!({
+                                                            "resolution": "canceled",
+                                                            "message": message,
+                                                        }))
+                                                    }
+                                                    Err(error) => DaemonResponse::err(error.to_string(), 1),
+                                                }
+                                            }
+                                            _ => DaemonResponse::err(
+                                                "invalid app approval resolution request",
+                                                64,
+                                            ),
+                                        }
+                                    }
+                                };
+                                #[cfg(not(target_os = "macos"))]
+                                let resp = DaemonResponse::err(
+                                    "app approval resolution is available only on macOS",
+                                    64,
                                 );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "call" => {
                                 let raw_name = req.name.as_deref().unwrap_or("").to_owned();
                                 // Deprecated alias: `type_text_chars` → `type_text`.
                                 // Mirrors Swift's `ToolRegistry.call` aliasing.
@@ -667,6 +2318,35 @@ pub async fn run_serve(
                                 let mut args = req.args.unwrap_or(serde_json::Value::Object(
                                     serde_json::Map::new()
                                 ));
+                                if let Err(error) = authenticate_compat_call(
+                                    &mut args,
+                                    profile,
+                                    req.session_id.as_deref(),
+                                    &approval_brokers,
+                                ) {
+                                    let resp = DaemonResponse::err(error, 77);
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
+                                attach_state_writer_identity(
+                                    &mut args,
+                                    peer_process_identity,
+                                );
+                                // Only authenticated calls keep session-owned
+                                // recording state alive.
+                                last_activity.store(
+                                    now_unix_secs(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                clamp_external_permission_prompt(
+                                    crate::bundle::is_env_truthy(
+                                        "CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW"
+                                    ),
+                                    &tool_name,
+                                    &mut args,
+                                );
                                 // Apply the caller-declared session identity
                                 // (explicit `session` → `_session_id`; minted id
                                 // as the recording/config fallback only). See
@@ -744,11 +2424,72 @@ pub async fn run_serve(
                                 // session in the post-loop block below. This is
                                 // the ONLY place a connection is marked control;
                                 // per-call connections never send this. ACK ok.
+                                let approval_broker_requested = req
+                                    .args
+                                    .as_ref()
+                                    .and_then(|args| args.get("approval_broker"))
+                                    .and_then(serde_json::Value::as_bool)
+                                    .unwrap_or(false);
+                                if profile == DaemonProfile::CodexComputerUseCompat {
+                                    if !approval_broker_requested {
+                                        let resp = DaemonResponse::err(
+                                            "daemon profile mismatch for session control: MCP requested `native` but daemon reports `codex-computer-use-compat`",
+                                            78,
+                                        );
+                                        let _ = writer.write_all(
+                                            (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                        ).await;
+                                        continue;
+                                    }
+                                    let authentication = match approval_peer_pid.as_ref() {
+                                        Ok(peer_pid) => approval_broker_peer_is_trusted(*peer_pid),
+                                        Err(error) => Err(error.clone()),
+                                    };
+                                    if let Err(reason) = authentication {
+                                        let resp = DaemonResponse::err(
+                                            format!(
+                                                "Computer Use approval broker authentication failed: {reason}. Only the signed OpenAI Codex app may use this profile. For isolated tests or local driver development only, set {CODEX_UNVERIFIED_CLIENT_ENV}=1."
+                                            ),
+                                            77,
+                                        );
+                                        let _ = writer.write_all(
+                                            (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                        ).await;
+                                        continue;
+                                    }
+                                }
+
+                                let mut approval_broker_token = None;
                                 if let Some(sid) = req.session_id.as_deref() {
+                                    // A proxy reconnect after daemon re-exec uses the same
+                                    // session id. If the old control connection died while
+                                    // this daemon stayed alive, its EOF reaper tombstoned the
+                                    // session first; the new control declaration revives it
+                                    // before accepting more calls.
+                                    cua_driver_core::session::revive_session(sid);
                                     control_session_id = Some(sid.to_owned());
+                                    if approval_broker_requested
+                                        && profile == DaemonProfile::CodexComputerUseCompat
+                                    {
+                                        let token = uuid::Uuid::new_v4().to_string();
+                                        approval_brokers
+                                            .lock()
+                                            .unwrap()
+                                            .insert(sid.to_owned(), token.clone());
+                                        #[cfg(target_os = "macos")]
+                                        platform_macos::app_approval::global()
+                                            .register_broker(sid, &token);
+                                        control_approval_token =
+                                            Some((sid.to_owned(), token.clone()));
+                                        approval_broker_token = Some(token);
+                                    }
                                 }
                                 let resp = DaemonResponse::ok(
-                                    serde_json::json!({"session_begin": true})
+                                    serde_json::json!({
+                                        "session_begin": true,
+                                        "profile": profile,
+                                        "approval_broker_token": approval_broker_token,
+                                    })
                                 );
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -811,23 +2552,50 @@ pub async fn run_serve(
                     // idempotent, so racing a legacy explicit session_end is
                     // benign.
                     if let Some(sid) = control_session_id {
-                        // stop_owner can SYNCHRONOUSLY finalize the recording's
-                        // mp4 — on macOS it hits SCStream::stop_capture(), which
-                        // blocks on disk I/O (video_sckit.rs). Run it on a
-                        // blocking thread so it does not stall a runtime worker.
-                        // fire_session_end stays inline: its hooks (overlay
-                        // Remove, config-override clear) are non-blocking.
-                        // Mark the session ended FIRST so an in-flight start_recording
-                        // sees ended=true and bails (mark-before-reap; the cursor/config
-                        // hooks already reap inside fire_session_end after the mark).
-                        // stop_owner ignores is_session_ended, so reaping after is safe.
-                        cua_driver_core::session::fire_session_end(&sid);
-                        let reg2 = reg.clone();
-                        let sid_for_stop = sid.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            reg2.recording.stop_owner(Some(&sid_for_stop))
-                        })
-                        .await;
+                        let owns_cleanup = if profile == DaemonProfile::CodexComputerUseCompat {
+                            match control_approval_token.take() {
+                                Some((owner, token))
+                                    if owner == sid
+                                        && release_approval_broker_if_owner(
+                                            &approval_brokers,
+                                            &owner,
+                                            &token,
+                                        ) =>
+                                {
+                                    #[cfg(target_os = "macos")]
+                                    platform_macos::app_approval::global()
+                                        .unregister_broker(&owner, &token);
+                                    true
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            true
+                        };
+                        if owns_cleanup {
+                            // stop_owner can SYNCHRONOUSLY finalize the recording's
+                            // mp4, on macOS it hits SCStream::stop_capture(), which
+                            // blocks on disk I/O (video_sckit.rs). Run it on a
+                            // blocking thread so it does not stall a runtime worker.
+                            // fire_session_end stays inline: its hooks (overlay
+                            // Remove, config-override clear) are non-blocking.
+                            // Mark the session ended FIRST so an in-flight start_recording
+                            // sees ended=true and bails (mark-before-reap; the cursor/config
+                            // hooks already reap inside fire_session_end after the mark).
+                            // stop_owner ignores is_session_ended, so reaping after is safe.
+                            cua_driver_core::session::fire_session_end(&sid);
+                            let reg2 = reg.clone();
+                            let sid_for_stop = sid.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                reg2.recording.stop_owner(Some(&sid_for_stop))
+                            })
+                            .await;
+                        } else {
+                            tracing::debug!(
+                                session_id = %sid,
+                                "stale Codex Computer Use control connection lost cleanup ownership"
+                            );
+                        }
                     }
                 });
             }
@@ -835,14 +2603,31 @@ pub async fn run_serve(
                 eprintln!("Cua Driver daemon shutting down.");
                 break;
             }
+            _ = authorized_root_health.tick(), if authorized_root_identity.is_some() => {
+                #[cfg(target_os = "macos")]
+                if let Some(root_process_identity) = authorized_root_identity {
+                    let root_is_still_live =
+                        macos_process_identity(root_process_identity.process_id)
+                            .is_some_and(|identity| {
+                                identity.is_same_generation_as(root_process_identity)
+                            });
+                    if !root_is_still_live {
+                        eprintln!("Authorized root process exited; shutting down daemon.");
+                        break;
+                    }
+                }
+            }
         }
     }
 
     // Clean up.
+    #[cfg(target_os = "macos")]
+    platform_macos::application_surface::stop_all();
     let _ = std::fs::remove_file(socket_path);
     if let Some(pid_path) = pid_file_path {
         let _ = std::fs::remove_file(pid_path);
     }
+    registry.remove_state_file();
 
     Ok(())
 }
@@ -1033,9 +2818,12 @@ pub async fn run_serve(
     registry: std::sync::Arc<cua_driver_core::tool::ToolRegistry>,
     socket_path: &str,
     pid_file_path: Option<&str>,
+    profile: DaemonProfile,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ServerOptions;
+
+    let host_authority_configured = configured_socket_host_auth_token().is_some();
 
     eprintln!("Cua Driver daemon listening on {socket_path}");
 
@@ -1078,10 +2866,9 @@ pub async fn run_serve(
     let last_activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_unix_secs()));
     spawn_recording_idle_backstop(registry.clone(), last_activity.clone());
     spawn_session_idle_sweep();
-    if let Some(port) = crate::mcp_http::configured_port() {
-        crate::mcp_http::spawn(registry.clone(), port);
-    }
+    maybe_start_http_transport(registry.clone(), profile);
     register_recording_session_end_hook(registry.recording.clone());
+    register_state_file_session_end_hook(&registry);
 
     loop {
         // Create a new pipe server instance to accept the next client.
@@ -1123,19 +2910,34 @@ pub async fn run_serve(
                     let mut control_session_id: Option<String> = None;
 
                     while let Ok(Some(line)) = lines.next_line().await {
-                        let req: DaemonRequest = match serde_json::from_str(&line) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                let resp = DaemonResponse::err(format!("JSON parse error: {e}"), 65);
+                        let parsed = match parse_request(&line) {
+                            Ok(request) => request,
+                            Err(resp) => {
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
                                 continue;
                             }
                         };
+                        let host_request_authorized = host_request_is_authorized(
+                            host_authority_configured,
+                            parsed.host_authenticated,
+                            !host_authority_configured,
+                        );
+                        let req = parsed.request;
 
                         match req.method.as_str() {
                             "shutdown" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
                                 let resp = DaemonResponse::ok(serde_json::json!({"shutdown": true}));
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -1143,6 +2945,49 @@ pub async fn run_serve(
                                 let mut guard = shutdown_tx2.lock().await;
                                 if let Some(tx) = guard.take() { let _ = tx.send(()); }
                                 return;
+                            }
+                            "request_system_permission" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
+                                let resp = validate_system_permission_request(req.name.as_deref());
+                                let response_sent = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await.is_ok();
+                                #[cfg(target_os = "macos")]
+                                if resp.ok && response_sent {
+                                    request_validated_system_permission(
+                                        req.name.as_deref().expect("validated permission has a name")
+                                    );
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                let _ = response_sent;
+                            }
+                            "verify_screen_capture" => {
+                                if !host_request_authorized {
+                                    let resp = DaemonResponse::err(
+                                        "Unauthorized host-only daemon request".to_owned(),
+                                        77,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                }
+                                let resp = DaemonResponse::err(
+                                    "Screen capture verification is available only on macOS",
+                                    64,
+                                );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
                             }
                             "list" => {
                                 // Include full ToolDef so MCP proxy callers can
@@ -1172,6 +3017,7 @@ pub async fn run_serve(
                                     "tools": tools,
                                     "capability_version": cua_driver_core::tool::CAPABILITY_VERSION,
                                     "schema_version": "1",
+                                    "profile": profile,
                                 }));
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -1202,6 +3048,13 @@ pub async fn run_serve(
                                     "type_text".to_owned()
                                 } else { raw_name.clone() };
                                 let mut args = req.args.unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                                clamp_external_permission_prompt(
+                                    crate::bundle::is_env_truthy(
+                                        "CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW"
+                                    ),
+                                    &tool_name,
+                                    &mut args,
+                                );
                                 // Apply the caller-declared session identity
                                 // (see the unix branch + apply_session_identity).
                                 let effective_session =
@@ -1261,10 +3114,14 @@ pub async fn run_serve(
                                 // pipe instance's EOF / broken-pipe reaps the
                                 // session in the post-loop block below. ACK ok.
                                 if let Some(sid) = req.session_id.as_deref() {
+                                    cua_driver_core::session::revive_session(sid);
                                     control_session_id = Some(sid.to_owned());
                                 }
                                 let resp = DaemonResponse::ok(
-                                    serde_json::json!({"session_begin": true})
+                                    serde_json::json!({
+                                        "session_begin": true,
+                                        "profile": profile,
+                                    })
                                 );
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -1351,6 +3208,7 @@ pub async fn run_serve(
     _registry: std::sync::Arc<cua_driver_core::tool::ToolRegistry>,
     _socket_path: &str,
     _pid_file_path: Option<&str>,
+    _profile: DaemonProfile,
 ) -> anyhow::Result<()> {
     anyhow::bail!("cua-driver serve is not supported on this platform");
 }
@@ -1362,6 +3220,7 @@ pub fn run_serve_cmd(
     registry: std::sync::Arc<cua_driver_core::tool::ToolRegistry>,
     socket_path: &str,
     pid_file_path: Option<&str>,
+    profile: DaemonProfile,
 ) {
     let socket_path = socket_path.to_owned();
     let pid_file_path = pid_file_path.map(str::to_owned);
@@ -1410,10 +3269,12 @@ pub fn run_serve_cmd(
         .expect("tokio runtime");
 
     if let Err(e) = rt.block_on(run_serve(
-        registry,
+        registry.clone(),
         &socket_path,
         pid_file_path.as_deref(),
+        profile,
     )) {
+        registry.remove_state_file();
         eprintln!("cua-driver serve error: {e}");
         std::process::exit(1);
     }
@@ -1475,6 +3336,301 @@ pub fn run_status_cmd(socket_path: &str, pid_file_path: &str) {
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+mod external_permission_flow_tests {
+    use super::{
+        clamp_external_permission_prompt, screen_capture_verification_response,
+        validate_system_permission_request,
+    };
+
+    #[test]
+    fn external_permission_flow_clamps_agent_prompt_requests() {
+        let mut args = serde_json::json!({ "prompt": true });
+        clamp_external_permission_prompt(true, "check_permissions", &mut args);
+        assert_eq!(args["prompt"], serde_json::json!(false));
+
+        let mut ordinary_tool_args = serde_json::json!({ "prompt": true });
+        clamp_external_permission_prompt(true, "click", &mut ordinary_tool_args);
+        assert_eq!(ordinary_tool_args["prompt"], serde_json::json!(true));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_permission_request_rejects_unknown_permission_without_prompting() {
+        let response = validate_system_permission_request(Some("camera"));
+        assert!(!response.ok);
+        assert_eq!(response.exit_code, Some(64));
+        assert_eq!(
+            response.error.as_deref(),
+            Some("Unknown system permission: camera")
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn host_permission_request_reports_platform_unavailability() {
+        let response = validate_system_permission_request(Some("camera"));
+        assert!(!response.ok);
+        assert_eq!(response.exit_code, Some(64));
+        assert_eq!(
+            response.error.as_deref(),
+            Some("System permission requests are only supported on macOS")
+        );
+    }
+
+    #[test]
+    fn host_screen_capture_verification_reports_live_readiness_explicitly() {
+        let ready = screen_capture_verification_response(true);
+        assert!(ready.ok);
+        assert_eq!(ready.result.unwrap()["capturable"], serde_json::json!(true));
+
+        let unavailable = screen_capture_verification_response(false);
+        assert!(unavailable.ok);
+        assert_eq!(
+            unavailable.result.unwrap()["capturable"],
+            serde_json::json!(false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod socket_authentication_tests {
+    use super::{
+        attach_state_writer_identity, host_request_is_authorized, parse_request_with_token,
+        parse_request_with_tokens, process_descends_from, socket_peer_requires_authorized_root,
+        state_authentication_key, DaemonRequest, ProcessIdentity,
+    };
+    use std::collections::HashMap;
+
+    fn list_request() -> DaemonRequest {
+        DaemonRequest {
+            method: "list".into(),
+            name: None,
+            args: None,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn authenticated_envelope_accepts_only_the_expected_token() {
+        let request = list_request();
+        let line = serde_json::json!({
+            "auth_token": "secret-A1B2C3",
+            "request": request,
+        })
+        .to_string();
+
+        let parsed = parse_request_with_token(&line, Some("secret-A1B2C3"))
+            .expect("matching token should authenticate");
+        assert_eq!(parsed.method, "list");
+
+        let rejected = parse_request_with_token(&line, Some("wrong-token"))
+            .expect_err("mismatched token must be rejected");
+        assert_eq!(rejected.exit_code, Some(77));
+        assert_eq!(rejected.error.as_deref(), Some("Unauthorized daemon client"));
+    }
+
+    #[test]
+    fn separate_host_capability_survives_agent_reparenting_without_leaking_host_authority() {
+        let request = list_request();
+        let host_line = serde_json::json!({
+            "auth_token": "agent-secret-A1B2C3",
+            "host_auth_token": "host-secret-D4E5F6",
+            "request": request,
+        })
+        .to_string();
+        let host = parse_request_with_tokens(
+            &host_line,
+            Some("agent-secret-A1B2C3"),
+            Some("host-secret-D4E5F6"),
+        )
+        .expect("the host should retain its separate authority");
+        assert!(host.host_authenticated);
+
+        let agent_line = serde_json::json!({
+            "auth_token": "agent-secret-A1B2C3",
+            "request": list_request(),
+        })
+        .to_string();
+        let agent = parse_request_with_tokens(
+            &agent_line,
+            Some("agent-secret-A1B2C3"),
+            Some("host-secret-D4E5F6"),
+        )
+        .expect("an authenticated agent request should remain usable");
+        assert!(!agent.host_authenticated);
+        assert!(!socket_peer_requires_authorized_root(true, true));
+        assert!(host_request_is_authorized(true, true, false));
+        assert!(!host_request_is_authorized(true, false, true));
+    }
+
+    #[test]
+    fn legacy_embedders_keep_process_ancestry_as_host_authority() {
+        assert!(socket_peer_requires_authorized_root(true, false));
+        assert!(host_request_is_authorized(false, false, true));
+        assert!(!host_request_is_authorized(false, false, false));
+    }
+
+    #[test]
+    fn state_authentication_configuration_accepts_only_32_byte_keys() {
+        use base64::Engine as _;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode([0x5a; 32]);
+        assert_eq!(
+            state_authentication_key(Some(&serde_json::json!({
+                "key_base64": encoded
+            }))),
+            Some(vec![0x5a; 32])
+        );
+        assert!(state_authentication_key(Some(&serde_json::json!({
+            "key_base64": base64::engine::general_purpose::STANDARD.encode([0x5a; 31])
+        })))
+        .is_none());
+        assert!(state_authentication_key(Some(&serde_json::json!({
+            "key_base64": "not-base64"
+        })))
+        .is_none());
+    }
+
+    #[test]
+    fn configured_authentication_rejects_legacy_and_missing_requests() {
+        let legacy = serde_json::to_string(&list_request()).expect("serialize request");
+        let rejected = parse_request_with_token(&legacy, Some("secret-A1B2C3"))
+            .expect_err("legacy request must not bypass configured auth");
+        assert_eq!(rejected.exit_code, Some(77));
+
+        let missing_request = r#"{"auth_token":"secret-A1B2C3"}"#;
+        let rejected = parse_request_with_token(missing_request, Some("secret-A1B2C3"))
+            .expect_err("authenticated envelope still requires a request");
+        assert_eq!(rejected.exit_code, Some(65));
+    }
+
+    #[test]
+    fn authentication_remains_opt_in_for_standalone_driver_clients() {
+        let legacy = serde_json::to_string(&list_request()).expect("serialize request");
+        let parsed = parse_request_with_token(&legacy, None)
+            .expect("legacy request should work when auth is not configured");
+        assert_eq!(parsed.method, "list");
+    }
+
+    #[test]
+    fn authenticated_peer_pid_replaces_untrusted_state_writer_identity() {
+        let mut args = serde_json::json!({
+            "pid": 42,
+            "_state_writer_pid": 999_999,
+        });
+
+        attach_state_writer_identity(
+            &mut args,
+            Some(ProcessIdentity {
+                process_id: 4_321,
+                parent_process_id: 4_000,
+                start_seconds: 1_700_000_000,
+                start_microseconds: 123_456,
+            }),
+        );
+        assert_eq!(args["_state_writer_pid"], serde_json::json!(4_321));
+        assert_eq!(
+            args["_state_writer_start_seconds"],
+            serde_json::json!(1_700_000_000)
+        );
+        assert_eq!(
+            args["_state_writer_start_microseconds"],
+            serde_json::json!(123_456)
+        );
+
+        attach_state_writer_identity(&mut args, None);
+        assert!(args.get("_state_writer_pid").is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn authenticated_peer_generation_replaces_untrusted_state_writer_identity() {
+        let mut args = serde_json::json!({
+            "pid": 42,
+            "_state_writer_pid": 999_999,
+            "_state_writer_start_seconds": 999_999,
+            "_state_writer_start_microseconds": 999_999,
+        });
+
+        let identity = super::macos_process_identity(std::process::id())
+            .expect("current process identity");
+        attach_state_writer_identity(&mut args, Some(identity));
+
+        assert_eq!(
+            args["_state_writer_pid"],
+            serde_json::json!(identity.process_id)
+        );
+        assert_eq!(
+            args["_state_writer_start_seconds"],
+            serde_json::json!(identity.start_seconds)
+        );
+        assert_eq!(
+            args["_state_writer_start_microseconds"],
+            serde_json::json!(identity.start_microseconds)
+        );
+
+        attach_state_writer_identity(&mut args, None);
+        assert!(args.get("_state_writer_pid").is_none());
+        assert!(args.get("_state_writer_start_seconds").is_none());
+        assert!(args.get("_state_writer_start_microseconds").is_none());
+    }
+
+    #[test]
+    fn process_ancestry_accepts_only_the_configured_root_and_descendants() {
+        let parents = HashMap::from([(400, 300), (300, 200), (200, 1), (500, 1)]);
+        let parent = |pid| parents.get(&pid).copied();
+
+        assert!(process_descends_from(400, 300, parent));
+        assert!(process_descends_from(300, 300, parent));
+        assert!(!process_descends_from(400, 500, parent));
+        assert!(!process_descends_from(500, 300, parent));
+        assert!(!process_descends_from(400, 1, parent));
+    }
+
+    #[test]
+    fn process_ancestry_fails_closed_on_cycles_and_missing_metadata() {
+        let cycle = HashMap::from([(400, 300), (300, 400)]);
+        let parent = |pid| cycle.get(&pid).copied();
+        assert!(!process_descends_from(400, 200, parent));
+        assert!(!process_descends_from(400, 200, |_| None));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_kernel_peer_pid_enforces_the_process_root() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let socket = directory.path().join("peer.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind test socket");
+        let client = tokio::net::UnixStream::connect(&socket);
+        let accepted = listener.accept();
+        let (client, accepted) = tokio::join!(client, accepted);
+        let _client = client.expect("connect test client");
+        let (server, _) = accepted.expect("accept test client");
+
+        let peer_process_id = super::macos_peer_process_id(&server);
+        assert_eq!(peer_process_id, Some(std::process::id()));
+        assert_eq!(
+            peer_process_id.and_then(super::macos_process_identity),
+            super::macos_process_identity(std::process::id())
+        );
+        let peer_identity = peer_process_id.and_then(super::macos_process_identity);
+        let root_identity =
+            super::macos_process_identity(std::process::id()).expect("root identity");
+        assert!(super::macos_process_is_authorized(
+            peer_identity,
+            root_identity
+        ));
+        assert!(!super::macos_process_is_authorized(
+            peer_identity,
+            ProcessIdentity {
+                start_seconds: root_identity.start_seconds.saturating_sub(1),
+                ..root_identity
+            }
+        ));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod gate_tests {
     //! Ended-session resurrection guard wired into the `call` dispatch.
@@ -1488,7 +3644,12 @@ mod gate_tests {
     //! a `start_session` re-declare REVIVES the id so its subsequent actions run
     //! again. Live and anonymous calls always pass through.
 
-    use super::{run_serve, send_request, DaemonRequest};
+    use super::{
+        codex_compat_default_pid_file_path, codex_compat_default_socket_path,
+        is_managed_pid_file_path, is_managed_socket_path, run_serve,
+        secure_runtime_directory, send_request, DaemonProfile, DaemonRequest,
+    };
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1517,6 +3678,169 @@ mod gate_tests {
                 },
             }
         }
+    }
+
+    #[test]
+    fn runtime_directory_is_private_and_rejects_symlinks() {
+        let root = tempfile::tempdir().expect("temp root");
+        let runtime = root.path().join("runtime");
+        std::fs::create_dir(&runtime).expect("create runtime");
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755))
+            .expect("make legacy mode");
+
+        secure_runtime_directory(&runtime, true).expect("harden runtime");
+        let mode = std::fs::metadata(&runtime)
+            .expect("runtime metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+
+        let link = root.path().join("runtime-link");
+        std::os::unix::fs::symlink(&runtime, &link).expect("create symlink");
+        assert!(
+            secure_runtime_directory(&link, true).is_err(),
+            "runtime directory must not follow a symlink"
+        );
+    }
+
+    #[test]
+    fn codex_compat_defaults_repair_legacy_runtime_directory_permissions() {
+        let socket = codex_compat_default_socket_path();
+        let pid = codex_compat_default_pid_file_path();
+        assert!(is_managed_socket_path(&socket));
+        assert!(is_managed_pid_file_path(&pid));
+
+        let root = tempfile::tempdir().expect("temp root");
+        let runtime = root.path().join("legacy-compat-runtime");
+        std::fs::create_dir(&runtime).expect("create runtime");
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755))
+            .expect("make legacy mode");
+        secure_runtime_directory(&runtime, is_managed_socket_path(&socket))
+            .expect("repair program-owned compat runtime");
+        let mode = std::fs::metadata(&runtime)
+            .expect("runtime metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[tokio::test]
+    async fn custom_socket_rejects_unsafe_directory_and_non_socket_path() {
+        let root = tempfile::tempdir().expect("temp root");
+        let unsafe_dir = root.path().join("shared");
+        std::fs::create_dir(&unsafe_dir).expect("create shared directory");
+        std::fs::set_permissions(&unsafe_dir, std::fs::Permissions::from_mode(0o777))
+            .expect("make directory unsafe");
+
+        let registry = Arc::new(ToolRegistry::new());
+        let unsafe_socket = unsafe_dir.join("driver.sock");
+        let error = run_serve(
+            registry.clone(),
+            unsafe_socket.to_str().expect("unsafe socket path"),
+            None,
+            DaemonProfile::Native,
+        )
+        .await
+        .expect_err("unsafe custom socket directory must fail closed");
+        assert!(error.to_string().contains("unsafe permissions"));
+
+        let safe_dir = root.path().join("private");
+        std::fs::create_dir(&safe_dir).expect("create private directory");
+        std::fs::set_permissions(&safe_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("make directory private");
+        let regular_file = safe_dir.join("driver.sock");
+        std::fs::write(&regular_file, b"do not delete").expect("create regular file");
+
+        let error = run_serve(
+            registry,
+            regular_file.to_str().expect("regular file path"),
+            None,
+            DaemonProfile::Native,
+        )
+        .await
+        .expect_err("non-socket path must not be replaced");
+        assert!(error.to_string().contains("non-socket"));
+        assert_eq!(
+            std::fs::read(&regular_file).expect("regular file preserved"),
+            b"do not delete"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_socket_and_pid_file_are_private() {
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make temp root private");
+        let socket = root.path().join("driver.sock");
+        let pid_file = root.path().join("driver.pid");
+        let socket_for_server = socket.clone();
+        let pid_for_server = pid_file.clone();
+        let registry = Arc::new(ToolRegistry::new());
+        let server = tokio::spawn(async move {
+            run_serve(
+                registry,
+                socket_for_server.to_str().expect("socket path"),
+                Some(pid_for_server.to_str().expect("pid path")),
+                DaemonProfile::Native,
+            )
+            .await
+        });
+
+        for _ in 0..100 {
+            if socket.exists() && pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        for path in [&socket, &pid_file] {
+            let mode = std::fs::metadata(path)
+                .unwrap_or_else(|error| panic!("{} metadata: {error}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "{} must be private", path.display());
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let status_request = DaemonRequest {
+                method: "permissions_status".into(),
+                name: None,
+                args: None,
+                session_id: None,
+            };
+            let socket_for_status = socket.to_string_lossy().into_owned();
+            let response = tokio::task::spawn_blocking(move || {
+                send_request(&socket_for_status, &status_request)
+            })
+            .await
+            .expect("permission status task")
+            .expect("permission status response");
+            assert!(response.ok);
+            let status = response.result.expect("permission status payload");
+            assert_eq!(status["profile"], "native");
+            assert_eq!(status["source"]["attribution"], "caller");
+            assert!(status["source"]["instance"].as_str().is_some());
+        }
+
+        let shutdown = DaemonRequest {
+            method: "shutdown".into(),
+            name: None,
+            args: None,
+            session_id: None,
+        };
+        let socket_for_client = socket.to_string_lossy().into_owned();
+        let response = tokio::task::spawn_blocking(move || {
+            send_request(&socket_for_client, &shutdown)
+        })
+        .await
+        .expect("shutdown task")
+        .expect("shutdown response");
+        assert!(response.ok);
+        server.await.expect("server task").expect("server result");
     }
 
     #[async_trait]
@@ -1550,19 +3874,25 @@ mod gate_tests {
         reg.register(Box::new(cua_driver_core::session_tools::StartSessionTool));
         let registry = Arc::new(reg);
 
-        // Unique temp socket — never the default socket / CuaDriver.app daemon.
-        let socket = format!(
-            "/tmp/cua-driver-gate-test-{}-{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
+        // Unique private temp socket, never the default socket or app daemon.
+        let socket_root = tempfile::tempdir().expect("socket temp root");
+        std::fs::set_permissions(socket_root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make socket temp root private");
+        let socket = socket_root
+            .path()
+            .join("driver.sock")
+            .to_string_lossy()
+            .into_owned();
         let socket_for_server = socket.clone();
         let reg_for_server = registry.clone();
         let server = tokio::spawn(async move {
-            let _ = run_serve(reg_for_server, &socket_for_server, None).await;
+            let _ = run_serve(
+                reg_for_server,
+                &socket_for_server,
+                None,
+                DaemonProfile::Native,
+            )
+            .await;
         });
 
         // Wait for the daemon to bind.
@@ -1682,8 +4012,13 @@ mod gate_tests {
 
 #[cfg(test)]
 mod session_boundary_tests {
-    use super::apply_session_identity;
+    use super::{
+        apply_session_identity, authenticate_compat_call, http_transport_allowed,
+        release_approval_broker_if_owner, DaemonProfile, APPROVAL_BROKER_TOKEN_ARG,
+    };
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
 
     #[test]
     fn explicit_session_becomes_session_id_and_is_returned() {
@@ -1719,5 +4054,116 @@ mod session_boundary_tests {
         let eff = apply_session_identity(&mut args, &Some("mcp-999".to_owned()));
         assert_eq!(args["_session_id"], "caller-set");
         assert_eq!(eff.as_deref(), Some("caller-set"));
+    }
+
+    #[test]
+    fn unauthenticated_http_transport_is_disabled_for_codex_compat() {
+        assert!(http_transport_allowed(DaemonProfile::Native));
+        assert!(!http_transport_allowed(
+            DaemonProfile::CodexComputerUseCompat
+        ));
+    }
+
+    #[test]
+    fn daemon_profiles_have_stable_wire_names() {
+        assert_eq!(
+            serde_json::to_value(DaemonProfile::Native).unwrap(),
+            json!("native")
+        );
+        assert_eq!(
+            serde_json::to_value(DaemonProfile::CodexComputerUseCompat).unwrap(),
+            json!("codex-computer-use-compat")
+        );
+    }
+
+    #[test]
+    fn compat_broker_session_overwrites_caller_session_identity() {
+        let brokers = Mutex::new(HashMap::from([(
+            "authenticated-session".to_owned(),
+            "daemon-minted".to_owned(),
+        )]));
+        let mut args = json!({
+            "app": "Calculator",
+            "session": "victim-session",
+            "_session_id": "victim-session",
+            (APPROVAL_BROKER_TOKEN_ARG): "daemon-minted",
+        });
+
+        authenticate_compat_call(
+            &mut args,
+            DaemonProfile::CodexComputerUseCompat,
+            Some("authenticated-session"),
+            &brokers,
+        )
+        .unwrap();
+
+        assert_eq!(args["app"], "Calculator");
+        assert_eq!(args["_session_id"], "authenticated-session");
+        assert!(args.get("session").is_none());
+        assert!(args.get(APPROVAL_BROKER_TOKEN_ARG).is_none());
+    }
+
+    #[test]
+    fn stale_control_token_cannot_release_new_session_owner() {
+        let brokers = Mutex::new(HashMap::from([(
+            "shared-session".to_owned(),
+            "new-owner-token".to_owned(),
+        )]));
+
+        assert!(!release_approval_broker_if_owner(
+            &brokers,
+            "shared-session",
+            "stale-owner-token",
+        ));
+        assert_eq!(
+            brokers.lock().unwrap().get("shared-session").map(String::as_str),
+            Some("new-owner-token")
+        );
+        assert!(release_approval_broker_if_owner(
+            &brokers,
+            "shared-session",
+            "new-owner-token",
+        ));
+        assert!(!brokers.lock().unwrap().contains_key("shared-session"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unverified_codex_override_requires_exact_scary_value() {
+        use super::unverified_codex_client_override_enabled;
+        use std::ffi::OsStr;
+
+        assert!(!unverified_codex_client_override_enabled(None));
+        assert!(!unverified_codex_client_override_enabled(Some(OsStr::new("true"))));
+        assert!(!unverified_codex_client_override_enabled(Some(OsStr::new("0"))));
+        assert!(unverified_codex_client_override_enabled(Some(OsStr::new("1"))));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn approval_resolution_requires_the_daemon_minted_broker_token() {
+        use super::app_approval_broker_matches;
+
+        let brokers = Mutex::new(HashMap::new());
+        assert!(!app_approval_broker_matches(
+            &brokers,
+            "raw-session",
+            "caller-forged"
+        ));
+
+        brokers
+            .lock()
+            .unwrap()
+            .insert("proxy-session".to_owned(), "daemon-minted".to_owned());
+        assert!(!app_approval_broker_matches(
+            &brokers,
+            "proxy-session",
+            "caller-forged"
+        ));
+        assert!(app_approval_broker_matches(
+            &brokers,
+            "proxy-session",
+            "daemon-minted"
+        ));
     }
 }

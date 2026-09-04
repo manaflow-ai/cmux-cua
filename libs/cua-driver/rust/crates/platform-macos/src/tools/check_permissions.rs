@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use cua_driver_core::{protocol::ToolResult, tool::{Tool, ToolDef}};
+use cua_driver_core::{
+    protocol::ToolResult,
+    tool::{Tool, ToolDef},
+};
 use serde_json::Value;
 
 use crate::permissions::status::{
@@ -18,11 +21,21 @@ pub struct CheckPermissionsTool;
 /// documents. `SCShareableContent::get()` does a live query: it only
 /// returns displays when the answering process can genuinely capture. When
 /// it disagrees with the preflight boolean, the preflight one is lying.
-fn screen_recording_capturable() -> bool {
+pub(super) fn screen_recording_capturable() -> bool {
     use screencapturekit::prelude::SCShareableContent;
     SCShareableContent::get()
         .map(|c| !c.displays().is_empty())
         .unwrap_or(false)
+}
+
+/// Run the ScreenCaptureKit probe only on an explicitly prompt-capable path.
+/// `SCShareableContent::get()` can itself register/raise TCC, so `None` is the
+/// only truthful answer when a silent or host-owned flow skips that probe.
+fn maybe_screen_recording_capture_probe(
+    should_probe: bool,
+    probe: impl FnOnce() -> bool,
+) -> Option<bool> {
+    should_probe.then(probe)
 }
 
 /// (B) Which TCC identity the booleans in this response reflect.
@@ -44,16 +57,36 @@ fn permission_source() -> serde_json::Value {
         .and_then(|p| std::fs::canonicalize(p).ok())
         .and_then(|p| p.to_str().map(str::to_owned))
         .unwrap_or_default();
-    let disclaimed =
-        std::env::var_os(cua_driver_core::RESPONSIBILITY_DISCLAIMED_ENV).is_some();
+    let disclaimed = std::env::var_os(cua_driver_core::RESPONSIBILITY_DISCLAIMED_ENV).is_some();
+    let embedded = cua_driver_core::embedded_mode();
+    let host_bundle_id = std::env::var(cua_driver_core::HOST_BUNDLE_ID_ENV).unwrap_or_default();
+    let bundle_identifier = super::health_report::current_bundle_identifier();
+    permission_source_for_context(
+        pid,
+        ppid,
+        &exe,
+        disclaimed,
+        embedded,
+        &host_bundle_id,
+        bundle_identifier.as_deref(),
+    )
+}
+
+fn permission_source_for_context(
+    pid: libc::pid_t,
+    ppid: libc::pid_t,
+    exe: &str,
+    disclaimed: bool,
+    embedded: bool,
+    host_bundle_id: &str,
+    bundle_identifier: Option<&str>,
+) -> serde_json::Value {
     // Embedded mode: the driver is a child in a host app's responsibility
     // chain, so the probes already answer for the host's TCC identity.
     // This branch only ever downgrades attribution (host, never
     // driver-daemon), so the caller-controlled env var can't spoof an
     // elevated identity. `host_bundle_id` is advisory, not a trust signal.
-    if cua_driver_core::embedded_mode() {
-        let host_bundle_id = std::env::var(cua_driver_core::HOST_BUNDLE_ID_ENV)
-            .unwrap_or_default();
+    if embedded {
         return serde_json::json!({
             "attribution": "host",
             "host_bundle_id": host_bundle_id,
@@ -78,15 +111,24 @@ fn permission_source() -> serde_json::Value {
     // — outside the bundle — the env var must NOT grant daemon attribution, or
     // a caller could pre-set it and spoof the TCC source. Fail closed to
     // "caller" whenever the bundle signal is absent.
-    let inside_bundle = exe.contains("/CuaDriver.app/Contents/MacOS/");
-    let is_driver_daemon = inside_bundle && (ppid == 1 || disclaimed);
+    let inside_app_bundle = exe.contains(".app/Contents/MacOS/");
+    let is_responsible_app = inside_app_bundle
+        && bundle_identifier.is_some_and(|identifier| !identifier.is_empty())
+        && (ppid == 1 || disclaimed);
 
-    let (attribution, note) = if is_driver_daemon {
+    let (attribution, note) = if is_responsible_app
+        && bundle_identifier == Some(super::health_report::CANONICAL_BUNDLE_ID)
+    {
         (
             "driver-daemon",
             "These booleans reflect the CuaDriver daemon's own TCC identity \
              (com.trycua.driver) because this process is its own responsible \
              process.",
+        )
+    } else if is_responsible_app {
+        (
+            "helper-daemon",
+            "These booleans reflect this helper application's own TCC identity. Permission setup belongs to the embedding host; do not run the standalone cua-driver permission flow.",
         )
     } else {
         (
@@ -104,6 +146,7 @@ fn permission_source() -> serde_json::Value {
         "pid": pid,
         "responsible_ppid": ppid,
         "executable": exe,
+        "bundle_identifier": bundle_identifier,
         "disclaim_env": disclaimed,
         "note": note,
     })
@@ -121,10 +164,11 @@ fn def() -> &'static ToolDef {
             safe to call repeatedly. Pass {\"prompt\": false} for a purely read-only \
             status check.\n\n\
             Returns: `accessibility` + `screen_recording` (booleans from the TCC \
-            preflight APIs), `screen_recording_capturable` (a live ScreenCaptureKit \
-            probe — if it disagrees with `screen_recording`, the preflight grant \
-            belongs to a different process), and `source` (which TCC identity the \
-            booleans reflect: the CuaDriver daemon vs the launching terminal/IDE). \
+            preflight APIs), `screen_recording_capturable` (true/false only when a \
+            live ScreenCaptureKit probe ran; null for prompt:false, embedded, or \
+            external permission flows), `screen_recording_probe_performed`, and \
+            `source` (which TCC identity the \
+            booleans reflect: the responsible daemon app vs the launching terminal/IDE). \
             macOS attributes grants to the responsible process, so a standalone call \
             from a terminal reports the terminal's grants, not the driver's.".into(),
         input_schema: serde_json::json!({
@@ -148,7 +192,9 @@ fn def() -> &'static ToolDef {
 
 #[async_trait]
 impl Tool for CheckPermissionsTool {
-    fn def(&self) -> &ToolDef { def() }
+    fn def(&self) -> &ToolDef {
+        def()
+    }
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
@@ -157,8 +203,9 @@ impl Tool for CheckPermissionsTool {
         // host owns the grant flow). This and the startup gate are the only
         // `request_*` call sites, so both being gated makes prompts
         // unreachable when embedded.
-        let should_prompt =
-            args.bool_or("prompt", true) && !cua_driver_core::embedded_mode();
+        let should_prompt = args.bool_or("prompt", true)
+            && !cua_driver_core::embedded_mode()
+            && !super::health_report::external_permission_flow_enabled();
         if should_prompt {
             let _ = request_accessibility();
             let _ = request_screen_recording();
@@ -166,51 +213,87 @@ impl Tool for CheckPermissionsTool {
         let accessibility = accessibility_granted();
         let screen_recording = screen_recording_granted();
         // (A) Authoritative live probe — see `screen_recording_capturable`.
-        let screen_recording_capturable = screen_recording_capturable();
+        //
+        // CRITICAL: `SCShareableContent::get()` REGISTERS this process with TCC
+        // and RAISES the Screen Recording system prompt when the grant is
+        // missing. That is a real side effect, so it must only happen when the
+        // caller opted into prompting (`prompt:true`). A read-only status query
+        // (`prompt:false`) — e.g. a host app refreshing the helper's status when
+        // an agent session merely starts — MUST stay silent; running the live
+        // probe there pops a permission dialog before the user has done anything
+        // with computer use. When we're not allowed to prompt, report capture
+        // status as unknown instead of mislabelling the preflight boolean as a
+        // live result.
+        let screen_recording_capturable = maybe_screen_recording_capture_probe(
+            should_prompt,
+            screen_recording_capturable,
+        );
         // (B) Which identity the booleans above belong to.
         let source = permission_source();
-        let is_caller = source.get("attribution").and_then(|v| v.as_str()) == Some("caller");
 
-        // Text format mirrors Swift 1:1:
-        //   "✅ Accessibility: granted.\n✅ Screen Recording: granted."
-        let ax_prefix  = if accessibility   { "✅" } else { "❌" };
-        let sr_prefix  = if screen_recording { "✅" } else { "❌" };
-        let ax_state   = if accessibility   { "granted" } else { "NOT granted" };
-        let sr_state   = if screen_recording { "granted" } else { "NOT granted" };
-        let mut summary = format!(
-            "{ax_prefix} Accessibility: {ax_state}.\n{sr_prefix} Screen Recording: {sr_state}."
-        );
-        // Flag a preflight/probe disagreement (the false-positive tell).
-        if screen_recording && !screen_recording_capturable {
-            summary.push_str(
-                "\n⚠️  Screen Recording reads granted but a live capture probe failed — \
-                 the grant likely belongs to a different process, not this one.",
-            );
-        }
-        // Make the attribution explicit when answering for a host or caller
-        // (not the daemon).
-        if source.get("attribution").and_then(|v| v.as_str()) == Some("host") {
-            summary.push_str(
-                "\nℹ️  Embedded mode: status reflects the HOST app's TCC grant. \
-                 If a permission is missing, the host must request it — the \
-                 driver will not prompt.",
-            );
-        }
-        if is_caller {
-            summary.push_str(
-                "\nℹ️  Status reflects the launching app's TCC identity, not the CuaDriver \
-                 daemon (com.trycua.driver). See `source` for details.",
-            );
-        }
-
-        ToolResult::text(summary)
-            .with_structured(serde_json::json!({
-                "accessibility":               accessibility,
-                "screen_recording":            screen_recording,
-                "screen_recording_capturable": screen_recording_capturable,
-                "source":                      source,
-            }))
+        permission_result(
+            accessibility,
+            screen_recording,
+            screen_recording_capturable,
+            source,
+        )
     }
+}
+
+fn permission_result(
+    accessibility: bool,
+    screen_recording: bool,
+    screen_recording_capturable: Option<bool>,
+    source: serde_json::Value,
+) -> ToolResult {
+    let is_caller = source.get("attribution").and_then(|v| v.as_str()) == Some("caller");
+    // Text format mirrors Swift 1:1:
+    //   "✅ Accessibility: granted.\n✅ Screen Recording: granted."
+    let ax_prefix = if accessibility { "✅" } else { "❌" };
+    let sr_prefix = if screen_recording { "✅" } else { "❌" };
+    let ax_state = if accessibility {
+        "granted"
+    } else {
+        "NOT granted"
+    };
+    let sr_state = if screen_recording {
+        "granted"
+    } else {
+        "NOT granted"
+    };
+    let mut summary = format!(
+        "{ax_prefix} Accessibility: {ax_state}.\n{sr_prefix} Screen Recording: {sr_state}."
+    );
+    // Flag a preflight/probe disagreement (the false-positive tell).
+    if screen_recording && screen_recording_capturable == Some(false) {
+        summary.push_str(
+            "\n⚠️  Screen Recording reads granted but a live capture probe failed — \
+             the grant likely belongs to a different process, not this one.",
+        );
+    }
+    // Make the attribution explicit when answering for a host or caller
+    // (not the daemon).
+    if source.get("attribution").and_then(|v| v.as_str()) == Some("host") {
+        summary.push_str(
+            "\nℹ️  Embedded mode: status reflects the HOST app's TCC grant. \
+             If a permission is missing, the host must request it — the \
+             driver will not prompt.",
+        );
+    }
+    if is_caller {
+        summary.push_str(
+            "\nℹ️  Status reflects the launching app's TCC identity, not the CuaDriver \
+             daemon (com.trycua.driver). See `source` for details.",
+        );
+    }
+
+    ToolResult::text(summary).with_structured(serde_json::json!({
+        "accessibility":               accessibility,
+        "screen_recording":            screen_recording,
+        "screen_recording_capturable": screen_recording_capturable,
+        "screen_recording_probe_performed": screen_recording_capturable.is_some(),
+        "source":                      source,
+    }))
 }
 
 #[cfg(test)]
@@ -266,7 +349,10 @@ mod tests {
     fn embedded_mode_reports_host_attribution() {
         let _guard = env_lock();
         let embedded = swap_env(cua_driver_core::EMBEDDED_ENV, Some("1"));
-        let host = swap_env(cua_driver_core::HOST_BUNDLE_ID_ENV, Some("com.example.host"));
+        let host = swap_env(
+            cua_driver_core::HOST_BUNDLE_ID_ENV,
+            Some("com.example.host"),
+        );
 
         let source = permission_source();
         assert_eq!(
@@ -312,5 +398,84 @@ mod tests {
             "only CUA_DRIVER_EMBEDDED=1 may enable embedded mode"
         );
         restore_env(cua_driver_core::EMBEDDED_ENV, embedded);
+    }
+
+    #[test]
+    fn cmux_helper_reports_its_own_daemon_identity() {
+        let source = permission_source_for_context(
+            42,
+            1,
+            "/Library/Application Support/cmux/computer-use/helper/tag/cmux Computer Use.app/Contents/MacOS/cmux-cua-driver",
+            true,
+            false,
+            "",
+            Some("com.cmuxterm.app.debug.tag.computer-use"),
+        );
+
+        assert_eq!(
+            source.get("attribution").and_then(|value| value.as_str()),
+            Some("helper-daemon"),
+        );
+        assert_eq!(
+            source
+                .get("bundle_identifier")
+                .and_then(|value| value.as_str()),
+            Some("com.cmuxterm.app.debug.tag.computer-use"),
+        );
+        assert!(
+            !source["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("permissions grant"),
+            "a host-owned helper must never recommend the standalone permission flow",
+        );
+    }
+
+    #[test]
+    fn silent_check_reports_capture_unknown_without_running_probe() {
+        let probe_called = std::cell::Cell::new(false);
+        let capturable = maybe_screen_recording_capture_probe(false, || {
+            probe_called.set(true);
+            true
+        });
+        assert_eq!(capturable, None);
+        assert!(!probe_called.get(), "silent status must not call SCShareableContent");
+
+        let result = permission_result(
+            true,
+            true,
+            capturable,
+            serde_json::json!({ "attribution": "helper-daemon" }),
+        );
+        let structured = result.structured_content.as_ref().expect("structured status");
+        assert!(structured["screen_recording_capturable"].is_null());
+        assert_eq!(structured["screen_recording_probe_performed"], false);
+        let text = result.content.iter().find_map(|content| match content {
+            cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        }).unwrap_or_default();
+        assert!(!text.contains("live capture probe failed"));
+    }
+
+    #[test]
+    fn live_check_reports_probe_true_or_false_and_warns_only_on_false() {
+        for (live, should_warn) in [(true, false), (false, true)] {
+            let capturable = maybe_screen_recording_capture_probe(true, || live);
+            assert_eq!(capturable, Some(live));
+            let result = permission_result(
+                true,
+                true,
+                capturable,
+                serde_json::json!({ "attribution": "helper-daemon" }),
+            );
+            let structured = result.structured_content.as_ref().expect("structured status");
+            assert_eq!(structured["screen_recording_capturable"], live);
+            assert_eq!(structured["screen_recording_probe_performed"], true);
+            let text = result.content.iter().find_map(|content| match content {
+                cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            }).unwrap_or_default();
+            assert_eq!(text.contains("live capture probe failed"), should_warn);
+        }
     }
 }

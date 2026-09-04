@@ -72,6 +72,14 @@ On macOS, shell-spawned MCP processes can auto-launch and proxy through a CuaDri
 | ---- | ---- | ------- | ----------- |
 | `--socket` | String | — | Override the daemon socket or named-pipe path used by the proxy fallback. |
 | `--host-bundle-id` | String | — | Advisory host bundle id label echoed in check_permissions output (embedded mode). |
+| `--cursor-id` | String | default | Name the default cursor instance. |
+| `--cursor-icon` | String | — | Use a custom PNG, SVG, or ICO cursor asset. |
+| `--cursor-shape` | String | teardrop | Select a built-in cursor silhouette. |
+| `--cursor-palette` | String | — | Select a built-in cursor colour palette. |
+| `--glide-ms` | Number | — | Use a fixed glide duration in milliseconds. |
+| `--dwell-ms` | Number | — | Override the post-click dwell in milliseconds. |
+| `--idle-hide-ms` | Number | — | Override the idle-hide delay in milliseconds. |
+| `--cursor-speed` | Number | 1.0 | Scale speed-based glides; clamped to 0.25–8. |
 
 **Flags:**
 
@@ -80,6 +88,7 @@ On macOS, shell-spawned MCP processes can auto-launch and proxy through a CuaDri
 | `--no-daemon-relaunch` | Stay in-process instead of proxying through a daemon. |
 | `--claude-code-computer-use-compat` | Expose the Claude Code computer-use compatibility screenshot surface. |
 | `--embedded` | Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1. |
+| `--no-overlay` | Disable the driver's in-process cursor overlay. |
 
 ### `cua-driver serve`
 
@@ -94,6 +103,14 @@ The daemon owns per-process state such as element-index caches, recording state,
 | `--socket` | String | — | Override the daemon socket or named-pipe path. |
 | `--pid-file` | String | — | Override the pid-file path on Unix targets. |
 | `--host-bundle-id` | String | — | Advisory host bundle id label echoed in check_permissions output (embedded mode). |
+| `--cursor-id` | String | default | Name the default cursor instance. |
+| `--cursor-icon` | String | — | Use a custom PNG, SVG, or ICO cursor asset. |
+| `--cursor-shape` | String | teardrop | Select a built-in cursor silhouette. |
+| `--cursor-palette` | String | — | Select a built-in cursor colour palette. |
+| `--glide-ms` | Number | — | Use a fixed glide duration in milliseconds. |
+| `--dwell-ms` | Number | — | Override the post-click dwell in milliseconds. |
+| `--idle-hide-ms` | Number | — | Override the idle-hide delay in milliseconds. |
+| `--cursor-speed` | Number | 1.0 | Scale speed-based glides; clamped to 0.25–8. |
 
 **Flags:**
 
@@ -101,6 +118,7 @@ The daemon owns per-process state such as element-index caches, recording state,
 | ---- | ----------- |
 | `--no-permissions-gate` | Skip the macOS first-launch permissions gate. |
 | `--embedded` | Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1. |
+| `--no-overlay` | Disable the driver's in-process cursor overlay. |
 
 ### `cua-driver stop`
 
@@ -112,6 +130,12 @@ Ask the running daemon to exit gracefully.
 | ---- | ---- | ------- | ----------- |
 | `--socket` | String | — | Override the daemon socket or named-pipe path. |
 
+**Flags:**
+
+| Name | Description |
+| ---- | ----------- |
+| `--codex-computer-use-compat` | Target the dedicated Codex Computer Use daemon. |
+
 ### `cua-driver status`
 
 Report whether a Cua Driver daemon is running.
@@ -122,6 +146,12 @@ Report whether a Cua Driver daemon is running.
 | ---- | ---- | ------- | ----------- |
 | `--socket` | String | — | Override the daemon socket or named-pipe path. |
 | `--pid-file` | String | — | Override the pid-file path on Unix targets. |
+
+**Flags:**
+
+| Name | Description |
+| ---- | ----------- |
+| `--codex-computer-use-compat` | Target the dedicated Codex Computer Use daemon. |
 
 ### `cua-driver mcp-config`
 
@@ -280,6 +310,36 @@ Exit code is non-zero when any probe is an error.
 Print a pasteable install-layout and permission-attribution report.
 
 ## Other commands
+
+### `cua-driver approvals`
+
+Manage permanent Codex Computer Use app approvals.
+
+macOS only. The commands operate on the private local approval store and do not add MCP tools.
+
+**Flags:**
+
+| Name | Description |
+| ---- | ----------- |
+| `--json` | Emit a machine-readable result. |
+
+#### `cua-driver approvals list`
+
+List permanent app approvals.
+
+#### `cua-driver approvals revoke`
+
+Revoke one permanent app approval.
+
+**Arguments:**
+
+| Name | Type | Required | Description |
+| ---- | ---- | -------- | ----------- |
+| `<bundle-id-or-stable-id>` | String | Yes | Bundle id or stable approval identity to revoke. |
+
+#### `cua-driver approvals clear`
+
+Revoke every permanent app approval.
 
 ### `cua-driver autostart`
 
