@@ -25,7 +25,7 @@ fn def() -> &'static ToolDef {
             "type": "object",
             "required": ["x", "y"],
             "properties": {
-                "session": { "type": "string", "description": "Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less." },
+                "session": { "type": "string", "description": "Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-<pid>); anonymous non-embedded calls remain cursor-less." },
                 "x": { "type": "number" },
                 "y": { "type": "number" },
                 "cursor_id": { "type": "string", "description": "Cursor instance to move. Default: 'default'." }
@@ -52,6 +52,26 @@ impl Tool for MoveCursorTool {
         let x = match args.require_f64("x") { Ok(v) => v, Err(e) => return e };
         let y = match args.require_f64("y") { Ok(v) => v, Err(e) => return e };
         let cursor_id = super::cursor_tools::resolve_cursor_key(&args);
+
+        // Unlike click/scroll/drag, move_cursor has no target window id to pin
+        // above. Re-anchor the overlay above WindowServer's real frontmost
+        // layer-0 window before animating so an explicit visual cursor move can
+        // never remain hidden behind the app the user is looking at.
+        let driver_pid = std::process::id() as i32;
+        let anchor_window_id = tokio::task::spawn_blocking(move || {
+            crate::windows::cursor_overlay_anchor_window(
+                &crate::windows::visible_windows(),
+                driver_pid,
+            )
+        })
+        .await
+        .unwrap_or(None);
+        if let Some(window_id) = anchor_window_id {
+            crate::cursor::overlay::send_command(
+                cursor_id.clone(),
+                cursor_overlay::OverlayCommand::PinAbove(window_id as u64),
+            );
+        }
 
         self.state.cursor_registry.update_position(&cursor_id, x, y);
         // Drive the DRAWN cursor via the same path as click's animation. A raw

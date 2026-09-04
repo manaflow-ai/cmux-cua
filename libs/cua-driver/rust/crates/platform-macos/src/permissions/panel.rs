@@ -1,5 +1,4 @@
-//! Native NSPanel onboarding UI — live status rows, dynamic heading,
-//! auto-dismiss on all-green.
+//! Native NSPanel onboarding UI with a two-step permission state machine.
 //!
 //! Replaces the terminal banner when the daemon is launched from the
 //! bundled `/Applications/CuaDriver.app`. Mirrors the Swift gate at
@@ -7,40 +6,41 @@
 //!
 //! ## UX
 //!
-//! On first launch with missing grants the panel shows:
+//! The branded explainer is shown before any system prompt. Each missing row
+//! has its own Allow action, and only one permission request can be active at
+//! a time. After a request is offered, its action becomes “Complete in System
+//! Settings” so a denied or previously-dismissed TCC prompt has a clear
+//! recovery path.
+//!
+//! On first launch with missing grants the panel resembles:
 //!
 //! ```text
-//! ┌─ CuaDriver Permissions ─────────────────────┐
-//! │  CuaDriver needs your permission            │
-//! │  Grant both so CuaDriver can …              │
+//! ┌─ Cua Driver Permissions ────────────────────┐
+//! │  Enable Cua Driver Computer Use             │
+//! │  Two macOS permissions are required.        │
 //! │                                             │
-//! │  ✗ Accessibility                            │
-//! │      lets cua-driver read the accessibility │
-//! │      tree of running apps …                 │
+//! │  ○ Accessibility                    [Allow] │
+//! │      Read interface text and use controls.  │
 //! │                                             │
-//! │  ✗ Screen Recording                         │
-//! │      lets cua-driver capture per-window …   │
+//! │  ○ Screen Recording                 [Allow] │
+//! │      See app windows to place actions.       │
 //! │                                             │
-//! │  ✅ All set. CuaDriver is ready to use.      │
-//! │     (hidden until both grants flip green)   │
-//! │                                             │
-//! │  [ Continue anyway ]  [ Open Settings ]     │
+//! │  Connected clients can use these grants.     │
 //! └─────────────────────────────────────────────┘
 //! ```
 //!
-//! A 1 Hz `NSTimer` reads [`current_status`] on every tick and updates
-//! the row icons / heading / subheading / "All set" strip in place.
-//! When both grants flip green and `suppress_auto_close == false` the
-//! poll callback calls `[NSApp stopModal]` and `show_modal` returns
-//! [`PanelOutcome::AllGranted`] so the caller can skip the trailing
-//! `wait_for_grants` loop.
+//! A 1 Hz `NSTimer` reads [`current_status`] as an opportunistic live
+//! update. Permission-dialog and System Settings focus transitions are the
+//! authoritative progress signal: when the user returns, the panel asks the
+//! gate to re-exec and verify the result in a fresh process. This avoids
+//! waiting forever on macOS versions that cache a false TCC probe.
 //!
 //! ## Threading
 //!
 //! `show_modal` MUST be called on the main thread. The Serve arm in
-//! `cua-driver/src/main.rs` invokes the gate synchronously before any
-//! threads spawn or NSApp.run() is called by the cursor overlay, so
-//! the gate already runs on the main thread. `panel_enabled()`
+//! `cua-driver/src/main.rs` starts its socket worker, then invokes the gate on
+//! the main thread before `NSApp.run()` is called by the cursor overlay.
+//! `panel_enabled()`
 //! double-checks and falls back to the terminal banner if anything
 //! is off (not main thread, headless, opt-out env var, non-`.app`
 //! invocation).
@@ -57,29 +57,118 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize};
 
 use crate::permissions::gate::MissingPermission;
-use crate::permissions::status::{current_status, PermissionsStatus};
+use crate::permissions::status::{
+    current_status, request_accessibility, request_screen_recording, PermissionGrantState,
+    PermissionsStatus,
+};
 
 // ── Public API ──────────────────────────────────────────────────────────
 
 /// What the user did with the panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelOutcome {
-    /// User asked us to open System Settings — caller should invoke
-    /// `open_system_settings_for(...)` for each missing permission and
-    /// then enter the polling phase.
-    OpenSettings,
-    /// User dismissed (Continue anyway button or red-dot close) — the
-    /// caller should enter the polling phase without opening Settings.
+    /// AppKit could not construct a useful panel. The caller should use its
+    /// terminal fallback instead.
+    Unavailable,
+    /// User closed the window. The daemon remains available and individual
+    /// tools can report that permission is not granted.
     Dismissed,
     /// Both grants flipped green while the panel was up; the poll
     /// callback auto-dismissed. Caller can skip the polling phase.
     AllGranted,
+    /// The user returned from a macOS permission decision or System Settings.
+    /// The current process may still cache a false probe, so the caller must
+    /// re-exec and verify without claiming that the grant succeeded.
+    RefreshRequired,
+}
+
+const OUTCOME_NONE: u8 = 0;
+const OUTCOME_DISMISSED: u8 = 1;
+const OUTCOME_ALL_GRANTED: u8 = 2;
+const OUTCOME_REFRESH_REQUIRED: u8 = 3;
+const OUTCOME_UNAVAILABLE: u8 = 4;
+
+static PANEL_VISIBLE: AtomicBool = AtomicBool::new(false);
+static PANEL_COMPLETION: AtomicU64 = AtomicU64::new(0);
+static PANEL_LAST_OUTCOME: AtomicU8 = AtomicU8::new(OUTCOME_NONE);
+
+struct PanelLifecycleGuard {
+    finished: bool,
+}
+
+impl PanelLifecycleGuard {
+    fn begin() -> Self {
+        PANEL_LAST_OUTCOME.store(OUTCOME_NONE, Ordering::Release);
+        PANEL_VISIBLE.store(true, Ordering::Release);
+        Self { finished: false }
+    }
+
+    fn finish(mut self, outcome: PanelOutcome) {
+        record_panel_completion(outcome);
+        self.finished = true;
+    }
+}
+
+impl Drop for PanelLifecycleGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            record_panel_completion(PanelOutcome::Unavailable);
+        }
+    }
+}
+
+fn record_panel_completion(outcome: PanelOutcome) {
+    let encoded = match outcome {
+        PanelOutcome::Unavailable => OUTCOME_UNAVAILABLE,
+        PanelOutcome::Dismissed => OUTCOME_DISMISSED,
+        PanelOutcome::AllGranted => OUTCOME_ALL_GRANTED,
+        PanelOutcome::RefreshRequired => OUTCOME_REFRESH_REQUIRED,
+    };
+    PANEL_LAST_OUTCOME.store(encoded, Ordering::Release);
+    PANEL_VISIBLE.store(false, Ordering::Release);
+    PANEL_COMPLETION.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Process-local lifecycle snapshot for the daemon's private permission
+/// control channel. This is intentionally separate from the MCP registry: a
+/// CLI can tell whether the already-running branded panel is still active (or
+/// was dismissed) without adding a public computer-use tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PanelLifecycle {
+    pub visible: bool,
+    pub completion: u64,
+    pub last_outcome: Option<PanelOutcome>,
+}
+
+pub fn lifecycle() -> PanelLifecycle {
+    let last_outcome = match PANEL_LAST_OUTCOME.load(Ordering::Acquire) {
+        OUTCOME_DISMISSED => Some(PanelOutcome::Dismissed),
+        OUTCOME_ALL_GRANTED => Some(PanelOutcome::AllGranted),
+        OUTCOME_REFRESH_REQUIRED => Some(PanelOutcome::RefreshRequired),
+        OUTCOME_UNAVAILABLE => Some(PanelOutcome::Unavailable),
+        _ => None,
+    };
+    PanelLifecycle {
+        visible: PANEL_VISIBLE.load(Ordering::Acquire),
+        completion: PANEL_COMPLETION.load(Ordering::Acquire),
+        last_outcome,
+    }
+}
+
+pub fn outcome_name(outcome: PanelOutcome) -> &'static str {
+    match outcome {
+        PanelOutcome::Unavailable => "unavailable",
+        PanelOutcome::Dismissed => "dismissed",
+        PanelOutcome::AllGranted => "all-granted",
+        PanelOutcome::RefreshRequired => "refresh-required",
+    }
 }
 
 /// Inputs for [`show_modal`].
@@ -92,30 +181,25 @@ pub struct PanelOpts {
     pub initial_status: PermissionsStatus,
 }
 
-/// Decide whether the panel can be shown right now. The panel is
-/// **opt-in**: the default behaviour is the terminal banner, and the
-/// panel only appears when:
+/// Decide whether the panel can be shown right now. Bundled app launches use
+/// the panel by default. Bare binaries retain the terminal flow.
 ///
-///   * `CUA_DRIVER_RS_PERMISSIONS_PANEL` env var is set to an on
-///     sentinel (`1` / `true` / `yes` / `on`, case-insensitive); AND
+///   * `CUA_DRIVER_RS_PERMISSIONS_PANEL` is not set to an explicit off
+///     sentinel (`0` / `false` / `no` / `off`, case-insensitive); AND
 ///   * the process is running on the main thread (a hard requirement
 ///     for AppKit calls); AND
 ///   * the binary lives inside an `.app` bundle (bare-binary
 ///     invocations have no Info.plist / bundle id for TCC to attribute
 ///     the window to, so they always use the terminal flow).
 ///
-/// Rationale for opt-in: the panel relies on a chain of macOS
-/// behaviours that are easy to break in practice — TCC responsible-
-/// process attribution, session-level TCC caches that survive
-/// `tccutil reset`, ad-hoc codesign identity mismatches between dev
-/// builds and the bundle id, and AppKit modal-run-loop modes. When
-/// any link is off, the panel can present a confusing UX (e.g. shows
-/// "missing" rows because TCC returns stale cache, or auto-dismisses
-/// against the user's intent). The terminal flow has none of those
-/// failure modes, so it's the safer default until we have signals
-/// that the UI is consistently helpful across users.
+/// The app-bundle requirement preserves correct TCC attribution: System
+/// Settings grants the signed helper identity, never the terminal that
+/// happened to launch it.
 pub fn panel_enabled() -> bool {
-    if !env_on("CUA_DRIVER_RS_PERMISSIONS_PANEL") {
+    if cua_driver_core::embedded_mode() {
+        return false;
+    }
+    if env_off("CUA_DRIVER_RS_PERMISSIONS_PANEL") {
         return false;
     }
     if MainThreadMarker::new().is_none() {
@@ -135,9 +219,11 @@ pub fn panel_enabled() -> bool {
 /// Safety / threading: panics if invoked off the main thread. Callers
 /// should check [`panel_enabled`] first to avoid the panic.
 pub fn show_modal(opts: PanelOpts) -> PanelOutcome {
-    let _mtm = MainThreadMarker::new()
-        .expect("show_modal must be called from the main thread");
-    unsafe { show_modal_unsafe(&opts) }
+    let _mtm = MainThreadMarker::new().expect("show_modal must be called from the main thread");
+    let lifecycle = PanelLifecycleGuard::begin();
+    let outcome = unsafe { show_modal_unsafe(&opts) };
+    lifecycle.finish(outcome);
+    outcome
 }
 
 /// Block the current (main) thread for `seconds` while letting the
@@ -170,8 +256,7 @@ pub fn pump_run_loop_briefly(seconds: f64) {
         return;
     }
     unsafe {
-        let run_loop: *mut AnyObject =
-            msg_send![class!(NSRunLoop), currentRunLoop];
+        let run_loop: *mut AnyObject = msg_send![class!(NSRunLoop), currentRunLoop];
         if run_loop.is_null() {
             std::thread::sleep(std::time::Duration::from_secs_f64(seconds.max(0.0)));
             return;
@@ -180,8 +265,7 @@ pub fn pump_run_loop_briefly(seconds: f64) {
         // deadline. `[NSRunLoop runMode:beforeDate:]` blocks up to
         // that deadline while dispatching pending input sources +
         // timers — including TCC notification taps.
-        let date: *mut AnyObject =
-            msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: seconds];
+        let date: *mut AnyObject = msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: seconds];
         if date.is_null() {
             std::thread::sleep(std::time::Duration::from_secs_f64(seconds.max(0.0)));
             return;
@@ -193,12 +277,12 @@ pub fn pump_run_loop_briefly(seconds: f64) {
 
 // ── Implementation ──────────────────────────────────────────────────────
 
-fn env_on(key: &str) -> bool {
+fn env_off(key: &str) -> bool {
     std::env::var(key)
         .ok()
         .map(|v| {
             let lower = v.to_ascii_lowercase();
-            matches!(lower.as_str(), "1" | "true" | "yes" | "on")
+            matches!(lower.as_str(), "0" | "false" | "no" | "off")
         })
         .unwrap_or(false)
 }
@@ -218,16 +302,14 @@ fn running_inside_app_bundle() -> bool {
 
 // ── Layout constants ────────────────────────────────────────────────────
 //
-// Window geometry mirrors Swift's `.frame(width: 460)` plus heights
-// chosen to fit: heading (24) + subheading (40) + 2 rows (76 each) +
-// "All set" strip (32) + button row (48) + paddings (20·5). Keeping
-// the numbers as a block here so the math is auditable.
+// Window geometry fits a heading, concise explainer, two permission rows with
+// independent actions, and an attribution footer.
 
-const WIN_W: f64 = 460.0;
-const WIN_H: f64 = 360.0;
-const PAD: f64 = 20.0;
-const ROW_H: f64 = 76.0;
-const READY_STRIP_H: f64 = 36.0;
+const WIN_W: f64 = 640.0;
+const WIN_H: f64 = 560.0;
+const PAD: f64 = 36.0;
+const ROW_H: f64 = 112.0;
+const FOOTER_H: f64 = 32.0;
 
 unsafe fn show_modal_unsafe(opts: &PanelOpts) -> PanelOutcome {
     // ---- NSApplication setup ----
@@ -237,7 +319,7 @@ unsafe fn show_modal_unsafe(opts: &PanelOpts) -> PanelOutcome {
 
     let main_screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
     if main_screen.is_null() {
-        return PanelOutcome::Dismissed;
+        return PanelOutcome::Unavailable;
     }
 
     // ---- Window ----
@@ -264,130 +346,154 @@ unsafe fn show_modal_unsafe(opts: &PanelOpts) -> PanelOutcome {
         ]
     };
     if window.is_null() {
-        return PanelOutcome::Dismissed;
+        return PanelOutcome::Unavailable;
     }
     let _: () = msg_send![window, setReleasedWhenClosed: false];
     let _: () = msg_send![window, setHidesOnDeactivate: false];
     // NSFloatingWindowLevel (3) so it stays on top of System Settings
     // when the user navigates over to grant permissions.
     let _: () = msg_send![window, setLevel: 3i64];
-    let title = ns_string("CuaDriver Permissions");
+    let product_name = product_name();
+    let title = ns_string(&localized_template(
+        "permissions.window_title",
+        "{product} Permissions",
+        &[("{product}", &product_name)],
+    ));
     let _: () = msg_send![window, setTitle: title];
+    // Keep native traffic-light controls while matching the focused,
+    // title-free onboarding presentation used by Codex.
+    let _: () = msg_send![window, setTitleVisibility: 1i64];
+    let _: () = msg_send![window, setTitlebarAppearsTransparent: true];
+    let window_delegate = panel_target_instance();
+    let _: () = msg_send![window, setDelegate: window_delegate];
 
     let content_view: *mut AnyObject = msg_send![window, contentView];
 
-    // ---- Heading + subheading ----
-    //
-    // Y coordinates use AppKit's bottom-left origin. We lay out top-
-    // down: subtract row heights from `WIN_H - PAD` as we go.
-    let mut y = WIN_H - PAD - 24.0;
+    // ---- Centered product identity, heading, and explainer ----
+    let app_icon = build_application_icon(
+        app,
+        NSPoint {
+            x: (WIN_W - 72.0) / 2.0,
+            y: 456.0,
+        },
+        NSSize {
+            width: 72.0,
+            height: 72.0,
+        },
+    );
+    let _: () = msg_send![content_view, addSubview: app_icon];
 
     let heading = build_label(
-        heading_for(opts.initial_status),
-        17.0,
+        &heading_for(opts.initial_status, &product_name),
+        24.0,
         /*bold=*/ true,
-        NSPoint { x: PAD, y },
+        NSPoint { x: PAD, y: 408.0 },
         NSSize {
             width: WIN_W - 2.0 * PAD,
-            height: 24.0,
+            height: 34.0,
         },
     );
+    let _: () = msg_send![heading, setAlignment: 1i64];
     let _: () = msg_send![content_view, addSubview: heading];
 
-    y -= 8.0 + 40.0; // gap + subheading height
-
     let subheading = build_label(
-        subheading_for(opts.initial_status),
-        12.0,
+        &subheading_for(opts.initial_status, &product_name),
+        13.0,
         /*bold=*/ false,
-        NSPoint { x: PAD, y },
+        NSPoint {
+            x: PAD + 28.0,
+            y: 344.0,
+        },
         NSSize {
-            width: WIN_W - 2.0 * PAD,
-            height: 40.0,
+            width: WIN_W - 2.0 * (PAD + 28.0),
+            height: 50.0,
         },
     );
+    let _: () = msg_send![subheading, setAlignment: 1i64];
     let _: () = msg_send![content_view, addSubview: subheading];
     // Subheading is secondary text — apply secondaryLabelColor.
-    let secondary_color: *mut AnyObject =
-        msg_send![class!(NSColor), secondaryLabelColor];
+    let secondary_color: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
     let _: () = msg_send![subheading, setTextColor: secondary_color];
 
-    y -= 16.0; // gap before first row
-
     // ---- Permission rows ----
+    let request_flow = PermissionRequestFlow::from_environment();
     let ax_row = build_row(
         MissingPermission::Accessibility,
-        opts.initial_status.accessibility,
-        NSPoint { x: PAD, y: y - ROW_H },
+        opts.initial_status,
+        &request_flow,
+        NSPoint { x: PAD, y: 210.0 },
         NSSize {
             width: WIN_W - 2.0 * PAD,
             height: ROW_H,
         },
     );
     let _: () = msg_send![content_view, addSubview: ax_row.container];
-    y -= ROW_H + 8.0;
 
     let sr_row = build_row(
         MissingPermission::ScreenRecording,
-        opts.initial_status.screen_recording,
-        NSPoint { x: PAD, y: y - ROW_H },
+        opts.initial_status,
+        &request_flow,
+        NSPoint { x: PAD, y: 82.0 },
         NSSize {
             width: WIN_W - 2.0 * PAD,
             height: ROW_H,
         },
     );
     let _: () = msg_send![content_view, addSubview: sr_row.container];
-    y -= ROW_H + 8.0;
 
-    // ---- Ready strip (initially hidden; shown by poll on all-green) ----
-    let ready_strip = build_ready_strip(NSPoint { x: PAD, y: y - READY_STRIP_H }, WIN_W - 2.0 * PAD);
-    let _: () = msg_send![content_view, addSubview: ready_strip];
-    let initially_all_green =
-        opts.initial_status.accessibility && opts.initial_status.screen_recording;
-    let _: () = msg_send![ready_strip, setHidden: !initially_all_green];
+    // ---- Attribution / completion footer ----
+    let footer = build_label(
+        &footer_for(opts.initial_status, &product_name),
+        11.0,
+        /*bold=*/ false,
+        NSPoint { x: PAD, y: 24.0 },
+        NSSize {
+            width: WIN_W - 2.0 * PAD,
+            height: FOOTER_H,
+        },
+    );
+    let _: () = msg_send![footer, setAlignment: 1i64];
+    let footer_color: *mut AnyObject = msg_send![class!(NSColor), tertiaryLabelColor];
+    let _: () = msg_send![footer, setTextColor: footer_color];
+    let _: () = msg_send![content_view, addSubview: footer];
 
-    // ---- Buttons across the bottom ----
     OUTCOME.with(|cell| *cell.borrow_mut() = None);
-
-    let continue_btn = build_button(
-        "Continue anyway",
-        NSPoint { x: PAD, y: 16.0 },
-        NSSize {
-            width: 160.0,
-            height: 32.0,
-        },
-        ButtonAction::Dismiss,
-    );
-    let _: () = msg_send![content_view, addSubview: continue_btn];
-
-    let open_settings_btn = build_button(
-        "Open System Settings",
-        NSPoint {
-            x: WIN_W - PAD - 180.0,
-            y: 16.0,
-        },
-        NSSize {
-            width: 180.0,
-            height: 32.0,
-        },
-        ButtonAction::OpenSettings,
-    );
-    let _: () = msg_send![content_view, addSubview: open_settings_btn];
-    let _: () = msg_send![open_settings_btn, setKeyEquivalent: ns_string("\r")];
 
     // ---- Stash handles for the timer callback ----
     HANDLES.with(|cell| {
         *cell.borrow_mut() = Some(PanelHandles {
             heading: ptr_to_usize(heading),
             subheading: ptr_to_usize(subheading),
-            ready_strip: ptr_to_usize(ready_strip),
+            footer: ptr_to_usize(footer),
             ax_row,
             sr_row,
             last_status: opts.initial_status,
+            request_flow,
+            product_name,
         });
     });
 
     // ---- Show window + start poll timer + run modal ----
+    // Observe both app activation and window-key transitions. TCC dialogs can
+    // use either shape depending on the permission and macOS release. A
+    // departure followed by a return is our signal to verify in a fresh
+    // process; we never infer that the permission was granted.
+    let notification_center: *mut AnyObject =
+        msg_send![class!(NSNotificationCenter), defaultCenter];
+    let app_resigned = ns_string("NSApplicationDidResignActiveNotification");
+    let app_activated = ns_string("NSApplicationDidBecomeActiveNotification");
+    let _: () = msg_send![notification_center,
+        addObserver: window_delegate
+        selector: objc2::sel!(applicationDidResignActive:)
+        name: app_resigned
+        object: app
+    ];
+    let _: () = msg_send![notification_center,
+        addObserver: window_delegate
+        selector: objc2::sel!(applicationDidBecomeActive:)
+        name: app_activated
+        object: app
+    ];
     let _: () = msg_send![window, center];
     let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
     let _: () = msg_send![app, activateIgnoringOtherApps: true];
@@ -396,6 +502,7 @@ unsafe fn show_modal_unsafe(opts: &PanelOpts) -> PanelOutcome {
     let _: i64 = msg_send![app, runModalForWindow: window];
     // Stop timer first so any in-flight tick can't race with teardown.
     let _: () = msg_send![timer, invalidate];
+    let _: () = msg_send![notification_center, removeObserver: window_delegate];
 
     // Resolve final outcome. The OUTCOME thread-local has the value
     // most actions set; if neither button nor the poll fired, treat
@@ -425,15 +532,174 @@ struct RowHandles {
     container: *mut AnyObject,
     icon: *mut AnyObject,
     title: *mut AnyObject,
+    button: *mut AnyObject,
+}
+
+/// Persisted across the one-shot verification re-exec so a denied or
+/// dismissed prompt comes back as “Complete in System Settings” instead of
+/// repeatedly raising the same TCC dialog.
+const REQUESTED_PERMISSIONS_ENV: &str = "CUA_DRIVER_RS_PERMISSION_REQUESTED";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionRequestPhase {
+    NotRequested,
+    PendingSystemDecision,
+    NotGranted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PermissionRequestFlow {
+    accessibility: PermissionRequestPhase,
+    screen_recording: PermissionRequestPhase,
+    active_prompt: Option<MissingPermission>,
+    settings_permission: Option<MissingPermission>,
+    system_ui_departed: bool,
+}
+
+impl PermissionRequestFlow {
+    fn new(accessibility_requested: bool, screen_recording_requested: bool) -> Self {
+        Self {
+            accessibility: if accessibility_requested {
+                PermissionRequestPhase::NotGranted
+            } else {
+                PermissionRequestPhase::NotRequested
+            },
+            screen_recording: if screen_recording_requested {
+                PermissionRequestPhase::NotGranted
+            } else {
+                PermissionRequestPhase::NotRequested
+            },
+            active_prompt: None,
+            settings_permission: None,
+            system_ui_departed: false,
+        }
+    }
+
+    fn from_environment() -> Self {
+        let requested = std::env::var(REQUESTED_PERMISSIONS_ENV).unwrap_or_default();
+        let has = |needle: &str| requested.split(',').any(|value| value == needle);
+        Self::new(has("accessibility"), has("screen_recording"))
+    }
+
+    fn phase(self, permission: MissingPermission) -> PermissionRequestPhase {
+        match permission {
+            MissingPermission::Accessibility => self.accessibility,
+            MissingPermission::ScreenRecording => self.screen_recording,
+        }
+    }
+
+    fn set_phase(&mut self, permission: MissingPermission, phase: PermissionRequestPhase) {
+        match permission {
+            MissingPermission::Accessibility => self.accessibility = phase,
+            MissingPermission::ScreenRecording => self.screen_recording = phase,
+        }
+    }
+
+    /// Begin one TCC request. Returns false if another system prompt is
+    /// already active, preserving the one-prompt-at-a-time invariant.
+    fn begin_request(&mut self, permission: MissingPermission) -> bool {
+        if self.active_prompt.is_some() {
+            return false;
+        }
+        self.set_phase(permission, PermissionRequestPhase::PendingSystemDecision);
+        self.active_prompt = Some(permission);
+        self.settings_permission = None;
+        self.system_ui_departed = false;
+        true
+    }
+
+    /// Move a requested permission into its recoverable Settings state. This
+    /// also releases the other row because the TCC prompt is no longer active.
+    fn begin_settings(&mut self, permission: MissingPermission) {
+        self.set_phase(permission, PermissionRequestPhase::NotGranted);
+        self.active_prompt = None;
+        self.settings_permission = Some(permission);
+        self.system_ui_departed = false;
+    }
+
+    fn settings_open_failed(&mut self, permission: MissingPermission) {
+        if self.settings_permission == Some(permission) {
+            self.settings_permission = None;
+            self.system_ui_departed = false;
+        }
+    }
+
+    fn note_system_ui_departed(&mut self) {
+        if self.active_prompt.is_some() || self.settings_permission.is_some() {
+            self.system_ui_departed = true;
+        }
+    }
+
+    /// A return signal never means “granted”. It only means the user's
+    /// decision is complete enough to verify in a fresh process.
+    fn note_system_ui_returned(&mut self) -> bool {
+        if !self.system_ui_departed {
+            return false;
+        }
+        let mut refresh_required = false;
+        if let Some(permission) = self.active_prompt.take() {
+            self.set_phase(permission, PermissionRequestPhase::NotGranted);
+            refresh_required = true;
+        }
+        if self.settings_permission.take().is_some() {
+            refresh_required = true;
+        }
+        self.system_ui_departed = false;
+        refresh_required
+    }
+
+    /// Accept a live green probe as progress, while treating a live red probe
+    /// as inconclusive because macOS may cache it for the process lifetime.
+    fn reconcile_grants(&mut self, status: PermissionsStatus) -> bool {
+        let mut changed = false;
+        for permission in [
+            MissingPermission::Accessibility,
+            MissingPermission::ScreenRecording,
+        ] {
+            if permission_is_granted(status, permission) {
+                if self.active_prompt == Some(permission) {
+                    self.active_prompt = None;
+                    changed = true;
+                }
+                if self.settings_permission == Some(permission) {
+                    self.settings_permission = None;
+                    changed = true;
+                }
+            }
+        }
+        if self.active_prompt.is_none() && self.settings_permission.is_none() {
+            self.system_ui_departed = false;
+        }
+        changed
+    }
+}
+
+fn remember_requested(permission: MissingPermission) {
+    let mut flow = PermissionRequestFlow::from_environment();
+    flow.set_phase(permission, PermissionRequestPhase::NotGranted);
+    let mut requested = Vec::new();
+    if flow.accessibility != PermissionRequestPhase::NotRequested {
+        requested.push("accessibility");
+    }
+    if flow.screen_recording != PermissionRequestPhase::NotRequested {
+        requested.push("screen_recording");
+    }
+    std::env::set_var(REQUESTED_PERMISSIONS_ENV, requested.join(","));
+}
+
+pub(crate) fn clear_request_history() {
+    std::env::remove_var(REQUESTED_PERMISSIONS_ENV);
 }
 
 struct PanelHandles {
     heading: usize,
     subheading: usize,
-    ready_strip: usize,
+    footer: usize,
     ax_row: RowHandles,
     sr_row: RowHandles,
     last_status: PermissionsStatus,
+    request_flow: PermissionRequestFlow,
+    product_name: String,
 }
 
 thread_local! {
@@ -502,25 +768,18 @@ unsafe fn poll_tick_inner() {
     let mut should_stop = false;
     HANDLES.with(|cell| {
         let mut guard = cell.borrow_mut();
-        let Some(handles) = guard.as_mut() else { return };
-        if status == handles.last_status {
+        let Some(handles) = guard.as_mut() else {
+            return;
+        };
+        let flow_changed = handles.request_flow.reconcile_grants(status);
+        if status == handles.last_status && !flow_changed {
             // No change — skip the redraw. Avoids needlessly thrashing
             // the layout engine every second on a steady-state panel.
             return;
         }
-        // Update row icons + label color tints.
-        update_row(handles.ax_row, status.accessibility);
-        update_row(handles.sr_row, status.screen_recording);
-        // Update heading + subheading copy.
-        let new_heading = ns_string(heading_for(status));
-        let _: () = msg_send![usize_to_ptr(handles.heading), setStringValue: new_heading];
-        let new_subheading = ns_string(subheading_for(status));
-        let _: () = msg_send![usize_to_ptr(handles.subheading), setStringValue: new_subheading];
-        // Toggle the ready strip.
-        let all_green = status.accessibility && status.screen_recording;
-        let _: () = msg_send![usize_to_ptr(handles.ready_strip), setHidden: !all_green];
+        render_panel(handles, status);
         handles.last_status = status;
-        if all_green {
+        if status.all_granted() {
             should_stop = true;
         }
     });
@@ -530,19 +789,135 @@ unsafe fn poll_tick_inner() {
     }
 }
 
-unsafe fn update_row(row: RowHandles, granted: bool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowAction {
+    Allow,
+    CompleteInSystemSettings,
+    WaitingForOtherPermission,
+    Allowed,
+}
+
+impl RowAction {
+    fn title(self) -> String {
+        match self {
+            Self::Allow => localized("permissions.action.allow", "Allow"),
+            Self::CompleteInSystemSettings => localized(
+                "permissions.action.complete_in_system_settings",
+                "Complete in System Settings",
+            ),
+            Self::WaitingForOtherPermission => {
+                localized("permissions.action.waiting", "Waiting")
+            }
+            Self::Allowed => localized("permissions.action.allowed", "Allowed"),
+        }
+    }
+
+    fn enabled(self) -> bool {
+        matches!(self, Self::Allow | Self::CompleteInSystemSettings)
+    }
+}
+
+fn permission_is_granted(status: PermissionsStatus, permission: MissingPermission) -> bool {
+    match permission {
+        MissingPermission::Accessibility => status.accessibility,
+        MissingPermission::ScreenRecording => status.screen_recording,
+    }
+}
+
+fn permission_symbol(permission: MissingPermission, granted: bool) -> &'static str {
+    if granted {
+        return "checkmark.circle.fill";
+    }
+    match permission {
+        MissingPermission::Accessibility => "accessibility",
+        MissingPermission::ScreenRecording => "camera.viewfinder",
+    }
+}
+
+fn row_action(
+    status: PermissionsStatus,
+    flow: &PermissionRequestFlow,
+    permission: MissingPermission,
+) -> RowAction {
+    if permission_is_granted(status, permission) {
+        return RowAction::Allowed;
+    }
+    match flow.active_prompt {
+        Some(active) if active == permission => RowAction::CompleteInSystemSettings,
+        Some(_) => RowAction::WaitingForOtherPermission,
+        None => match flow.phase(permission) {
+            PermissionRequestPhase::NotRequested => RowAction::Allow,
+            PermissionRequestPhase::PendingSystemDecision | PermissionRequestPhase::NotGranted => {
+                RowAction::CompleteInSystemSettings
+            }
+        },
+    }
+}
+
+fn primary_allow_permission(
+    status: PermissionsStatus,
+    flow: &PermissionRequestFlow,
+) -> Option<MissingPermission> {
+    if flow.active_prompt.is_some() {
+        return None;
+    }
+    [
+        MissingPermission::Accessibility,
+        MissingPermission::ScreenRecording,
+    ]
+    .into_iter()
+    .find(|permission| {
+        !permission_is_granted(status, *permission)
+            && flow.phase(*permission) == PermissionRequestPhase::NotRequested
+    })
+}
+
+fn is_primary_allow(
+    status: PermissionsStatus,
+    flow: &PermissionRequestFlow,
+    permission: MissingPermission,
+    action: RowAction,
+) -> bool {
+    action == RowAction::Allow && primary_allow_permission(status, flow) == Some(permission)
+}
+
+unsafe fn render_panel(handles: &PanelHandles, status: PermissionsStatus) {
+    update_row(
+        handles.ax_row,
+        MissingPermission::Accessibility,
+        status,
+        &handles.request_flow,
+    );
+    update_row(
+        handles.sr_row,
+        MissingPermission::ScreenRecording,
+        status,
+        &handles.request_flow,
+    );
+
+    let heading = ns_string(&heading_for(status, &handles.product_name));
+    let _: () = msg_send![usize_to_ptr(handles.heading), setStringValue: heading];
+    let subheading = ns_string(&subheading_for(status, &handles.product_name));
+    let _: () = msg_send![usize_to_ptr(handles.subheading), setStringValue: subheading];
+    let footer = ns_string(&footer_for(status, &handles.product_name));
+    let _: () = msg_send![usize_to_ptr(handles.footer), setStringValue: footer];
+}
+
+unsafe fn update_row(
+    row: RowHandles,
+    permission: MissingPermission,
+    status: PermissionsStatus,
+    flow: &PermissionRequestFlow,
+) {
+    let granted = permission_is_granted(status, permission);
     // Swap icon symbol and tint.
-    let symbol = if granted {
-        "checkmark.circle.fill"
-    } else {
-        "xmark.circle.fill"
-    };
+    let symbol = permission_symbol(permission, granted);
     let img = ns_image_for_symbol(symbol);
     let _: () = msg_send![row.icon, setImage: img];
     let tint: *mut AnyObject = if granted {
         msg_send![class!(NSColor), systemGreenColor]
     } else {
-        msg_send![class!(NSColor), systemRedColor]
+        msg_send![class!(NSColor), systemBlueColor]
     };
     let _: () = msg_send![row.icon, setContentTintColor: tint];
     // Title bold turns from default → secondary on grant (subtle visual
@@ -553,29 +928,88 @@ unsafe fn update_row(row: RowHandles, granted: bool) {
         msg_send![class!(NSColor), labelColor]
     };
     let _: () = msg_send![row.title, setTextColor: title_color];
+
+    let action = row_action(status, flow, permission);
+    let title = ns_string(&action.title());
+    let _: () = msg_send![row.button, setTitle: title];
+    style_button(
+        row.button,
+        action,
+        is_primary_allow(status, flow, permission, action),
+    );
 }
 
-// ── Heading / subheading copy (parity with Swift) ────────────────────────
+// ── User-facing copy ────────────────────────────────────────────────────
 
-fn heading_for(s: PermissionsStatus) -> &'static str {
-    match (s.accessibility, s.screen_recording) {
-        (true, true) => "CuaDriver is ready",
-        (true, false) | (false, true) => "One more permission",
-        (false, false) => "CuaDriver needs your permission",
+fn heading_for(status: PermissionsStatus, product_name: &str) -> String {
+    let feature_name = computer_use_feature_name(product_name);
+    match status.grant_state() {
+        PermissionGrantState::BothGranted => localized_template(
+            "permissions.heading.ready",
+            "{feature} is ready",
+            &[("{feature}", &feature_name)],
+        ),
+        PermissionGrantState::AccessibilityGranted
+        | PermissionGrantState::ScreenRecordingGranted => localized_template(
+            "permissions.heading.finish",
+            "Finish enabling {feature}",
+            &[("{feature}", &feature_name)],
+        ),
+        PermissionGrantState::NoneGranted => localized_template(
+            "permissions.heading.enable",
+            "Enable {feature}",
+            &[("{feature}", &feature_name)],
+        ),
     }
 }
 
-fn subheading_for(s: PermissionsStatus) -> &'static str {
-    match (s.accessibility, s.screen_recording) {
-        (true, true) =>
-            "Both permissions are granted. You can close this window whenever you're ready.",
-        (true, false) =>
-            "Accessibility is granted. Now grant Screen Recording in the System Settings window that just opened.",
-        (false, true) =>
-            "Screen Recording is granted. Now grant Accessibility in the System Settings window that just opened.",
-        (false, false) =>
-            "Grant both so CuaDriver can inspect and drive native apps on your behalf. This window closes on its own once each item turns green.",
+fn computer_use_feature_name(product_name: &str) -> String {
+    if product_name.to_ascii_lowercase().contains("computer use") {
+        product_name.to_owned()
+    } else {
+        localized_template(
+            "permissions.feature_name",
+            "{product} Computer Use",
+            &[("{product}", product_name)],
+        )
     }
+}
+
+fn subheading_for(status: PermissionsStatus, product_name: &str) -> String {
+    match status.grant_state() {
+        PermissionGrantState::BothGranted => localized(
+            "permissions.subheading.ready",
+            "Both macOS permissions are active. Computer control can start now.",
+        ),
+        PermissionGrantState::AccessibilityGranted => localized(
+            "permissions.subheading.accessibility_granted",
+            "Accessibility is allowed. Allow Screen Recording to finish setup.",
+        ),
+        PermissionGrantState::ScreenRecordingGranted => localized(
+            "permissions.subheading.screen_recording_granted",
+            "Screen Recording is allowed. Allow Accessibility to finish setup.",
+        ),
+        PermissionGrantState::NoneGranted => localized_template(
+            "permissions.subheading.none_granted",
+            "{product} needs these permissions to use apps on your Mac.\nContinue only if you trust the app or client that started {product}.",
+            &[("{product}", product_name)],
+        ),
+    }
+}
+
+fn footer_for(status: PermissionsStatus, product_name: &str) -> String {
+    if status.all_granted() {
+        return localized_template(
+            "permissions.footer.ready",
+            "All set. {product} can now use apps on your Mac.",
+            &[("{product}", product_name)],
+        );
+    }
+    localized_template(
+        "permissions.footer.pending",
+        "macOS grants access to {product}, not your terminal. Connected clients can use these grants; revoke them anytime in Privacy & Security.",
+        &[("{product}", product_name)],
+    )
 }
 
 // ── Helpers: NSString, labels, buttons, icons, rows ──────────────────────
@@ -583,12 +1017,102 @@ fn subheading_for(s: PermissionsStatus) -> &'static str {
 /// Bridge `&str` → autoreleased `NSString` via `stringWithUTF8String:`.
 unsafe fn ns_string(text: &str) -> *mut AnyObject {
     let owned = std::ffi::CString::new(text).unwrap_or_default();
-    msg_send![class!(NSString), stringWithUTF8String: owned.as_ptr() as *const c_void]
+    msg_send![class!(NSString), stringWithUTF8String: owned.as_ptr()]
+}
+
+/// Resolve a user-facing string through the main app bundle. Passing the
+/// English source as `value:` preserves the existing copy for bare-binary,
+/// test, and downstream bundles that do not ship this table.
+fn localized(key: &str, english: &str) -> String {
+    unsafe {
+        let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
+        if bundle.is_null() {
+            return english.to_owned();
+        }
+        let value: *mut AnyObject = msg_send![
+            bundle,
+            localizedStringForKey: ns_string(key)
+            value: ns_string(english)
+            table: ns_string("Localizable")
+        ];
+        if value.is_null() {
+            return english.to_owned();
+        }
+        let utf8: *const std::ffi::c_char = msg_send![value, UTF8String];
+        if utf8.is_null() {
+            english.to_owned()
+        } else {
+            std::ffi::CStr::from_ptr(utf8)
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+}
+
+fn localized_template(
+    key: &str,
+    english: &str,
+    replacements: &[(&str, &str)],
+) -> String {
+    let mut value = localized(key, english);
+    for (placeholder, replacement) in replacements {
+        value = value.replace(placeholder, replacement);
+    }
+    value
+}
+
+/// The name macOS will show in Privacy & Security. Reading it from the main
+/// bundle keeps the explainer aligned with the actual TCC identity after a
+/// downstream app rebrands the driver.
+fn product_name() -> String {
+    unsafe {
+        let bundle: *mut AnyObject = msg_send![class!(NSBundle), mainBundle];
+        if !bundle.is_null() {
+            for key in ["CFBundleDisplayName", "CFBundleName"] {
+                let value: *mut AnyObject = msg_send![
+                    bundle,
+                    objectForInfoDictionaryKey: ns_string(key)
+                ];
+                if value.is_null() {
+                    continue;
+                }
+                let utf8: *const std::ffi::c_char = msg_send![value, UTF8String];
+                if utf8.is_null() {
+                    continue;
+                }
+                let value = std::ffi::CStr::from_ptr(utf8).to_string_lossy();
+                if !value.trim().is_empty() {
+                    return value.into_owned();
+                }
+            }
+        }
+    }
+    "Cua Driver".into()
+}
+
+unsafe fn build_application_icon(
+    app: *mut AnyObject,
+    origin: NSPoint,
+    size: NSSize,
+) -> *mut AnyObject {
+    let view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+    let view: *mut AnyObject = msg_send![view, initWithFrame: NSRect { origin, size }];
+    let mut image: *mut AnyObject = msg_send![app, applicationIconImage];
+    if image.is_null() {
+        image = ns_image_for_symbol("cursorarrow.rays");
+    }
+    let _: () = msg_send![view, setImage: image];
+    // NSImageScaleProportionallyUpOrDown.
+    let _: () = msg_send![view, setImageScaling: 3i64];
+    view
 }
 
 unsafe fn ns_image_for_symbol(symbol: &str) -> *mut AnyObject {
     let name = ns_string(symbol);
-    let desc = ns_string("permission status");
+    let desc = ns_string(&localized(
+        "permissions.accessibility.permission_status",
+        "permission status",
+    ));
     let img: *mut AnyObject = msg_send![class!(NSImage),
         imageWithSystemSymbolName: name
         accessibilityDescription: desc
@@ -630,8 +1154,8 @@ unsafe fn build_label(
 
 #[derive(Debug, Clone, Copy)]
 enum ButtonAction {
-    OpenSettings,
-    Dismiss,
+    Accessibility,
+    ScreenRecording,
 }
 
 unsafe fn build_button(
@@ -651,12 +1175,31 @@ unsafe fn build_button(
     button
 }
 
-/// Build one permission row: container NSView with three subviews
-/// (icon, title, subtitle). Returns handles so the poll timer can
-/// update the icon + title tint live.
+unsafe fn style_button(button: *mut AnyObject, action: RowAction, primary: bool) {
+    let _: () = msg_send![button, setEnabled: action.enabled()];
+    if primary {
+        let blue: *mut AnyObject = msg_send![class!(NSColor), systemBlueColor];
+        let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
+        let _: () = msg_send![button, setBezelColor: blue];
+        let _: () = msg_send![button, setContentTintColor: white];
+        let _: () = msg_send![button, setKeyEquivalent: ns_string("\r")];
+    } else {
+        let tint: *mut AnyObject = if action.enabled() {
+            msg_send![class!(NSColor), labelColor]
+        } else {
+            msg_send![class!(NSColor), secondaryLabelColor]
+        };
+        let _: () = msg_send![button, setBezelColor: std::ptr::null::<AnyObject>()];
+        let _: () = msg_send![button, setContentTintColor: tint];
+        let _: () = msg_send![button, setKeyEquivalent: ns_string("")];
+    }
+}
+
+/// Build one permission row: status icon, title, explanation, and action.
 unsafe fn build_row(
     permission: MissingPermission,
-    granted: bool,
+    status: PermissionsStatus,
+    flow: &PermissionRequestFlow,
     origin: NSPoint,
     size: NSSize,
 ) -> RowHandles {
@@ -665,47 +1208,53 @@ unsafe fn build_row(
         origin,
         size,
     }];
+    let _: () = msg_send![container, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![container, layer];
+    if !layer.is_null() {
+        let fill: *mut AnyObject = msg_send![class!(NSColor), controlBackgroundColor];
+        let cg_color: *mut c_void = msg_send![fill, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: cg_color];
+        let _: () = msg_send![layer, setCornerRadius: 18.0_f64];
+        let _: () = msg_send![layer, setShadowOpacity: 0.14_f32];
+        let _: () = msg_send![layer, setShadowRadius: 12.0_f64];
+        let _: () = msg_send![layer, setShadowOffset: NSSize {
+            width: 0.0,
+            height: -3.0,
+        }];
+    }
 
     // Icon
     let icon_frame = NSRect {
-        origin: NSPoint {
-            x: 8.0,
-            y: size.height - 32.0,
-        },
+        origin: NSPoint { x: 22.0, y: 32.0 },
         size: NSSize {
-            width: 24.0,
-            height: 24.0,
+            width: 48.0,
+            height: 48.0,
         },
     };
     let icon: *mut AnyObject = msg_send![class!(NSImageView), alloc];
     let icon: *mut AnyObject = msg_send![icon, initWithFrame: icon_frame];
-    let symbol = if granted {
-        "checkmark.circle.fill"
-    } else {
-        "xmark.circle.fill"
-    };
+    let granted = permission_is_granted(status, permission);
+    let symbol = permission_symbol(permission, granted);
     let img = ns_image_for_symbol(symbol);
     let _: () = msg_send![icon, setImage: img];
+    let _: () = msg_send![icon, setImageScaling: 3i64];
     let tint: *mut AnyObject = if granted {
         msg_send![class!(NSColor), systemGreenColor]
     } else {
-        msg_send![class!(NSColor), systemRedColor]
+        msg_send![class!(NSColor), systemBlueColor]
     };
     let _: () = msg_send![icon, setContentTintColor: tint];
     let _: () = msg_send![container, addSubview: icon];
 
     // Title
     let title = build_label(
-        permission.label(),
-        13.0,
+        &permission_title(permission),
+        15.0,
         /*bold=*/ true,
-        NSPoint {
-            x: 44.0,
-            y: size.height - 28.0,
-        },
+        NSPoint { x: 88.0, y: 61.0 },
         NSSize {
-            width: size.width - 60.0,
-            height: 20.0,
+            width: size.width - 330.0,
+            height: 24.0,
         },
     );
     if granted {
@@ -716,40 +1265,75 @@ unsafe fn build_row(
 
     // Subtitle (rationale)
     let subtitle = build_label(
-        permission.rationale(),
-        11.0,
+        &row_description(permission),
+        12.0,
         /*bold=*/ false,
-        NSPoint { x: 44.0, y: 8.0 },
+        NSPoint { x: 88.0, y: 29.0 },
         NSSize {
-            width: size.width - 60.0,
-            height: 40.0,
+            width: size.width - 330.0,
+            height: 28.0,
         },
     );
     let secondary: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
     let _: () = msg_send![subtitle, setTextColor: secondary];
     let _: () = msg_send![container, addSubview: subtitle];
 
+    let action = row_action(status, flow, permission);
+    let button_action = match permission {
+        MissingPermission::Accessibility => ButtonAction::Accessibility,
+        MissingPermission::ScreenRecording => ButtonAction::ScreenRecording,
+    };
+    let button = build_button(
+        &action.title(),
+        NSPoint {
+            x: size.width - 224.0,
+            y: 38.0,
+        },
+        NSSize {
+            width: 202.0,
+            height: 36.0,
+        },
+        button_action,
+    );
+    style_button(
+        button,
+        action,
+        is_primary_allow(status, flow, permission, action),
+    );
+    let _: () = msg_send![container, addSubview: button];
+
     RowHandles {
         container,
         icon,
         title,
+        button,
     }
 }
 
-unsafe fn build_ready_strip(origin: NSPoint, width: f64) -> *mut AnyObject {
-    let strip = build_label(
-        "✅  All set. CuaDriver is ready to use.",
-        12.0,
-        /*bold=*/ false,
-        origin,
-        NSSize {
-            width,
-            height: READY_STRIP_H,
-        },
-    );
-    let green: *mut AnyObject = msg_send![class!(NSColor), systemGreenColor];
-    let _: () = msg_send![strip, setTextColor: green];
-    strip
+fn permission_title(permission: MissingPermission) -> String {
+    match permission {
+        MissingPermission::Accessibility => localized(
+            "permissions.permission.accessibility.title",
+            "Accessibility",
+        ),
+        MissingPermission::ScreenRecording => localized(
+            "permissions.permission.screen_recording.title",
+            "Screen Recording",
+        ),
+    }
+}
+
+fn row_description(permission: MissingPermission) -> String {
+    match permission {
+        MissingPermission::Accessibility => localized(
+            "permissions.permission.accessibility.description",
+            "Access app interfaces to read and use controls.",
+        ),
+        MissingPermission::ScreenRecording => localized(
+            "permissions.permission.screen_recording.description",
+            "Capture app windows to know where to click.",
+        ),
+    }
 }
 
 // ── Button target/action plumbing + poll timer target ────────────────────
@@ -758,8 +1342,8 @@ unsafe fn install_target(button: *mut AnyObject, action: ButtonAction) {
     let target = panel_target_instance();
     let _: () = msg_send![button, setTarget: target];
     let sel = match action {
-        ButtonAction::OpenSettings => objc2::sel!(openSettings:),
-        ButtonAction::Dismiss => objc2::sel!(dismiss:),
+        ButtonAction::Accessibility => objc2::sel!(accessibilityPermission:),
+        ButtonAction::ScreenRecording => objc2::sel!(screenRecordingPermission:),
     };
     let _: () = msg_send![button, setAction: sel];
 }
@@ -786,37 +1370,184 @@ fn panel_target_class() -> &'static objc2::runtime::AnyClass {
             .expect("CuaDriverPermissionsPanelTarget already registered");
         unsafe {
             builder.add_method(
-                objc2::sel!(openSettings:),
-                on_open_settings as extern "C" fn(_, _, _),
+                objc2::sel!(accessibilityPermission:),
+                on_accessibility_permission as extern "C" fn(_, _, _),
             );
             builder.add_method(
-                objc2::sel!(dismiss:),
-                on_dismiss as extern "C" fn(_, _, _),
+                objc2::sel!(screenRecordingPermission:),
+                on_screen_recording_permission as extern "C" fn(_, _, _),
             );
             builder.add_method(
                 objc2::sel!(pollTick:),
                 on_poll_tick as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(windowWillClose:),
+                on_window_will_close as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(windowDidResignKey:),
+                on_system_ui_departed as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(windowDidBecomeKey:),
+                on_system_ui_returned as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(applicationDidResignActive:),
+                on_system_ui_departed as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                objc2::sel!(applicationDidBecomeActive:),
+                on_system_ui_returned as extern "C" fn(_, _, _),
             );
         }
         builder.register()
     })
 }
 
-extern "C" fn on_open_settings(
+extern "C" fn on_accessibility_permission(
     _self: *mut AnyObject,
     _cmd: objc2::runtime::Sel,
     _sender: *mut AnyObject,
 ) {
-    OUTCOME.with(|cell| *cell.borrow_mut() = Some(PanelOutcome::OpenSettings));
+    handle_permission_action(MissingPermission::Accessibility);
+}
+
+extern "C" fn on_screen_recording_permission(
+    _self: *mut AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _sender: *mut AnyObject,
+) {
+    handle_permission_action(MissingPermission::ScreenRecording);
+}
+
+fn handle_permission_action(permission: MissingPermission) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let action = HANDLES.with(|cell| {
+            let guard = cell.borrow();
+            guard
+                .as_ref()
+                .map(|handles| row_action(handles.last_status, &handles.request_flow, permission))
+        });
+
+        match action {
+            Some(RowAction::Allow) => {
+                // Paint the in-progress state before invoking the TCC API. The
+                // system prompt may immediately move focus to another app.
+                HANDLES.with(|cell| unsafe {
+                    let mut guard = cell.borrow_mut();
+                    let Some(handles) = guard.as_mut() else {
+                        return;
+                    };
+                    if !handles.request_flow.begin_request(permission) {
+                        return;
+                    }
+                    let status = handles.last_status;
+                    render_panel(handles, status);
+                });
+                remember_requested(permission);
+
+                let granted_signal = match permission {
+                    MissingPermission::Accessibility => request_accessibility(),
+                    MissingPermission::ScreenRecording => request_screen_recording(),
+                };
+                if granted_signal {
+                    // A true request result is authoritative, but still do not
+                    // paint the row green from that return value. Re-exec and
+                    // let a fresh preflight prove the grant.
+                    request_refresh();
+                } else {
+                    unsafe { poll_tick_inner() };
+                }
+            }
+            Some(RowAction::CompleteInSystemSettings) => {
+                HANDLES.with(|cell| unsafe {
+                    let mut guard = cell.borrow_mut();
+                    let Some(handles) = guard.as_mut() else {
+                        return;
+                    };
+                    handles.request_flow.begin_settings(permission);
+                    let status = handles.last_status;
+                    render_panel(handles, status);
+                });
+                remember_requested(permission);
+                if let Err(error) = crate::permissions::gate::open_system_settings_for(permission) {
+                    eprintln!(
+                        "[cua-driver] could not open System Settings for {}: {error}",
+                        permission.label()
+                    );
+                    HANDLES.with(|cell| unsafe {
+                        let mut guard = cell.borrow_mut();
+                        let Some(handles) = guard.as_mut() else {
+                            return;
+                        };
+                        handles.request_flow.settings_open_failed(permission);
+                        let status = handles.last_status;
+                        render_panel(handles, status);
+                    });
+                }
+            }
+            Some(RowAction::WaitingForOtherPermission | RowAction::Allowed) | None => {}
+        }
+    }));
+    if let Err(error) = result {
+        eprintln!("[cua-driver] permissions panel action panicked: {error:?}");
+    }
+}
+
+extern "C" fn on_system_ui_departed(
+    _self: *mut AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _notification: *mut AnyObject,
+) {
+    HANDLES.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let Some(handles) = guard.as_mut() else {
+            return;
+        };
+        handles.request_flow.note_system_ui_departed();
+    });
+}
+
+extern "C" fn on_system_ui_returned(
+    _self: *mut AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _notification: *mut AnyObject,
+) {
+    let refresh_required = HANDLES.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let Some(handles) = guard.as_mut() else {
+            return false;
+        };
+        handles.request_flow.note_system_ui_returned()
+    });
+    if refresh_required {
+        request_refresh();
+    }
+}
+
+fn request_refresh() {
+    OUTCOME.with(|cell| {
+        let mut outcome = cell.borrow_mut();
+        if outcome.is_none() {
+            *outcome = Some(PanelOutcome::RefreshRequired);
+        }
+    });
     stop_modal();
 }
 
-extern "C" fn on_dismiss(
+extern "C" fn on_window_will_close(
     _self: *mut AnyObject,
     _cmd: objc2::runtime::Sel,
-    _sender: *mut AnyObject,
+    _notification: *mut AnyObject,
 ) {
-    OUTCOME.with(|cell| *cell.borrow_mut() = Some(PanelOutcome::Dismissed));
+    OUTCOME.with(|cell| {
+        let mut outcome = cell.borrow_mut();
+        if outcome.is_none() {
+            *outcome = Some(PanelOutcome::Dismissed);
+        }
+    });
     stop_modal();
 }
 
@@ -830,77 +1561,324 @@ fn stop_modal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
-    static PANEL_ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    const LOCALIZATION_KEYS: &[&str] = &[
+        "permissions.window_title",
+        "permissions.action.allow",
+        "permissions.action.complete_in_system_settings",
+        "permissions.action.waiting",
+        "permissions.action.allowed",
+        "permissions.heading.ready",
+        "permissions.heading.finish",
+        "permissions.heading.enable",
+        "permissions.feature_name",
+        "permissions.subheading.ready",
+        "permissions.subheading.accessibility_granted",
+        "permissions.subheading.screen_recording_granted",
+        "permissions.subheading.none_granted",
+        "permissions.footer.ready",
+        "permissions.footer.pending",
+        "permissions.accessibility.permission_status",
+        "permissions.permission.accessibility.title",
+        "permissions.permission.screen_recording.title",
+        "permissions.permission.accessibility.description",
+        "permissions.permission.screen_recording.description",
+    ];
+
+    fn strings_value<'a>(table: &'a str, key: &str) -> Option<&'a str> {
+        let prefix = format!("\"{key}\" = \"");
+        table
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix)?.strip_suffix("\";"))
+    }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        PANEL_ENV_MUTEX
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        crate::permissions::test_env_lock()
     }
 
     #[test]
-    fn env_on_recognises_documented_sentinels() {
+    fn explicit_off_values_disable_panel() {
         let _guard = env_lock();
-        for v in &["1", "true", "TRUE", "True", "yes", "YES", "on", "ON"] {
+        for v in &["0", "false", "FALSE", "False", "no", "NO", "off", "OFF"] {
             std::env::set_var("CUA_DRIVER_RS_PERMISSIONS_PANEL", v);
             assert!(
-                env_on("CUA_DRIVER_RS_PERMISSIONS_PANEL"),
-                "value {v:?} must be treated as on",
+                env_off("CUA_DRIVER_RS_PERMISSIONS_PANEL"),
+                "value {v:?} must disable the panel",
             );
         }
         std::env::remove_var("CUA_DRIVER_RS_PERMISSIONS_PANEL");
     }
 
     #[test]
-    fn env_on_ignores_falsy_and_unknown() {
+    fn truthy_and_unknown_values_leave_panel_enabled() {
         let _guard = env_lock();
-        for v in &["0", "false", "no", "off", "garbage", ""] {
+        for v in &["1", "true", "yes", "on", "garbage", ""] {
             std::env::set_var("CUA_DRIVER_RS_PERMISSIONS_PANEL", v);
             assert!(
-                !env_on("CUA_DRIVER_RS_PERMISSIONS_PANEL"),
-                "value {v:?} must not be treated as on",
+                !env_off("CUA_DRIVER_RS_PERMISSIONS_PANEL"),
+                "value {v:?} must not disable the panel",
             );
         }
         std::env::remove_var("CUA_DRIVER_RS_PERMISSIONS_PANEL");
     }
 
     #[test]
-    fn unset_env_keeps_panel_disabled_by_default() {
-        // Opt-in default: with no env var set, the panel does not show
-        // and the gate falls back to the terminal banner.
+    fn unset_env_uses_bundled_panel_by_default() {
         let _guard = env_lock();
         std::env::remove_var("CUA_DRIVER_RS_PERMISSIONS_PANEL");
-        assert!(!env_on("CUA_DRIVER_RS_PERMISSIONS_PANEL"));
+        assert!(!env_off("CUA_DRIVER_RS_PERMISSIONS_PANEL"));
     }
 
     #[test]
-    fn heading_parity_with_swift() {
-        // Verbatim parity with PermissionsGate.swift lines 239-244.
+    fn requested_history_survives_verification_reexec() {
+        let _guard = env_lock();
+        clear_request_history();
+        remember_requested(MissingPermission::Accessibility);
+        let flow = PermissionRequestFlow::from_environment();
+        assert_eq!(
+            flow.phase(MissingPermission::Accessibility),
+            PermissionRequestPhase::NotGranted
+        );
+        assert_eq!(
+            flow.phase(MissingPermission::ScreenRecording),
+            PermissionRequestPhase::NotRequested
+        );
+        clear_request_history();
+    }
+
+    #[test]
+    fn embedded_host_never_uses_driver_owned_panel() {
+        let _guard = env_lock();
+        std::env::set_var(cua_driver_core::EMBEDDED_ENV, "1");
+        assert!(!panel_enabled());
+        std::env::remove_var(cua_driver_core::EMBEDDED_ENV);
+    }
+
+    #[test]
+    fn copy_tracks_each_grant_state() {
         let st = |a: bool, sr: bool| PermissionsStatus {
             accessibility: a,
             screen_recording: sr,
         };
-        assert_eq!(heading_for(st(true, true)), "CuaDriver is ready");
-        assert_eq!(heading_for(st(true, false)), "One more permission");
-        assert_eq!(heading_for(st(false, true)), "One more permission");
         assert_eq!(
-            heading_for(st(false, false)),
-            "CuaDriver needs your permission"
+            heading_for(st(false, false), "Cua Driver"),
+            "Enable Cua Driver Computer Use"
+        );
+        assert_eq!(
+            heading_for(st(true, false), "Cua Driver"),
+            "Finish enabling Cua Driver Computer Use"
+        );
+        assert_eq!(
+            heading_for(st(false, true), "Cua Driver"),
+            "Finish enabling Cua Driver Computer Use"
+        );
+        assert_eq!(
+            heading_for(st(true, true), "Cua Driver"),
+            "Cua Driver Computer Use is ready"
+        );
+        assert_eq!(
+            heading_for(st(false, false), "Codex Computer Use"),
+            "Enable Codex Computer Use"
+        );
+        assert!(subheading_for(st(true, false), "Cua Driver").contains("Screen Recording"));
+        assert!(subheading_for(st(false, true), "Cua Driver").contains("Accessibility"));
+        assert_eq!(
+            subheading_for(st(false, false), "Cua Driver"),
+            "Cua Driver needs these permissions to use apps on your Mac.\n\
+             Continue only if you trust the app or client that started Cua Driver."
+        );
+        assert!(footer_for(st(false, false), "Cua Driver").contains("not your terminal"));
+        assert!(footer_for(st(false, false), "Cua Driver").contains("Connected clients"));
+    }
+
+    #[test]
+    fn app_bundle_ships_complete_english_and_japanese_permission_copy() {
+        let english = include_str!(
+            "../../../../scripts/CuaDriverBundle/Contents/Resources/en.lproj/Localizable.strings"
+        );
+        let japanese = include_str!(
+            "../../../../scripts/CuaDriverBundle/Contents/Resources/ja.lproj/Localizable.strings"
+        );
+
+        for key in LOCALIZATION_KEYS {
+            let english_value = strings_value(english, key)
+                .unwrap_or_else(|| panic!("English localization is missing {key}"));
+            let japanese_value = strings_value(japanese, key)
+                .unwrap_or_else(|| panic!("Japanese localization is missing {key}"));
+            assert!(!english_value.is_empty(), "English localization is empty: {key}");
+            assert!(!japanese_value.is_empty(), "Japanese localization is empty: {key}");
+            assert_ne!(
+                english_value, japanese_value,
+                "Japanese localization must not fall back to English: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn localized_templates_replace_every_dynamic_product_token() {
+        let value = localized_template(
+            "missing.test.localization.key",
+            "Enable {feature} for {product}",
+            &[("{feature}", "Computer Use"), ("{product}", "Cua Driver")],
+        );
+        assert_eq!(value, "Enable Computer Use for Cua Driver");
+        assert!(!value.contains('{'));
+    }
+
+    #[test]
+    fn only_one_permission_request_is_active() {
+        let neither = PermissionsStatus {
+            accessibility: false,
+            screen_recording: false,
+        };
+        let mut flow = PermissionRequestFlow::new(false, false);
+        assert_eq!(
+            row_action(neither, &flow, MissingPermission::Accessibility),
+            RowAction::Allow
+        );
+        assert_eq!(
+            row_action(neither, &flow, MissingPermission::ScreenRecording),
+            RowAction::Allow
+        );
+
+        assert!(flow.begin_request(MissingPermission::Accessibility));
+        assert!(!flow.begin_request(MissingPermission::ScreenRecording));
+        assert_eq!(
+            row_action(neither, &flow, MissingPermission::Accessibility,),
+            RowAction::CompleteInSystemSettings
+        );
+        assert_eq!(
+            row_action(neither, &flow, MissingPermission::ScreenRecording,),
+            RowAction::WaitingForOtherPermission
         );
     }
 
     #[test]
-    fn subheading_mentions_remaining_permission() {
-        let st = |a: bool, sr: bool| PermissionsStatus {
-            accessibility: a,
-            screen_recording: sr,
+    fn only_one_allow_button_is_primary() {
+        let neither = PermissionsStatus {
+            accessibility: false,
+            screen_recording: false,
         };
-        // Only Accessibility granted → mentions Screen Recording next.
-        assert!(subheading_for(st(true, false)).contains("Screen Recording"));
-        // Only Screen Recording granted → mentions Accessibility next.
-        assert!(subheading_for(st(false, true)).contains("Accessibility"));
+        let flow = PermissionRequestFlow::new(false, false);
+        assert!(is_primary_allow(
+            neither,
+            &flow,
+            MissingPermission::Accessibility,
+            RowAction::Allow,
+        ));
+        assert!(!is_primary_allow(
+            neither,
+            &flow,
+            MissingPermission::ScreenRecording,
+            RowAction::Allow,
+        ));
+
+        let accessibility_allowed = PermissionsStatus {
+            accessibility: true,
+            screen_recording: false,
+        };
+        assert!(is_primary_allow(
+            accessibility_allowed,
+            &flow,
+            MissingPermission::ScreenRecording,
+            RowAction::Allow,
+        ));
+    }
+
+    #[test]
+    fn denied_or_dismissed_prompt_recovers_both_rows_after_return_signal() {
+        let neither = PermissionsStatus {
+            accessibility: false,
+            screen_recording: false,
+        };
+        let mut flow = PermissionRequestFlow::new(false, false);
+        assert!(flow.begin_request(MissingPermission::Accessibility));
+
+        // A stray activation notification cannot complete a request. The
+        // panel waits for an actual departure/return pair from system UI.
+        assert!(!flow.note_system_ui_returned());
+        flow.note_system_ui_departed();
+        assert!(flow.note_system_ui_returned());
+
+        // Cached false remains false: the return asks the gate to re-exec but
+        // never paints a false green grant. The denied row gets Settings and
+        // the untouched row is immediately usable.
+        assert_eq!(
+            flow.phase(MissingPermission::Accessibility),
+            PermissionRequestPhase::NotGranted
+        );
+        assert_eq!(
+            row_action(neither, &flow, MissingPermission::Accessibility),
+            RowAction::CompleteInSystemSettings
+        );
+        assert_eq!(
+            row_action(neither, &flow, MissingPermission::ScreenRecording),
+            RowAction::Allow
+        );
+    }
+
+    #[test]
+    fn settings_recovery_releases_a_pending_prompt() {
+        let neither = PermissionsStatus {
+            accessibility: false,
+            screen_recording: false,
+        };
+        let mut flow = PermissionRequestFlow::new(false, false);
+        assert!(flow.begin_request(MissingPermission::Accessibility));
+        flow.begin_settings(MissingPermission::Accessibility);
+
+        assert_eq!(flow.active_prompt, None);
+        assert_eq!(
+            row_action(neither, &flow, MissingPermission::Accessibility),
+            RowAction::CompleteInSystemSettings
+        );
+        assert_eq!(
+            row_action(neither, &flow, MissingPermission::ScreenRecording),
+            RowAction::Allow
+        );
+        flow.note_system_ui_departed();
+        assert!(
+            flow.note_system_ui_returned(),
+            "returning from Settings must request a fresh-process verification"
+        );
+    }
+
+    #[test]
+    fn live_green_probe_advances_without_waiting_for_return() {
+        let accessibility_only = PermissionsStatus {
+            accessibility: true,
+            screen_recording: false,
+        };
+        let mut flow = PermissionRequestFlow::new(false, false);
+        assert!(flow.begin_request(MissingPermission::Accessibility));
+        flow.note_system_ui_departed();
+        assert!(flow.reconcile_grants(accessibility_only));
+        assert_eq!(
+            row_action(accessibility_only, &flow, MissingPermission::Accessibility,),
+            RowAction::Allowed
+        );
+        assert_eq!(
+            row_action(
+                accessibility_only,
+                &flow,
+                MissingPermission::ScreenRecording,
+            ),
+            RowAction::Allow
+        );
+        assert!(!flow.note_system_ui_returned());
+    }
+
+    #[test]
+    fn panel_lifecycle_guard_records_unwind_as_unavailable() {
+        let _guard = env_lock();
+        let before = lifecycle().completion;
+        {
+            let _lifecycle = PanelLifecycleGuard::begin();
+            assert!(lifecycle().visible);
+        }
+        let after = lifecycle();
+        assert!(!after.visible);
+        assert_eq!(after.completion, before + 1);
+        assert_eq!(after.last_outcome, Some(PanelOutcome::Unavailable));
     }
 }
