@@ -22,8 +22,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 #[cfg(target_os = "linux")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 use cursor_overlay::ZOrderEnforcer;
