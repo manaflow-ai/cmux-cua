@@ -3113,6 +3113,7 @@ mod external_permission_flow_tests {
         assert_eq!(ordinary_tool_args["prompt"], serde_json::json!(true));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn host_permission_request_rejects_unknown_permission_without_prompting() {
         let response = validate_system_permission_request(Some("camera"));
@@ -3121,6 +3122,18 @@ mod external_permission_flow_tests {
         assert_eq!(
             response.error.as_deref(),
             Some("Unknown system permission: camera")
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn host_permission_request_reports_platform_scope() {
+        let response = validate_system_permission_request(Some("accessibility"));
+        assert!(!response.ok);
+        assert_eq!(response.exit_code, Some(64));
+        assert_eq!(
+            response.error.as_deref(),
+            Some("System permission requests are only supported on macOS")
         );
     }
 }
