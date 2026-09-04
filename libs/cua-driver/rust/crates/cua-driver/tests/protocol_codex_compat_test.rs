@@ -225,7 +225,11 @@ fn mcp_tool_names(driver: &mut CompatDriver) -> Vec<String> {
         .collect()
 }
 
-fn run_proxy_to_explicit_socket(socket: &PathBuf, compat: bool) -> std::process::Output {
+fn run_proxy_script(
+    socket: &PathBuf,
+    compat: bool,
+    requests: &[Value],
+) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cua-driver"));
     command
         .arg("mcp")
@@ -233,13 +237,21 @@ fn run_proxy_to_explicit_socket(socket: &PathBuf, compat: bool) -> std::process:
         .arg(socket)
         .arg("--no-overlay")
         .env("CUA_DRIVER_RS_MCP_FORCE_PROXY", "1")
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if compat {
         command.arg("--codex-computer-use-compat");
     }
-    command.output().expect("run explicit-socket MCP proxy")
+    let mut child = command.spawn().expect("spawn scripted MCP proxy");
+    {
+        let mut stdin = child.stdin.take().expect("proxy stdin");
+        for request in requests {
+            writeln!(stdin, "{request}").expect("write scripted MCP request");
+        }
+        stdin.flush().expect("flush scripted MCP requests");
+    }
+    child.wait_with_output().expect("collect scripted proxy output")
 }
 
 fn default_profile_socket(home: &std::path::Path, compat: bool) -> PathBuf {
@@ -686,31 +698,116 @@ fn explicit_socket_proxy_rejects_mismatched_daemon_profile() {
     let native = DaemonDriver::spawn(native_socket.clone(), false);
     let compat = DaemonDriver::spawn(compat_socket.clone(), true);
 
-    let matching_compat = run_proxy_to_explicit_socket(&compat_socket, true);
+    let matching_compat = run_proxy_script(
+        &compat_socket,
+        true,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {},
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {},
+            }),
+        ],
+    );
     assert!(
         matching_compat.status.success(),
-        "matching compat proxy must authenticate its approval broker: {}",
+        "matching compat proxy handshake failed: {}",
         String::from_utf8_lossy(&matching_compat.stderr)
     );
+    let matching_lines: Vec<Value> = String::from_utf8(matching_compat.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(matching_lines.len(), 2);
+    assert_eq!(matching_lines[0]["id"], 1);
+    assert_eq!(matching_lines[1]["id"], 2);
 
-    let compat_to_native = run_proxy_to_explicit_socket(&native_socket, true);
-    assert!(!compat_to_native.status.success());
-    let stderr = String::from_utf8_lossy(&compat_to_native.stderr);
+    let compat_to_native = run_proxy_script(
+        &native_socket,
+        true,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {},
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {},
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "list_apps", "arguments": {}},
+            }),
+        ],
+    );
+    assert!(compat_to_native.status.success());
+    let compat_lines: Vec<Value> = String::from_utf8(compat_to_native.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(compat_lines.len(), 3);
+    assert_eq!(compat_lines[0]["id"], 1);
+    assert_eq!(compat_lines[1]["id"], 2);
+    let error = compat_lines[2]["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        stderr.contains("daemon profile mismatch")
-            && stderr.contains("MCP requested `codex-computer-use-compat`")
-            && stderr.contains("daemon reports `native`"),
-        "unexpected compat-to-native error: {stderr}"
+        error.contains("daemon profile mismatch")
+            && error.contains("MCP requested `codex-computer-use-compat`")
+            && error.contains("daemon reports `native`"),
+        "unexpected compat-to-native error: {compat_lines:?}"
     );
 
-    let native_to_compat = run_proxy_to_explicit_socket(&compat_socket, false);
-    assert!(!native_to_compat.status.success());
-    let stderr = String::from_utf8_lossy(&native_to_compat.stderr);
+    let native_to_compat = run_proxy_script(
+        &compat_socket,
+        false,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {},
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {},
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "list_apps", "arguments": {}},
+            }),
+        ],
+    );
+    assert!(native_to_compat.status.success());
+    let native_lines: Vec<Value> = String::from_utf8(native_to_compat.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(native_lines.len(), 3);
+    let error = native_lines[2]["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        stderr.contains("daemon profile mismatch")
-            && stderr.contains("MCP requested `native`")
-            && stderr.contains("daemon reports `codex-computer-use-compat`"),
-        "unexpected native-to-compat error: {stderr}"
+        error.contains("daemon profile mismatch")
+            && error.contains("MCP requested `native`")
+            && error.contains("daemon reports `codex-computer-use-compat`"),
+        "unexpected native-to-compat error: {native_lines:?}"
     );
 
     drop(compat);
@@ -728,12 +825,41 @@ fn compat_approval_broker_fails_closed_without_signed_codex_parent() {
     let socket = root.join("compat.sock");
     let daemon = DaemonDriver::spawn_with_unverified_client_override(socket.clone(), true, false);
 
-    let output = run_proxy_to_explicit_socket(&socket, true);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let output = run_proxy_script(
+        &socket,
+        true,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {},
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {},
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "list_apps", "arguments": {}},
+            }),
+        ],
+    );
+    assert!(output.status.success());
+    let responses: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 3);
+    let error = responses[2]["error"]["message"].as_str().unwrap_or_default();
     assert!(
-        stderr.contains("Only the signed OpenAI Codex app may use this profile"),
-        "unexpected unsigned-parent rejection: {stderr}"
+        error.contains("Only the signed OpenAI Codex app may use this profile"),
+        "unexpected unsigned-parent rejection: {responses:?}"
     );
 
     drop(daemon);
@@ -758,6 +884,7 @@ fn raw_client_cannot_reuse_a_live_compat_session_without_its_broker_token() {
         .arg("--codex-computer-use-compat")
         .arg("--no-overlay")
         .env("CUA_DRIVER_RS_MCP_FORCE_PROXY", "1")
+        .env("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW", "1")
         .env("CUA_LOG", "cua_driver::proxy=debug")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -789,18 +916,30 @@ fn raw_client_cannot_reuse_a_live_compat_session_without_its_broker_token() {
             }
         }
     });
-    let session_id = session_rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("proxy established authenticated control session");
-
     writeln!(
         proxy_stdin,
         "{}",
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
+            "method": "initialize",
+            "params": {},
+        })
+    )
+    .unwrap();
+    proxy_stdin.flush().unwrap();
+    let mut initialize_line = String::new();
+    proxy_stdout.read_line(&mut initialize_line).unwrap();
+    assert!(initialize_line.contains("\"id\":1"), "proxy handshake failed: {initialize_line}");
+
+    writeln!(
+        proxy_stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
             "method": "tools/call",
-            "params": {"name": "not_a_real_tool", "arguments": {}},
+            "params": {"name": "list_apps", "arguments": {}},
         })
     )
     .unwrap();
@@ -808,9 +947,13 @@ fn raw_client_cannot_reuse_a_live_compat_session_without_its_broker_token() {
     let mut proxy_line = String::new();
     proxy_stdout.read_line(&mut proxy_line).unwrap();
     assert!(
-        proxy_line.contains("Unknown tool: not_a_real_tool"),
+        proxy_line.contains("\"id\":2") && !proxy_line.contains("\"error\""),
         "authenticated proxy call did not reach the registry: {proxy_line}"
     );
+
+    let session_id = session_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("proxy established authenticated control session");
 
     for args in [
         serde_json::json!({}),
@@ -912,11 +1055,13 @@ fn compat_proxy_brokers_nested_app_approval_and_retries_once() {
     let calls = Arc::new(AtomicUsize::new(0));
     let resolutions = Arc::new(AtomicUsize::new(0));
     let permission_statuses = Arc::new(AtomicUsize::new(0));
+    let forwarded_calls = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
     let server = {
         let stopping = stopping.clone();
         let calls = calls.clone();
         let resolutions = resolutions.clone();
         let permission_statuses = permission_statuses.clone();
+        let forwarded_calls = forwarded_calls.clone();
         std::thread::spawn(move || {
             let mut workers = Vec::new();
             while !stopping.load(Ordering::SeqCst) {
@@ -925,6 +1070,7 @@ fn compat_proxy_brokers_nested_app_approval_and_retries_once() {
                         let calls = calls.clone();
                         let resolutions = resolutions.clone();
                         let permission_statuses = permission_statuses.clone();
+                        let forwarded_calls = forwarded_calls.clone();
                         workers.push(std::thread::spawn(move || {
                             let mut reader = BufReader::new(stream.try_clone().unwrap());
                             let mut line = String::new();
@@ -986,6 +1132,7 @@ fn compat_proxy_brokers_nested_app_approval_and_retries_once() {
                                     })
                                 }
                                 "call" => {
+                                    forwarded_calls.lock().unwrap().push(request.clone());
                                     assert_eq!(
                                         request["args"]["_cua_approval_broker_token"],
                                         "daemon-broker-token"
@@ -1068,6 +1215,7 @@ fn compat_proxy_brokers_nested_app_approval_and_retries_once() {
         .arg("--codex-computer-use-compat")
         .arg("--no-overlay")
         .env("CUA_DRIVER_RS_MCP_FORCE_PROXY", "1")
+        .env("CUA_DRIVER_DEFAULT_SESSION", "cmux-wire-host-7A8B9C")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1177,6 +1325,25 @@ fn compat_proxy_brokers_nested_app_approval_and_retries_once() {
 
     assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+    let forwarded_calls = forwarded_calls.lock().unwrap();
+    assert_eq!(forwarded_calls.len(), 3);
+    for request in forwarded_calls.iter() {
+        assert_eq!(
+            request["args"]["_cua_proxy_host_session"],
+            "cmux-wire-host-7A8B9C",
+            "managed Codex proxy calls must carry host-owned cursor identity: {request}"
+        );
+        assert_eq!(
+            request["args"]["session"],
+            request["session_id"],
+            "proxy lifecycle identity must be bound in the forwarded args: {request}"
+        );
+        assert_eq!(
+            request["args"]["_session_id"],
+            request["session_id"],
+            "caller session overrides must not cross the hosted boundary: {request}"
+        );
+    }
     assert!(
         permission_statuses.load(Ordering::SeqCst) >= 1,
         "the first driving action must wait on the daemon-private permission status"

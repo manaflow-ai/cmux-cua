@@ -236,28 +236,6 @@ pub async fn run_proxy(
     let (daemon_lifecycle_tx, mut daemon_lifecycle_rx) =
         tokio::sync::mpsc::unbounded_channel::<DaemonLifecycleEvent>();
 
-    // A host-owned proxy may be registered before its helper is enabled, so a
-    // missing socket must remain lazy. Once the host's socket is already
-    // listening, however, authenticate the persistent control connection
-    // before accepting MCP traffic. This fails closed on a mismatched daemon
-    // profile or an untrusted Codex approval broker instead of letting a
-    // stdin-EOF probe (or a local initialize/tools-list exchange) report a
-    // healthy proxy that cannot safely dispatch its first action.
-    #[cfg(target_os = "macos")]
-    if crate::bundle::requires_external_daemon() && is_daemon_listening(&socket_path) {
-        ensure_daemon_started(
-            &socket_path,
-            &mut daemon_state,
-            &session_id,
-            claude_code_compat,
-            expected_profile,
-            &control_ready_tx,
-            false,
-            &daemon_lifecycle_tx,
-        )
-        .await?;
-    }
-
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut lines = BufReader::new(stdin).lines();
@@ -981,15 +959,52 @@ struct AppApprovalChallenge {
 }
 
 const APPROVAL_BROKER_TOKEN_ARG: &str = "_cua_approval_broker_token";
+/// Private transport metadata used to carry cmux's stable host identity
+/// through the Codex approval broker. The daemon authenticates and strips
+/// these fields before exposing the public `_host_session`/state-owner keys
+/// to the tool registry, so a Codex client cannot forge another host's state.
+pub(crate) const COMPAT_PROXY_HOST_SESSION_ARG: &str = "_cua_proxy_host_session";
+pub(crate) const COMPAT_PROXY_STATE_OWNER_PID_ARG: &str = "_cua_proxy_state_owner_pid";
 
-fn with_approval_broker_token(
+fn compat_authenticated_arguments(
     mut args: serde_json::Value,
     broker_token: &str,
+    session_id: &str,
+    managed_session: bool,
+    state_owner_pid: Option<u32>,
 ) -> serde_json::Value {
     if !args.is_object() {
         args = serde_json::Value::Object(serde_json::Map::new());
     }
-    args.as_object_mut().unwrap().insert(
+
+    let object = args.as_object_mut().unwrap();
+
+    // Host authority is transport metadata owned by this proxy. Remove any
+    // copies supplied by the MCP caller before adding the authenticated form.
+    object.remove(cua_driver_core::HOST_SESSION_ARG);
+    object.remove(cua_driver_core::session_state::STATE_OWNER_PID_ARG);
+    object.remove(COMPAT_PROXY_HOST_SESSION_ARG);
+    object.remove(COMPAT_PROXY_STATE_OWNER_PID_ARG);
+
+    if managed_session {
+        let lifecycle_session = serde_json::Value::String(session_id.to_owned());
+        object.insert("session".to_owned(), lifecycle_session.clone());
+        object.insert("_session_id".to_owned(), lifecycle_session);
+        if let Some(host_session) = managed_host_session(session_id) {
+            object.insert(
+                COMPAT_PROXY_HOST_SESSION_ARG.to_owned(),
+                serde_json::Value::String(host_session.to_owned()),
+            );
+        }
+        if let Some(owner_pid) = state_owner_pid.filter(|value| *value > 1) {
+            object.insert(
+                COMPAT_PROXY_STATE_OWNER_PID_ARG.to_owned(),
+                serde_json::json!(owner_pid),
+            );
+        }
+    }
+
+    object.insert(
         APPROVAL_BROKER_TOKEN_ARG.to_owned(),
         serde_json::Value::String(broker_token.to_owned()),
     );
@@ -1259,7 +1274,15 @@ where
         }
     };
 
-    let authenticated_args = with_approval_broker_token(args, &broker_token);
+    let managed_session = configured_default_session()
+        .is_some_and(|base| session_id.starts_with(&format!("{base}-mcp-")));
+    let authenticated_args = compat_authenticated_arguments(
+        args,
+        &broker_token,
+        session_id,
+        managed_session,
+        configured_state_owner_pid(),
+    );
 
     let first = match call_daemon_tool(
         socket_path,
@@ -2291,15 +2314,73 @@ mod tests {
 
     #[test]
     fn compat_calls_overwrite_caller_broker_fields_with_the_daemon_token() {
-        let args = with_approval_broker_token(
+        let args = compat_authenticated_arguments(
             serde_json::json!({
                 "app": "Calculator",
                 (APPROVAL_BROKER_TOKEN_ARG): "caller-forged",
             }),
             "daemon-minted",
+            "mcp-4242-99",
+            false,
+            None,
         );
         assert_eq!(args["app"], "Calculator");
         assert_eq!(args[APPROVAL_BROKER_TOKEN_ARG], "daemon-minted");
+    }
+
+    #[test]
+    fn compat_calls_forward_only_trusted_host_identity() {
+        let managed = "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF-mcp-4242-99";
+        let args = compat_authenticated_arguments(
+            serde_json::json!({
+                "app": "Calculator",
+                "session": "caller-session",
+                "_session_id": "caller-session",
+                (cua_driver_core::HOST_SESSION_ARG): "caller-forged-host",
+                (cua_driver_core::session_state::STATE_OWNER_PID_ARG): 7,
+                (COMPAT_PROXY_HOST_SESSION_ARG): "caller-forged-proxy-host",
+                (COMPAT_PROXY_STATE_OWNER_PID_ARG): 8,
+            }),
+            "daemon-minted",
+            managed,
+            true,
+            Some(4242),
+        );
+
+        assert!(args.get(cua_driver_core::HOST_SESSION_ARG).is_none());
+        assert!(args
+            .get(cua_driver_core::session_state::STATE_OWNER_PID_ARG)
+            .is_none());
+        assert_eq!(
+            args[COMPAT_PROXY_HOST_SESSION_ARG],
+            "cmux-C0D0FE9B-CB9C-421D-AD81-149B2318E7FF"
+        );
+        assert_eq!(args[COMPAT_PROXY_STATE_OWNER_PID_ARG], 4242);
+        assert_eq!(args[APPROVAL_BROKER_TOKEN_ARG], "daemon-minted");
+        assert_eq!(args["session"], managed);
+        assert_eq!(args["_session_id"], managed);
+    }
+
+    #[test]
+    fn compat_host_identity_survives_proxy_generation_turnover() {
+        let host = "cmux-stable-surface-71A2B3";
+        let (first, first_managed) = proxy_session_identity("mcp-42-1000", Some(host));
+        let (second, second_managed) = proxy_session_identity("mcp-84-2000", Some(host));
+        assert!(first_managed && second_managed);
+        assert_ne!(first, second, "each proxy generation still needs a unique lifecycle id");
+
+        for generation in [first, second] {
+            let args = compat_authenticated_arguments(
+                serde_json::json!({"app": "Calculator"}),
+                "daemon-token",
+                &generation,
+                true,
+                None,
+            );
+            assert_eq!(args[COMPAT_PROXY_HOST_SESSION_ARG], host);
+            assert_eq!(args["session"], generation);
+            assert_eq!(args["_session_id"], generation);
+        }
     }
 
     #[test]
