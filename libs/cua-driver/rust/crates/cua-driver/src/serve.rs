@@ -659,21 +659,41 @@ fn spawn_session_idle_sweep() {
 /// `fire_session_end`; this adds recording teardown to the SAME signal, so
 /// `end_session`, the idle-TTL sweep, and the control-connection EOF reaper all
 /// stop a session's recording uniformly (matching `end_session`'s contract).
-/// `stop_owner(Some(sid))` is a no-op unless `sid` owns the live recording, and
-/// runs on a detached thread so finalizing the mp4 never blocks the synchronous
-/// `fire_session_end` caller (the sweep task or an async tool invoke). The EOF
-/// arm keeps its own inline `spawn_blocking` stop for ordered finalize-then-reply;
-/// a second stop here is an idempotent no-op.
+/// A generation-bound ownership ticket is reserved synchronously before the
+/// finalization thread is spawned. This keeps an immediate session-id revival
+/// from letting an old cleanup thread stop a replacement recording with the
+/// same id. The expensive video/cursor finalization remains off the caller's
+/// thread; a replacement `start()` supersedes the ticket and reaps its old
+/// resources itself.
 fn register_recording_session_end_hook(
     recording: std::sync::Arc<cua_driver_core::recording::RecordingSession>,
 ) {
     cua_driver_core::session::register_session_end_hook(move |sid| {
+        let Some(token) = recording.reserve_owner_stop(sid) else {
+            return;
+        };
         let recording = recording.clone();
-        let sid = sid.to_owned();
         std::thread::spawn(move || {
-            let _ = recording.stop_owner(Some(&sid));
+            let _ = recording.stop_owner_token(token);
         });
     });
+}
+
+/// End one session and, when it owns the current recording generation, await a
+/// generation-bound finalization ticket. The session-end hook also schedules a
+/// detached ticket for idle-eviction and other synchronous callers; this
+/// explicit await preserves the daemon EOF path's finalize-before-disconnect
+/// behavior without allowing a reused session id to stop a newer recording.
+async fn finish_session_end(
+    recording: std::sync::Arc<cua_driver_core::recording::RecordingSession>,
+    session_id: String,
+) {
+    let token = recording.reserve_owner_stop(&session_id);
+    cua_driver_core::session::fire_session_end(&session_id);
+    let Some(token) = token else {
+        return;
+    };
+    let _ = tokio::task::spawn_blocking(move || recording.stop_owner_token(token)).await;
 }
 
 /// Removes per-session activity state when the same lifecycle fan-out tears
@@ -2320,24 +2340,7 @@ pub async fn run_serve(
                                 // proxies never send it — the control-connection
                                 // EOF is the single teardown path. Always ACK ok.
                                 if let Some(sid) = req.session_id.as_deref() {
-                                    // stop_owner can SYNCHRONOUSLY finalize the
-                                    // recording's mp4 — run it off the reactor on
-                                    // a blocking thread (see the EOF reaper).
-                                    // fire_session_end stays inline (non-blocking).
-                                    // Mark the session ended FIRST so an in-flight
-                                    // start_recording sees ended=true and bails — the
-                                    // mark-before-reap invariant the cursor/config hooks
-                                    // already satisfy (their reap runs inside
-                                    // fire_session_end, after the mark). stop_owner does
-                                    // not consult is_session_ended, so reaping after the
-                                    // mark is safe.
-                                    cua_driver_core::session::fire_session_end(sid);
-                                    let reg2 = reg.clone();
-                                    let sid_for_stop = sid.to_owned();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        reg2.recording.stop_owner(Some(&sid_for_stop))
-                                    })
-                                    .await;
+                                    finish_session_end(reg.recording.clone(), sid.to_owned()).await;
                                 }
                                 let resp = DaemonResponse::ok(
                                     serde_json::json!({"session_end": true})
@@ -2390,23 +2393,7 @@ pub async fn run_serve(
                         #[cfg(not(target_os = "macos"))]
                         let owns_cleanup = true;
                         if owns_cleanup {
-                            // stop_owner can SYNCHRONOUSLY finalize the recording's
-                            // mp4, on macOS it hits SCStream::stop_capture(), which
-                            // blocks on disk I/O (video_sckit.rs). Run it on a
-                            // blocking thread so it does not stall a runtime worker.
-                            // fire_session_end stays inline: its hooks (overlay
-                            // Remove, config-override clear) are non-blocking.
-                            // Mark the session ended FIRST so an in-flight start_recording
-                            // sees ended=true and bails (mark-before-reap; the cursor/config
-                            // hooks already reap inside fire_session_end after the mark).
-                            // stop_owner ignores is_session_ended, so reaping after is safe.
-                            cua_driver_core::session::fire_session_end(&sid);
-                            let reg2 = reg.clone();
-                            let sid_for_stop = sid.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                reg2.recording.stop_owner(Some(&sid_for_stop))
-                            })
-                            .await;
+                            finish_session_end(reg.recording.clone(), sid).await;
                         } else {
                             tracing::debug!(
                                 session_id = %sid,
@@ -2901,24 +2888,7 @@ pub async fn run_serve(
                                 // connection; control_session_id stays None so no
                                 // EOF double-fire. fire_session_end is idempotent.
                                 if let Some(sid) = req.session_id.as_deref() {
-                                    // stop_owner can SYNCHRONOUSLY finalize the
-                                    // recording's mp4 — run it off the reactor on
-                                    // a blocking thread (see the EOF reaper).
-                                    // fire_session_end stays inline (non-blocking).
-                                    // Mark the session ended FIRST so an in-flight
-                                    // start_recording sees ended=true and bails — the
-                                    // mark-before-reap invariant the cursor/config hooks
-                                    // already satisfy (their reap runs inside
-                                    // fire_session_end, after the mark). stop_owner does
-                                    // not consult is_session_ended, so reaping after the
-                                    // mark is safe.
-                                    cua_driver_core::session::fire_session_end(sid);
-                                    let reg2 = reg.clone();
-                                    let sid_for_stop = sid.to_owned();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        reg2.recording.stop_owner(Some(&sid_for_stop))
-                                    })
-                                    .await;
+                                    finish_session_end(reg.recording.clone(), sid.to_owned()).await;
                                 }
                                 let resp = DaemonResponse::ok(
                                     serde_json::json!({"session_end": true})
@@ -2942,20 +2912,7 @@ pub async fn run_serve(
                     // the full rationale). Per-call connections leave
                     // control_session_id None.
                     if let Some(sid) = control_session_id {
-                        // Run stop_owner off the reactor (see the unix branch):
-                        // recording finalize can be a synchronous blocking call.
-                        // fire_session_end stays inline (non-blocking hooks).
-                        // Mark the session ended FIRST so an in-flight start_recording
-                        // sees ended=true and bails (mark-before-reap; the cursor/config
-                        // hooks already reap inside fire_session_end after the mark).
-                        // stop_owner ignores is_session_ended, so reaping after is safe.
-                        cua_driver_core::session::fire_session_end(&sid);
-                        let reg2 = reg.clone();
-                        let sid_for_stop = sid.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            reg2.recording.stop_owner(Some(&sid_for_stop))
-                        })
-                        .await;
+                        finish_session_end(reg.recording.clone(), sid).await;
                     }
                 });
             }

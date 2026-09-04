@@ -155,6 +155,18 @@ pub struct RecordingSession {
     inner: Mutex<RecordingInner>,
 }
 
+/// Generation-bound ownership ticket for asynchronous session teardown.
+///
+/// A session id may be deliberately reused after `start_session`. The ticket
+/// therefore carries the recording generation in addition to the owner id so
+/// an older cleanup thread cannot stop a replacement recording with the same
+/// session name.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RecordingStopToken {
+    owner: String,
+    generation: u64,
+}
+
 struct RecordingInner {
     enabled: bool,
     generation: u64,
@@ -166,9 +178,10 @@ struct RecordingInner {
     /// own session id to `stop_owner()`, which no-ops when the live owner has
     /// moved on. `None` means the recording was started anonymously (CLI
     /// one-shot / legacy `configure()` shim) and is owned by nobody — only an
-    /// unconditional `stop_owner(None)` can tear it down. Supersedes the
-    /// #1775 generation token: a session id is a stable owner identity rather
-    /// than a monotonic counter, and it doubles as the config-override key.
+    /// unconditional `stop_owner(None)` can tear it down. The session id is
+    /// the stable owner identity and doubles as the config-override key; the
+    /// monotonic generation is retained for asynchronous cleanup tickets when
+    /// an id is deliberately reused.
     owner: Option<String>,
     output_dir: Option<PathBuf>,
     next_turn: u32,
@@ -267,8 +280,8 @@ impl RecordingSession {
         // recording owned by a dead session — a leaked ffmpeg/SCStream. The
         // teardown sites call `fire_session_end` (which marks ENDED_SESSIONS)
         // BEFORE `stop_owner`, so either the mark is already set and we bail
-        // here, or we win the lock first and the reaper's later stop_owner(owner)
-        // reaps what we started. Anonymous starts (owner = None: CLI one-shot /
+        // here, or we win the lock first and the reaper's generation-bound stop
+        // ticket reaps what we started. Anonymous starts (owner = None: CLI one-shot /
         // legacy shim) are never gated.
         if let Some(o) = owner {
             if crate::session::is_session_ended(o) {
@@ -358,27 +371,49 @@ impl RecordingSession {
         Ok(())
     }
 
+    /// Reserve an owner-bound stop before handing finalization to a background
+    /// thread. The reservation is a generation snapshot; a later `start()`
+    /// increments the generation and makes this token harmless.
+    pub fn reserve_owner_stop(&self, requester: &str) -> Option<RecordingStopToken> {
+        let inner = self.inner.lock().unwrap();
+        if !inner.enabled || inner.owner.as_deref() != Some(requester) {
+            return None;
+        }
+        Some(RecordingStopToken {
+            owner: requester.to_owned(),
+            generation: inner.generation,
+        })
+    }
+
+    /// Finalize a previously reserved generation, doing nothing if a newer
+    /// recording has taken ownership in the meantime.
+    pub fn stop_owner_token(&self, token: RecordingStopToken) -> anyhow::Result<()> {
+        self.stop_owner_at_generation(Some(&token.owner), Some(token.generation))
+    }
+
     /// Disable recording. Idempotent — calling stop on an already-stopped
-    /// session is a no-op. If a video subprocess is running, it's
-    /// gracefully terminated and the finalized metadata is folded into
-    /// `session.json`.
+    /// session is a no-op. If a video subprocess is running, it is gracefully
+    /// terminated and the finalized metadata is folded into `session.json`.
     ///
-    /// `requester` is the ownership guard for session-driven teardown
-    /// (`session_end` / proxy-exit). Semantics:
-    ///   - `None` — unconditional stop. Manual `stop_recording`, the legacy
-    ///     `configure()` shim, the CLI one-shot path, and the idle-TTL backstop
-    ///     all pass `None` to preserve today's manual-stop behavior.
-    ///   - `Some(sid)` where `sid` owns the live recording — stop + clear owner.
-    ///   - `Some(sid)` where `sid` does NOT own it (a disconnecting session
-    ///     whose recording was already clobbered by a newer `start()`, or which
-    ///     never started a recording) — silent no-op, leaving the current
-    ///     owner's recording running.
-    ///
-    /// The guard lives inside the lock so it is race-free against a concurrent
-    /// `start()`. Supersedes the #1775 generation-token `stop()`.
+    /// `requester` is the ownership guard for session-driven teardown:
+    /// `None` unconditionally stops the current recording, while `Some(sid)`
+    /// stops only when that session owns the live generation.
+    /// Generation-bound asynchronous cleanup uses
+    /// [`reserve_owner_stop`] and [`stop_owner_token`].
     pub fn stop_owner(&self, requester: Option<&str>) -> anyhow::Result<()> {
+        self.stop_owner_at_generation(requester, None)
+    }
+
+    fn stop_owner_at_generation(
+        &self,
+        requester: Option<&str>,
+        expected_generation: Option<u64>,
+    ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if !inner.enabled {
+            return Ok(());
+        }
+        if expected_generation.is_some_and(|generation| inner.generation != generation) {
             return Ok(());
         }
         if let Some(req) = requester {
@@ -1020,6 +1055,38 @@ mod tests {
         assert_eq!(manifest["video"]["present"], false);
         assert_eq!(manifest["video"]["error"], "recorder did not finalize");
         let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn stale_owner_stop_token_cannot_stop_a_reused_session_generation() {
+        let session = RecordingSession::new();
+        let sid = "recording-reused-session-778899";
+        {
+            let mut inner = session.inner.lock().expect("recording lock");
+            inner.enabled = true;
+            inner.owner = Some(sid.to_owned());
+            inner.generation = 7;
+        }
+
+        let token = session
+            .reserve_owner_stop(sid)
+            .expect("live owner should reserve a stop token");
+
+        // Simulate a quick explicit revival and replacement start. The new
+        // generation keeps the same session id but is a different recording.
+        {
+            let mut inner = session.inner.lock().expect("recording lock");
+            inner.generation = 8;
+            inner.enabled = true;
+            inner.owner = Some(sid.to_owned());
+        }
+
+        session
+            .stop_owner_token(token)
+            .expect("stale token is a safe no-op");
+        let state = session.current_state();
+        assert!(state.enabled, "a stale cleanup must not stop the replacement");
+        assert_eq!(state.owner.as_deref(), Some(sid));
     }
 
     #[test]
