@@ -10,7 +10,9 @@
 //!   cua-driver <tool> [json-args]           → shorthand for call (snake_case names)
 //!
 //! Cursor-overlay flags (--cursor-id, --no-overlay, etc.) are consumed by
-//! `CursorConfig::from_args()` and are ignored here.
+//! `CursorConfig::from_args()` and are ignored by command dispatch after the
+//! subcommand has been selected (the macOS proxy separately forwards them to
+//! a freshly launched `serve` daemon).
 
 use std::process;
 use cua_driver_core::{protocol::Content, tool::ToolRegistry};
@@ -154,18 +156,92 @@ pub enum Command {
     Skills { subcommand: String, flags: Vec<String> },
 }
 
-/// Flags whose next token is a value (not a subcommand).
-/// We skip both the flag and its value when scanning for the subcommand.
-const VALUE_FLAGS: &[&str] = &[
-    "--cursor-icon", "--cursor-id", "--cursor-palette", "--cursor-shape",
-    "--glide-ms", "--dwell-ms", "--idle-hide-ms",
-    "--screenshot-out-file", "--client", "--socket", "--pid-file", "--type",
+/// Cursor arguments that must be copied when an `mcp` proxy launches the
+/// long-lived `serve` daemon. The proxy process itself does not render the
+/// overlay, so dropping these arguments would make a documented `mcp` flag a
+/// no-op on the installed LaunchServices path.
+const CURSOR_BARE_FLAGS: &[&str] = &["--no-overlay"];
+const CURSOR_VALUE_FLAGS: &[&str] = &[
+    "--cursor-icon",
+    "--cursor-id",
+    "--cursor-palette",
+    "--cursor-shape",
+    "--glide-ms",
+    "--dwell-ms",
+    "--idle-hide-ms",
+    "--cursor-speed",
+];
+
+/// Non-cursor flags whose next token is a value (not a subcommand). Cursor
+/// value flags live in [`CURSOR_VALUE_FLAGS`] so the parser and proxy cannot
+/// drift apart when a new cursor option is added.
+const OTHER_VALUE_FLAGS: &[&str] = &[
+    "--screenshot-out-file",
+    "--client",
+    "--socket",
+    "--pid-file",
+    "--type",
     "--host-bundle-id",
     // Experimental PiP preview — value flag for the optional geometry
     // override (--experimental-pip itself is a bare flag and doesn't
     // need to be listed here).
     "--experimental-pip-geometry",
 ];
+
+fn is_value_flag(arg: &str) -> bool {
+    CURSOR_VALUE_FLAGS.contains(&arg) || OTHER_VALUE_FLAGS.contains(&arg)
+}
+
+/// Return the positional arguments left after global/value flags are removed.
+///
+/// The hand-written CLI accepts options before or after a subcommand. Keeping
+/// this scan in one pure helper makes that contract testable without invoking
+/// `parse_command` (which intentionally exits for malformed/interactive
+/// invocations).
+fn command_positionals(args: &[String]) -> Vec<&str> {
+    let mut positionals = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if is_value_flag(arg) {
+            i += 2;
+        } else if arg.starts_with('-') {
+            i += 1;
+        } else {
+            positionals.push(arg);
+            i += 1;
+        }
+    }
+    positionals
+}
+
+/// Select only cursor-overlay arguments from an MCP proxy's argv so they can
+/// be forwarded to the freshly launched `serve` daemon. Values are copied as
+/// separate argv entries (never shell-interpolated), preserving paths and
+/// spaces safely. The next token is preserved verbatim when present (even if
+/// it begins with a dash) so this has the same tolerant parsing semantics as
+/// `CursorConfig::parse`; a genuinely missing value is left as a bare flag.
+fn cursor_overlay_args(args: &[String]) -> Vec<String> {
+    let mut forwarded = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if CURSOR_BARE_FLAGS.contains(&arg) {
+            forwarded.push(args[i].clone());
+            i += 1;
+        } else if CURSOR_VALUE_FLAGS.contains(&arg) {
+            forwarded.push(args[i].clone());
+            if let Some(value) = args.get(i + 1) {
+                forwarded.push(value.clone());
+                i += 1;
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    forwarded
+}
 
 /// Parse cursor flags and apply the Codex compatibility default. Native mode
 /// remains teardrop; Codex compatibility uses Sky unless the caller explicitly
@@ -295,7 +371,7 @@ pub fn parse_command() -> Command {
         println!("  action snaps the cursor with a brief pulse on its first action instead of a long");
         println!("  glide, so it can be easy to miss — do a pixel click or move_cursor first");
         println!("  for a visibly gliding demo. These flags tune the overlay on `serve`/`mcp`:");
-        println!("  --no-overlay            Disable the cursor overlay entirely for this daemon.");
+        println!("  --no-overlay            Disable the driver's in-process cursor overlay.");
         println!("  --cursor-id <id>        Name the default cursor instance (default: 'default').");
         println!("  --cursor-icon <path>    Use a custom PNG / SVG / ICO cursor asset.");
         println!("  --cursor-shape <name>   Built-in silhouette: {} ('teardrop' is the default —",
@@ -305,6 +381,11 @@ pub fn parse_command() -> Command {
         println!("                          Lawrence's fixed upright branded Sky kite).");
         println!("                          Same vocabulary as MCP `cursor_icon`.");
         println!("  --cursor-palette <name> Pick a built-in colour palette for the cursor.");
+        println!("  --glide-ms <ms>         Use a fixed glide duration in milliseconds.");
+        println!("  --dwell-ms <ms>         Override the post-click dwell in milliseconds.");
+        println!("  --idle-hide-ms <ms>     Override the idle-hide delay in milliseconds.");
+        println!("  --cursor-speed <f64>   Scale speed-based glides (0.25–8; default 1.0).");
+        println!("                          --glide-ms, when supplied, keeps its fixed duration.");
         println!("  (These are no-ops for one-shot CLI calls like `cua-driver call` — the overlay");
         println!("   needs the long-lived AppKit runloop that only `serve` / `mcp` keep alive.)");
         println!();
@@ -343,20 +424,10 @@ pub fn parse_command() -> Command {
         std::env::set_var(cua_driver_core::HOST_BUNDLE_ID_ENV, id);
     }
 
-    // Strip cursor-overlay flags (and their values) to expose the subcommand.
-    let mut positionals: Vec<&str> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i].as_str();
-        if VALUE_FLAGS.contains(&a) {
-            i += 2; // skip flag + value
-        } else if a.starts_with('-') {
-            i += 1; // skip bare flag
-        } else {
-            positionals.push(a);
-            i += 1;
-        }
-    }
+    // Strip cursor/global value flags to expose the subcommand. The helper is
+    // also used by tests so a newly added cursor option cannot accidentally
+    // become the implicit tool name when it appears before `mcp`/`serve`.
+    let positionals = command_positionals(&args);
 
     let no_daemon_relaunch = args.iter().any(|a| a == "--no-daemon-relaunch");
     let claude_code_compat = args.iter().any(|a| a == "--claude-code-computer-use-compat");
@@ -809,6 +880,44 @@ pub fn should_use_daemon_proxy(no_daemon_relaunch: bool) -> bool {
     crate::serve::is_daemon_listening(&crate::serve::default_socket_path())
 }
 
+/// Build the LaunchServices argv for a freshly spawned daemon. Keeping this
+/// pure lets tests verify the proxy's public cursor-configuration handoff
+/// without launching an app or changing desktop state.
+#[cfg(target_os = "macos")]
+fn daemon_open_args(
+    socket_path: &str,
+    daemon_app: &str,
+    claude_code_compat: bool,
+    codex_computer_use_compat: bool,
+    process_args: &[String],
+) -> Vec<String> {
+    let pass_socket = socket_path != crate::serve::default_socket_path();
+    let mut open_args = vec![
+        "-n".to_owned(),
+        "-g".to_owned(),
+        "-a".to_owned(),
+        daemon_app.to_owned(),
+        "--args".to_owned(),
+        "serve".to_owned(),
+    ];
+    if pass_socket {
+        open_args.push("--socket".to_owned());
+        open_args.push(socket_path.to_owned());
+    }
+    if claude_code_compat {
+        open_args.push("--claude-code-computer-use-compat".to_owned());
+    }
+    if codex_computer_use_compat {
+        open_args.push("--codex-computer-use-compat".to_owned());
+    }
+    // The proxy is only a stdio transport; the freshly launched daemon owns
+    // the actual overlay. Preserve every cursor setting from the caller so
+    // `mcp --cursor-speed …` and its sibling flags have the same effect on
+    // the installed LaunchServices path as they do for direct `serve`.
+    open_args.extend(cursor_overlay_args(process_args));
+    open_args
+}
+
 /// Spawn `/usr/bin/open -n -g -a CuaDriver --args serve` to launch
 /// the daemon under `LaunchServices` (so it inherits the bundle's
 /// TCC attribution), then poll the socket for up to `timeout_secs`
@@ -843,29 +952,17 @@ pub fn launch_daemon_and_wait(
     // — the permission prompt names "cmux Computer Use", not the host app.
     let daemon_app =
         std::env::var("CUA_DRIVER_DAEMON_APP").unwrap_or_else(|_| "CuaDriver".to_string());
-    let mut open_args: Vec<&str> =
-        vec!["-n", "-g", "-a", daemon_app.as_str(), "--args", "serve"];
-    if pass_socket {
-        open_args.push("--socket");
-        open_args.push(socket_path);
-    }
-    // Thread the Claude-Code compat flag through to the daemon. Without this
-    // the proxy-spawned daemon always called build_macos_registry() (compat
-    // hardcoded false), so `cua-driver mcp --claude-code-computer-use-compat`
-    // SILENTLY DROPPED the flag on the proxy path — the path users actually
-    // run on an installed bundle. Today this is latent: the compat screenshot
-    // tool was removed in #1692, so `register_all(compat)` ignores the flag and
-    // the served surface is identical either way. But the flag was being lost
-    // before reaching the daemon at all, so the moment any compat-gated tool is
-    // re-introduced the proxy path would not honour it. This makes the flag
-    // travel end-to-end. Only honoured on a freshly-launched daemon — a
-    // pre-existing daemon keeps whatever surface it launched with.
-    if claude_code_compat {
-        open_args.push("--claude-code-computer-use-compat");
-    }
-    if codex_computer_use_compat {
-        open_args.push("--codex-computer-use-compat");
-    }
+    let process_args: Vec<String> = std::env::args().skip(1).collect();
+    // `daemon_open_args` forwards the compatibility profile and cursor flags
+    // together. Only a freshly launched daemon consumes them; a pre-existing
+    // daemon keeps the surface and cursor configuration it was started with.
+    let open_args = daemon_open_args(
+        socket_path,
+        &daemon_app,
+        claude_code_compat,
+        codex_computer_use_compat,
+        &process_args,
+    );
 
     let status = Cmd::new("/usr/bin/open")
         // `-n` forces a new instance: CuaDriver.app might already be
@@ -1103,7 +1200,16 @@ pub fn build_manifest() -> serde_json::Value {
                   { "name": "--claude-code-computer-use-compat", "type": "flag", "description": "Select the Claude Code computer-use compat tool surface." },
                   { "name": "--codex-computer-use-compat", "type": "flag", "description": "Select the ten-tool Codex Computer Use compatibility surface." },
                   { "name": "--embedded", "type": "flag", "description": "Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1." },
-                  { "name": "--host-bundle-id", "type": "string", "description": "Advisory host bundle id label echoed in check_permissions output." }
+                  { "name": "--host-bundle-id", "type": "string", "description": "Advisory host bundle id label echoed in check_permissions output." },
+                  { "name": "--cursor-id", "type": "string", "description": "Name the default cursor instance." },
+                  { "name": "--cursor-icon", "type": "string", "description": "Use a custom PNG, SVG, or ICO cursor asset." },
+                  { "name": "--cursor-shape", "type": "string", "description": "Select a built-in cursor silhouette." },
+                  { "name": "--cursor-palette", "type": "string", "description": "Select a built-in cursor colour palette." },
+                  { "name": "--glide-ms", "type": "number", "description": "Use a fixed glide duration in milliseconds." },
+                  { "name": "--dwell-ms", "type": "number", "description": "Override the post-click dwell in milliseconds." },
+                  { "name": "--idle-hide-ms", "type": "number", "description": "Override the idle-hide delay in milliseconds." },
+                  { "name": "--cursor-speed", "type": "number", "description": "Scale speed-based glides; clamped to 0.25–8." },
+                  { "name": "--no-overlay", "type": "flag", "description": "Disable the driver's in-process cursor overlay." }
               ] },
             { "name": "serve",
               "description": "Run the long-lived daemon — backs the proxy/auto-relaunch path on macOS and the autostart Session 1+ daemon on Windows.",
@@ -1113,7 +1219,16 @@ pub fn build_manifest() -> serde_json::Value {
                   { "name": "--claude-code-computer-use-compat", "type": "flag", "description": "Forwarded by the MCP proxy when the client asked for the compat surface." },
                   { "name": "--codex-computer-use-compat", "type": "flag", "description": "Forwarded by the MCP proxy when the client asked for the Codex compatibility surface." },
                   { "name": "--embedded", "type": "flag", "description": "Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1." },
-                  { "name": "--host-bundle-id", "type": "string", "description": "Advisory host bundle id label echoed in check_permissions output." }
+                  { "name": "--host-bundle-id", "type": "string", "description": "Advisory host bundle id label echoed in check_permissions output." },
+                  { "name": "--cursor-id", "type": "string", "description": "Name the default cursor instance." },
+                  { "name": "--cursor-icon", "type": "string", "description": "Use a custom PNG, SVG, or ICO cursor asset." },
+                  { "name": "--cursor-shape", "type": "string", "description": "Select a built-in cursor silhouette." },
+                  { "name": "--cursor-palette", "type": "string", "description": "Select a built-in cursor colour palette." },
+                  { "name": "--glide-ms", "type": "number", "description": "Use a fixed glide duration in milliseconds." },
+                  { "name": "--dwell-ms", "type": "number", "description": "Override the post-click dwell in milliseconds." },
+                  { "name": "--idle-hide-ms", "type": "number", "description": "Override the idle-hide delay in milliseconds." },
+                  { "name": "--cursor-speed", "type": "number", "description": "Scale speed-based glides; clamped to 0.25–8." },
+                  { "name": "--no-overlay", "type": "flag", "description": "Disable the driver's in-process cursor overlay." }
               ] },
             { "name": "stop",
               "description": "Stop a running daemon by sending it a shutdown request.",
@@ -2687,12 +2802,21 @@ fn cli_docs_json() -> serde_json::Value {
                 "arguments": no_args,
                 "options": [
                     {"name":"socket","short_name":null,"help":"Override the daemon socket or named-pipe path used by the proxy fallback.","type":"String","default_value":null,"is_optional":true},
-                    {"name":"host-bundle-id","short_name":null,"help":"Advisory host bundle id label echoed in check_permissions output (embedded mode).","type":"String","default_value":null,"is_optional":true}
+                    {"name":"host-bundle-id","short_name":null,"help":"Advisory host bundle id label echoed in check_permissions output (embedded mode).","type":"String","default_value":null,"is_optional":true},
+                    {"name":"cursor-id","short_name":null,"help":"Name the default cursor instance.","type":"String","default_value":"default","is_optional":true},
+                    {"name":"cursor-icon","short_name":null,"help":"Use a custom PNG, SVG, or ICO cursor asset.","type":"String","default_value":null,"is_optional":true},
+                    {"name":"cursor-shape","short_name":null,"help":"Select a built-in cursor silhouette.","type":"String","default_value":"teardrop","is_optional":true},
+                    {"name":"cursor-palette","short_name":null,"help":"Select a built-in cursor colour palette.","type":"String","default_value":null,"is_optional":true},
+                    {"name":"glide-ms","short_name":null,"help":"Use a fixed glide duration in milliseconds.","type":"Number","default_value":null,"is_optional":true},
+                    {"name":"dwell-ms","short_name":null,"help":"Override the post-click dwell in milliseconds.","type":"Number","default_value":null,"is_optional":true},
+                    {"name":"idle-hide-ms","short_name":null,"help":"Override the idle-hide delay in milliseconds.","type":"Number","default_value":null,"is_optional":true},
+                    {"name":"cursor-speed","short_name":null,"help":"Scale speed-based glides; clamped to 0.25–8.","type":"Number","default_value":"1.0","is_optional":true}
                 ],
                 "flags": [
                     {"name":"no-daemon-relaunch","short_name":null,"help":"Stay in-process instead of proxying through a daemon.","default_value":false},
                     {"name":"claude-code-computer-use-compat","short_name":null,"help":"Expose the Claude Code computer-use compatibility screenshot surface.","default_value":false},
-                    {"name":"embedded","short_name":null,"help":"Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1.","default_value":false}
+                    {"name":"embedded","short_name":null,"help":"Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1.","default_value":false},
+                    {"name":"no-overlay","short_name":null,"help":"Disable the driver's in-process cursor overlay.","default_value":false}
                 ],
                 "subcommands": no_subcommands
             },
@@ -2737,11 +2861,20 @@ fn cli_docs_json() -> serde_json::Value {
                 "options": [
                     {"name":"socket","short_name":null,"help":"Override the daemon socket or named-pipe path.","type":"String","default_value":null,"is_optional":true},
                     {"name":"pid-file","short_name":null,"help":"Override the pid-file path on Unix targets.","type":"String","default_value":null,"is_optional":true},
-                    {"name":"host-bundle-id","short_name":null,"help":"Advisory host bundle id label echoed in check_permissions output (embedded mode).","type":"String","default_value":null,"is_optional":true}
+                    {"name":"host-bundle-id","short_name":null,"help":"Advisory host bundle id label echoed in check_permissions output (embedded mode).","type":"String","default_value":null,"is_optional":true},
+                    {"name":"cursor-id","short_name":null,"help":"Name the default cursor instance.","type":"String","default_value":"default","is_optional":true},
+                    {"name":"cursor-icon","short_name":null,"help":"Use a custom PNG, SVG, or ICO cursor asset.","type":"String","default_value":null,"is_optional":true},
+                    {"name":"cursor-shape","short_name":null,"help":"Select a built-in cursor silhouette.","type":"String","default_value":"teardrop","is_optional":true},
+                    {"name":"cursor-palette","short_name":null,"help":"Select a built-in cursor colour palette.","type":"String","default_value":null,"is_optional":true},
+                    {"name":"glide-ms","short_name":null,"help":"Use a fixed glide duration in milliseconds.","type":"Number","default_value":null,"is_optional":true},
+                    {"name":"dwell-ms","short_name":null,"help":"Override the post-click dwell in milliseconds.","type":"Number","default_value":null,"is_optional":true},
+                    {"name":"idle-hide-ms","short_name":null,"help":"Override the idle-hide delay in milliseconds.","type":"Number","default_value":null,"is_optional":true},
+                    {"name":"cursor-speed","short_name":null,"help":"Scale speed-based glides; clamped to 0.25–8.","type":"Number","default_value":"1.0","is_optional":true}
                 ],
                 "flags": [
                     {"name":"no-permissions-gate","short_name":null,"help":"Skip the macOS first-launch permissions gate.","default_value":false},
-                    {"name":"embedded","short_name":null,"help":"Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1.","default_value":false}
+                    {"name":"embedded","short_name":null,"help":"Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1.","default_value":false},
+                    {"name":"no-overlay","short_name":null,"help":"Disable the driver's in-process cursor overlay.","default_value":false}
                 ],
                 "subcommands": no_subcommands
             },
@@ -3780,6 +3913,97 @@ mod tests {
     }
 
     #[test]
+    fn cursor_speed_value_before_subcommand_is_not_treated_as_tool_name() {
+        let args = [
+            "--cursor-speed",
+            "2.0",
+            "serve",
+            "--no-permissions-gate",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+        assert_eq!(command_positionals(&args), vec!["serve"]);
+        let config = cursor_config_from_args(&args, false);
+        assert_eq!(
+            config.motion.peak_speed,
+            cursor_overlay::MotionConfig::default().peak_speed * 2.0
+        );
+    }
+
+    #[test]
+    fn proxy_forwarding_preserves_cursor_flags_and_values_only() {
+        let args = [
+            "mcp",
+            "--socket",
+            "/tmp/cua.sock",
+            "--cursor-speed",
+            "1.75",
+            "--cursor-icon",
+            "/tmp/cursor with spaces.svg",
+            "--no-overlay",
+            "--glide-ms",
+            "250",
+            "list-tools",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            cursor_overlay_args(&args),
+            vec![
+                "--cursor-speed",
+                "1.75",
+                "--cursor-icon",
+                "/tmp/cursor with spaces.svg",
+                "--no-overlay",
+                "--glide-ms",
+                "250",
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn daemon_launch_argv_keeps_profile_socket_and_cursor_contract() {
+        let args = ["mcp", "--cursor-speed", "2.0", "--no-overlay"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let launch = daemon_open_args(
+            "/tmp/cua-cursor.sock",
+            "CuaDriver",
+            true,
+            true,
+            &args,
+        );
+
+        assert_eq!(
+            launch,
+            vec![
+                "-n",
+                "-g",
+                "-a",
+                "CuaDriver",
+                "--args",
+                "serve",
+                "--socket",
+                "/tmp/cua-cursor.sock",
+                "--claude-code-computer-use-compat",
+                "--codex-computer-use-compat",
+                "--cursor-speed",
+                "2.0",
+                "--no-overlay",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn codex_compat_uses_dedicated_default_daemon_paths() {
         let native_socket = daemon_socket_path(None, false);
         let compat_socket = daemon_socket_path(None, true);
@@ -3990,6 +4214,32 @@ mod tests {
                 "subcommand missing description: {entry}");
             assert!(obj.get("args").and_then(|v| v.as_array()).is_some(),
                 "subcommand missing args[]: {entry}");
+        }
+    }
+
+    #[test]
+    fn manifest_advertises_cursor_speed_on_both_daemon_entrypoints() {
+        let m = build_manifest();
+        let subs = m["subcommands"].as_array().expect("subcommands");
+        for command in ["mcp", "serve"] {
+            let entry = subs
+                .iter()
+                .find(|entry| entry["name"] == command)
+                .unwrap_or_else(|| panic!("missing {command} manifest entry"));
+            let names = entry["args"]
+                .as_array()
+                .expect("args[]")
+                .iter()
+                .filter_map(|arg| arg["name"].as_str())
+                .collect::<Vec<_>>();
+            assert!(
+                names.contains(&"--cursor-speed"),
+                "{command} must advertise --cursor-speed"
+            );
+            assert!(
+                names.contains(&"--no-overlay"),
+                "{command} must advertise --no-overlay"
+            );
         }
     }
 

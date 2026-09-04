@@ -13,9 +13,9 @@
 //!   `pinned_wid`, `gradient_colors`, `bloom_override`).
 //! - [`RenderStateCore::tick_motion`] — speed-profile + spring physics +
 //!   click-pulse + idle-fade using runtime [`MotionConfig`] (Windows + Linux).
-//! - [`RenderStateCore::tick_swift_constants`] — same physics but with the
-//!   hardcoded Swift reference constants used by macOS; returns whether the
-//!   path just ended (so the caller can fire arrival signals).
+//! - [`RenderStateCore::tick_swift_constants`] — the Swift reference spring
+//!   physics used by macOS, with runtime glide-speed fields; returns whether
+//!   the path just ended (so the caller can fire arrival signals).
 //! - [`RenderStateCore::apply_command_base`] — the OverlayCommand match arms
 //!   that all three platforms implement identically (MoveTo / ClickPulse /
 //!   SetEnabled / SetMotion / SetPalette / PinAbove / SetShape / SetGradient).
@@ -42,6 +42,14 @@ use crate::{
     BuiltinShape, CursorConfig, CursorShape, MotionConfig, OverlayCommand, Palette, PathPlanner,
     PathState, PlannedPath, Spring,
 };
+
+fn finite_positive_or(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        fallback
+    }
+}
 
 /// Platform-agnostic render state shared by macOS / Windows / Linux overlays.
 ///
@@ -240,10 +248,15 @@ impl RenderStateCore {
         fire_arrival
     }
 
-    /// Advance the animation by `dt` seconds using the hardcoded Swift
-    /// reference constants (`peakSpeed=900`, `minStart=300`, `minEnd=200`,
-    /// `springK=400`, `springC=17`, `springOvershoot=0.8`).  Used by macOS,
-    /// which mirrors `AgentCursorRenderer.swift` 1:1.
+    /// Advance the animation by `dt` seconds using the Swift reference
+    /// spring constants (`springK=400`, `springC=17`,
+    /// `springOvershoot=0.8`).  Glide speeds come from the runtime
+    /// [`MotionConfig`], whose defaults match the Swift reference
+    /// (`peakSpeed=900`, `minStart=300`, `minEnd=200`).  Keeping those
+    /// values configurable here is important: macOS is the renderer used by
+    /// the Codex compatibility profile, so launch-time `--cursor-speed` and
+    /// any live motion update must affect the actual animation rather than
+    /// only the parsed configuration.
     ///
     /// Returns `true` when the path just ended (so the caller can fire its
     /// arrival oneshot to unblock `animate_cursor_to`).
@@ -253,12 +266,22 @@ impl RenderStateCore {
     /// peak at 1.0 at u=0.5.  The original Swift code uses the 30/1.875
     /// form so we preserve it here for parity.
     pub fn tick_swift_constants(&mut self, dt: f64) -> bool {
-        const PEAK_SPEED: f64 = 900.0;
-        const MIN_START_SPEED: f64 = 300.0;
-        const MIN_END_SPEED: f64 = 200.0;
+        const DEFAULT_PEAK_SPEED: f64 = 900.0;
+        const DEFAULT_MIN_START_SPEED: f64 = 300.0;
+        const DEFAULT_MIN_END_SPEED: f64 = 200.0;
         const SPRING_K: f64 = 400.0;
         const SPRING_C: f64 = 17.0;
         const SPRING_OVERSHOOT: f64 = 0.8;
+
+        // `MotionConfig` is normally built from validated defaults/overrides,
+        // but it is also deserializable and can be supplied by an embedding
+        // host.  A malformed speed must not stall the render loop (NaN) or
+        // make a path move backwards (negative), so retain the reference
+        // constant as a safe fallback for those values.
+        let peak_speed = finite_positive_or(self.motion.peak_speed, DEFAULT_PEAK_SPEED);
+        let min_start_speed =
+            finite_positive_or(self.motion.min_start_speed, DEFAULT_MIN_START_SPEED);
+        let min_end_speed = finite_positive_or(self.motion.min_end_speed, DEFAULT_MIN_END_SPEED);
 
         let mut fire_arrival = false;
 
@@ -269,11 +292,12 @@ impl RenderStateCore {
             // Smootherstep speed profile (normalised: peak = 1.0).
             let profile = (30.0 * u * u * (1.0 - u) * (1.0 - u)) / 1.875;
             let floor_speed = if u < 0.5 {
-                MIN_START_SPEED
+                min_start_speed
             } else {
-                MIN_END_SPEED
+                min_end_speed
             };
-            let speed_based = floor_speed + (PEAK_SPEED - floor_speed) * profile;
+            let speed_based =
+                (floor_speed + (peak_speed - floor_speed) * profile).max(floor_speed);
             // Fixed-duration override: when `glide_duration_ms > 0` the move
             // takes exactly that long regardless of distance, so an orchestrator
             // can lock glides to a known cadence. `0` (the default) keeps the
@@ -296,7 +320,7 @@ impl RenderStateCore {
                 // stays as crisp as a speed-based glide instead of overshooting
                 // proportionally to a short duration.
                 let impulse = if self.motion.glide_duration_ms > 0.0 {
-                    MIN_END_SPEED
+                    min_end_speed
                 } else {
                     current_speed
                 };
@@ -1034,8 +1058,13 @@ mod glide_duration_tests {
     /// took. `tick` selects the platform path: `false` = `tick_motion`
     /// (Windows/Linux), `true` = `tick_swift_constants` (macOS reference).
     fn arrival_secs(glide_ms: f64, dist_pts: f64, swift: bool) -> f64 {
-        let mut core = RenderStateCore::new(CursorConfig::default());
-        core.motion.glide_duration_ms = glide_ms;
+        let mut cfg = CursorConfig::default();
+        cfg.motion.glide_duration_ms = glide_ms;
+        arrival_secs_for_config(cfg, dist_pts, swift)
+    }
+
+    fn arrival_secs_for_config(cfg: CursorConfig, dist_pts: f64, swift: bool) -> f64 {
+        let mut core = RenderStateCore::new(cfg);
         core.motion.idle_hide_ms = 0.0;
         core.place_at(0.0, 0.0);
         // Aligned headings → an effectively straight path of length ~dist_pts.
@@ -1082,6 +1111,46 @@ mod glide_duration_tests {
                 "swift={swift} short={short} long={long}"
             );
         }
+    }
+
+    #[test]
+    fn cursor_speed_changes_macos_speed_based_glide() {
+        // This is the public launch-configuration path: parse the CLI flag,
+        // build the render state, and advance the same tick macOS uses. Before
+        // the fix, `tick_swift_constants` ignored these fields, so all three
+        // runs arrived in essentially the same time.
+        let parsed = |multiplier: f64| {
+            let args = vec!["--cursor-speed".to_owned(), multiplier.to_string()];
+            CursorConfig::parse(&args)
+        };
+
+        let normal = arrival_secs_for_config(parsed(1.0), 1400.0, true);
+        let fast = arrival_secs_for_config(parsed(2.0), 1400.0, true);
+        let slow = arrival_secs_for_config(parsed(0.5), 1400.0, true);
+
+        assert!(
+            fast < normal * 0.75,
+            "2x cursor speed must shorten the macOS glide: normal={normal}, fast={fast}"
+        );
+        assert!(
+            slow > normal * 1.25,
+            "0.5x cursor speed must lengthen the macOS glide: normal={normal}, slow={slow}"
+        );
+    }
+
+    #[test]
+    fn explicit_glide_duration_stays_authoritative_over_cursor_speed() {
+        let args = vec![
+            "--cursor-speed".to_owned(),
+            "4.0".to_owned(),
+            "--glide-ms".to_owned(),
+            "300".to_owned(),
+        ];
+        let elapsed = arrival_secs_for_config(CursorConfig::parse(&args), 1400.0, true);
+        assert!(
+            (elapsed - 0.3).abs() < 0.05,
+            "a fixed glide duration must win over speed scaling: elapsed={elapsed}"
+        );
     }
 }
 

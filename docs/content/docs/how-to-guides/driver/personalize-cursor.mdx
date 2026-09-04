@@ -67,6 +67,22 @@ cua-driver serve --cursor-palette <name>
 
 Run `cua-driver serve --help` for the available palette names.
 
+## Tune glide speed
+
+Use `--cursor-speed <multiplier>` on `serve` or `mcp` to scale the
+speed-based cursor glide without changing the click pulse or dwell timing.
+The multiplier is clamped to `0.25`–`8` (the default is `1`). For example:
+
+```bash
+cua-driver serve --cursor-speed 1.5
+```
+
+When `mcp` starts a fresh background daemon, it forwards this cursor setting
+to that daemon so the proxy and direct `serve` paths behave the same. An
+explicit `--glide-ms` fixed-duration override takes precedence over the speed
+multiplier; an already-running daemon keeps the motion configuration it was
+started with.
+
 ## Things that aren't currently personalizable
 
 - **Multiple built-in palettes per agent.** Runtime overrides can recolour a cursor, but built-in named palettes are shared.

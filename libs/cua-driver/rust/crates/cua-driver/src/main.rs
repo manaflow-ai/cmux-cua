@@ -11,6 +11,7 @@
 //!   --glide-ms     <f64>                  glide duration override
 //!   --dwell-ms     <f64>                  post-click dwell override
 //!   --idle-hide-ms <f64>                  idle-hide timeout override
+//!   --cursor-speed <f64>                  speed multiplier (0.25–8; speed-based glides)
 //!
 //! ## macOS threading model
 //!
