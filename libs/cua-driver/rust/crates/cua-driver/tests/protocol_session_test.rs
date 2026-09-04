@@ -398,11 +398,12 @@ fn external_display_cursor_preserves_global_protocol_coordinates() {
             let y = bounds.get("y")?.as_f64()?;
             let width = bounds.get("width")?.as_f64()?;
             let height = bounds.get("height")?.as_f64()?;
+            let window_id = window["window_id"].as_u64()?;
             (x < -50.0 && width > 100.0 && height > 100.0)
-                .then_some((x, y, width, height))
+                .then_some((window_id, x, y, width, height))
         })
         .next();
-    let Some((window_x, window_y, window_width, window_height)) = target else {
+    let Some((target_window_id, window_x, window_y, window_width, window_height)) = target else {
         eprintln!(
             "[macos-cursor] no visible negative-origin window; skipping external-display probe"
         );
@@ -486,6 +487,20 @@ fn external_display_cursor_preserves_global_protocol_coordinates() {
         (panel_center.0 - requested.0).abs() <= 24.0
             && (panel_center.1 - requested.1).abs() <= 24.0,
         "cursor panel lost global coordinates: requested={requested:?}, panel={panel_center:?}, overlay={overlay:?}"
+    );
+    let target_after = after_move["result"]["structuredContent"]["windows"]
+        .as_array()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|window| window["window_id"].as_u64() == Some(target_window_id))
+        })
+        .expect("the discovered external target must remain in the current-space listing");
+    let overlay_z = overlay["z_index"].as_u64().expect("overlay z-index");
+    let target_z = target_after["z_index"].as_u64().expect("target z-index");
+    assert!(
+        overlay_z > target_z,
+        "cursor panel was not above the current-space target: overlay_z={overlay_z}, target_z={target_z}, overlay={overlay:?}, target={target_after:?}"
     );
 
     driver.send(&serde_json::json!({
