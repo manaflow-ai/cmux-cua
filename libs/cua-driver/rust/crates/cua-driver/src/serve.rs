@@ -1718,6 +1718,7 @@ pub async fn run_serve(
                     // connection EOFs (graceful proxy exit OR kill -9, both
                     // kernel-guaranteed), the post-loop block reaps the session.
                     let mut control_session_id: Option<String> = None;
+                    #[cfg(target_os = "macos")]
                     let mut control_approval_token: Option<(String, String)> = None;
 
                     while let Ok(Some(line)) = lines.next_line().await {
@@ -1915,6 +1916,7 @@ pub async fn run_serve(
                                 ).await;
                             }
                             "set_cursor_enabled" => {
+                                #[cfg(target_os = "macos")]
                                 let response = if !host_request_authorized {
                                     DaemonResponse::err(
                                         "Unauthorized host-only daemon request".to_owned(),
@@ -1953,6 +1955,11 @@ pub async fn run_serve(
                                         ),
                                     }
                                 };
+                                #[cfg(not(target_os = "macos"))]
+                                let response = DaemonResponse::err(
+                                    "set_cursor_enabled is available only on macOS",
+                                    64,
+                                );
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&response).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -2265,6 +2272,7 @@ pub async fn run_serve(
                                     // before accepting more calls.
                                     cua_driver_core::session::revive_session(sid);
                                     control_session_id = Some(sid.to_owned());
+                                    #[cfg(target_os = "macos")]
                                     if approval_broker_requested
                                         && profile == DaemonProfile::CodexComputerUseCompat
                                     {
@@ -2348,6 +2356,7 @@ pub async fn run_serve(
                     // idempotent, so racing a legacy explicit session_end is
                     // benign.
                     if let Some(sid) = control_session_id {
+                        #[cfg(target_os = "macos")]
                         let owns_cleanup = if profile == DaemonProfile::CodexComputerUseCompat {
                             match control_approval_token.take() {
                                 Some((owner, token))
@@ -2367,6 +2376,8 @@ pub async fn run_serve(
                         } else {
                             true
                         };
+                        #[cfg(not(target_os = "macos"))]
+                        let owns_cleanup = true;
                         if owns_cleanup {
                             // stop_owner can SYNCHRONOUSLY finalize the recording's
                             // mp4, on macOS it hits SCStream::stop_capture(), which
@@ -2701,7 +2712,7 @@ pub async fn run_serve(
                     let mut control_session_id: Option<String> = None;
 
                     while let Ok(Some(line)) = lines.next_line().await {
-                        let req = match parse_request(&line) {
+                        let parsed = match parse_request(&line) {
                             Ok(request) => request,
                             Err(resp) => {
                                 let _ = writer.write_all(
@@ -2710,6 +2721,7 @@ pub async fn run_serve(
                                 continue;
                             }
                         };
+                        let req = parsed.request;
 
                         match req.method.as_str() {
                             "shutdown" => {
