@@ -64,16 +64,126 @@ pub(crate) fn main_screen_size() -> Option<(i64, i64, f64)> {
     Some((w, h, scale))
 }
 
-/// Estimate backing scale by comparing the display's pixel mode width to its
-/// logical (CoreGraphics) bounds width.
+/// Resolve the display's backing scale from its current mode.
+///
+/// `CGDisplayPixelsWide` is not a reliable primary source on HiDPI Macs: it
+/// can report the mode's logical point width even while the backing surface is
+/// rendered at twice that many physical pixels. The current display mode keeps
+/// both values, so use its physical-pixel/point ratio and retain the old API as
+/// a fallback for older or partially configured displays.
 pub(crate) fn get_backing_scale(display_id: u32, logical_w: i64) -> f64 {
+    get_backing_scale_optional(display_id, logical_w).unwrap_or(1.0)
+}
+
+/// Same resolver as [`get_backing_scale`], retaining `None` when neither the
+/// display mode nor the legacy framebuffer query can provide usable widths.
+/// Callers that already have an independent AppKit scale can use that value as
+/// the final fallback instead of treating an unavailable mode as a real 1×
+/// display.
+pub(crate) fn get_backing_scale_optional(display_id: u32, logical_w: i64) -> Option<f64> {
+    use core_graphics::display::CGDisplay;
+    if let Some(mode) = CGDisplay::new(display_id).display_mode() {
+        if let Some(scale) = scale_from_widths(mode.pixel_width() as f64, mode.width() as f64) {
+            return Some(scale);
+        }
+    }
+
+    // Legacy framebuffer-width heuristic; correct on non-HiDPI modes and a
+    // useful fallback when the mode copy is unavailable.
     use core_graphics::display::CGDisplayPixelsWide;
-    let pixel_w = unsafe { CGDisplayPixelsWide(display_id) } as i64;
-    if pixel_w > 0 && logical_w > 0 {
-        let ratio = pixel_w as f64 / logical_w as f64;
-        // Round to nearest 0.5 to avoid floating point noise.
-        (ratio * 2.0).round() / 2.0
+    let pixel_w = unsafe { CGDisplayPixelsWide(display_id) } as f64;
+    scale_from_widths(pixel_w, logical_w as f64)
+}
+
+/// Pixels-per-point ratio rounded to the nearest 0.5 to absorb display-mode
+/// floating-point noise. Returns `None` for unusable dimensions.
+fn scale_from_widths(pixel_w: f64, point_w: f64) -> Option<f64> {
+    if pixel_w > 0.0 && point_w > 0.0 {
+        Some((((pixel_w / point_w) * 2.0).round() / 2.0).max(1.0))
     } else {
-        1.0
+        None
+    }
+}
+
+#[cfg(test)]
+mod backing_scale_tests {
+    use super::{get_backing_scale, scale_from_widths, GetScreenSizeTool};
+    use cua_driver_core::tool::Tool;
+
+    #[test]
+    fn display_mode_dimensions_preserve_retina_ratio() {
+        // HiDPI mode: 3024 physical pixels over 1512 logical points. The
+        // legacy CGDisplayPixelsWide path sees 1512/1512 and incorrectly
+        // collapses this to 1×.
+        assert_eq!(scale_from_widths(3024.0, 1512.0), Some(2.0));
+        assert_eq!(scale_from_widths(1512.0, 1512.0), Some(1.0));
+        // Scaled modes can legitimately use a half-step ratio.
+        assert_eq!(scale_from_widths(3600.0, 2400.0), Some(1.5));
+        assert_eq!(
+            scale_from_widths(600.0, 1200.0),
+            Some(1.0),
+            "a malformed sub-1x ratio must not be exposed as a backing scale"
+        );
+        assert_eq!(scale_from_widths(0.0, 1512.0), None);
+        assert_eq!(scale_from_widths(3024.0, 0.0), None);
+    }
+
+    #[test]
+    fn live_display_mode_is_the_backing_scale_oracle_when_available() {
+        use core_graphics::display::{CGDisplay, CGDisplayBounds, CGMainDisplayID};
+
+        let display_id = unsafe { CGMainDisplayID() };
+        if display_id == 0 {
+            return;
+        }
+        let bounds = unsafe { CGDisplayBounds(display_id) };
+        let Some(mode) = CGDisplay::new(display_id).display_mode() else {
+            // A headless WindowServer can expose an id without a mode.
+            return;
+        };
+        let Some(expected) = scale_from_widths(mode.pixel_width() as f64, mode.width() as f64)
+        else {
+            return;
+        };
+
+        let actual = get_backing_scale(display_id, bounds.size.width.round() as i64);
+        assert_eq!(
+            actual, expected,
+            "the screen-size protocol and cursor rasterizer must use the mode's physical/logical ratio"
+        );
+    }
+
+    #[tokio::test]
+    async fn screen_size_protocol_reports_the_live_mode_scale() {
+        use core_graphics::display::{CGDisplay, CGDisplayBounds, CGMainDisplayID};
+
+        let display_id = unsafe { CGMainDisplayID() };
+        if display_id == 0 {
+            return;
+        }
+        let bounds = unsafe { CGDisplayBounds(display_id) };
+        let Some(mode) = CGDisplay::new(display_id).display_mode() else {
+            return;
+        };
+        let expected = scale_from_widths(mode.pixel_width() as f64, mode.width() as f64)
+            .expect("valid display-mode dimensions");
+
+        let response = GetScreenSizeTool.invoke(serde_json::json!({})).await;
+        assert_ne!(
+            response.is_error,
+            Some(true),
+            "get_screen_size must succeed when a display mode is available"
+        );
+        let Some(structured) = response.structured_content else {
+            panic!("get_screen_size returned no structured payload");
+        };
+        let reported = structured["scale_factor"]
+            .as_f64()
+            .expect("get_screen_size scale_factor");
+        assert_eq!(
+            reported,
+            expected,
+            "get_screen_size must expose the same mode scale used by cursor rasterization (bounds={bounds:?})"
+        );
     }
 }

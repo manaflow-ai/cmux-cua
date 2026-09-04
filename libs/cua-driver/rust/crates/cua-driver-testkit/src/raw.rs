@@ -58,6 +58,15 @@ impl RawDriver {
         self.stdout.read_line(&mut line).expect("read response line");
         serde_json::from_str(line.trim()).expect("parse JSON response")
     }
+
+    /// Process id of the source-built driver owned by this test.
+    ///
+    /// GUI protocol tests use the pid to distinguish the cursor panel they
+    /// just created from other cua-driver instances that may already be
+    /// present on the desktop.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
 }
 
 impl Drop for RawDriver {

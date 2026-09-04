@@ -118,16 +118,16 @@ static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
 
 /// The keyed, insertion-ordered collection of owned cursors that the render
 /// loop composites every frame. Insertion order = stable z-order (later keys
-/// paint on top). `win_w` / `win_h` are screen-global, hoisted out of the
-/// per-cursor `RenderState` (written once in `run_appkit`).
+/// paint on top). The launch display bounds are retained only as a defensive
+/// fallback when CoreGraphics cannot enumerate the active global display
+/// layout; normal placement uses the containing display's global bounds.
 struct RenderMap {
     cursors: IndexMap<CursorKey, RenderState>,
     /// Most recent cursor key touched by an inbound command. Idle-dwell
     /// timeout selection prefers this cursor so a stale visible cursor cannot
     /// shorten the dwell of the cursor the user just moved.
     last_active_key: Option<CursorKey>,
-    win_w: f64,
-    win_h: f64,
+    fallback_display_bounds: Option<LogicalRect>,
     /// Frozen launch-time config used as the template for lazily-created
     /// cursors (its palette is overridden per-key via `Palette::for_instance`).
     template: CursorConfig,
@@ -225,8 +225,7 @@ pub fn init(cfg: CursorConfig) {
     *RENDER.lock().unwrap() = Some(RenderMap {
         cursors,
         last_active_key: None,
-        win_w: 0.0,
-        win_h: 0.0,
+        fallback_display_bounds: None,
         template: cfg,
         ended: std::collections::HashSet::new(),
     });
@@ -373,26 +372,39 @@ pub fn current_motion(key: &str) -> MotionConfig {
 /// Returns true if a seed was applied (i.e. the cursor was at the sentinel and
 /// is now primed to glide).
 fn seed_start_if_sentinel(key: &CursorKey, target_x: f64, target_y: f64) -> bool {
+    // Resolve the current global display layout at the placement boundary.
+    // `NSScreen.mainScreen` can be an external/key display, while cursor
+    // coordinates are global Quartz points; clamping against that one screen
+    // would strand a first action on a different display.
+    let displays = active_display_geometries(1.0);
     let mut guard = RENDER.lock().unwrap();
     let Some(map) = guard.as_mut() else {
         return false;
     };
-    seed_start_in_map(map, key, target_x, target_y)
+    seed_start_in_map_with_displays(map, key, target_x, target_y, &displays)
 }
 
 /// Pure seed step operating on a borrowed [`RenderMap`] — factored out of
 /// `seed_start_if_sentinel` so the get-or-create + clamp logic is unit-testable
 /// without the global `RENDER` static or AppKit.
+#[cfg(test)]
 fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target_y: f64) -> bool {
-    // Offset the start up-left of the target so the Dubins path has room to
-    // curve in; 140pt is enough to read as motion at 900pt/s peak speed.
-    const SEED_OFFSET: f64 = 140.0;
-    let (win_w, win_h) = (map.win_w, map.win_h);
+    seed_start_in_map_with_displays(map, key, target_x, target_y, &[])
+}
+
+fn seed_start_in_map_with_displays(
+    map: &mut RenderMap,
+    key: &CursorKey,
+    target_x: f64,
+    target_y: f64,
+    displays: &[DisplayGeometry],
+) -> bool {
     // Respect the resurrection guard: never seed (and thus re-create) a cursor
     // whose session already ended.
     if map.ended.contains(key) {
         return false;
     }
+    let fallback_display_bounds = map.fallback_display_bounds;
     // Get-or-create the cursor so the very first AX action seeds + glides even
     // when the lazy render-thread creation hasn't drained the PinAbove yet
     // (the render loop's drain would otherwise win the race and the seed read
@@ -406,23 +418,49 @@ fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target
     if !(rs.core.cfg.enabled && rs.core.is_unplaced()) {
         return false;
     }
-    let mut sx = target_x - SEED_OFFSET;
-    let mut sy = target_y - SEED_OFFSET;
-    // Clamp into the screen frame when we know it (win_w/h are 0 until the
-    // AppKit window is up; in that headless case the unclamped seed is still
-    // on-screen-by-construction for any realistic target).
-    if win_w > 0.0 && win_h > 0.0 {
-        sx = sx.clamp(2.0, win_w - 2.0);
-        sy = sy.clamp(2.0, win_h - 2.0);
-        // If clamping collapsed the seed onto the target (target in a corner),
-        // nudge it the other way so there is still a visible glide distance.
-        if (sx - target_x).abs() < 8.0 && (sy - target_y).abs() < 8.0 {
-            sx = (target_x + SEED_OFFSET).min(win_w - 2.0);
-            sy = (target_y + SEED_OFFSET).min(win_h - 2.0);
-        }
-    }
+    let (sx, sy) = seed_point_for_target(target_x, target_y, displays, fallback_display_bounds);
     rs.core.place_at(sx, sy);
     true
+}
+
+fn seed_point_for_target(
+    target_x: f64,
+    target_y: f64,
+    displays: &[DisplayGeometry],
+    fallback_display_bounds: Option<LogicalRect>,
+) -> (f64, f64) {
+    // Offset the start up-left of the target so the Dubins path has room to
+    // curve in; 140pt is enough to read as motion at the reference peak speed.
+    const SEED_OFFSET: f64 = 140.0;
+    let mut seed = (target_x - SEED_OFFSET, target_y - SEED_OFFSET);
+
+    // Keep the seed on the same global display as the target whenever the
+    // WindowServer layout is available. This handles negative x/y display
+    // origins and avoids a first action jumping through an unrelated display.
+    let bounds = display_for_cursor(displays, (target_x, target_y), None)
+        .map(|display| display.bounds)
+        .or_else(|| fallback_display_bounds.filter(|bounds| bounds.is_valid()));
+    let Some(bounds) = bounds else {
+        return seed;
+    };
+
+    let minimum_x = bounds.left + 2.0;
+    let maximum_x = bounds.left + bounds.width - 2.0;
+    let minimum_y = bounds.top + 2.0;
+    let maximum_y = bounds.top + bounds.height - 2.0;
+    if minimum_x > maximum_x || minimum_y > maximum_y {
+        return seed;
+    }
+    seed.0 = seed.0.clamp(minimum_x, maximum_x);
+    seed.1 = seed.1.clamp(minimum_y, maximum_y);
+
+    // If clamping collapsed the seed onto a corner target, nudge it in the
+    // opposite direction while remaining inside that same global display.
+    if (seed.0 - target_x).abs() < 8.0 && (seed.1 - target_y).abs() < 8.0 {
+        seed.0 = (target_x + SEED_OFFSET).clamp(minimum_x, maximum_x);
+        seed.1 = (target_y + SEED_OFFSET).clamp(minimum_y, maximum_y);
+    }
+    seed
 }
 
 /// Animate the overlay cursor to `(x, y)` and suspend until the Dubins path
@@ -819,7 +857,6 @@ impl LogicalRect {
 
 #[derive(Debug, Clone, Copy)]
 struct ScreenGeometry {
-    origin_x: f64,
     origin_y: f64,
     height: f64,
     fallback_backing_scale: f64,
@@ -873,10 +910,33 @@ fn cursor_window_collection_behavior() -> u64 {
 
 fn appkit_frame_for_rect(rect: LogicalRect, screen: ScreenGeometry) -> AppKitRect {
     AppKitRect {
-        x: screen.origin_x + rect.left,
+        // Cursor positions originate in Quartz's global desktop space. AppKit
+        // uses the same global x-axis, so applying the key screen's x origin
+        // again shifts cursors on an external display by one whole monitor.
+        x: rect.left,
         y: screen.origin_y + screen.height - rect.top - rect.height,
         width: rect.width,
         height: rect.height,
+    }
+}
+
+fn screen_geometry_for_primary_display(
+    primary_display: LogicalRect,
+    fallback_main_screen: LogicalRect,
+    fallback_backing_scale: f64,
+) -> ScreenGeometry {
+    // NSScreen.mainScreen follows the key window and may be an external
+    // display. The y-axis flip must instead use the primary Quartz display so
+    // global CGWindow/AX points map to AppKit frames consistently.
+    let anchor = if primary_display.is_valid() {
+        primary_display
+    } else {
+        fallback_main_screen
+    };
+    ScreenGeometry {
+        origin_y: anchor.top,
+        height: anchor.height,
+        fallback_backing_scale,
     }
 }
 
@@ -1234,57 +1294,69 @@ unsafe fn run_appkit(_cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
         return;
     }
     let screen_frame: NSRect = msg_send![main_screen, frame];
-    let win_w = screen_frame.size.width;
-    let win_h = screen_frame.size.height;
-    // NSScreen.backingScaleFactor is the most direct source of truth — it's
-    // what AppKit will use for the layer's native backing surface anyway.
-    // Fall back to the CG estimator (pixel mode width ÷ logical bounds) when
-    // the AppKit call returns a non-positive value, since downstream paint
-    // math divides by this and a 0.0 would zero out the cursor.
-    let mut backing_scale: f64 = msg_send![main_screen, backingScaleFactor];
-    if !(backing_scale > 0.0) {
-        use core_graphics::display::{CGDisplayBounds, CGMainDisplayID};
-        let display_id = CGMainDisplayID();
-        let bounds = CGDisplayBounds(display_id);
-        backing_scale =
-            crate::tools::get_screen_size::get_backing_scale(display_id, bounds.size.width as i64);
-        if !(backing_scale > 0.0) {
-            backing_scale = 1.0;
-        }
-    }
+    let fallback_main_screen = LogicalRect {
+        left: screen_frame.origin.x,
+        top: screen_frame.origin.y,
+        width: screen_frame.size.width,
+        height: screen_frame.size.height,
+    };
+    // `NSScreen.mainScreen` is the screen containing the current key window,
+    // not necessarily the primary display. Quartz window/AX coordinates are
+    // globally anchored, so resolve the primary display once and use it for
+    // both the y-axis flip and the fallback placement bounds.
+    let primary_display_id = core_graphics::display::CGMainDisplayID();
+    let primary_bounds = core_graphics::display::CGDisplay::new(primary_display_id).bounds();
+    let primary_display = LogicalRect {
+        left: primary_bounds.origin.x,
+        top: primary_bounds.origin.y,
+        width: primary_bounds.size.width,
+        height: primary_bounds.size.height,
+    };
+    let fallback_display_bounds = if primary_display.is_valid() {
+        Some(primary_display)
+    } else {
+        fallback_main_screen.is_valid().then_some(fallback_main_screen)
+    };
+    // Prefer the primary display mode's physical-pixel/point ratio so the
+    // cursor raster matches the display even when CGDisplayPixelsWide reports
+    // logical points. The key screen's AppKit scale is only a defensive
+    // fallback for a transiently unavailable mode.
+    let main_screen_scale: f64 = msg_send![main_screen, backingScaleFactor];
+    let backing_scale = if primary_display.is_valid() {
+        let scale = crate::tools::get_screen_size::get_backing_scale_optional(
+            primary_display_id,
+            primary_display.width.round() as i64,
+        )
+        .unwrap_or_else(|| normalized_backing_scale(main_screen_scale, 1.0));
+        normalized_backing_scale(scale, main_screen_scale)
+    } else {
+        normalized_backing_scale(main_screen_scale, 1.0)
+    };
     let max_fps: i64 = msg_send![main_screen, maximumFramesPerSecond];
     let frame_budget = frame_budget_for_max_fps(max_fps);
 
-    // Keep the main screen as the global top-left coordinate anchor. Raster
-    // density is selected independently per cursor from every active display.
+    // Keep global display bounds as the placement fallback. Raster density is
+    // selected independently per cursor from every active display.
     {
         let mut guard = RENDER.lock().unwrap();
         if let Some(m) = guard.as_mut() {
-            m.win_w = win_w;
-            m.win_h = win_h;
+            m.fallback_display_bounds = fallback_display_bounds;
         }
     }
 
     let mut displays = active_display_geometries(backing_scale);
     if displays.is_empty() {
-        displays.push(DisplayGeometry {
-            bounds: LogicalRect {
-                left: 0.0,
-                top: 0.0,
-                width: win_w,
-                height: win_h,
-            },
-            backing_scale,
-        });
+        if let Some(bounds) = fallback_display_bounds {
+            displays.push(DisplayGeometry { bounds, backing_scale });
+        }
     }
 
     // ---- Render thread (display-rate while animating, quiescent while idle) ----
-    let screen = ScreenGeometry {
-        origin_x: screen_frame.origin.x,
-        origin_y: screen_frame.origin.y,
-        height: win_h,
-        fallback_backing_scale: backing_scale,
-    };
+    let screen = screen_geometry_for_primary_display(
+        primary_display,
+        fallback_main_screen,
+        backing_scale,
+    );
     std::thread::spawn(move || {
         render_loop(rx, screen, displays, frame_budget);
     });
@@ -2020,8 +2092,12 @@ mod tests {
         RenderMap {
             cursors,
             last_active_key: None,
-            win_w: 100.0,
-            win_h: 100.0,
+            fallback_display_bounds: Some(LogicalRect {
+                left: 0.0,
+                top: 0.0,
+                width: 100.0,
+                height: 100.0,
+            }),
             template: CursorConfig::default(),
             ended: std::collections::HashSet::new(),
         }
@@ -2421,9 +2497,8 @@ mod tests {
     }
 
     #[test]
-    fn global_appkit_transform_preserves_left_and_above_main_coordinates() {
+    fn global_appkit_transform_does_not_reapply_key_display_origin() {
         let main = ScreenGeometry {
-            origin_x: 10.0,
             origin_y: 20.0,
             height: 900.0,
             fallback_backing_scale: 2.0,
@@ -2437,7 +2512,10 @@ mod tests {
             },
             main,
         );
-        assert_eq!(left.x, -1790.0);
+        assert_eq!(
+            left.x, -1800.0,
+            "Quartz cursor coordinates are already global; a key display origin must not be added"
+        );
         assert_eq!(left.y, 676.0);
 
         let above = appkit_frame_for_rect(
@@ -2449,10 +2527,98 @@ mod tests {
             },
             main,
         );
-        assert_eq!(above.x, 310.0);
+        assert_eq!(above.x, 300.0);
         assert_eq!(above.y, 1376.0);
         assert_eq!(above.width, 144.0);
         assert_eq!(above.height, 144.0);
+    }
+
+    #[test]
+    fn primary_display_geometry_is_stable_when_key_screen_is_external() {
+        let external_key_screen = LogicalRect {
+            left: -688.0,
+            top: 982.0,
+            width: 2560.0,
+            height: 1440.0,
+        };
+        let primary_display = LogicalRect {
+            left: 0.0,
+            top: 0.0,
+            width: 1512.0,
+            height: 982.0,
+        };
+
+        let screen = screen_geometry_for_primary_display(
+            primary_display,
+            external_key_screen,
+            2.0,
+        );
+
+        assert_eq!(screen.origin_y, 0.0);
+        assert_eq!(screen.height, 982.0);
+        assert_eq!(
+            appkit_frame_for_rect(
+                LogicalRect {
+                    left: -500.0,
+                    top: -1_200.0,
+                    width: 40.0,
+                    height: 40.0,
+                },
+                screen,
+            )
+            .x,
+            -500.0,
+            "external-display x must remain in global Quartz space"
+        );
+        assert_eq!(
+            appkit_frame_for_rect(
+                LogicalRect {
+                    left: -500.0,
+                    top: -1_200.0,
+                    width: 40.0,
+                    height: 40.0,
+                },
+                screen,
+            )
+            .y,
+            2_142.0,
+            "Quartz top-left y must flip against the primary display, not the key display"
+        );
+    }
+
+    #[test]
+    fn first_seed_stays_on_the_target_display_with_global_negative_origins() {
+        let displays = [
+            DisplayGeometry {
+                bounds: LogicalRect {
+                    left: -1920.0,
+                    top: 0.0,
+                    width: 1920.0,
+                    height: 1080.0,
+                },
+                backing_scale: 1.0,
+            },
+            DisplayGeometry {
+                bounds: LogicalRect {
+                    left: -688.0,
+                    top: -1440.0,
+                    width: 2560.0,
+                    height: 1440.0,
+                },
+                backing_scale: 2.0,
+            },
+        ];
+
+        assert_eq!(
+            seed_point_for_target(-1_700.0, 400.0, &displays, None),
+            (-1_840.0, 260.0),
+            "a first action on a left-hand display must not clamp into the primary display"
+        );
+        assert_eq!(
+            seed_point_for_target(400.0, -1_200.0, &displays, None),
+            (260.0, -1_340.0),
+            "a first action above the primary display must retain global y coordinates"
+        );
     }
 
     #[test]
@@ -2662,7 +2828,6 @@ mod tests {
             appkit_frame_for_rect(
                 rect_a,
                 ScreenGeometry {
-                    origin_x: 0.0,
                     origin_y: 0.0,
                     height: 200.0,
                     fallback_backing_scale: 2.0,
@@ -2672,7 +2837,6 @@ mod tests {
             appkit_frame_for_rect(
                 rect_b,
                 ScreenGeometry {
-                    origin_x: 0.0,
                     origin_y: 0.0,
                     height: 200.0,
                     fallback_backing_scale: 2.0,

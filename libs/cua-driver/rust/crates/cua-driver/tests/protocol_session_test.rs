@@ -6,9 +6,10 @@
 //! mac/windows pairs merge and branch only where assertions differ.
 //!
 //! Note: the originals asserted process liveness with `child.try_wait()`.
-//! `RawDriver` kills its child on drop and does not expose the handle, so the
-//! liveness check is replaced with an equivalent post-sleep request probe — a
-//! crashed process would EOF and panic inside `recv()`.
+//! `RawDriver` owns and kills its child (and exposes only its pid for window
+//! attribution), so the liveness check is replaced with an equivalent
+//! post-sleep request probe — a crashed process would EOF and panic inside
+//! `recv()`.
 
 #![cfg(any(target_os = "macos", target_os = "windows"))]
 
@@ -346,4 +347,222 @@ fn set_agent_cursor_motion_bezier_knobs() {
     let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("500") || text.contains("motion"),
         "Expected motion summary in response, got: {text}");
+}
+
+/// Exercise the real MCP → AppKit → WindowServer path on a negative-origin
+/// display. This is the behavior-level guard for the global Quartz coordinate
+/// contract: when the key screen is external, reapplying its origin moves the
+/// panel an entire monitor away. It also checks the no-input contract and that
+/// an explicit session end removes the panel from WindowServer.
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore]
+fn external_display_cursor_preserves_global_protocol_coordinates() {
+    let Some(mut driver) = RawDriver::spawn() else { return; };
+
+    driver.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {}
+    }));
+    let initialized = driver.recv();
+    assert_eq!(initialized["id"], 1);
+
+    // Discover a live negative-origin display through the public protocol. A
+    // single-display runner has no meaningful external-display assertion, so
+    // leave it as an explicit environment skip rather than inventing pixels.
+    driver.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "list_windows",
+            "arguments": { "on_screen_only": true }
+        }
+    }));
+    let listed = driver.recv();
+    assert_eq!(listed["id"], 2);
+    assert!(listed["error"].is_null());
+    assert_ne!(listed["result"]["isError"].as_bool(), Some(true));
+    let windows = listed["result"]["structuredContent"]["windows"]
+        .as_array()
+        .expect("list_windows protocol payload");
+    let target = windows
+        .iter()
+        .filter(|window| window["pid"].as_u64() != Some(driver.pid() as u64))
+        .filter(|window| window["is_on_screen"].as_bool() == Some(true))
+        .filter_map(|window| {
+            let bounds = window["bounds"].as_object()?;
+            let x = bounds.get("x")?.as_f64()?;
+            let y = bounds.get("y")?.as_f64()?;
+            let width = bounds.get("width")?.as_f64()?;
+            let height = bounds.get("height")?.as_f64()?;
+            (x < -50.0 && width > 100.0 && height > 100.0)
+                .then_some((x, y, width, height))
+        })
+        .next();
+    let Some((window_x, window_y, window_width, window_height)) = target else {
+        eprintln!(
+            "[macos-cursor] no visible negative-origin window; skipping external-display probe"
+        );
+        return;
+    };
+    let requested = (
+        window_x + window_width / 2.0,
+        window_y + window_height / 2.0,
+    );
+
+    driver.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": { "name": "get_cursor_position", "arguments": {} }
+    }));
+    let before_cursor = driver.recv();
+    assert_eq!(before_cursor["id"], 3);
+    assert!(before_cursor["error"].is_null());
+    assert_ne!(before_cursor["result"]["isError"].as_bool(), Some(true));
+    let before_x = before_cursor["result"]["structuredContent"]["x"]
+        .as_f64()
+        .expect("pre-action cursor x");
+    let before_y = before_cursor["result"]["structuredContent"]["y"]
+        .as_f64()
+        .expect("pre-action cursor y");
+
+    driver.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "move_cursor",
+            "arguments": {
+                "session": "external-display-probe",
+                "x": requested.0,
+                "y": requested.1
+            }
+        }
+    }));
+    let moved = driver.recv();
+    assert_eq!(moved["id"], 4);
+    assert!(moved["error"].is_null());
+    assert_ne!(
+        moved["result"]["isError"].as_bool(),
+        Some(true),
+        "move_cursor failed: {moved:?}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    driver.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+            "name": "list_windows",
+            "arguments": { "on_screen_only": true }
+        }
+    }));
+    let after_move = driver.recv();
+    assert_eq!(after_move["id"], 5);
+    assert!(after_move["error"].is_null());
+    assert_ne!(after_move["result"]["isError"].as_bool(), Some(true));
+    let overlay = after_move["result"]["structuredContent"]["windows"]
+        .as_array()
+        .and_then(|entries| {
+            entries.iter().find(|window| {
+                window["pid"].as_u64() == Some(driver.pid() as u64)
+                    && window["is_on_screen"].as_bool() == Some(true)
+                    && window["bounds"]["width"].as_f64().unwrap_or(0.0) >= 100.0
+                    && window["bounds"]["height"].as_f64().unwrap_or(0.0) >= 100.0
+            })
+        })
+        .expect("the source-built cursor panel must be visible on the external display");
+    let panel_x = overlay["bounds"]["x"].as_f64().expect("panel x");
+    let panel_y = overlay["bounds"]["y"].as_f64().expect("panel y");
+    let panel_width = overlay["bounds"]["width"].as_f64().expect("panel width");
+    let panel_height = overlay["bounds"]["height"].as_f64().expect("panel height");
+    let panel_center = (panel_x + panel_width / 2.0, panel_y + panel_height / 2.0);
+    assert!(
+        (panel_center.0 - requested.0).abs() <= 24.0
+            && (panel_center.1 - requested.1).abs() <= 24.0,
+        "cursor panel lost global coordinates: requested={requested:?}, panel={panel_center:?}, overlay={overlay:?}"
+    );
+
+    driver.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": { "name": "get_cursor_position", "arguments": {} }
+    }));
+    let after_cursor = driver.recv();
+    assert_eq!(after_cursor["id"], 6);
+    assert!(after_cursor["error"].is_null());
+    assert_ne!(after_cursor["result"]["isError"].as_bool(), Some(true));
+    let after_x = after_cursor["result"]["structuredContent"]["x"]
+        .as_f64()
+        .expect("post-action cursor x");
+    let after_y = after_cursor["result"]["structuredContent"]["y"]
+        .as_f64()
+        .expect("post-action cursor y");
+    assert!(
+        (after_x - before_x).abs() <= 1.0 && (after_y - before_y).abs() <= 1.0,
+        "move_cursor moved the user's real pointer: before=({before_x},{before_y}) after=({after_x},{after_y})"
+    );
+
+    driver.send(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "end_session",
+            "arguments": { "session": "external-display-probe" }
+        }
+    }));
+    let ended = driver.recv();
+    assert_eq!(ended["id"], 7);
+    assert!(ended["error"].is_null());
+    assert_ne!(
+        ended["result"]["isError"].as_bool(),
+        Some(true),
+        "end_session failed: {ended:?}"
+    );
+
+    // Closing the NSPanel is dispatched asynchronously to AppKit's main
+    // queue. Poll the public WindowServer listing for a bounded interval
+    // instead of asserting at an arbitrary frame boundary.
+    let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut request_id = 8;
+    loop {
+        driver.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": "list_windows",
+                "arguments": { "on_screen_only": true }
+            }
+        }));
+        let after_end = driver.recv();
+        assert_eq!(after_end["id"], request_id);
+        assert!(after_end["error"].is_null());
+        assert_ne!(after_end["result"]["isError"].as_bool(), Some(true));
+        let entries = after_end["result"]["structuredContent"]["windows"]
+            .as_array()
+            .expect("post-end list_windows protocol payload");
+        let leaked_panel = entries.iter().any(|window| {
+            window["pid"].as_u64() == Some(driver.pid() as u64)
+                && window["is_on_screen"].as_bool() == Some(true)
+                && window["bounds"]["width"].as_f64().unwrap_or(0.0) >= 100.0
+                && window["bounds"]["height"].as_f64().unwrap_or(0.0) >= 100.0
+        });
+        if !leaked_panel {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < cleanup_deadline,
+            "ended session left a cursor panel in WindowServer"
+        );
+        request_id += 1;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
