@@ -402,6 +402,22 @@ impl RenderStateCore {
         }
     }
 
+    /// Charge elapsed wall-clock time to idle-hide accounting without
+    /// advancing a glide, spring, or click pulse.
+    ///
+    /// The macOS renderer deliberately blocks while a fully-visible cursor is
+    /// in its idle dwell. If an unrelated command wakes that renderer, the
+    /// elapsed dwell must still be accounted for before the command is
+    /// applied; advancing the new command's motion by that same interval would
+    /// skip the beginning of its animation. Keeping this seam separate makes
+    /// that wake-up path explicit and preserves the frame-tick cap used by the
+    /// normal animation loop.
+    pub fn advance_idle_only(&mut self, dt: f64) {
+        if dt.is_finite() && dt > 0.0 {
+            self.tick_idle(dt);
+        }
+    }
+
     fn active_shape_has_center_hotspot(&self) -> bool {
         match self.shape.as_ref() {
             Some(shape) => shape.has_center_hotspot(),
@@ -534,7 +550,17 @@ impl RenderStateCore {
                 true
             }
             OverlayCommand::SetEnabled(v) => {
+                let was_visible = self.visible;
                 self.visible = v;
+                if v && (!was_visible || self.idle_alpha < 1.0) {
+                    // Re-enabling is a user-visible show operation, not just a
+                    // Window/NSPanel visibility toggle.  An idle-hidden cursor
+                    // has `idle_alpha == 0`; restore its visual state and
+                    // restart the idle deadline so `enabled=true` really
+                    // re-shows the cursor at its last position.
+                    self.idle_secs = 0.0;
+                    self.idle_alpha = 1.0;
+                }
                 true
             }
             OverlayCommand::SetMotion(m) => {
@@ -1150,6 +1176,46 @@ mod glide_duration_tests {
         assert!(
             (elapsed - 0.3).abs() < 0.05,
             "a fixed glide duration must win over speed scaling: elapsed={elapsed}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod idle_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn re_enable_restores_an_idle_hidden_cursor_at_its_last_position() {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        core.place_at(64.0, 64.0);
+        core.motion.idle_hide_ms = 1_000.0;
+
+        // Let the normal idle state machine complete its 1s dwell + 180ms
+        // fade.  This is the state reached by the production render loop
+        // before a caller asks to re-show the cursor.
+        core.tick_motion(1.20);
+        assert_eq!(core.idle_alpha, 0.0);
+        assert!(core.idle_secs > 1.0);
+
+        core.apply_command_base(OverlayCommand::SetEnabled(false), false, false);
+        core.apply_command_base(OverlayCommand::SetEnabled(true), false, false);
+
+        assert!(core.visible, "enabled=true must make the cursor visible");
+        assert_eq!(core.idle_alpha, 1.0, "re-enable must clear the idle fade");
+        assert_eq!(core.idle_secs, 0.0, "re-enable must restart idle accounting");
+        assert_eq!(core.pos, (64.0, 64.0), "re-enable must preserve position");
+
+        // A repeated enable on an already-visible cursor is idempotent and
+        // must not unexpectedly extend its next idle-hide deadline.
+        core.idle_secs = 0.25;
+        core.apply_command_base(OverlayCommand::SetEnabled(true), false, false);
+        assert_eq!(core.idle_secs, 0.25);
+
+        let mut pixmap = tiny_skia::Pixmap::new(128, 128).unwrap();
+        paint_cursor(&mut pixmap, &core, 0.0, 0.0, None, 1.0);
+        assert!(
+            pixmap.data().chunks_exact(4).any(|pixel| pixel[3] > 0),
+            "re-enabled cursor must contribute visible pixels"
         );
     }
 }

@@ -685,6 +685,20 @@ fn render_map_idle_fade_due_in(map: &RenderMap) -> Option<Duration> {
         .min()
 }
 
+/// Account for time spent blocked in `recv`/`recv_timeout` before applying a
+/// command that woke the idle renderer. Motion itself is advanced separately
+/// with a zero (or frame-capped) delta after the command, so a command from one
+/// session cannot postpone another session's idle-hide fade or jump its own
+/// newly-created glide forward by the whole sleep interval.
+fn advance_idle_for_command_wake(map: &mut RenderMap, elapsed: f64) {
+    if !elapsed.is_finite() || elapsed <= 0.0 {
+        return;
+    }
+    for state in map.cursors.values_mut() {
+        state.core.advance_idle_only(elapsed);
+    }
+}
+
 /// Static pinned panels still need an occasional target-relative order pass.
 /// AppKit can reshuffle another application's normal-level windows after the
 /// last cursor frame (activation, Space changes, sheets, or tab/window churn).
@@ -1409,6 +1423,7 @@ fn render_loop(
             pinned_bounds = window_bounds_snapshot();
             last_geometry_refresh = Some(now);
         }
+        let elapsed_since_last_tick = now.duration_since(last_tick).as_secs_f64();
         let dt = if woke_from_idle {
             // The blocking recv() above can span an arbitrarily long idle period.
             // Do not charge that time to the first animation tick after a command;
@@ -1418,9 +1433,9 @@ fn render_loop(
             // Paths/springs/clicks are absent while idle. Feeding the slept
             // wall-clock duration into tick_idle is safe and lets an idle-hide
             // fade begin even when the wake was also serving z-order upkeep.
-            now.duration_since(last_tick).as_secs_f64()
+            elapsed_since_last_tick
         } else {
-            now.duration_since(last_tick).as_secs_f64().min(0.05)
+            elapsed_since_last_tick.min(0.05)
         };
         last_tick = now;
 
@@ -1434,6 +1449,14 @@ fn render_loop(
             match guard.as_mut() {
                 Some(map) => {
                     let mut had_msg = false;
+                    if woke_from_idle {
+                        // A command woke the renderer during a fully-visible
+                        // dwell. Charge the slept wall-clock time before
+                        // applying the command; the regular tick below still
+                        // receives dt=0 so a newly-started glide does not jump
+                        // over its opening frames.
+                        advance_idle_for_command_wake(map, elapsed_since_last_tick);
+                    }
                     if let Some(msg) = first_msg {
                         had_msg = true;
                         note_command_dequeued(&msg);
@@ -2457,6 +2480,61 @@ mod tests {
         assert!(
             render_map_needs_frame_tick(&map),
             "fade in progress should resume frame ticks"
+        );
+    }
+
+    #[test]
+    fn unrelated_command_wake_does_not_postpone_idle_hide() {
+        let mut map = empty_map();
+        let key = "idle-session".to_owned();
+        seed_start_in_map(&mut map, &key, 60.0, 60.0);
+        {
+            let cursor = map.cursors.get_mut(&key).unwrap();
+            cursor.core.path = None;
+            cursor.core.spring = None;
+            cursor.core.click_t = None;
+            cursor.focus_rect = None;
+            cursor.core.visible = true;
+            cursor.core.place_at(60.0, 60.0);
+            cursor.core.motion.idle_hide_ms = 1_000.0;
+            cursor.core.idle_secs = 0.95;
+            cursor.core.idle_alpha = 1.0;
+        }
+        map.cursors
+            .get_mut("default")
+            .unwrap()
+            .core
+            .place_at(10.0, 10.0);
+
+        // This is the render-loop state after a long recv_timeout sleep: an
+        // unrelated command (here, a move for the default cursor) wakes the
+        // thread while `idle-session` is already at the fade deadline.
+        // Charge that wall-clock interval before applying the command, while
+        // keeping the command's own motion tick at dt=0.
+        advance_idle_for_command_wake(&mut map, 0.10);
+        apply_msg(&mut map, move_msg("default", 90.0, 90.0));
+        for cursor in map.cursors.values_mut() {
+            let _ = cursor.tick(0.0);
+        }
+
+        let cursor = &map.cursors[&key];
+        assert!(
+            cursor.core.idle_alpha < 1.0,
+            "an unrelated wake must still start the idle fade"
+        );
+        assert!(
+            cursor.core.idle_secs >= 1.05,
+            "idle time must include the blocked interval, got {}",
+            cursor.core.idle_secs
+        );
+        assert!(
+            map.cursors["default"].core.path.is_some()
+                && map.cursors["default"].core.dist == 0.0,
+            "the waking command must still begin its glide at t=0"
+        );
+        assert!(
+            render_map_needs_frame_tick(&map),
+            "once the deadline is crossed, the fade must re-arm frame ticks"
         );
     }
 
