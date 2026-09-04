@@ -65,6 +65,23 @@ impl ToolDef {
             "capabilities": caps,
         })
     }
+
+    /// MCP tool entry matching Codex Computer Use's public wire contract.
+    /// The native profile keeps its additive capability metadata, while this
+    /// compatibility entry deliberately contains only the built-in fields.
+    pub fn to_codex_computer_use_list_entry(&self) -> Value {
+        serde_json::json!({
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": self.input_schema,
+            "annotations": {
+                "readOnlyHint": self.read_only,
+                "destructiveHint": self.destructive,
+                "idempotentHint": self.idempotent,
+                "openWorldHint": self.open_world,
+            },
+        })
+    }
 }
 
 /// Centralised tool name → capability tokens map. Lookup is by name so
@@ -280,7 +297,165 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn def(&self) -> &ToolDef;
+
+    /// Validate everything that must be known before a targeted action may
+    /// have observable dispatch side effects (for example, fronting its app).
+    ///
+    /// The registry calls this at the embedded action choke point immediately
+    /// before the front hook and `invoke`. The default validates the advertised
+    /// input-schema subset used by driver tools; tools with semantic delivery
+    /// constraints (such as macOS foreground-only drag) extend it and return a
+    /// structured rejection here. Implementations must be side-effect free.
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        validate_dispatch_args(self.def(), args)
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult;
+}
+
+/// Validate the JSON-Schema vocabulary used by driver tool definitions at the
+/// embedded dispatch boundary. This intentionally covers only the vocabulary
+/// emitted by our hand-written schemas: object properties, required fields,
+/// primitive types, array item types/cardinality, enums, and numeric bounds.
+///
+/// MCP clients normally validate this schema themselves, but the driver cannot
+/// rely on that for focus safety: direct CLI/daemon callers can reach the
+/// registry with malformed JSON. Internal daemon metadata keys (`_...`) are
+/// ignored because they are injected after client-side schema validation.
+pub fn validate_dispatch_args(def: &ToolDef, args: &Value) -> Result<(), ToolResult> {
+    let Some(object) = args.as_object() else {
+        return Err(dispatch_validation_error(&def.name, "arguments must be an object"));
+    };
+    let schema = &def.input_schema;
+    let properties = schema.get("properties").and_then(Value::as_object);
+
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for field in required.iter().filter_map(Value::as_str) {
+            if !object.get(field).is_some_and(|value| !value.is_null()) {
+                return Err(dispatch_validation_error(
+                    &def.name,
+                    &format!("missing required field `{field}`"),
+                ));
+            }
+        }
+    }
+
+    if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
+        if let Some(properties) = properties {
+            if let Some(field) = object
+                .keys()
+                .find(|field| !field.starts_with('_') && !properties.contains_key(*field))
+            {
+                return Err(dispatch_validation_error(
+                    &def.name,
+                    &format!("unknown field `{field}`"),
+                ));
+            }
+        }
+    }
+
+    let Some(properties) = properties else {
+        return Ok(());
+    };
+    for (field, value) in object {
+        if field.starts_with('_') || value.is_null() {
+            continue;
+        }
+        let Some(field_schema) = properties.get(field) else {
+            continue;
+        };
+        validate_dispatch_value(&def.name, field, value, field_schema)?;
+    }
+    Ok(())
+}
+
+fn validate_dispatch_value(
+    tool_name: &str,
+    field: &str,
+    value: &Value,
+    schema: &Value,
+) -> Result<(), ToolResult> {
+    if let Some(expected) = schema.get("type").and_then(Value::as_str) {
+        let valid = match expected {
+            "string" => value.is_string(),
+            "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+            "number" => value.is_number(),
+            "boolean" => value.is_boolean(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            _ => true,
+        };
+        if !valid {
+            return Err(dispatch_validation_error(
+                tool_name,
+                &format!("field `{field}` must be {expected}"),
+            ));
+        }
+    }
+
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        if !allowed.contains(value) {
+            return Err(dispatch_validation_error(
+                tool_name,
+                &format!("field `{field}` has an unsupported value"),
+            ));
+        }
+    }
+
+    if let Some(number) = value.as_f64() {
+        if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64) {
+            if number < minimum {
+                return Err(dispatch_validation_error(
+                    tool_name,
+                    &format!("field `{field}` must be at least {minimum}"),
+                ));
+            }
+        }
+        if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
+            if number > maximum {
+                return Err(dispatch_validation_error(
+                    tool_name,
+                    &format!("field `{field}` must be at most {maximum}"),
+                ));
+            }
+        }
+    }
+
+    if let (Some(values), Some(item_schema)) =
+        (value.as_array(), schema.get("items"))
+    {
+        for item in values {
+            validate_dispatch_value(tool_name, field, item, item_schema)?;
+        }
+    }
+    if let Some(values) = value.as_array() {
+        if let Some(min_items) = schema.get("minItems").and_then(Value::as_u64) {
+            if values.len() < min_items as usize {
+                return Err(dispatch_validation_error(
+                    tool_name,
+                    &format!("field `{field}` must contain at least {min_items} items"),
+                ));
+            }
+        }
+        if let Some(max_items) = schema.get("maxItems").and_then(Value::as_u64) {
+            if values.len() > max_items as usize {
+                return Err(dispatch_validation_error(
+                    tool_name,
+                    &format!("field `{field}` must contain at most {max_items} items"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_validation_error(tool_name: &str, detail: &str) -> ToolResult {
+    ToolResult::error(format!("Invalid {tool_name} arguments: {detail}."))
+        .with_structured(serde_json::json!({
+            "code": "invalid_arguments",
+            "tool": tool_name,
+            "detail": detail,
+        }))
 }
 
 /// Thread-safe collection of all registered tools.
@@ -290,6 +465,18 @@ pub struct ToolRegistry {
     order: Vec<String>,
     /// Shared recording session — auto-records each non-read-only tool call.
     pub recording: Arc<RecordingSession>,
+    /// Optional embedded-host state file, enabled by CUA_DRIVER_STATE_DIR.
+    state_file: Option<crate::session_state::StateFile>,
+    /// Platform hook for resolving a human-readable target application name.
+    target_app_resolver: Option<fn(i64) -> Option<String>>,
+    /// Platform hook that brings a driven target app to the foreground so the
+    /// watching user sees the window being driven. Only invoked after the host
+    /// explicitly opts into watchable foregrounding, from the shared action
+    /// choke point, for targeted action tools.
+    /// The hook is best-effort and must never fail a tool call; it owns its own
+    /// front-once/dedupe state. Called with `(target_pid, session)`. May remain
+    /// `None` on platforms that do not support visible foregrounding.
+    target_front_hook: Option<fn(i64, Option<&str>)>,
 }
 
 impl ToolRegistry {
@@ -298,6 +485,56 @@ impl ToolRegistry {
             tools: HashMap::new(),
             order: Vec::new(),
             recording: Arc::new(RecordingSession::new()),
+            state_file: crate::session_state::StateFile::from_env(),
+            target_app_resolver: Some(crate::session_state::resolve_process_name),
+            target_front_hook: None,
+        }
+    }
+
+    pub fn set_target_app_resolver(&mut self, resolver: fn(i64) -> Option<String>) {
+        self.target_app_resolver = Some(resolver);
+    }
+
+    /// Install the platform hook that fronts a driven target in watchable mode.
+    /// See [`ToolRegistry::target_front_hook`].
+    pub fn set_target_front_hook(&mut self, hook: fn(i64, Option<&str>)) {
+        self.target_front_hook = Some(hook);
+    }
+
+    /// Installs the cmux host's in-memory key for authenticating state files.
+    pub fn set_state_authentication_key(&self, key: Vec<u8>) -> bool {
+        self.state_file
+            .as_ref()
+            .is_some_and(|state_file| state_file.set_authentication_key(key))
+    }
+
+    #[cfg(test)]
+    fn set_state_file_for_test(&mut self, state_file: crate::session_state::StateFile) {
+        self.state_file = Some(state_file);
+    }
+
+    /// Best-effort explicit cleanup for long-running servers whose entry point
+    /// exits the process before ordinary Rust destructors can run.
+    pub fn remove_state_file(&self) {
+        if let Some(state_file) = &self.state_file {
+            if let Err(error) = state_file.remove() {
+                eprintln!("[cua-driver] warning: failed to remove state file: {error}");
+            }
+        }
+        // Clean up the embedded-mode agent-cursor feed on the same shutdown
+        // paths (stdio EOF / clean exit). No-op unless the feed is enabled.
+        crate::cursor_feed::remove();
+    }
+
+    /// Best-effort cleanup for one ended daemon/proxy session.
+    pub fn remove_session_state_file(&self, session_id: &str) {
+        if let Some(state_file) = &self.state_file {
+            if let Err(error) = state_file.remove_session(session_id) {
+                eprintln!(
+                    "[cua-driver] warning: failed to remove state for session \
+                     {session_id}: {error}"
+                );
+            }
         }
     }
 
@@ -357,6 +594,17 @@ impl ToolRegistry {
         })
     }
 
+    /// Exact tools/list envelope for Codex Computer Use compatibility.
+    pub fn codex_computer_use_tools_list(&self) -> Value {
+        let tools: Vec<Value> = self
+            .order
+            .iter()
+            .filter_map(|name| self.tools.get(name))
+            .map(|tool| tool.def().to_codex_computer_use_list_entry())
+            .collect();
+        serde_json::json!({"tools": tools})
+    }
+
     /// Iterate over (name, &ToolDef) in registration order.
     pub fn iter_defs(&self) -> impl Iterator<Item = (&str, &ToolDef)> {
         self.order.iter().filter_map(move |n| {
@@ -392,11 +640,13 @@ impl ToolRegistry {
             other => other,
         };
 
+        let Some(tool) = self.tools.get(resolved_name) else {
+            return ToolResult::error(format!("Unknown tool: {name}"));
+        };
+
         // Reserve and capture the turn before dispatch so recorded evidence
         // shows the application immediately before the action changed it.
-        let should_record = self.tools.get(resolved_name)
-            .map(|tool| !tool.def().read_only)
-            .unwrap_or(false)
+        let should_record = !tool.def().read_only
             && !matches!(
                 resolved_name,
                 "start_recording" | "stop_recording" | "get_recording_state" | "replay_trajectory"
@@ -405,10 +655,111 @@ impl ToolRegistry {
             .then(|| self.recording.begin_turn(resolved_name, &args, start_ms))
             .flatten();
 
-        let result = match self.tools.get(resolved_name) {
-            Some(tool) => tool.invoke(args.clone()).await,
-            None => return ToolResult::error(format!("Unknown tool: {name}")),
-        };
+        // A rejected action must be side-effect free. In particular, explicit
+        // watchable mode must not front a target until schema + tool-specific
+        // delivery preflight has accepted the call. This is intentionally the
+        // final boundary before invoke so accepted actions remain visible.
+        if let Err(error) = preflight_and_front_target(
+            tool.as_ref(),
+            resolved_name,
+            &args,
+            crate::watchable_front_mode(),
+            self.target_front_hook,
+        ) {
+            if let Some(pending_turn) = pending_turn {
+                let result_text = error.content.iter().find_map(|content| match content {
+                    Content::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                }).unwrap_or("");
+                self.recording.finish_turn(pending_turn, result_text);
+            }
+            return error;
+        }
+
+        let result = tool.invoke(args.clone()).await;
+
+        // Embedded-host process state is action-scoped: update it only after a
+        // successful call to one of the target-driving tools, using target
+        // identity from the call arguments or (for app-named Codex calls) its
+        // structured result. State I/O is observability-only and must never
+        // turn a successful tool action into an error.
+        const STATE_ACTION_TOOLS: &[&str] = &[
+            "click",
+            "double_click",
+            "right_click",
+            "type_text",
+            "press_key",
+            "hotkey",
+            "scroll",
+            "drag",
+            "set_value",
+            "get_window_state",
+            // Codex compatibility tools address their target by app name and
+            // resolve the pid/window internally. Their successful structured
+            // result carries that resolved identity, so include them in the
+            // hosted state-write path below.
+            "get_app_state",
+            "perform_secondary_action",
+            "select_text",
+        ];
+        if result.is_error != Some(true) && STATE_ACTION_TOOLS.contains(&resolved_name) {
+            // Native tools carry the target identity in their arguments. The
+            // Codex compatibility surface carries only `app`; use the
+            // successful result's top-level or nested app identity instead.
+            // A failed tool never publishes state, and a result with no
+            // target identity remains a no-op for this observability path.
+            let structured = result.structured_content.as_ref();
+            let target_pid = args
+                .get("pid")
+                .and_then(Value::as_i64)
+                .or_else(|| {
+                    structured
+                        .and_then(|value| value.get("pid"))
+                        .and_then(Value::as_i64)
+                })
+                .or_else(|| {
+                    structured
+                        .and_then(|value| value.get("app"))
+                        .and_then(|value| value.get("pid"))
+                        .and_then(Value::as_i64)
+                });
+            let target_window = args
+                .get("window_id")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    structured
+                        .and_then(|value| value.get("window_id"))
+                        .and_then(Value::as_u64)
+                });
+            if let Some(state_file) = self
+                .state_file
+                .as_ref()
+                .filter(|_| target_pid.is_some() || target_window.is_some())
+            {
+                let target_app = target_pid
+                    .and_then(|pid| self.target_app_resolver.and_then(|resolver| resolver(pid)));
+                let mut state_args = args.clone();
+                if let Some(pid) = target_pid {
+                    state_args["pid"] = serde_json::json!(pid);
+                }
+                if let Some(window_id) = target_window {
+                    state_args["window_id"] = serde_json::json!(window_id);
+                }
+                if state_args.get("window_id").and_then(Value::as_u64).is_none() {
+                    if let (Some(pid), Some(token)) = (
+                        target_pid.and_then(|pid| i32::try_from(pid).ok()),
+                        state_args.get("element_token").and_then(Value::as_str),
+                    ) {
+                        if let Ok((window_id, _)) = crate::element_token::global().resolve(pid, token) {
+                            state_args["window_id"] = serde_json::json!(window_id);
+                        }
+                    }
+                }
+                if let Err(error) = state_file.update(&state_args, target_app) {
+                    eprintln!("[cua-driver] warning: failed to update state file: {error}");
+                }
+            }
+        }
         // Use the original name for downstream code paths below so the
         // exit-code matching and recording paths keep treating the alias
         // as a distinct call site.
@@ -451,10 +802,67 @@ impl ToolRegistry {
     }
 }
 
+/// Shared watchable-action boundary: validate first, then front exactly once.
+/// Kept separate from [`ToolRegistry::invoke`] so focus ordering can be tested
+/// without mutating the process-wide watchable-mode environment.
+fn preflight_and_front_target(
+    tool: &dyn Tool,
+    name: &str,
+    args: &Value,
+    watchable_front: bool,
+    hook: Option<fn(i64, Option<&str>)>,
+) -> Result<(), ToolResult> {
+    if !watchable_front || !action_targets_window(name, args) {
+        return Ok(());
+    }
+
+    tool.dispatch_preflight(args)?;
+    if let (Some(hook), Some(target_pid)) = (hook, args.get("pid").and_then(Value::as_i64)) {
+        let session = args
+            .get("session")
+            .and_then(Value::as_str)
+            .or_else(|| args.get("_session_id").and_then(Value::as_str));
+        hook(target_pid, session);
+    }
+    Ok(())
+}
+
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The action tools that DRIVE a specific target window (as opposed to merely
+/// inspecting it). In explicit watchable mode the driver fronts the target
+/// before these so the watching user sees the driven window.
+/// `get_window_state` is a perception tool and is fronted only when it carries
+/// an explicit `action` (it does not today — so it stays a pure read, never
+/// stealing focus on inspection). No mode fronts unless
+/// `CUA_DRIVER_WATCHABLE_FRONT=1`.
+const FRONT_ACTION_TOOLS: &[&str] = &[
+    "click",
+    "double_click",
+    "right_click",
+    "type_text",
+    "press_key",
+    "hotkey",
+    "scroll",
+    "drag",
+    "set_value",
+];
+
+/// Whether a call is a targeted drive action that should front its target in
+/// watchable mode. `get_window_state` fronts only with an explicit non-null
+/// `action` arg so ordinary perception never steals focus.
+fn action_targets_window(name: &str, args: &Value) -> bool {
+    if FRONT_ACTION_TOOLS.contains(&name) {
+        return true;
+    }
+    if name == "get_window_state" {
+        return args.get("action").map(|v| !v.is_null()).unwrap_or(false);
+    }
+    false
 }
 
 /// Build a short, human-friendly label for the PiP overlay from the
@@ -505,12 +913,354 @@ fn synthesize_action_label(tool_name: &str, args: &Value) -> String {
 }
 
 #[cfg(test)]
+mod front_gate_tests {
+    //! Which calls trigger explicit watchable fronting at the choke point.
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static FRONT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_front(_pid: i64, _session: Option<&str>) {
+        FRONT_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    struct PreflightTool {
+        def: ToolDef,
+        foreground_drag_only: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for PreflightTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+            validate_dispatch_args(self.def(), args)?;
+            if self.foreground_drag_only
+                && args.get("delivery_mode").and_then(Value::as_str) != Some("foreground")
+            {
+                return Err(ToolResult::error("background drag rejected"));
+            }
+            Ok(())
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            ToolResult::text("dispatched")
+        }
+    }
+
+    fn action_tool(name: &str, required: &[&str], foreground_drag_only: bool) -> PreflightTool {
+        PreflightTool {
+            def: ToolDef {
+                name: name.to_owned(),
+                description: "test action".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": required,
+                    "properties": {
+                        "pid": { "type": "integer" },
+                        "window_id": { "type": "integer" },
+                        "from_x": { "type": "number" },
+                        "from_y": { "type": "number" },
+                        "to_x": { "type": "number" },
+                        "to_y": { "type": "number" },
+                        "x": { "type": "number" },
+                        "y": { "type": "number" },
+                        "delivery_mode": {
+                            "type": "string",
+                            "enum": ["background", "foreground"]
+                        },
+                        "keys": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "minItems": 2
+                        },
+                    },
+                    "additionalProperties": false
+                }),
+                read_only: false,
+                destructive: true,
+                idempotent: false,
+                open_world: true,
+            },
+            foreground_drag_only,
+        }
+    }
+
+    #[test]
+    fn drive_action_tools_front() {
+        for name in [
+            "click", "double_click", "right_click", "type_text", "press_key", "hotkey", "scroll",
+            "drag", "set_value",
+        ] {
+            assert!(action_targets_window(name, &json!({"pid": 42})), "{name} should front");
+        }
+    }
+
+    #[test]
+    fn perception_and_unknown_tools_do_not_front() {
+        // get_window_state is perception: no fronting unless it carries an
+        // explicit action (it does not today).
+        assert!(!action_targets_window("get_window_state", &json!({"pid": 42})));
+        assert!(!action_targets_window("get_window_state", &json!({"pid": 42, "action": null})));
+        assert!(action_targets_window("get_window_state", &json!({"pid": 42, "action": "press"})));
+        // Read-only / non-drive tools never front.
+        assert!(!action_targets_window("list_windows", &json!({})));
+        assert!(!action_targets_window("launch_app", &json!({"bundle_id": "x"})));
+    }
+
+    #[test]
+    fn rejected_actions_never_front_and_valid_action_fronts_once() {
+        FRONT_CALLS.store(0, Ordering::SeqCst);
+        let drag = action_tool(
+            "drag",
+            &["pid", "window_id", "from_x", "from_y", "to_x", "to_y"],
+            true,
+        );
+        let click = action_tool("click", &["pid", "x", "y"], false);
+
+        for rejected in [
+            json!({
+                "pid": 42, "window_id": 9,
+                "from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4,
+                "delivery_mode": "background"
+            }),
+            json!({
+                "pid": 42,
+                "from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4,
+                "delivery_mode": "foreground"
+            }),
+            json!({
+                "pid": 42, "window_id": "not-a-window",
+                "from_x": 1, "from_y": 2, "to_x": 3, "to_y": 4,
+                "delivery_mode": "foreground"
+            }),
+        ] {
+            assert!(
+                preflight_and_front_target(&drag, "drag", &rejected, true, Some(count_front))
+                    .is_err()
+            );
+        }
+        assert!(
+            preflight_and_front_target(
+                &click,
+                "click",
+                &json!({"pid": "not-a-pid", "x": 1, "y": 2}),
+                true,
+                Some(count_front),
+            )
+            .is_err()
+        );
+        assert_eq!(FRONT_CALLS.load(Ordering::SeqCst), 0);
+
+        preflight_and_front_target(
+            &click,
+            "click",
+            &json!({"pid": 42, "x": 1, "y": 2}),
+            false,
+            Some(count_front),
+        )
+        .expect("background delivery without host opt-in should pass without fronting");
+        assert_eq!(FRONT_CALLS.load(Ordering::SeqCst), 0);
+
+        preflight_and_front_target(
+            &click,
+            "click",
+            &json!({"pid": 42, "x": 1, "y": 2}),
+            true,
+            Some(count_front),
+        )
+        .expect("valid click should pass dispatch preflight");
+        assert_eq!(FRONT_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn malformed_hotkey_below_min_items_never_fronts() {
+        static HOTKEY_FRONT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn count_hotkey_front(_pid: i64, _session: Option<&str>) {
+            HOTKEY_FRONT_CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        HOTKEY_FRONT_CALLS.store(0, Ordering::SeqCst);
+        let hotkey = action_tool("hotkey", &["pid", "keys"], false);
+        let result = preflight_and_front_target(
+            &hotkey,
+            "hotkey",
+            &json!({"pid": 42, "keys": ["cmd"]}),
+            true,
+            Some(count_hotkey_front),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(HOTKEY_FRONT_CALLS.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
 mod capability_tests {
     //! Unit tests for the per-tool `capabilities` array and the
     //! top-level `capability_version` exposed in `tools/list`.
     //! These belong in cua-driver-core because they cover the shape
     //! of the registry response — no platform code involved.
     use super::*;
+
+    struct SuccessfulTargetTool {
+        def: ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SuccessfulTargetTool {
+        fn def(&self) -> &ToolDef { &self.def }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            ToolResult::text("ok")
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_click_actions_update_embedded_process_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.set_state_file_for_test(crate::session_state::StateFile::new(
+            dir.path().to_owned(),
+            5151,
+        ));
+        registry.set_target_app_resolver(|pid| Some(format!("Target-{pid}")));
+        for name in ["click", "double_click", "right_click"] {
+            registry.register(Box::new(SuccessfulTargetTool {
+                def: dummy_def(name),
+            }));
+        }
+
+        for (index, name) in ["click", "double_click", "right_click"]
+            .into_iter()
+            .enumerate()
+        {
+            let pid = 42 + index as i64;
+            let window_id = 99 + index as u64;
+            let session = format!("embedded-{name}");
+            let target_app = format!("Target-{pid}");
+            let result = registry
+                .invoke(
+                    name,
+                    serde_json::json!({
+                        "session": session,
+                        "pid": pid,
+                        "window_id": window_id,
+                    }),
+                )
+                .await;
+            assert_ne!(result.is_error, Some(true));
+            let path = registry
+                .state_file
+                .as_ref()
+                .unwrap()
+                .path_for_session(Some(&session));
+            let state: crate::session_state::DriverProcessState =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(state.session.as_deref(), Some(session.as_str()));
+            assert_eq!(state.target_app.as_deref(), Some(target_app.as_str()));
+            assert_eq!(state.target_pid, Some(pid));
+            assert_eq!(state.target_window_id, Some(window_id));
+        }
+    }
+
+    struct StructuredTargetTool {
+        def: ToolDef,
+        result: Value,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StructuredTargetTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            ToolResult::text("ok").with_structured(self.result.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn app_named_codex_actions_update_state_from_structured_target() {
+        // Codex compatibility calls carry only an app name. The adapter's
+        // successful result exposes the resolved identity; the host state file
+        // must still receive the target so cmux can keep focus/stop controls in
+        // sync with the action.
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.set_state_file_for_test(crate::session_state::StateFile::new(
+            dir.path().to_owned(),
+            6161,
+        ));
+        registry.set_target_app_resolver(|pid| Some(format!("Target-{pid}")));
+        let structured_target = serde_json::json!({
+            "app": {
+                "name": "Calculator",
+                "bundle_id": "com.apple.calculator",
+                "pid": 4242,
+            },
+            "window_id": 777,
+        });
+        for name in [
+            "click",
+            "get_app_state",
+            "perform_secondary_action",
+            "select_text",
+            "type_text",
+        ] {
+            registry.register(Box::new(StructuredTargetTool {
+                def: dummy_def(name),
+                result: structured_target.clone(),
+            }));
+        }
+
+        for name in [
+            "click",
+            "get_app_state",
+            "perform_secondary_action",
+            "select_text",
+            "type_text",
+        ] {
+            let session = format!("codex-state-{name}");
+            let result = registry
+                .invoke(
+                    name,
+                    serde_json::json!({
+                        "session": session,
+                        "app": "Calculator",
+                    }),
+                )
+                .await;
+            assert_ne!(result.is_error, Some(true));
+            let path = registry
+                .state_file
+                .as_ref()
+                .unwrap()
+                .path_for_session(Some(&session));
+            let state: crate::session_state::DriverProcessState =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(state.session.as_deref(), Some(session.as_str()));
+            assert_eq!(state.target_app.as_deref(), Some("Target-4242"));
+            assert_eq!(state.target_pid, Some(4242));
+            assert_eq!(state.target_window_id, Some(777));
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_state_dir_never_fails_a_successful_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("plain-file");
+        std::fs::write(&not_a_dir, b"occupied").unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.set_state_file_for_test(crate::session_state::StateFile::new(not_a_dir, 5252));
+        registry.register(Box::new(SuccessfulTargetTool { def: dummy_def("click") }));
+
+        let result = registry.invoke("click", serde_json::json!({"pid": 42})).await;
+        assert_ne!(result.is_error, Some(true));
+    }
 
     /// Tools whose `default_capabilities_for` mapping must NOT be
     /// empty. Mirrors the documented vocabulary above. Lives here
