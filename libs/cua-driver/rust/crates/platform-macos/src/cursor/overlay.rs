@@ -367,8 +367,8 @@ pub fn current_motion(key: &str) -> MotionConfig {
 /// the sentinel and only `ClickPulse` snapped a static arrow, which is easy to
 /// miss. See the AX-no-glide report.
 ///
-/// No-op when the cursor is already placed or absent. The
-/// seed is clamped to the main screen frame so it never starts off-display.
+/// No-op when the cursor is already placed or absent. The seed is clamped to
+/// the containing display's global bounds so it never starts off-display.
 /// Returns true if a seed was applied (i.e. the cursor was at the sentinel and
 /// is now primed to glide).
 fn seed_start_if_sentinel(key: &CursorKey, target_x: f64, target_y: f64) -> bool {
