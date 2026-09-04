@@ -409,10 +409,16 @@ fn external_display_cursor_preserves_global_protocol_coordinates() {
         );
         return;
     };
-    let requested = (
-        window_x + window_width / 2.0,
-        window_y + window_height / 2.0,
+    // A full-screen window can span the primary display even though its left
+    // edge is on the external display. Pick a point that is demonstrably in
+    // the negative-origin portion, rather than its (possibly positive) center.
+    let negative_span = (-window_x).min((window_width - 20.0).max(1.0));
+    let requested_x = window_x + negative_span / 2.0;
+    assert!(
+        requested_x < 0.0,
+        "the selected window did not provide a negative-origin point: bounds=({window_x},{window_y},{window_width},{window_height})"
     );
+    let requested = (requested_x, window_y + window_height / 2.0);
 
     driver.send(&serde_json::json!({
         "jsonrpc": "2.0",
