@@ -1189,6 +1189,33 @@ mod glide_duration_tests {
 }
 
 #[cfg(test)]
+mod drag_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn held_cursor_stays_visible_until_release() {
+        let mut state = RenderStateCore::new(CursorConfig::default());
+        state.motion.idle_hide_ms = 100.0;
+        state.apply_command_base(
+            OverlayCommand::SnapTo { x: 120.0, y: 240.0, heading_radians: None },
+            true,
+            true,
+        );
+        state.apply_command_base(OverlayCommand::SetPressed(true), true, true);
+        for _ in 0..120 {
+            state.tick_swift_constants(1.0 / 60.0);
+        }
+        assert_eq!(state.idle_alpha, 1.0, "a held drag must not idle-hide");
+
+        state.apply_command_base(OverlayCommand::SetPressed(false), true, true);
+        for _ in 0..120 {
+            state.tick_swift_constants(1.0 / 60.0);
+        }
+        assert_eq!(state.idle_alpha, 0.0, "release restores ordinary idle hiding");
+    }
+}
+
+#[cfg(test)]
 mod hotspot_shape_tests {
     use super::*;
     use crate::{BuiltinShape, CursorConfig};
