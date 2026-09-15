@@ -98,6 +98,7 @@ fn default_session_id_from_env(value: Option<&str>, pid: u32) -> String {
 pub mod capture_mode;
 pub mod cdp;
 pub mod cursor_feed;
+mod cursor_feed_writer;
 pub mod element_cache;
 pub mod element_token;
 pub mod ffmpeg_install;

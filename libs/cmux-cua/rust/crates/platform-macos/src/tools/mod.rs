@@ -10,6 +10,7 @@ mod click;
 mod double_click;
 mod right_click;
 mod drag;
+mod drag_cursor;
 mod type_text;
 mod press_key;
 mod hotkey;

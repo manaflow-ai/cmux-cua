@@ -770,20 +770,14 @@ pub async fn animate_cursor_for_action(
     }
 }
 
-async fn animate_cursor_to_with_timing(
-    key: CursorKey,
-    x: f64,
-    y: f64,
-    close_enough: bool,
-) {
+/// Publish an actual cursor position while preserving session visibility.
+pub(crate) fn publish_cursor_position(key: &str, x: f64, y: f64, coalesced: bool) {
     // Empty key is the explicit no-cursor sentinel → nothing to animate.
     if key.is_empty() {
         return;
     }
-    // Embedded-mode cursor feed: the in-process overlay renders nothing for a
-    // CLI-grandchild driver, so emit the destination (already GLOBAL screen
-    // coords, top-left origin) to `<state_dir>/<pid>.cursor.json` for the cmux
-    // host to render. Best-effort, no-op unless embedded + STATE_DIR is set.
+    // The optional file feed mirrors the native overlay in global, top-left
+    // screen coordinates. Best-effort, no-op unless STATE_DIR is set.
     //
     // Gate the feed on the cursor's enabled + not-ended state: after
     // set_agent_cursor_enabled(false) or once a session has ended, the driver
@@ -793,15 +787,33 @@ async fn animate_cursor_to_with_timing(
         let guard = RENDER.lock().unwrap();
         guard
             .as_ref()
-            .and_then(|m| m.cursors.get(&key))
+            .and_then(|m| m.cursors.get(key))
             .map(|rs| rs.core.cfg.enabled && rs.core.visible)
             .unwrap_or(true)
     };
-    if cursor_enabled && !cmux_cua_core::session::is_session_ended(&key) {
-        cmux_cua_core::cursor_feed::emit_move(Some(&key), x, y);
+    if cursor_enabled && !cmux_cua_core::session::is_session_ended(key) {
+        if coalesced {
+            cmux_cua_core::cursor_feed::emit_move_coalesced(Some(key), x, y);
+        } else {
+            cmux_cua_core::cursor_feed::emit_move(Some(key), x, y);
+        }
+    } else if coalesced {
+        cmux_cua_core::cursor_feed::emit_hidden_if_owned_coalesced(key);
     } else {
-        cmux_cua_core::cursor_feed::emit_hidden_if_owned(&key);
+        cmux_cua_core::cursor_feed::emit_hidden_if_owned(key);
     }
+}
+
+async fn animate_cursor_to_with_timing(
+    key: CursorKey,
+    x: f64,
+    y: f64,
+    close_enough: bool,
+) {
+    if key.is_empty() {
+        return;
+    }
+    publish_cursor_position(&key, x, y, false);
     // Seed a sentinel cursor on-screen so the MoveTo below glides instead of
     // being short-circuited. After this the cursor is explicitly placed, so
     // the should-animate check passes on the first action just like later ones.
@@ -1007,6 +1019,7 @@ impl RenderState {
     /// needed unless a command arrives first.
     fn idle_fade_due_in(&self) -> Option<Duration> {
         if self.active_animation_or_focus()
+            || self.core.pressed
             || self.core.motion.idle_hide_ms <= 0.0
             || !self.visible_on_screen()
             || self.core.idle_alpha < 1.0
@@ -2481,6 +2494,21 @@ fn pixmap_to_cgimage(pixmap: &tiny_skia::Pixmap) -> Option<usize> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn held_cursor_waits_for_input_without_idle_polling() {
+        let mut state = RenderState::new(CursorConfig::default());
+        state.core.motion.idle_hide_ms = 100.0;
+        state.apply_command(OverlayCommand::SnapTo {
+            x: 120.0, y: 240.0, heading_radians: None,
+        });
+        state.apply_command(OverlayCommand::SetPressed(true));
+        assert!(!state.needs_frame_tick());
+        assert!(state.idle_fade_due_in().is_none());
+
+        state.apply_command(OverlayCommand::SetPressed(false));
+        assert!(state.idle_fade_due_in().is_some());
+    }
 
     #[test]
     fn negative_x_cursor_is_not_the_unplaced_sentinel() {

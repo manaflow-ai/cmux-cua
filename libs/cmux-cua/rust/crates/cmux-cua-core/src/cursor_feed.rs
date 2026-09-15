@@ -289,9 +289,16 @@ impl Drop for CursorFeed {
 // platform cursor path emits through the free functions below so it never has
 // to thread a handle through every tool.
 
-fn global() -> Option<&'static CursorFeed> {
-    static FEED: OnceLock<Option<CursorFeed>> = OnceLock::new();
-    FEED.get_or_init(CursorFeed::from_env).as_ref()
+fn global() -> Option<&'static crate::cursor_feed_writer::CursorFeedWriter> {
+    use crate::cursor_feed_writer::CursorFeedWriter;
+    static FEED: OnceLock<Option<CursorFeedWriter>> = OnceLock::new();
+    FEED.get_or_init(|| {
+        let feed = CursorFeed::from_env()?;
+        Some(CursorFeedWriter::new(move |snapshot| match snapshot {
+            Some(state) => feed.write_state(state.session.as_deref(), state.visible, state.x, state.y),
+            None => feed.remove(),
+        }))
+    }).as_ref()
 }
 
 /// Best-effort emit of a cursor move at GLOBAL screen coordinates. No-op when
@@ -299,9 +306,22 @@ fn global() -> Option<&'static CursorFeed> {
 /// call — a write error is logged to stderr only.
 pub fn emit_move(session: Option<&str>, x: f64, y: f64) {
     if let Some(feed) = global() {
-        if let Err(error) = feed.update(session, x, y) {
-            eprintln!("[cmux-cua] warning: failed to update cursor feed: {error}");
-        }
+        feed.update(session, x, y, true);
+    }
+}
+
+/// Queue the latest input sample without waiting for filesystem persistence.
+/// The single writer coalesces superseded samples and retains the final one.
+pub fn emit_move_coalesced(session: Option<&str>, x: f64, y: f64) {
+    if let Some(feed) = global() {
+        feed.update(session, x, y, false);
+    }
+}
+
+/// Wait for queued feed changes only after native input has released capture.
+pub fn flush() {
+    if let Some(feed) = global() {
+        feed.flush();
     }
 }
 
@@ -310,9 +330,7 @@ pub fn emit_move(session: Option<&str>, x: f64, y: f64) {
 /// is disabled.
 pub fn emit_hidden() {
     if let Some(feed) = global() {
-        if let Err(error) = feed.hide() {
-            eprintln!("[cmux-cua] warning: failed to hide cursor feed: {error}");
-        }
+        feed.visibility(None, false, true);
     }
 }
 
@@ -321,9 +339,14 @@ pub fn emit_hidden() {
 /// different session's active feed.
 pub fn emit_hidden_if_owned(session: &str) {
     if let Some(feed) = global() {
-        if let Err(error) = feed.hide_if_owned(session) {
-            eprintln!("[cmux-cua] warning: failed to hide owned cursor feed: {error}");
-        }
+        feed.visibility(Some(session), false, true);
+    }
+}
+
+/// Hide a disabled/ended input cursor without stalling the native event stream.
+pub fn emit_hidden_if_owned_coalesced(session: &str) {
+    if let Some(feed) = global() {
+        feed.visibility(Some(session), false, false);
     }
 }
 
@@ -332,9 +355,7 @@ pub fn emit_hidden_if_owned(session: &str) {
 /// at its prior position without allowing one session to reveal another's feed.
 pub fn emit_visible_if_owned(session: &str) {
     if let Some(feed) = global() {
-        if let Err(error) = feed.show_if_owned(session) {
-            eprintln!("[cmux-cua] warning: failed to show owned cursor feed: {error}");
-        }
+        feed.visibility(Some(session), true, true);
     }
 }
 
@@ -342,9 +363,7 @@ pub fn emit_visible_if_owned(session: &str) {
 /// the feed is disabled or the file is already gone.
 pub fn remove() {
     if let Some(feed) = global() {
-        if let Err(error) = feed.remove() {
-            eprintln!("[cmux-cua] warning: failed to remove cursor feed file: {error}");
-        }
+        feed.remove();
     }
 }
 

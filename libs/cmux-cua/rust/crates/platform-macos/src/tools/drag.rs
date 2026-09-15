@@ -287,6 +287,7 @@ impl Tool for DragTool {
 
         // Dispatch blocking drag synthesis.
         let mods_owned = modifiers.clone();
+        let drag_cursor = super::drag_cursor::DragCursor::new(self.state.cursor_registry.clone(), &args);
         let fg = delivery_mode.is_foreground() && window_id.is_some();
         let gate = dispatch_gate.clone();
         let result = focus_guard::with_focus_suppressed(
@@ -321,6 +322,7 @@ impl Tool for DragTool {
                                 &m,
                                 button,
                                 &action_gate,
+                                |event| drag_cursor.observe(event),
                             );
                         }
                         crate::input::mouse::drag_at_xy_guarded(
@@ -367,14 +369,9 @@ impl Tool for DragTool {
 
         let changes = snapshot.detect_async_for_args(&args).await;
 
-        // Animate cursor to end position.
-        crate::cursor::overlay::animate_cursor_for_action(
-            cursor_key.clone(),
-            to_sx,
-            to_sy,
-            &args,
-        )
-        .await;
+        // The posted release event placed the cursor at its actual endpoint.
+        // In particular, a failed gesture must not animate toward an unposted
+        // destination after the native worker's cleanup has completed.
         if let Some(wid) = window_id {
             crate::cursor::overlay::send_command(
                 cursor_key.clone(),

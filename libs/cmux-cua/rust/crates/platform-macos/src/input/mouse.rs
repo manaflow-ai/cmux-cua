@@ -799,6 +799,7 @@ pub fn drag_at_xy_foreground(
         modifiers,
         button,
         &NativeDispatchGate::default(),
+        |_| {},
     )
 }
 
@@ -813,6 +814,7 @@ pub(crate) fn drag_at_xy_foreground_guarded(
     modifiers: &[&str],
     button: DragButton,
     gate: &NativeDispatchGate,
+    observe_posted_event: impl Fn(&CGEvent),
 ) -> anyhow::Result<()> {
     use core_graphics::display::CGDisplay;
     use core_graphics::event::CGEventTapLocation;
@@ -847,7 +849,12 @@ pub(crate) fn drag_at_xy_foreground_guarded(
         duration_ms
     };
 
-    let post = |event: &CGEvent| event.post(CGEventTapLocation::HID);
+    // Observe the exact event after posting, including the unconditional
+    // cleanup release. Cursor motion must share the input stream's timing.
+    let post = |event: &CGEvent| {
+        event.post(CGEventTapLocation::HID);
+        observe_posted_event(event);
+    };
 
     // Keep WindowServer's hardware cursor and event stream coupled. AppKit
     // hit-tests some pointer-capture surfaces against the actual cursor even
@@ -894,7 +901,7 @@ pub(crate) fn drag_at_xy_foreground_guarded(
     }
     down.set_integer_value_field(core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE, 1);
     gate.check()?;
-    down.post(CGEventTapLocation::HID);
+    post(&down);
     std::thread::sleep(std::time::Duration::from_millis(16));
 
     for i in 1..=steps {
