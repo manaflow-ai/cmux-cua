@@ -771,7 +771,7 @@ pub async fn animate_cursor_for_action(
 }
 
 /// Publish an actual cursor position while preserving session visibility.
-pub(crate) fn publish_cursor_position(key: &str, x: f64, y: f64) {
+pub(crate) fn publish_cursor_position(key: &str, x: f64, y: f64, coalesced: bool) {
     // Empty key is the explicit no-cursor sentinel → nothing to animate.
     if key.is_empty() {
         return;
@@ -792,7 +792,13 @@ pub(crate) fn publish_cursor_position(key: &str, x: f64, y: f64) {
             .unwrap_or(true)
     };
     if cursor_enabled && !cmux_cua_core::session::is_session_ended(key) {
-        cmux_cua_core::cursor_feed::emit_move(Some(key), x, y);
+        if coalesced {
+            cmux_cua_core::cursor_feed::emit_move_coalesced(Some(key), x, y);
+        } else {
+            cmux_cua_core::cursor_feed::emit_move(Some(key), x, y);
+        }
+    } else if coalesced {
+        cmux_cua_core::cursor_feed::emit_hidden_if_owned_coalesced(key);
     } else {
         cmux_cua_core::cursor_feed::emit_hidden_if_owned(key);
     }
@@ -807,7 +813,7 @@ async fn animate_cursor_to_with_timing(
     if key.is_empty() {
         return;
     }
-    publish_cursor_position(&key, x, y);
+    publish_cursor_position(&key, x, y, false);
     // Seed a sentinel cursor on-screen so the MoveTo below glides instead of
     // being short-circuited. After this the cursor is explicitly placed, so
     // the should-animate check passes on the first action just like later ones.

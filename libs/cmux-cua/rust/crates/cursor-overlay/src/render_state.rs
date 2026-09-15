@@ -447,6 +447,11 @@ impl RenderStateCore {
         }
     }
 
+    fn action_position(&self, x: f64, y: f64, heading: f64) -> (f64, f64) {
+        let offset = self.click_offset_points();
+        (x + heading.cos() * offset, y + heading.sin() * offset)
+    }
+
     /// Handle the OverlayCommand variants that are identical across all
     /// three platforms.  Returns `true` if the command was consumed; `false`
     /// for variants the platform must handle itself (e.g. macOS's
@@ -480,10 +485,8 @@ impl RenderStateCore {
                 // `moveTo(point:endAngleRadians:)` for legacy shapes:
                 //   tx = clickPoint.x + cos(endAngle) * clickOffset
                 //   ty = clickPoint.y + sin(endAngle) * clickOffset
-                let click_offset = self.click_offset_points();
                 let turn_radius = self.motion.turn_radius;
-                let tx = x + end_heading_radians.cos() * click_offset;
-                let ty = y + end_heading_radians.sin() * click_offset;
+                let (tx, ty) = self.action_position(x, y, end_heading_radians);
 
                 // macOS-only: if the cursor is still at the initial off-screen
                 // sentinel, snap it to the offset target so the path starts on-screen.
@@ -533,6 +536,16 @@ impl RenderStateCore {
                 self.idle_secs = 0.0;
                 self.idle_alpha = 1.0;
                 true
+            }
+            OverlayCommand::DragTo { x, y, pressed } => {
+                let heading = std::f64::consts::FRAC_PI_4;
+                let (x, y) = self.action_position(x, y, heading);
+                self.pressed = pressed;
+                self.apply_command_base(
+                    OverlayCommand::SnapTo { x, y, heading_radians: Some(heading) },
+                    move_to_snap_sentinel,
+                    click_pulse_sentinel_only,
+                )
             }
             OverlayCommand::ClickPulse { x, y } => {
                 if click_pulse_sentinel_only {
@@ -1191,6 +1204,24 @@ mod glide_duration_tests {
 #[cfg(test)]
 mod drag_visibility_tests {
     use super::*;
+
+    #[test]
+    fn drag_samples_preserve_each_builtin_hotspot_and_stop_at_release() {
+        for shape in [crate::BuiltinShape::Arrow, crate::BuiltinShape::Teardrop, crate::BuiltinShape::Sky, crate::BuiltinShape::Cmux] {
+            let mut cfg = CursorConfig::default();
+            cfg.builtin_shape = shape;
+            let mut state = RenderStateCore::new(cfg);
+            let offset = if matches!(shape, crate::BuiltinShape::Sky | crate::BuiltinShape::Cmux) { 0.0 } else { 16.0 / 2.0_f64.sqrt() };
+            for (x, y, pressed) in [(-420.0, 100.0, true), (-400.0, 150.0, true), (-380.0, 200.0, false)] {
+                state.apply_command_base(OverlayCommand::DragTo { x, y, pressed }, true, true);
+                for _ in 0..10 { state.tick_swift_constants(1.0 / 60.0); }
+                assert!((state.pos.0 - x - offset).abs() < 0.001);
+                assert!((state.pos.1 - y - offset).abs() < 0.001);
+                assert_eq!(state.pressed, pressed);
+                assert!(state.path.is_none() && state.spring.is_none());
+            }
+        }
+    }
 
     #[test]
     fn held_cursor_stays_visible_until_release() {

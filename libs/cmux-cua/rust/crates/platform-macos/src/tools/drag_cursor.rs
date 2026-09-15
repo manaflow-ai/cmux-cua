@@ -51,16 +51,22 @@ impl DragCursor {
         // Samples already carry the real gesture pacing. Snapping each sample
         // avoids trailing the divider or continuing toward an unposted target
         // after cancellation. The renderer retains its click-through ordering.
-        crate::cursor::overlay::publish_cursor_position(&self.key, point.x, point.y);
         crate::cursor::overlay::send_command(
             self.key.clone(),
-            OverlayCommand::SnapTo {
+            OverlayCommand::DragTo {
                 x: point.x,
                 y: point.y,
-                heading_radians: None,
+                pressed,
             },
         );
-        crate::cursor::overlay::send_command(self.key.clone(), OverlayCommand::SetPressed(pressed));
+        crate::cursor::overlay::publish_cursor_position(&self.key, point.x, point.y, true);
         self.registry.update_position(&self.key, point.x, point.y);
+        if matches!(
+            event.get_type(),
+            CGEventType::LeftMouseUp | CGEventType::RightMouseUp | CGEventType::OtherMouseUp
+        ) {
+            // This barrier runs only after native capture has been released.
+            cmux_cua_core::cursor_feed::flush();
+        }
     }
 }
