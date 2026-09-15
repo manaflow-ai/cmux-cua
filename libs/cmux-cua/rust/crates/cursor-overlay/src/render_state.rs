@@ -409,7 +409,7 @@ impl RenderStateCore {
     fn tick_idle(&mut self, dt: f64) {
         let idle_hide_ms = self.motion.idle_hide_ms;
         if idle_hide_ms > 0.0 {
-            let moving = self.path.is_some() || self.spring.is_some() || self.click_t.is_some();
+            let moving = self.pressed || self.path.is_some() || self.spring.is_some() || self.click_t.is_some();
             if moving {
                 self.idle_secs = 0.0;
                 self.idle_alpha = 1.0;
