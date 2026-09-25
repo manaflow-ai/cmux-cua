@@ -41,53 +41,10 @@ fn emit_sdk_framework_search_path() {
 }
 
 fn emit_swift_runtime_link_args() {
-    use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
-
+    // The Swift runtime shipped by macOS is the only runtime search root that
+    // belongs in a redistributable binary. xcode-select/xcrun also expose the
+    // build machine's toolchain directories, but embedding those absolute
+    // paths makes a quarantined bundle fail Gatekeeper on machines that do not
+    // have that exact Xcode installation (and is rejected by syspolicy_check).
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
-
-    let mut dirs = BTreeSet::new();
-
-    if let Ok(out) = std::process::Command::new("xcode-select")
-        .arg("-p")
-        .output()
-    {
-        if out.status.success() {
-            let xcode_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let developer_dir = PathBuf::from(xcode_path);
-            for sub in [
-                "Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx",
-                "Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.5/macosx",
-                "Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-6.2/macosx",
-                "usr/lib/swift/macosx",
-                "usr/lib/swift-5.5/macosx",
-                "usr/lib/swift-6.2/macosx",
-            ] {
-                dirs.insert(developer_dir.join(sub));
-            }
-        }
-    }
-
-    if let Ok(out) = Command::new("xcrun").args(["--find", "swiftc"]).output() {
-        if out.status.success() {
-            let swiftc = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-            if let Some(usr_dir) = swiftc.parent().and_then(Path::parent) {
-                for sub in [
-                    "lib/swift/macosx",
-                    "lib/swift-5.5/macosx",
-                    "lib/swift-6.2/macosx",
-                ] {
-                    dirs.insert(usr_dir.join(sub));
-                }
-            }
-        }
-    }
-
-    for dir in dirs {
-        if dir.is_dir() {
-            println!("cargo:rustc-link-search=native={}", dir.display());
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
-        }
-    }
 }
