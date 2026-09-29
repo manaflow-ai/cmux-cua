@@ -29,6 +29,12 @@ fn def() -> &'static ToolDef {
              shared instance. Without it, single-instance apps (Calculator, many utilities) hand \
              every caller the same window, so two sessions fight over it.\n\n\
              Optional `additional_arguments`: extra argv strings appended after --args.\n\n\
+             Optional `display`: where to put windows this call opens, overriding the \
+             `launch_display` config (default [\"secondary\"]: move to the first non-main \
+             display when more than one is attached, else leave in place). A selector or \
+             ordered list: none|off, main|primary, secondary, index:N, id:N, uuid:X. Only \
+             windows that did not exist before the call are moved, so an already-open \
+             user window is never relocated. The response reports the move as `placement`.\n\n\
              Returns the launched app's pid, bundle_id, name, and a `windows` array \
              (same shape as `list_windows`) so callers can skip an extra round-trip before \
              `get_window_state(pid, window_id)`. When the focus-steal belt-and-braces \
@@ -68,6 +74,11 @@ fn def() -> &'static ToolDef {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Extra arguments appended after --args when launching."
+                },
+                "display": {
+                    "type": ["string", "array"],
+                    "items": { "type": "string" },
+                    "description": "Display for windows this call opens; overrides the launch_display config. Selector or ordered preference list: none|off, main|primary, secondary, index:N, id:N, uuid:X. See get_screen_size `displays`."
                 }
             },
             "additionalProperties": false
@@ -92,6 +103,24 @@ impl Tool for LaunchAppTool {
         let webkit_inspector_port = args.opt_u64("webkit_inspector_port").map(|v| v as u16);
         let creates_new_instance = args.bool_or("creates_new_application_instance", false);
         let mut additional_arguments: Vec<String> = args.str_array("additional_arguments");
+        let display_policy = match args.get("display") {
+            Some(raw) => match cmux_cua_core::display_placement::DisplayPolicy::from_json(raw) {
+                Ok(p) => p,
+                Err(e) => return ToolResult::error(format!("`display`: {e}")),
+            },
+            // Read fresh like get_desktop_state: `cmux-cua config set` may
+            // have written the file from another process.
+            None => super::load_driver_config().launch_display,
+        };
+        // Windows that exist before the launch are never moved: they may be
+        // the user's own windows of an already-running app.
+        let preexisting_windows: std::collections::HashSet<u32> =
+            crate::windows::all_windows().into_iter().map(|w| w.window_id).collect();
+        let preexisting_pids: std::collections::HashSet<i32> =
+            crate::apps::list_running_apps().into_iter().map(|a| a.pid).collect();
+        // Re-launching a running app without open targets usually creates no
+        // window, so placement should not wait for one.
+        let expects_new_window = !urls.is_empty();
 
         if bundle_id.is_none() && name.is_none() {
             return ToolResult::error(
@@ -434,8 +463,31 @@ impl Tool for LaunchAppTool {
             }
         }
 
+        // Display placement runs after the activation window so windows that
+        // appear late (Calculator's shows ~1s after launch) are still new
+        // windows we can see and move.
+        let launch_result = match launch_result {
+            Ok(Ok((pid, app_info, mut windows))) => {
+                let wait = if preexisting_pids.contains(&pid) && !expects_new_window {
+                    std::time::Duration::ZERO
+                } else {
+                    crate::displays::PLACEMENT_WINDOW_WAIT
+                };
+                let placed = tokio::task::spawn_blocking(move || {
+                    let p = crate::displays::place_new_windows(pid, &mut windows, &preexisting_windows, &display_policy, wait);
+                    (windows, p)
+                }).await;
+                match placed {
+                    Ok((windows, p)) => Ok(Ok((pid, app_info, windows, p))),
+                    Err(e) => Err(e),
+                }
+            }
+            Ok(Err(e)) => Ok(Err(e)),
+            Err(e) => Err(e),
+        };
+
         match launch_result {
-            Ok(Ok((pid, app_info, windows))) => {
+            Ok(Ok((pid, app_info, windows, display_placement))) => {
                 let app_name = app_info.as_ref().map(|a| a.name.as_str()).unwrap_or("?");
                 let bid = app_info.as_ref().and_then(|a| a.bundle_id.as_deref()).unwrap_or("?");
 
@@ -484,6 +536,16 @@ impl Tool for LaunchAppTool {
                     structured["self_activation_suppressed"] =
                         serde_json::Value::Bool(suppressed);
                 }
+                if let Some(p) = display_placement {
+                    let moved = p["moved"].as_array().map_or(0, Vec::len);
+                    if moved > 0 {
+                        summary.push_str(&format!(
+                            "\nMoved {moved} new window(s) to display {}.",
+                            p["display_id"]
+                        ));
+                    }
+                    structured["placement"] = p;
+                }
                 ToolResult::text(summary).with_structured(structured)
             }
             Ok(Err(e)) => ToolResult::error(format!("Launch failed: {e}")),
@@ -507,11 +569,7 @@ fn suppresses_activation(watchable_front: bool) -> bool {
 /// LaunchServices → WindowServer latency (mirrors the Swift reference).
 fn resolve_windows_for_pid(pid: i32) -> Vec<crate::windows::WindowInfo> {
     for attempt in 0..5 {
-        let found: Vec<_> = crate::windows::all_windows()
-            .into_iter()
-            .filter(|w| w.pid == pid && w.layer == 0)
-            .filter(|w| w.bounds.width > 1.0 && w.bounds.height > 1.0)
-            .collect();
+        let found = crate::displays::current_windows_for_pid(pid);
         if !found.is_empty() {
             return found;
         }
