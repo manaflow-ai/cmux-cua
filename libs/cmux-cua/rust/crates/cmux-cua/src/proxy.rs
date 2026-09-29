@@ -273,6 +273,8 @@ pub async fn run_proxy(
         }
         debug!(raw = trimmed, "→ proxy request");
 
+        let mut journal_call: Option<(String, Option<serde_json::Value>, std::time::Instant)> =
+            None;
         let response = match serde_json::from_str::<Request>(trimmed) {
             Err(e) => {
                 error!("JSON parse error: {e}");
@@ -284,6 +286,10 @@ pub async fn run_proxy(
             }
             Ok(req) => {
                 let id = req.id.clone().unwrap_or(serde_json::Value::Null);
+                journal_call = (req.method == "tools/call" && crate::journal::enabled())
+                    .then(|| req.tool_call().ok())
+                    .flatten()
+                    .map(|call| (call.name, Some(call.args), std::time::Instant::now()));
                 if req.method == "initialize" {
                     client_supports_elicitation = supports_elicitation(&req);
                 }
@@ -409,6 +415,19 @@ pub async fn run_proxy(
                 platform_response
             }
         };
+
+        if let Some((tool, args, started)) = journal_call {
+            if let Ok(value) = serde_json::to_value(&response) {
+                crate::journal::record_tool_call(
+                    &tool,
+                    args.as_ref(),
+                    &session_id,
+                    &format!("{expected_profile:?}"),
+                    started.elapsed(),
+                    &value,
+                );
+            }
+        }
 
         let serialized = serde_json::to_string(&response).unwrap_or_else(|e| {
             format!(
@@ -1721,17 +1740,22 @@ async fn wait_for_daemon_permission_readiness(
     external_permission_flow: bool,
 ) -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
-    let deadline = Instant::now() + Duration::from_secs(55);
+    let started = Instant::now();
+    // While a TCC grant is missing the user may be granting it right now, so
+    // waiting is useful. When both grants are present and only the host's
+    // readiness milestone is missing, waiting does not help: the host must
+    // republish it, which needs a user action. Fail fast in that case.
+    let grants_deadline = Duration::from_secs(55);
+    let host_only_deadline = Duration::from_secs(6);
+    let mut last: Option<(bool, bool, Option<bool>)> = None;
     loop {
-        if Instant::now() >= deadline {
-            if external_permission_flow {
-                anyhow::bail!(
-                    "Computer Use onboarding is still in progress. Finish setup in cmux, then retry."
-                );
-            }
-            anyhow::bail!(
-                "Computer Use permissions are not ready. Finish granting Accessibility and Screen Recording, then retry."
-            );
+        let elapsed = started.elapsed();
+        let host_only_missing =
+            matches!(last, Some((true, true, host)) if host != Some(true));
+        if elapsed >= grants_deadline || (host_only_missing && elapsed >= host_only_deadline) {
+            let message = permission_readiness_failure(last, external_permission_flow);
+            crate::journal::record_event("permission_gate_refused", &message);
+            anyhow::bail!(message);
         }
         let sp = socket_path.to_owned();
         let sid = session_id.to_owned();
@@ -1747,6 +1771,7 @@ async fn wait_for_daemon_permission_readiness(
         .await;
         if let Ok(Ok(resp)) = probe {
             if let Some(result) = resp.result.as_ref() {
+                last = extract_permission_readiness(result);
                 if daemon_permission_readiness(result, external_permission_flow) {
                     debug!(
                         external_permission_flow = external_permission_flow,
@@ -1757,6 +1782,43 @@ async fn wait_for_daemon_permission_readiness(
             }
         }
         tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+}
+
+/// Name exactly which precondition is missing so the agent (and the journal)
+/// can tell a missing TCC grant from a host that has not republished readiness.
+#[cfg(target_os = "macos")]
+fn permission_readiness_failure(
+    last: Option<(bool, bool, Option<bool>)>,
+    external_permission_flow: bool,
+) -> String {
+    match last {
+        None => "Computer Use permissions are not ready: the cmux Computer Use helper did not \
+                 answer a permission status request. Open cmux Settings > Computer Use."
+            .to_owned(),
+        Some((accessibility, screen_recording, _)) if !accessibility || !screen_recording => {
+            let mut missing = Vec::new();
+            if !accessibility {
+                missing.push("Accessibility");
+            }
+            if !screen_recording {
+                missing.push("Screen Recording");
+            }
+            format!(
+                "Computer Use permissions are not ready: {} not granted to cmux Computer Use. \
+                 Grant it in System Settings > Privacy & Security, or open cmux Settings > \
+                 Computer Use, then retry.",
+                missing.join(" and ")
+            )
+        }
+        Some(_) if external_permission_flow => "Computer Use onboarding is still in progress: \
+             Accessibility and Screen Recording are granted, but cmux has not marked setup \
+             complete for this helper. Open cmux Settings > Computer Use and turn Computer Use \
+             off and on to finish setup, then retry. This needs a person; do not retry in a loop."
+            .to_owned(),
+        Some(_) => "Computer Use permissions are not ready. Finish granting Accessibility and \
+                    Screen Recording, then retry."
+            .to_owned(),
     }
 }
 
@@ -1823,11 +1885,13 @@ async fn handle_proxy_request(
     match req.method.as_str() {
         "initialize" => Response::ok(
             id,
-            if expected_profile == DaemonProfile::CodexComputerUseCompat {
-                codex_computer_use_initialize_result()
-            } else {
-                initialize_result()
-            },
+            crate::journal::with_complaint_instructions(
+                if expected_profile == DaemonProfile::CodexComputerUseCompat {
+                    codex_computer_use_initialize_result()
+                } else {
+                    initialize_result()
+                },
+            ),
         ),
 
         "tools/list" => Response::ok(id, cached_tools_list.clone()),
