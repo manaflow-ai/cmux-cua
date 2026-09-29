@@ -99,6 +99,7 @@ pub mod capture_mode;
 pub mod cdp;
 pub mod cursor_feed;
 mod cursor_feed_writer;
+pub mod display_placement;
 pub mod element_cache;
 pub mod element_token;
 pub mod ffmpeg_install;

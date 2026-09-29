@@ -12,6 +12,8 @@ fn def() -> &'static ToolDef {
         name: "get_screen_size".into(),
         description: "Return the logical size of the main display in points plus its backing \
             scale factor. Agents click in points; Retina displays have scale_factor 2.0. \
+            Structured output also lists every active display as `displays` (id, uuid, \
+            bounds, is_main, index) in the order `launch_display` selectors use. \
             Requires no TCC permissions.".into(),
         input_schema: serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
         read_only: true,
@@ -32,11 +34,27 @@ impl Tool for GetScreenSizeTool {
                 ToolResult::text(format!("✅ Main display: {w}x{h} points @ {scale}x"))
                     .with_structured(serde_json::json!({
                         "width": w, "height": h, "scale_factor": scale,
+                        "displays": displays_json(),
                     }))
             }
             None => ToolResult::error("No main display detected."),
         }
     }
+}
+
+fn displays_json() -> Value {
+    let displays = crate::displays::active_displays();
+    let ordered = cmux_cua_core::display_placement::ordered_displays(&displays);
+    Value::Array(ordered.iter().enumerate().map(|(index, d)| serde_json::json!({
+        "index": index,
+        "id": d.id,
+        "uuid": d.uuid,
+        "is_main": d.is_main,
+        "bounds": {
+            "x": d.bounds.x, "y": d.bounds.y,
+            "width": d.bounds.width, "height": d.bounds.height,
+        },
+    })).collect())
 }
 
 /// Returns `(width_points, height_points, backing_scale_factor)` from

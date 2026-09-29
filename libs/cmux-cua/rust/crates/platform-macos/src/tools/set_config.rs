@@ -19,7 +19,7 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "set_config".into(),
         description: "Update cmux-cua configuration. Changes to \
-            max_image_dimension and capture_scope take effect immediately. The \
+            max_image_dimension, capture_scope, and launch_display take effect immediately. The \
             experimental_pip keys are persisted to ~/.cmux-cua/config.json and \
             take effect on the next daemon restart (the PiP backend is \
             initialised once at startup).\n\nNote: capture_mode is a per-call \
@@ -48,6 +48,16 @@ fn def() -> &'static ToolDef {
                     "description": "Capture scope: \"window\" (default) or \"desktop\". Desktop \
                         scope enables get_desktop_state (full-display capture) and window-less \
                         screen-absolute click/scroll. Global setting; takes effect immediately."
+                },
+                "launch_display": {
+                    "type": ["string", "array", "null"],
+                    "items": { "type": "string" },
+                    "description": "Display that launch_app moves newly opened windows to. A \
+                        selector or an ordered preference list; the first attached match wins. \
+                        Selectors: none|off, main|primary, secondary (first non-main display), \
+                        index:N (0 = main, then left-to-right), id:N (CGDirectDisplayID), \
+                        uuid:X (stable across reboots; see get_screen_size `displays`). \
+                        Default [\"secondary\"]. Global setting; takes effect immediately."
                 },
                 "experimental_pip": {
                     "type": "boolean",
@@ -167,6 +177,26 @@ impl Tool for SetConfigTool {
             capture_scope_note = format!(", capture_scope={sc}");
         }
 
+        // launch_display: GLOBAL, persisted, like capture_scope.
+        let launch_display_arg = args.get("launch_display").cloned().or_else(|| {
+            kv.as_ref()
+                .filter(|(k, _)| k == "launch_display")
+                .map(|(_, v)| v.clone())
+        });
+        let mut launch_display_note = String::new();
+        if let Some(raw) = launch_display_arg {
+            let policy = match cmux_cua_core::display_placement::DisplayPolicy::from_json(&raw) {
+                Ok(p) => p,
+                Err(e) => return ToolResult::error(format!("`launch_display`: {e}")),
+            };
+            let json = policy.to_json();
+            self.state.config.write().unwrap().launch_display = policy;
+            if let Err(e) = write_driver_config_key("launch_display", &json) {
+                tracing::warn!("set_config: failed to persist launch_display: {e}");
+            }
+            launch_display_note = format!(", launch_display={json}");
+        }
+
         let scope_note = if session_id.is_some() {
             " (session-scoped; persisted default unchanged)"
         } else {
@@ -174,16 +204,20 @@ impl Tool for SetConfigTool {
         };
         // Echo the config back in structured content (matches Windows/Linux
         // set_config, which callers/tests read for the applied capture_scope).
-        let capture_scope = self.state.config.read().unwrap().capture_scope.clone();
+        let (capture_scope, launch_display) = {
+            let cfg = self.state.config.read().unwrap();
+            (cfg.capture_scope.clone(), cfg.launch_display.to_json())
+        };
         ToolResult::text(format!(
-            "Config updated: max_image_dimension={}{}{}{}",
-            effective_dim, capture_scope_note, scope_note, pip_note
+            "Config updated: max_image_dimension={}{}{}{}{}",
+            effective_dim, capture_scope_note, launch_display_note, scope_note, pip_note
         ))
         .with_structured(serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "platform": "macos",
             "max_image_dimension": effective_dim,
             "capture_scope": capture_scope,
+            "launch_display": launch_display,
         }))
     }
 }

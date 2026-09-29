@@ -827,6 +827,23 @@ impl CompatState {
             Ok(window) => window,
             Err(error) => return error.into_result(),
         };
+        if needs_launch {
+            // Same launch_display policy as launch_app. The app was not
+            // running, so every window it has now is one this call created.
+            let pid = app.pid;
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut windows = crate::displays::current_windows_for_pid(pid);
+                let policy = super::load_driver_config().launch_display;
+                crate::displays::place_new_windows(
+                    pid,
+                    &mut windows,
+                    &Default::default(),
+                    &policy,
+                    std::time::Duration::ZERO,
+                )
+            })
+            .await;
+        }
         if let Err(error) = self.validate_lock_epoch(lock_epoch) {
             return error.into_result();
         }
