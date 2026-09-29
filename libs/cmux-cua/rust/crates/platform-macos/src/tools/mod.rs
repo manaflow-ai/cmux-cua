@@ -386,6 +386,9 @@ pub struct DriverConfig {
     /// Capture scope: `"window"` (default) or `"desktop"`. Gates
     /// `get_desktop_state` (full-display capture requires `"desktop"`).
     pub capture_scope: String,
+    /// Display that `launch_app` moves newly opened windows to. Default
+    /// `["secondary"]`: off the main display when another is attached.
+    pub launch_display: cmux_cua_core::display_placement::DisplayPolicy,
 }
 
 impl Default for DriverConfig {
@@ -393,6 +396,7 @@ impl Default for DriverConfig {
         Self {
             max_image_dimension: 1568,
             capture_scope: "window".to_owned(),
+            launch_display: Default::default(),
         }
     }
 }
@@ -429,6 +433,12 @@ pub fn load_driver_config() -> DriverConfig {
     if let Some(s) = json.get("capture_scope").and_then(|v| v.as_str()) {
         if s == "window" || s == "desktop" {
             cfg.capture_scope = s.to_owned();
+        }
+    }
+    if let Some(v) = json.get("launch_display") {
+        match cmux_cua_core::display_placement::DisplayPolicy::from_json(v) {
+            Ok(policy) => cfg.launch_display = policy,
+            Err(e) => tracing::warn!("ignoring invalid launch_display in config: {e}"),
         }
     }
     cfg
