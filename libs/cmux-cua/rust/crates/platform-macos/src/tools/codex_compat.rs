@@ -414,6 +414,10 @@ struct CanonicalAppIdentity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppResolveMode {
     LaunchIfNeeded,
+    /// `get_app_state` is an explicit capture request and must inspect any
+    /// installed app. Identity and session-lock validation still apply; this
+    /// mode bypasses only the compatibility target policy and app elicitation.
+    UnrestrictedLaunchIfNeeded,
     RunningOnly,
 }
 
@@ -454,6 +458,8 @@ struct AppSnapshot {
     window_id: u32,
     window_title: String,
     generation: u64,
+    /// Snapshot was captured through unrestricted `get_app_state`.
+    target_policy_bypassed: bool,
     element_indices: HashSet<String>,
     /// Compatibility screenshots are normalized to logical window points.
     /// Native tools still consume the PNG pixel coordinate space, so actions
@@ -739,7 +745,7 @@ impl CompatState {
             &app_ref,
             args,
             &session,
-            AppResolveMode::LaunchIfNeeded,
+            AppResolveMode::UnrestrictedLaunchIfNeeded,
         )
             .await
     }
@@ -770,8 +776,11 @@ impl CompatState {
         if let Err(error) = self.validate_lock_epoch(lock_epoch) {
             return error.into_result();
         }
-        if let Err(error) = enforce_target_policy(&app) {
-            return error.into_result();
+        let target_policy_bypassed = resolve_mode == AppResolveMode::UnrestrictedLaunchIfNeeded;
+        if !target_policy_bypassed {
+            if let Err(error) = enforce_target_policy(&app) {
+                return error.into_result();
+            }
         }
         let expected_identity = match canonical_resolved_app_identity(&app) {
             Ok(identity) => identity,
@@ -936,6 +945,7 @@ impl CompatState {
                 window_id,
                 window_title,
                 generation: 0,
+                target_policy_bypassed,
                 element_indices,
                 native_pixels_per_compat_x: native_width / logical_width as f64,
                 native_pixels_per_compat_y: native_height / logical_height as f64,
@@ -2527,7 +2537,9 @@ fn identity_and_launch_requirement(
         launch_path: info.launch_path.clone(),
         pid: info.pid,
     };
-    enforce_target_policy(&identity)?;
+    if mode != AppResolveMode::UnrestrictedLaunchIfNeeded {
+        enforce_target_policy(&identity)?;
+    }
 
     if info.running && info.pid > 0 {
         return Ok((identity, false));
@@ -2809,7 +2821,9 @@ where
 }
 
 fn validate_live_snapshot(snapshot: &AppSnapshot) -> Result<(), CompatError> {
-    enforce_target_policy(&snapshot.app)?;
+    if !snapshot.target_policy_bypassed {
+        enforce_target_policy(&snapshot.app)?;
+    }
     validate_live_pid_identity(&snapshot.app, &snapshot.expected_identity)?;
     let window_is_live = crate::windows::all_windows()
         .iter()
@@ -3321,6 +3335,7 @@ mod tests {
             window_id: 7,
             window_title: requested.to_owned(),
             generation: 0,
+            target_policy_bypassed: false,
             element_indices: HashSet::new(),
             native_pixels_per_compat_x: 2.0,
             native_pixels_per_compat_y: 2.0,
@@ -3922,6 +3937,39 @@ mod tests {
             store.lookup("session-a", "AppA").unwrap().generation,
             replacement.generation,
             "invalidating an old action snapshot must not retire a concurrent refresh"
+        );
+    }
+
+    #[test]
+    fn unrestricted_get_app_state_resolves_protected_apps_without_target_policy() {
+        let identity = |name: &str, bundle: &str| AppIdentity {
+            requested: name.to_owned(),
+            name: name.to_owned(),
+            bundle_id: Some(bundle.to_owned()),
+            launch_path: Some("/System/Applications/Calculator.app".to_owned()),
+            pid: 0,
+        };
+        let protected = crate::apps::AppInfo {
+            name: "System Settings".to_owned(),
+            pid: 0,
+            bundle_id: Some("com.apple.systempreferences".to_owned()),
+            running: false,
+            active: false,
+            launch_path: Some("/System/Applications/System Settings.app".to_owned()),
+            kind: Some("desktop".to_owned()),
+            last_used: None,
+        };
+        let (resolved, needs_launch) = identity_and_launch_requirement(
+            "System Settings",
+            &protected,
+            AppResolveMode::UnrestrictedLaunchIfNeeded,
+        )
+        .unwrap();
+        assert_eq!(resolved.name, "System Settings");
+        assert!(needs_launch);
+        assert!(
+            enforce_target_policy(&identity("System Settings", "com.apple.systempreferences"))
+                .is_err()
         );
     }
 
