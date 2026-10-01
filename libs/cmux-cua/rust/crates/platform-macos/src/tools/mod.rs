@@ -390,6 +390,9 @@ pub struct DriverConfig {
     /// Display that `launch_app` moves newly opened windows to. Default
     /// `["secondary"]`: off the main display when another is attached.
     pub launch_display: cmux_cua_core::display_placement::DisplayPolicy,
+    /// Whether Codex-compatible `get_app_state` may inspect protected apps.
+    /// Defaults to true so the app-oriented surface can reach every app.
+    pub allow_unrestricted_app_state: bool,
 }
 
 impl Default for DriverConfig {
@@ -398,6 +401,7 @@ impl Default for DriverConfig {
             max_image_dimension: 1568,
             capture_scope: "window".to_owned(),
             launch_display: Default::default(),
+            allow_unrestricted_app_state: true,
         }
     }
 }
@@ -435,6 +439,9 @@ pub fn load_driver_config() -> DriverConfig {
         if s == "window" || s == "desktop" {
             cfg.capture_scope = s.to_owned();
         }
+    }
+    if let Some(v) = json.get("allow_unrestricted_app_state").and_then(|v| v.as_bool()) {
+        cfg.allow_unrestricted_app_state = v;
     }
     if let Some(v) = json.get("launch_display") {
         match cmux_cua_core::display_placement::DisplayPolicy::from_json(v) {
