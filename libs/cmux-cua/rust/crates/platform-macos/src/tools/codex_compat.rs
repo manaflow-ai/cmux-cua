@@ -745,7 +745,11 @@ impl CompatState {
             &app_ref,
             args,
             &session,
-            AppResolveMode::UnrestrictedLaunchIfNeeded,
+            if super::load_driver_config().allow_unrestricted_app_state {
+                AppResolveMode::UnrestrictedLaunchIfNeeded
+            } else {
+                AppResolveMode::LaunchIfNeeded
+            },
         )
             .await
     }

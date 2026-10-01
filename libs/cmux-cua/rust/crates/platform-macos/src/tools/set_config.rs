@@ -49,6 +49,10 @@ fn def() -> &'static ToolDef {
                         scope enables get_desktop_state (full-display capture) and window-less \
                         screen-absolute click/scroll. Global setting; takes effect immediately."
                 },
+                "allow_unrestricted_app_state": {
+                    "type": "boolean",
+                    "description": "Allow Codex-compatible get_app_state to inspect every app, including protected host and terminal apps. Defaults to true."
+                },
                 "launch_display": {
                     "type": ["string", "array", "null"],
                     "items": { "type": "string" },
@@ -154,6 +158,26 @@ impl Tool for SetConfigTool {
                 pip_note = format!(" — restart cmux-cua for experimental_pip_geometry={geom} to take effect");
             }
         }
+        // allow_unrestricted_app_state: GLOBAL setting controlling whether the
+        // Codex-compatible app snapshot path bypasses its target allowlist.
+        let unrestricted_arg = args
+            .get("allow_unrestricted_app_state")
+            .and_then(|value| value.as_bool())
+            .or_else(|| {
+                kv.as_ref()
+                    .filter(|(key, _)| key == "allow_unrestricted_app_state")
+                    .and_then(|(_, value)| value.as_bool())
+            });
+        if let Some(allow) = unrestricted_arg {
+            self.state.config.write().unwrap().allow_unrestricted_app_state = allow;
+            if let Err(error) = write_driver_config_key(
+                "allow_unrestricted_app_state",
+                &Value::Bool(allow),
+            ) {
+                tracing::warn!("set_config: failed to persist allow_unrestricted_app_state: {error}");
+            }
+        }
+
         // capture_scope: GLOBAL setting (gates get_desktop_state). Accept the
         // direct field or {key,value} shape; validate window|desktop; write the
         // shared global config + persist (matches Windows/Linux — not
@@ -204,9 +228,13 @@ impl Tool for SetConfigTool {
         };
         // Echo the config back in structured content (matches Windows/Linux
         // set_config, which callers/tests read for the applied capture_scope).
-        let (capture_scope, launch_display) = {
+        let (capture_scope, launch_display, allow_unrestricted_app_state) = {
             let cfg = self.state.config.read().unwrap();
-            (cfg.capture_scope.clone(), cfg.launch_display.to_json())
+            (
+                cfg.capture_scope.clone(),
+                cfg.launch_display.to_json(),
+                cfg.allow_unrestricted_app_state,
+            )
         };
         ToolResult::text(format!(
             "Config updated: max_image_dimension={}{}{}{}{}",
@@ -218,6 +246,7 @@ impl Tool for SetConfigTool {
             "max_image_dimension": effective_dim,
             "capture_scope": capture_scope,
             "launch_display": launch_display,
+            "allow_unrestricted_app_state": allow_unrestricted_app_state,
         }))
     }
 }
