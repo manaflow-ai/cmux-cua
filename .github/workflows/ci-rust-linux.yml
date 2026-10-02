@@ -49,6 +49,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
             libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev
+      # Runs first: the full step below stops at the first failing crate, and
+      # cmux-cua has pre-existing failures (bundle, telemetry, version_check).
+      - name: Run activity store tests
+        working-directory: libs/cmux-cua/rust
+        run: cargo test -p cmux-cua-core --lib activity --locked
       - name: Run Linux Rust tests
         working-directory: libs/cmux-cua/rust
         run: cargo test -p cmux-cua -p cmux-cua-core -p cmux-cua-testkit -p platform-linux --all-targets --locked
