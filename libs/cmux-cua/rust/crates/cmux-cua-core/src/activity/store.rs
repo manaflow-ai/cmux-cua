@@ -33,6 +33,12 @@ pub struct FrameEntry {
     pub blob: String,
     pub width: u32,
     pub height: u32,
+    /// Size of the captured image the thumbnail was made from (click points
+    /// are in its pixels).
+    #[serde(default)]
+    pub source_width: u32,
+    #[serde(default)]
+    pub source_height: u32,
     pub bytes: u64,
     pub captured_at_ms: u64,
 }
@@ -484,7 +490,7 @@ mod tests {
         let gone = store.put_blob(b"gone", "jpg").unwrap();
         let entry = |seq, blob: &str, at| FrameEntry {
             seq, slot: FrameSlot::After, kind: StoredFrameKind::Thumbnail, blob: blob.into(),
-            width: 320, height: 200, bytes: 5, captured_at_ms: at,
+            width: 320, height: 200, source_width: 1280, source_height: 800, bytes: 5, captured_at_ms: at,
         };
         store.append_frames(&old.id, &[entry(0, &gone, now - 40 * DAY_MS)]).unwrap();
         store.append_frames(&live.id, &[entry(1, &stale, now - 8 * DAY_MS), entry(4, &fresh, now)]).unwrap();

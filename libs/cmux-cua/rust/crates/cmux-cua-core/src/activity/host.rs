@@ -85,6 +85,9 @@ pub struct CapturedFrames {
 pub struct FrameInfo {
     pub width: u32,
     pub height: u32,
+    /// Captured image size; click points are in these pixels.
+    pub source_width: u32,
+    pub source_height: u32,
     pub expired: bool,
 }
 
@@ -216,15 +219,15 @@ impl ActivityHost {
             .record(&start.session)
             .map(|r| r.recording != RecordingMode::Events)
             .unwrap_or(false);
-        let mut entries: Vec<(FrameSlot, StoredFrameKind, String, u32, u32, u64)> = Vec::new();
+        let mut entries: Vec<(FrameSlot, StoredFrameKind, String, (u32, u32), (u32, u32), u64)> = Vec::new();
         let mut stored = |slot: FrameSlot, png: &Option<Vec<u8>>| -> Option<String> {
             let png = png.as_ref()?;
-            let (jpeg, w, h) = encode_thumbnail(png)?;
+            let (jpeg, w, h, sw, sh) = encode_thumbnail(png)?;
             let blob = self.store.put_blob(&jpeg, "jpg").ok()?;
-            entries.push((slot, StoredFrameKind::Thumbnail, blob.clone(), w, h, jpeg.len() as u64));
+            entries.push((slot, StoredFrameKind::Thumbnail, blob.clone(), (w, h), (sw, sh), jpeg.len() as u64));
             if full {
-                if let (Ok(full_blob), Some((fw, fh))) = (self.store.put_blob(png, "png"), png_size(png)) {
-                    entries.push((slot, StoredFrameKind::Full, full_blob, fw, fh, png.len() as u64));
+                if let Ok(full_blob) = self.store.put_blob(png, "png") {
+                    entries.push((slot, StoredFrameKind::Full, full_blob, (sw, sh), (sw, sh), png.len() as u64));
                 }
             }
             Some(blob)
@@ -242,13 +245,15 @@ impl ActivityHost {
             if let Some(event) = applied.events.first() {
                 let rows: Vec<FrameEntry> = entries
                     .into_iter()
-                    .map(|(slot, kind, blob, width, height, bytes)| FrameEntry {
+                    .map(|(slot, kind, blob, (width, height), (source_width, source_height), bytes)| FrameEntry {
                         seq: event.seq,
                         slot,
                         kind,
                         blob,
                         width,
                         height,
+                        source_width,
+                        source_height,
                         bytes,
                         captured_at_ms: now_ms,
                     })
@@ -313,19 +318,19 @@ impl ActivityHost {
     pub fn timeline(&self, id: &SessionId, after_seq: Option<u64>, limit: usize) -> io::Result<TimelinePage> {
         let next_seq = self.lock().book.next_seq(id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown session"))?;
         let events = self.store.read_events(id, after_seq, limit.max(1))?;
-        let sizes: BTreeMap<String, (u32, u32)> = self
+        let sizes: BTreeMap<String, (u32, u32, u32, u32)> = self
             .store
             .read_frames(id)?
             .into_iter()
             .filter(|f| f.kind == StoredFrameKind::Thumbnail)
-            .map(|f| (f.blob, (f.width, f.height)))
+            .map(|f| (f.blob, (f.width, f.height, f.source_width, f.source_height)))
             .collect();
         let mut frames = BTreeMap::new();
         for event in &events {
             for blob in [&event.before_frame, &event.after_frame].into_iter().flatten() {
-                let (width, height) = sizes.get(blob).copied().unwrap_or((0, 0));
+                let (width, height, source_width, source_height) = sizes.get(blob).copied().unwrap_or((0, 0, 0, 0));
                 let expired = !sizes.contains_key(blob) || !self.store.has_blob(blob);
-                frames.insert(blob.clone(), FrameInfo { width, height, expired });
+                frames.insert(blob.clone(), FrameInfo { width, height, source_width, source_height, expired });
             }
         }
         Ok(TimelinePage { events, next_seq, frames })
@@ -506,19 +511,16 @@ pub fn outcome_from_result(is_error: bool, structured: Option<&Value>) -> CallOu
     CallOutcome { ok: !is_error, effect, verified, error_code, reply: Value::Null }
 }
 
-fn png_size(png: &[u8]) -> Option<(u32, u32)> {
-    crate::image_utils::png_dimensions(png).ok()
-}
-
-/// PNG to a ~320 px JPEG thumbnail.
-pub fn encode_thumbnail(png: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+/// An image (PNG or JPEG) to a ~320 px JPEG thumbnail; returns the JPEG,
+/// its size and the source size.
+pub fn encode_thumbnail(png: &[u8]) -> Option<(Vec<u8>, u32, u32, u32, u32)> {
     let image = image::load_from_memory(png).ok()?;
     let (w, h) = thumbnail_dimensions(image.width(), image.height(), THUMBNAIL_LONG_EDGE)?;
     let small = image.thumbnail(w, h).to_rgb8();
     let mut out = Vec::new();
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, THUMBNAIL_JPEG_QUALITY);
     encoder.encode_image(&small).ok()?;
-    Some((out, small.width(), small.height()))
+    Some((out, small.width(), small.height(), image.width(), image.height()))
 }
 
 #[cfg(test)]
@@ -575,6 +577,7 @@ mod tests {
         let blob = act.after_frame.clone().expect("thumbnail");
         assert_eq!(page.frames[&blob].width, 320);
         assert_eq!(page.frames[&blob].height, 200);
+        assert_eq!(page.frames[&blob].source_width, 1280);
         let (mime, bytes) = host.frame(Some(&session), &blob, false).unwrap();
         assert_eq!(mime, "image/jpeg");
         assert!(!bytes.is_empty());
