@@ -53,7 +53,9 @@ jobs:
       # cmux-cua has pre-existing failures (bundle, telemetry, version_check).
       - name: Run activity store tests
         working-directory: libs/cmux-cua/rust
-        run: cargo test -p cmux-cua-core --lib activity --locked
+        run: |
+          cargo test -p cmux-cua-core --lib activity --locked
+          cargo test -p cmux-cua --bin cmux-cua activity_daemon --locked
       - name: Run Linux Rust tests
         working-directory: libs/cmux-cua/rust
         run: cargo test -p cmux-cua -p cmux-cua-core -p cmux-cua-testkit -p platform-linux --all-targets --locked

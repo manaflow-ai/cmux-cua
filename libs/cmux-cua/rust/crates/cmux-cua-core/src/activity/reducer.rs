@@ -31,7 +31,7 @@ use super::model::{
     CallKind, CallOutcome, Caller, ClickPoint, EndReason, Event, EventKind, Profile, RecordingMode,
     Scope, SessionId, SessionRecord, SessionStatus, Target,
 };
-use super::redact::redact_args;
+use super::redact::{redact_args_with, RedactPolicy};
 
 /// How long a finished call's result is replayed for its idempotency key.
 pub const CALL_CACHE_TTL_MS: u64 = 10 * 60 * 1000;
@@ -232,6 +232,7 @@ pub struct SessionBook {
     live_labels: HashMap<(String, String), SessionId>,
     stopped_labels: HashSet<(String, String)>,
     stopped_actors: HashSet<String>,
+    redact_policy: RedactPolicy,
 }
 
 impl SessionBook {
@@ -242,7 +243,27 @@ impl SessionBook {
             live_labels: HashMap::new(),
             stopped_labels: HashSet::new(),
             stopped_actors: HashSet::new(),
+            redact_policy: RedactPolicy::default(),
         }
+    }
+
+    pub fn redact_policy(&self) -> RedactPolicy {
+        self.redact_policy
+    }
+
+    /// Set by a user-origin `activity_policy_set` only (the daemon checks).
+    pub fn set_redact_policy(&mut self, policy: RedactPolicy) {
+        self.redact_policy = policy;
+    }
+
+    /// Ids of live sessions.
+    pub fn live_ids(&self) -> std::collections::BTreeSet<SessionId> {
+        self.sessions.iter().filter(|(_, s)| s.record.status.is_live()).map(|(id, _)| id.clone()).collect()
+    }
+
+    /// The (record, next_seq) pair the store persists for `id`.
+    pub fn persisted(&self, id: &SessionId) -> Option<(&SessionRecord, u64)> {
+        self.sessions.get(id).map(|state| (&state.record, state.next_seq))
     }
 
     /// Rebuilds a book from stored records and each session's next seq. Call
@@ -525,7 +546,7 @@ impl SessionBook {
         if ctx.caller.identity.actor != state.record.agent.actor {
             return Err(Reject::NotOwner);
         }
-        let args_redacted = redact_args(&tool, &args);
+        let args_redacted = redact_args_with(&tool, &args, self.redact_policy);
         let refusal = if agent_stopped {
             Some(Reject::AgentStopped)
         } else {

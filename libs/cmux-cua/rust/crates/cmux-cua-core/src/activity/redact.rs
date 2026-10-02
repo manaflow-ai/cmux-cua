@@ -21,16 +21,33 @@ const COMMAND_MODIFIERS: &[&str] = &[
     "cmd", "command", "super", "meta", "ctrl", "control", "option", "alt", "fn",
 ];
 
+/// User policy for what the log may keep (`activity_policy_set`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct RedactPolicy {
+    /// Keep the first [`JAVASCRIPT_KEEP_CHARS`] characters of JavaScript
+    /// passed to `page`. Typed text is never kept.
+    #[serde(default)]
+    pub store_javascript: bool,
+}
+
+/// Characters of JavaScript kept when `store_javascript` is on.
+pub const JAVASCRIPT_KEEP_CHARS: usize = 4096;
+
 /// Returns a copy of `args` that is safe to persist for `tool`.
 pub fn redact_args(tool: &str, args: &Value) -> Value {
+    redact_args_with(tool, args, RedactPolicy::default())
+}
+
+/// [`redact_args`] under a user policy.
+pub fn redact_args_with(tool: &str, args: &Value, policy: RedactPolicy) -> Value {
     match args {
-        Value::Object(map) => Value::Object(redact_object(tool, map)),
-        Value::Array(items) => Value::Array(items.iter().map(|item| redact_args(tool, item)).collect()),
+        Value::Object(map) => Value::Object(redact_object(tool, map, policy)),
+        Value::Array(items) => Value::Array(items.iter().map(|item| redact_args_with(tool, item, policy)).collect()),
         other => other.clone(),
     }
 }
 
-fn redact_object(tool: &str, map: &Map<String, Value>) -> Map<String, Value> {
+fn redact_object(tool: &str, map: &Map<String, Value>, policy: RedactPolicy) -> Map<String, Value> {
     // A `perform_actions` step (or any nested call) carries its own tool name.
     if let (Some(Value::String(step_tool)), Some(step_args)) = (map.get("tool"), map.get("arguments")) {
         let mut out = Map::new();
@@ -39,9 +56,9 @@ fn redact_object(tool: &str, map: &Map<String, Value>) -> Map<String, Value> {
                 continue;
             }
             if key == "arguments" {
-                out.insert(key.clone(), redact_args(step_tool, step_args));
+                out.insert(key.clone(), redact_args_with(step_tool, step_args, policy));
             } else {
-                out.insert(key.clone(), redact_args(tool, value));
+                out.insert(key.clone(), redact_args_with(tool, value, policy));
             }
         }
         return out;
@@ -53,6 +70,13 @@ fn redact_object(tool: &str, map: &Map<String, Value>) -> Map<String, Value> {
         if key.starts_with('_') {
             continue;
         }
+        if key == "javascript" && policy.store_javascript {
+            if let Value::String(text) = value {
+                let kept: String = text.chars().take(JAVASCRIPT_KEEP_CHARS).collect();
+                out.insert(key.clone(), Value::String(kept));
+                continue;
+            }
+        }
         if let Some(marker) = text_marker(key) {
             if let Value::String(text) = value {
                 out.insert(key.clone(), redacted(marker, text));
@@ -63,7 +87,7 @@ fn redact_object(tool: &str, map: &Map<String, Value>) -> Map<String, Value> {
             out.insert(key.clone(), json!({"redacted": "key"}));
             continue;
         }
-        out.insert(key.clone(), redact_args(tool, value));
+        out.insert(key.clone(), redact_args_with(tool, value, policy));
     }
     out
 }
@@ -186,6 +210,15 @@ mod tests {
         );
         assert_eq!(out["javascript"], json!({"redacted": "javascript", "length": 13}));
         assert_eq!(out["action"], json!("execute_javascript"));
+    }
+
+    #[test]
+    fn javascript_policy_keeps_a_prefix_but_never_typed_text() {
+        let policy = RedactPolicy { store_javascript: true };
+        let long = "x".repeat(JAVASCRIPT_KEEP_CHARS + 10);
+        let out = redact_args_with("page", &json!({"javascript": long, "text": "pw"}), policy);
+        assert_eq!(out["javascript"].as_str().unwrap().len(), JAVASCRIPT_KEEP_CHARS);
+        assert_eq!(out["text"]["redacted"], json!("text"));
     }
 
     #[test]

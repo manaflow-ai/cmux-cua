@@ -11,3 +11,5 @@ pub mod reducer;
 pub mod redact;
 pub mod retention;
 pub mod thumbnail;
+pub mod host;
+pub mod store;
