@@ -10,8 +10,24 @@ pub const THUMBNAIL_JPEG_QUALITY: u8 = 70;
 /// the aspect ratio. Never upscales, never returns a zero dimension, and
 /// returns `None` for an empty source.
 pub fn thumbnail_dimensions(width: u32, height: u32, long_edge: u32) -> Option<(u32, u32)> {
-        todo!("thumbnail sizing lands in the next commit")
+    if width == 0 || height == 0 || long_edge == 0 {
+        return None;
     }
+    let source_long = width.max(height);
+    if source_long <= long_edge {
+        return Some((width, height));
+    }
+    let scale = |side: u32| -> u32 {
+        let scaled = (u64::from(side) * u64::from(long_edge) + u64::from(source_long) / 2)
+            / u64::from(source_long);
+        (scaled as u32).max(1)
+    };
+    if width >= height {
+        Some((long_edge, scale(height)))
+    } else {
+        Some((scale(width), long_edge))
+    }
+}
 
 #[cfg(test)]
 mod tests {

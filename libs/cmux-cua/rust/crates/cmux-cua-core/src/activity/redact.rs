@@ -23,8 +23,12 @@ const COMMAND_MODIFIERS: &[&str] = &[
 
 /// Returns a copy of `args` that is safe to persist for `tool`.
 pub fn redact_args(tool: &str, args: &Value) -> Value {
-        todo!("redaction lands in the next commit")
+    match args {
+        Value::Object(map) => Value::Object(redact_object(tool, map)),
+        Value::Array(items) => Value::Array(items.iter().map(|item| redact_args(tool, item)).collect()),
+        other => other.clone(),
     }
+}
 
 fn redact_object(tool: &str, map: &Map<String, Value>) -> Map<String, Value> {
     // A `perform_actions` step (or any nested call) carries its own tool name.

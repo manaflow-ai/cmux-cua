@@ -305,7 +305,73 @@ impl SessionBook {
         mint: &mut dyn FnMut(&str) -> Minted,
         command: Command,
     ) -> Result<Applied, Reject> {
-        todo!("session reducer lands in the next commit")
+        match command {
+            Command::Start { label, scope } => self.start(ctx, mint, label, scope),
+            Command::End { id } => self.end(ctx, &id),
+            Command::Stop { id } => self.stop(ctx, &id),
+            Command::Pause { id } => self.pause(ctx, &id),
+            Command::Resume { id } => self.resume(ctx, &id),
+            Command::StopAgent { actor } => self.stop_agent(ctx, &actor),
+            Command::AllowAgent { actor } => {
+                if !ctx.caller.is_user() {
+                    return Err(Reject::UserRequired);
+                }
+                self.stopped_actors.remove(&actor);
+                self.stopped_labels.retain(|(a, _)| a != &actor);
+                Ok(Applied::done(Vec::new()))
+            }
+            Command::SetRecording { id, mode } => {
+                let state = self.sessions.get_mut(&id).ok_or(Reject::UnknownSession)?;
+                if !ctx.caller.is_user() && ctx.caller.identity.actor != state.record.agent.actor {
+                    return Err(Reject::NotOwner);
+                }
+                state.record.recording = mode;
+                Ok(Applied::done(Vec::new()))
+            }
+            Command::BeginCall { id, kind, tool, args, target, idempotency_key } => {
+                self.begin_call(ctx, &id, kind, tool, args, target, idempotency_key)
+            }
+            Command::FinishCall { id, ticket, outcome, duration_ms, frames } => {
+                self.finish_call(ctx, &id, ticket, outcome, duration_ms, frames)
+            }
+            Command::MarkIdle { id } => {
+                let state = self.sessions.get_mut(&id).ok_or(Reject::UnknownSession)?;
+                if state.record.status != SessionStatus::Active || !state.in_flight.is_empty() {
+                    return Ok(Applied::done(Vec::new()));
+                }
+                state.record.status = SessionStatus::Idle;
+                let event = push_event(state, ctx, EventKind::SessionIdle);
+                Ok(Applied::done(vec![event]))
+            }
+            Command::ExpireIdle { id } => {
+                let state = self.sessions.get(&id).ok_or(Reject::UnknownSession)?;
+                if !matches!(state.record.status, SessionStatus::Active | SessionStatus::Idle) {
+                    return Ok(Applied::done(Vec::new()));
+                }
+                if !state.in_flight.is_empty() {
+                    return Ok(Applied { outcome: Outcome::Refused { reason: Reject::CallInFlight }, events: Vec::new() });
+                }
+                let event = self.close(ctx, &id, EndReason::IdleTtl, EventKind::SessionEnd);
+                Ok(Applied::done(vec![event]))
+            }
+            Command::HostRestart => {
+                let live: Vec<SessionId> = self
+                    .sessions
+                    .iter()
+                    .filter(|(_, state)| state.record.status.is_live())
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                let mut events = Vec::new();
+                for id in live {
+                    events.push(self.close(ctx, &id, EndReason::HostRestart, EventKind::SessionEnd));
+                }
+                for state in self.sessions.values_mut() {
+                    state.in_flight.clear();
+                    state.cache = CallCache::default();
+                }
+                Ok(Applied::done(events))
+            }
+        }
     }
 
     fn start(

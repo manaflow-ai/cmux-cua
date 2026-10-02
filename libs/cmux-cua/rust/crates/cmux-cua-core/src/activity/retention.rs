@@ -92,8 +92,108 @@ pub fn plan(
     sessions: &[SessionSummary],
     frames: &[FrameRef],
 ) -> Plan {
-        todo!("retention planner lands in the next commit")
+    let mut out = Plan::default();
+    let mut gone_sessions: BTreeSet<&SessionId> = BTreeSet::new();
+    let mut truncated: BTreeMap<&SessionId, u64> = BTreeMap::new();
+    let mut next_run: Option<u64> = None;
+    let mut wake_at = |at: u64| {
+        next_run = Some(next_run.map_or(at, |current: u64| current.min(at)));
+    };
+
+    let live: BTreeSet<&SessionId> = sessions
+        .iter()
+        .filter(|s| s.ended_at_ms.is_none())
+        .map(|s| &s.id)
+        .collect();
+
+    // Rules 1 and 3.
+    for session in sessions {
+        if let Some(ended) = session.ended_at_ms {
+            let expires = ended.saturating_add(policy.event_ttl_ms);
+            if expires <= now_ms {
+                gone_sessions.insert(&session.id);
+                out.delete_sessions.push(session.id.clone());
+                continue;
+            }
+            wake_at(expires);
+        }
+        let stored = session.next_seq.saturating_sub(session.first_seq);
+        if stored > policy.session_event_cap {
+            let before = session.next_seq - policy.session_event_cap;
+            truncated.insert(&session.id, before);
+            out.truncate_events.push((session.id.clone(), before));
+        }
     }
+
+    // Frames that survive rules 1 and 3 (those rules delete them implicitly).
+    let mut kept: Vec<&FrameRef> = Vec::new();
+    for frame in frames {
+        if gone_sessions.contains(&frame.session) {
+            continue;
+        }
+        if let Some(&before) = truncated.get(&frame.session) {
+            if frame.seq < before {
+                continue;
+            }
+        }
+        // Rule 2.
+        let expires = frame.captured_at_ms.saturating_add(policy.frame_ttl_ms);
+        if expires <= now_ms {
+            out.delete_frames.push(frame.clone());
+            continue;
+        }
+        kept.push(frame);
+    }
+
+    // Rule 4: per-session byte cap.
+    let mut by_session: BTreeMap<&SessionId, Vec<&FrameRef>> = BTreeMap::new();
+    for frame in kept.iter().copied() {
+        by_session.entry(&frame.session).or_default().push(frame);
+    }
+    let mut dropped: BTreeSet<(SessionId, u64, FrameKind, String)> = BTreeSet::new();
+    for (_, mut list) in by_session {
+        let mut total: u64 = list.iter().map(|f| f.bytes).sum();
+        if total <= policy.session_frame_bytes {
+            continue;
+        }
+        list.sort_by(|a, b| (a.kind, a.captured_at_ms, a.seq).cmp(&(b.kind, b.captured_at_ms, b.seq)));
+        for frame in list {
+            if total <= policy.session_frame_bytes {
+                break;
+            }
+            total -= frame.bytes;
+            dropped.insert(frame_key(frame));
+            out.delete_frames.push(frame.clone());
+        }
+    }
+    kept.retain(|f| !dropped.contains(&frame_key(f)));
+
+    // Rule 5: machine byte cap.
+    let mut total: u64 = kept.iter().map(|f| f.bytes).sum();
+    if total > policy.machine_frame_bytes {
+        let mut order = kept.clone();
+        order.sort_by(|a, b| {
+            let a_live = live.contains(&a.session);
+            let b_live = live.contains(&b.session);
+            (a_live, a.kind, a.captured_at_ms, a.seq).cmp(&(b_live, b.kind, b.captured_at_ms, b.seq))
+        });
+        for frame in order {
+            if total <= policy.machine_frame_bytes {
+                break;
+            }
+            total -= frame.bytes;
+            dropped.insert(frame_key(frame));
+            out.delete_frames.push(frame.clone());
+        }
+        kept.retain(|f| !dropped.contains(&frame_key(f)));
+    }
+
+    for frame in &kept {
+        wake_at(frame.captured_at_ms.saturating_add(policy.frame_ttl_ms));
+    }
+    out.next_run_ms = next_run;
+    out
+}
 
 fn frame_key(frame: &FrameRef) -> (SessionId, u64, FrameKind, String) {
     (frame.session.clone(), frame.seq, frame.kind, frame.blob.clone())
