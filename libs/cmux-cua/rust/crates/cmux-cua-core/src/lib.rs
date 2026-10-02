@@ -95,6 +95,7 @@ fn default_session_id_from_env(value: Option<&str>, pid: u32) -> String {
         .unwrap_or_else(|| format!("embedded-{pid}"))
 }
 
+pub mod activity;
 pub mod capture_mode;
 pub mod cdp;
 pub mod cursor_feed;
