@@ -65,6 +65,8 @@ def mutate(message):
  temp.replace(root/'mutation.json')
  time.sleep(.5)
 first=state()
+assert compact(first), 'fixture must expose compact controls'
+assert all(n['id'].startswith(f'ax-{pid}-{win["window_id"]}-') for n in compact(first)), compact(first)
 time.sleep(.25)
 second=state()
 assert second['ax_snapshot']['cache_hit'], second['ax_snapshot']
