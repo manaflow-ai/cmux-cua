@@ -188,6 +188,12 @@ impl Tool for BringToFrontTool {
                 || {
                     crate::windows::all_windows()
                         .into_iter()
+                        .filter(|window| {
+                            requested_window_id.is_some()
+                                || (window.layer == 0
+                                    && window.bounds.width > 0.0
+                                    && window.bounds.height > 0.0)
+                        })
                         .map(|window| (window.window_id, window.pid))
                         .collect()
                 },
