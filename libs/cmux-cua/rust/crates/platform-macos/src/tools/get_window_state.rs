@@ -37,7 +37,7 @@ fn def() -> &'static ToolDef {
             `tree_markdown` stays available \
             and unchanged in shape for existing text-parsing callers — but new \
             fields will only be added to the structured side.\n\n\
-            Always returns BOTH the element tree AND a screenshot — ground on \
+            By default returns BOTH the element tree AND a screenshot — ground on \
             both and cross-check (the tree lies on some surfaces: Electron \
             echo-confirms, Catalyst null values, virtualized off-viewport rows \
             with `h:1` frames). You choose the modality at ACTION time, not here: \
@@ -50,11 +50,13 @@ fn def() -> &'static ToolDef {
             Optional `query` filters the tree_markdown to matching lines plus their ancestor \
             chain (case-insensitive substring). The element_index values are unchanged — \
             filtering only trims the rendered Markdown.\n\n\
-            Optional `max_elements` / `max_depth` bound the AX walk to mitigate \
+            Pass `include_accessibility:false` for screenshot-only state; this \
+            invalidates the old element index map for that window. Optional \
+            `max_ax_time_ms` / `max_elements` / `max_depth` bound the AX walk to mitigate \
             context-window blow-up on Electron / Obsidian / large web apps that \
             produce 10k+ element trees. When applied, BOTH the markdown \
             and the structured elements are truncated identically. Omit both for \
-            current default behaviour (≤2 000 elements, depth ≤25).".into(),
+            current default behaviour (≤2 000 elements, depth ≤25, 2 000 ms).".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["pid", "window_id"],
@@ -67,6 +69,10 @@ fn def() -> &'static ToolDef {
                 "include_screenshot": {
                     "type": "boolean",
                     "description": "Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return the tree only (the cheap path when you're just re-indexing before an element ax action; saves the image tokens + screen-grab latency). screenshot_out_file still forces a capture to disk."
+                },
+                "include_accessibility": {
+                    "type": "boolean",
+                    "description": "Default true. Set false for a screenshot-only snapshot; this skips AX and invalidates element indices for the window."
                 },
                 "screenshot_out_file": {
                     "type": "string",
@@ -81,6 +87,11 @@ fn def() -> &'static ToolDef {
                     "type": "integer",
                     "minimum": 1,
                     "description": "Cap on the AX-tree walk depth. Nodes whose rendered indent would exceed this are omitted. Omit for the default (25). Lower this for deep menu/Electron trees."
+                },
+                "max_ax_time_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Cooperative wall-time budget for the AX walk in milliseconds. The result reports truncation when the budget expires; an individual AX IPC call may still run until its messaging timeout."
                 }
             },
             "additionalProperties": false
@@ -131,6 +142,10 @@ impl Tool for GetWindowStateTool {
         // still forces a capture (an explicit "write the frame to disk").
         let include_screenshot = args.get("include_screenshot").and_then(|v| v.as_bool());
         let should_capture = include_screenshot != Some(false) || screenshot_out_file.is_some();
+        let include_accessibility = args
+            .get("include_accessibility")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
         // Optional caps — when omitted, fall back to the defaults baked into
         // the AX walker (#22865). minimum:1 keyed in the schema, but defend
         // against 0 here as well so a misbehaving client can't disable the
@@ -145,6 +160,11 @@ impl Tool for GetWindowStateTool {
             .and_then(|v| v.as_u64())
             .map(|v| v.max(1) as usize)
             .unwrap_or(crate::ax::tree::DEFAULT_MAX_DEPTH);
+        let max_ax_time_ms = args
+            .get("max_ax_time_ms")
+            .and_then(|value| value.as_u64())
+            .map(|value| value.max(1))
+            .or(Some(crate::ax::tree::DEFAULT_MAX_AX_TIME_MS));
         // Internal-only compatibility mode. It is deliberately absent from
         // this native tool's public schema so the default action-only map and
         // collapsed layout shape remain unchanged for existing consumers.
@@ -154,7 +174,7 @@ impl Tool for GetWindowStateTool {
             .unwrap_or(false);
 
         // Always walk the AX tree (perception returns both tree + screenshot).
-        let tree_result = {
+        let tree_result = if include_accessibility {
             let q = query.clone();
             // Wrap the blocking AX walk in a 30-second timeout. Heavy webview apps
             // (Arc, Safari with many tabs, Electron) can block
@@ -162,21 +182,23 @@ impl Tool for GetWindowStateTool {
             // deadline the MCP server hangs forever (issue #1537).
             let walk_future = tokio::task::spawn_blocking(move || {
                 if codex_full_ax_map {
-                    crate::ax::tree::walk_tree_bounded_full_map(
+                        crate::ax::tree::walk_tree_bounded_full_map_with_timeout(
                         pid,
                         Some(window_id),
                         q.as_deref(),
                         max_elements,
                         max_depth,
+                        max_ax_time_ms,
                     )
                 } else {
-                    crate::ax::tree::walk_tree_bounded(
-                        pid,
-                        Some(window_id),
-                        q.as_deref(),
-                        max_elements,
-                        max_depth,
-                    )
+                        crate::ax::tree::walk_tree_bounded_with_timeout(
+                            pid,
+                            Some(window_id),
+                            q.as_deref(),
+                            max_elements,
+                            max_depth,
+                            max_ax_time_ms,
+                        )
                 }
             });
             match tokio::time::timeout(std::time::Duration::from_secs(30), walk_future).await {
@@ -193,6 +215,13 @@ impl Tool for GetWindowStateTool {
                     ));
                 }
             }
+        } else {
+            // A screenshot-only snapshot is a deliberate new perception
+            // boundary. Existing AX pointers and tokens must not remain
+            // actionable after the caller chose to skip accessibility.
+            self.state.element_cache.update(pid, window_id, &[]);
+            cmux_cua_core::element_token::global().invalidate_window(pid, window_id);
+            None
         };
 
         // Update element cache.
@@ -318,6 +347,18 @@ impl Tool for GetWindowStateTool {
             "element_count": element_count,
             "tree_markdown": tree_md,
             "elements": elements_json,
+            "ax_walk": {
+                "requested": include_accessibility,
+                "truncated": tree_result.as_ref().map(|r| r.truncated).unwrap_or(false),
+                "truncation_reason": tree_result.as_ref().and_then(|r| r.truncation_reason.clone()),
+                "nodes_visited": tree_result.as_ref().map(|r| r.nodes_visited).unwrap_or(0),
+                "elapsed_ms": tree_result.as_ref().map(|r| r.elapsed_ms).unwrap_or(0),
+                "max_elements": max_elements,
+                "max_depth": max_depth,
+                "max_ax_time_ms": max_ax_time_ms,
+            },
+            "ax_truncated": tree_result.as_ref().map(|r| r.truncated).unwrap_or(false),
+            "ax_truncation_reason": tree_result.as_ref().and_then(|r| r.truncation_reason.clone()),
             // Surface 6: an opaque snapshot identifier consumers can log
             // alongside the per-element tokens for debug correlation.
             // Same value embedded in every `element_token` emitted in

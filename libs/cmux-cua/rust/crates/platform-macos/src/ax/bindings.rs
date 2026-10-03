@@ -72,6 +72,11 @@ extern "C" {
         attribute: CFStringRef,
         value: CFTypeRef,
     ) -> AXError;
+    /// Bound one AX IPC request. The timeout is in seconds and applies to
+    /// subsequent messaging for this element. This is cooperative with the
+    /// walk deadline: calls already in flight still return when this limit or
+    /// the system's own AX messaging timeout is reached.
+    pub fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: f32) -> AXError;
     pub fn AXUIElementGetTypeID() -> CFTypeID;
     pub fn AXIsProcessTrusted() -> bool;
     /// `AXIsProcessTrustedWithOptions(options)` — when called with

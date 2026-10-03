@@ -559,6 +559,55 @@ pub fn bundle_id_for_pid(pid: i32) -> Option<String> {
     }
 }
 
+/// Return whether a running application bundles Electron or Chromium's
+/// framework.  AX enablement must be based on the actual bundle contents,
+/// rather than the localized process name: a renamed Electron app is still
+/// lazy until an assistive client opts it in, while a native app named
+/// "Chrome Helper" must not receive Chromium-only AX attributes.
+pub fn has_chromium_framework(pid: i32) -> bool {
+    use objc2_app_kit::NSRunningApplication;
+
+    unsafe {
+        let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
+            return false;
+        };
+        let Some(url) = app.bundleURL() else {
+            return false;
+        };
+        let Some(path) = url.path() else {
+            return false;
+        };
+        let path = path.to_string();
+        bundle_path_has_chromium_framework(std::path::Path::new(&path))
+    }
+}
+
+/// Pure bundle-content seam for tests and callers that already resolved an
+/// application bundle path.  Electron and Chromium variants use one of these
+/// framework bundle names under `Contents/Frameworks`.
+pub fn bundle_path_has_chromium_framework(path: &std::path::Path) -> bool {
+    let frameworks = path.join("Contents").join("Frameworks");
+    let Ok(entries) = std::fs::read_dir(frameworks) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if !entry.path().is_dir() || !name.ends_with(".framework") {
+            return false;
+        }
+        // Electron uses "Electron Framework.framework". Branded Chromium
+        // distributions use names such as "Google Chrome Framework.framework",
+        // "Brave Browser Framework.framework", and "Microsoft Edge Framework.framework".
+        // Match the framework identity, never the app's display name.
+        name.contains("electron")
+            || name.contains("chromium")
+            || name.contains("chrome framework")
+            || name.contains("brave browser framework")
+            || name.contains("edge framework")
+            || name.contains("arc framework")
+    })
+}
+
 /// Return the localized application name for a running process by PID.
 /// Uses `ps -p {pid} -o comm=` which gives the command name without path.
 /// Returns `None` if the PID is unknown or the command fails.
@@ -601,7 +650,10 @@ pub fn format_app_list(apps: &[AppInfo]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{app_path_for_info_plist, read_app_plist, unix_secs_to_rfc3339};
+    use super::{
+        app_path_for_info_plist, bundle_path_has_chromium_framework, read_app_plist,
+        unix_secs_to_rfc3339,
+    };
 
     #[test]
     fn rfc3339_epoch() {
@@ -695,5 +747,30 @@ mod tests {
     fn rfc3339_known_pre_2000_timestamp() {
         // 1990-07-04T15:30:00Z → 647105400.
         assert_eq!(unix_secs_to_rfc3339(647_105_400), "1990-07-04T15:30:00Z");
+    }
+
+    #[test]
+    fn chromium_detection_uses_bundle_framework_not_display_name() {
+        let root = std::env::temp_dir().join(format!(
+            "cmux-cua-framework-detector-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let renamed_electron = root.join("NativeName.app");
+        std::fs::create_dir_all(
+            renamed_electron
+                .join("Contents/Frameworks/Electron Framework.framework"),
+        )
+        .unwrap();
+        assert!(bundle_path_has_chromium_framework(&renamed_electron));
+
+        let name_only = root.join("Chromium.app");
+        std::fs::create_dir_all(&name_only).unwrap();
+        assert!(!bundle_path_has_chromium_framework(&name_only));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

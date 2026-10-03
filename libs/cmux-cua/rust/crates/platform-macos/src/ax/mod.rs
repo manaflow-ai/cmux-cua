@@ -20,5 +20,9 @@ pub mod bindings;
 pub mod tree;
 pub mod cache;
 
-pub use tree::{walk_tree, walk_tree_bounded, AXNode, TreeWalkResult, DEFAULT_MAX_ELEMENTS, DEFAULT_MAX_DEPTH};
+pub use tree::{
+    walk_tree, walk_tree_bounded, walk_tree_bounded_full_map_with_timeout,
+    walk_tree_bounded_with_timeout, AXNode, TreeWalkResult, DEFAULT_MAX_AX_TIME_MS,
+    DEFAULT_MAX_ELEMENTS, DEFAULT_MAX_DEPTH,
+};
 pub use cache::ElementCache;

@@ -1,0 +1,13 @@
+<!doctype html><html><head><title>CUA Electron Click Fixture</title>
+<style>body{margin:0;font:18px sans-serif;background:#fafafa}h1{margin:20px}
+button{position:absolute;width:130px;height:50px;background:#ddeeff;font-size:16px}
+button.hit{background:#87dd9d}input{position:absolute;left:560px;top:360px;width:150px}
+</style></head><body><h1>CUA click delivery</h1><input aria-label="Text probe" value="before"><script>
+const {ipcRenderer}=require('electron');
+const requireFocus = new URLSearchParams(location.search).get('requireFocus') !== '0';
+for(let i=0;i<20;i++) {let b=document.createElement('button');b.textContent='Probe '+i;
+b.setAttribute('aria-label','Probe '+i);b.style.left=(20+(i%5)*145)+'px';
+b.style.top=(85+Math.floor(i/5)*65)+'px';b.onclick=()=>{if (requireFocus && !document.hasFocus()) return; ipcRenderer.send('hit',String(i));
+b.classList.toggle('hit');b.dataset.count=String(Number(b.dataset.count || 0)+1);
+b.textContent='Clicked '+i+' ('+b.dataset.count+')';b.setAttribute('aria-label',b.textContent);};document.body.appendChild(b);}
+</script></body></html>

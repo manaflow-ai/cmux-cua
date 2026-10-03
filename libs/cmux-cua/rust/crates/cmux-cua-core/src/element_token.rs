@@ -141,6 +141,22 @@ impl TokenRegistry {
         id
     }
 
+    /// Invalidate every snapshot for one window. A screenshot-only perception
+    /// call deliberately has no AX index map, so tokens from an earlier AX
+    /// snapshot must not remain resolvable through the per-pid LRU.
+    pub fn invalidate_window(&self, pid: i32, window_id: u32) {
+        let mut by_pid = self.by_pid.lock().unwrap();
+        let empty = if let Some(lane) = by_pid.get_mut(&pid) {
+            lane.retain(|entry| entry.window_id != window_id);
+            lane.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            by_pid.remove(&pid);
+        }
+    }
+
     /// Resolve `token` against the LRU for `pid`. On success returns
     /// `(window_id, element_index)` — the same pair the caller would
     /// have passed as `(window_id, element_index)` integers. On failure
@@ -456,6 +472,18 @@ mod tests {
         // Both should still resolve.
         let _ = reg.resolve(pid, &format_token(s1, 0)).expect("s1 still in LRU");
         let _ = reg.resolve(pid, &format_token(s2, 0)).expect("s2 fresh");
+    }
+
+    #[test]
+    fn invalidate_window_stales_only_that_windows_tokens() {
+        let reg = fresh_registry();
+        let pid = 0x7fff_0042;
+        let old = reg.register_snapshot(pid, 101, 1);
+        let keep = reg.register_snapshot(pid, 202, 1);
+
+        reg.invalidate_window(pid, 101);
+        assert_eq!(reg.resolve(pid, &format_token(old, 0)).unwrap_err(), STALE_TOKEN_ERROR);
+        assert_eq!(reg.resolve(pid, &format_token(keep, 0)), Ok((202, 0)));
     }
 
     #[test]

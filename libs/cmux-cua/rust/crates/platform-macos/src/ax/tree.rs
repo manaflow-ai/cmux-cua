@@ -34,6 +34,30 @@ pub const DEFAULT_MAX_DEPTH: usize = 25;
 /// (issue #22865).
 pub const DEFAULT_MAX_ELEMENTS: usize = 2_000;
 
+/// Default cooperative wall-time budget for one AX snapshot. A single AX IPC
+/// call can still run until the system messaging timeout, but the walker stops
+/// traversing as soon as it regains control after this deadline.
+pub const DEFAULT_MAX_AX_TIME_MS: u64 = 2_000;
+
+const MAX_AX_MESSAGE_TIMEOUT_SECONDS: f32 = 0.1;
+const MIN_AX_MESSAGE_TIMEOUT_SECONDS: f32 = 0.001;
+
+fn messaging_timeout_seconds(remaining: std::time::Duration) -> f32 {
+    remaining
+        .as_secs_f32()
+        .clamp(MIN_AX_MESSAGE_TIMEOUT_SECONDS, MAX_AX_MESSAGE_TIMEOUT_SECONDS)
+}
+
+unsafe fn apply_messaging_timeout(
+    element: AXUIElementRef,
+    deadline: Option<std::time::Instant>,
+) {
+    if let Some(limit) = deadline {
+        let remaining = limit.saturating_duration_since(std::time::Instant::now());
+        let _ = AXUIElementSetMessagingTimeout(element, messaging_timeout_seconds(remaining));
+    }
+}
+
 /// Maximum number of Unicode scalar values emitted for one AXValue. Large
 /// document/text-area values otherwise duplicate entire documents into both
 /// the structured array and Markdown tree.
@@ -95,6 +119,42 @@ fn enabled_pids() -> &'static Mutex<HashSet<i32>> {
     ENABLED_PIDS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+/// Enable the lazy web-content AX tree for an Electron/Chromium application.
+/// This is intentionally a no-op for every other bundle and is shared by
+/// `launch_app` and the first AX snapshot so both attach paths have identical
+/// behavior. Returns true only when an AX attribute write was accepted.
+pub(crate) fn enable_chromium_accessibility_for_pid(pid: i32) -> bool {
+    if !crate::apps::has_chromium_framework(pid) {
+        return false;
+    }
+
+    let already_enabled = enabled_pids()
+        .lock()
+        .map(|s| s.contains(&pid))
+        .unwrap_or(false);
+    if already_enabled {
+        return true;
+    }
+
+    let enabled = unsafe {
+        let app_elem = AXUIElementCreateApplication(pid);
+        if app_elem.is_null() {
+            false
+        } else {
+            let enabled = enable_chromium_accessibility(app_elem);
+            CFRelease(app_elem as CFTypeRef);
+            enabled
+        }
+    };
+    if enabled {
+        crate::permissions::panel::pump_run_loop_briefly(CHROMIUM_SETTLE_SECONDS);
+        if let Ok(mut set) = enabled_pids().lock() {
+            set.insert(pid);
+        }
+    }
+    enabled
+}
+
 /// A single node in the AX tree.
 #[derive(Debug, Clone)]
 pub struct AXNode {
@@ -132,6 +192,13 @@ pub struct TreeWalkResult {
     pub nodes: Vec<AXNode>,
     /// True when the walk was cut short by the MAX_ELEMENTS cap.
     pub truncated: bool,
+    /// Why the walk was truncated, when it was partial. This is kept as a
+    /// string so tool responses can expose stable machine-readable metadata.
+    pub truncation_reason: Option<String>,
+    /// Number of AX nodes inspected before returning.
+    pub nodes_visited: usize,
+    /// Elapsed wall time spent in the cooperative walk, in milliseconds.
+    pub elapsed_ms: u64,
 }
 
 /// Walk the AX tree of `pid`, optionally filtered to a specific window.
@@ -173,12 +240,32 @@ pub fn walk_tree_bounded(
     max_elements: usize,
     max_depth: usize,
 ) -> TreeWalkResult {
+    walk_tree_bounded_with_timeout(
+        pid,
+        window_id,
+        query,
+        max_elements,
+        max_depth,
+        None,
+    )
+}
+
+/// Walk an AX tree with count, depth, and optional cooperative time caps.
+pub fn walk_tree_bounded_with_timeout(
+    pid: i32,
+    window_id: Option<u32>,
+    query: Option<&str>,
+    max_elements: usize,
+    max_depth: usize,
+    max_ax_time_ms: Option<u64>,
+) -> TreeWalkResult {
     walk_tree_bounded_with_mode(
         pid,
         window_id,
         query,
         max_elements,
         max_depth,
+        max_ax_time_ms,
         WalkMode::Native,
     )
 }
@@ -195,12 +282,28 @@ pub fn walk_tree_bounded_full_map(
     max_elements: usize,
     max_depth: usize,
 ) -> TreeWalkResult {
+    walk_tree_bounded_full_map_with_timeout(
+        pid, window_id, query, max_elements, max_depth, None,
+    )
+}
+
+/// Codex compatibility walk with the same cooperative time budget as the
+/// native action-only walk.
+pub fn walk_tree_bounded_full_map_with_timeout(
+    pid: i32,
+    window_id: Option<u32>,
+    query: Option<&str>,
+    max_elements: usize,
+    max_depth: usize,
+    max_ax_time_ms: Option<u64>,
+) -> TreeWalkResult {
     walk_tree_bounded_with_mode(
         pid,
         window_id,
         query,
         max_elements,
         max_depth,
+        max_ax_time_ms,
         WalkMode::CodexFull,
     )
 }
@@ -217,8 +320,13 @@ fn walk_tree_bounded_with_mode(
     query: Option<&str>,
     max_elements: usize,
     max_depth: usize,
+    max_ax_time_ms: Option<u64>,
     mode: WalkMode,
 ) -> TreeWalkResult {
+    let started_at = std::time::Instant::now();
+    let deadline = max_ax_time_ms.map(|ms| {
+        started_at + std::time::Duration::from_millis(ms.clamp(1, 60_000))
+    });
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
@@ -227,6 +335,7 @@ fn walk_tree_bounded_with_mode(
     // Set to true only when walk_element actually stops early due to the cap —
     // avoids a false-positive when the tree naturally ends on exactly the cap.
     let mut truncated = false;
+    let mut truncation_reason: Option<String> = None;
 
     unsafe {
         let app_elem = AXUIElementCreateApplication(pid);
@@ -235,6 +344,9 @@ fn walk_tree_bounded_with_mode(
                 tree_markdown: String::new(),
                 nodes,
                 truncated: false,
+                truncation_reason: None,
+                nodes_visited: 0,
+                elapsed_ms: started_at.elapsed().as_millis() as u64,
             };
         }
 
@@ -247,16 +359,23 @@ fn walk_tree_bounded_with_mode(
         // read it. Native Cocoa apps reject the attribute, so they pay no
         // settle cost. This relies on the MAX_ELEMENTS node cap to keep the
         // now-materialized (potentially large) tree bounded.
-        let already_enabled = enabled_pids()
-            .lock()
-            .map(|s| s.contains(&pid))
-            .unwrap_or(false);
-        if !already_enabled && enable_chromium_accessibility(app_elem) {
-            crate::permissions::panel::pump_run_loop_briefly(CHROMIUM_SETTLE_SECONDS);
-            if let Ok(mut set) = enabled_pids().lock() {
-                set.insert(pid);
+        // Only Electron/Chromium bundles lazily materialize their web AX tree.
+        // Native applications reject these attributes and should not pay a
+        // settle delay or receive Chromium-specific AX state.
+        if crate::apps::has_chromium_framework(pid) {
+            let already_enabled = enabled_pids()
+                .lock()
+                .map(|s| s.contains(&pid))
+                .unwrap_or(false);
+            if !already_enabled && enable_chromium_accessibility(app_elem) {
+                crate::permissions::panel::pump_run_loop_briefly(CHROMIUM_SETTLE_SECONDS);
+                if let Ok(mut set) = enabled_pids().lock() {
+                    set.insert(pid);
+                }
             }
         }
+
+        apply_messaging_timeout(app_elem, deadline);
 
         // Union AXChildren + AXWindows — the only way to see background windows.
         // AXChildren omits windows when the app isn't frontmost (AppKit limitation).
@@ -292,6 +411,7 @@ fn walk_tree_bounded_with_mode(
                 .iter()
                 .copied()
                 .filter(|&child| {
+                    apply_messaging_timeout(child, deadline);
                     let role = copy_string_attr(child, "AXRole").unwrap_or_default();
                     should_walk_top_level(
                         &role,
@@ -316,8 +436,10 @@ fn walk_tree_bounded_with_mode(
                 &mut index_counter,
                 &mut visited_count,
                 &mut truncated,
+                &mut truncation_reason,
                 max_elements,
                 max_depth,
+                deadline,
                 mode,
             );
         }
@@ -339,13 +461,17 @@ fn walk_tree_bounded_with_mode(
     };
 
     if truncated_flag {
-        let detail = if mode == WalkMode::CodexFull {
-            format!(
+        let detail = match truncation_reason.as_deref() {
+            Some("max_ax_time_ms") => format!(
+                "the cooperative time budget ({})",
+                max_ax_time_ms.map(|ms| format!("{ms} ms")).unwrap_or_else(|| "expired".into())
+            ),
+            Some("max_depth") => format!("the maximum depth ({max_depth})"),
+            _ if mode == WalkMode::CodexFull => format!(
                 "{max_elements} returned nodes or {} scanned nodes",
                 scan_limit_for_mode(max_elements, mode)
-            )
-        } else {
-            format!("{max_elements} nodes")
+            ),
+            _ => format!("{max_elements} nodes"),
         };
         tree_markdown.push_str(&format!(
             "\n⚠️  AX tree truncated at {detail} \
@@ -359,6 +485,9 @@ fn walk_tree_bounded_with_mode(
         tree_markdown,
         nodes,
         truncated: truncated_flag,
+        truncation_reason,
+        nodes_visited: visited_count,
+        elapsed_ms: started_at.elapsed().as_millis() as u64,
     }
 }
 
@@ -443,13 +572,22 @@ unsafe fn walk_element(
     counter: &mut usize,
     visited_count: &mut usize,
     truncated: &mut bool,
+    truncation_reason: &mut Option<String>,
     max_elements: usize,
     max_depth: usize,
+    deadline: Option<std::time::Instant>,
     mode: WalkMode,
 ) {
     if depth_limit_reached(depth, max_depth, truncated) {
+        *truncation_reason = Some("max_depth".to_owned());
         return;
     }
+    if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+        *truncated = true;
+        *truncation_reason = Some("max_ax_time_ms".to_owned());
+        return;
+    }
+    apply_messaging_timeout(element, deadline);
     // Codex compatibility separates the 800-node response budget from a
     // larger bounded scan budget. This lets empty Electron layout wrappers be
     // traversed without crowding useful controls out of the addressable map,
@@ -457,6 +595,7 @@ unsafe fn walk_element(
     let scan_limit = scan_limit_for_mode(max_elements, mode);
     if *visited_count >= scan_limit {
         *truncated = true;
+        *truncation_reason = Some("max_elements".to_owned());
         return;
     }
     *visited_count += 1;
@@ -479,8 +618,10 @@ unsafe fn walk_element(
                 counter,
                 visited_count,
                 truncated,
+                truncation_reason,
                 max_elements,
                 max_depth,
+                deadline,
                 mode,
             );
             CFRelease(child as CFTypeRef);
@@ -526,8 +667,10 @@ unsafe fn walk_element(
                 counter,
                 visited_count,
                 truncated,
+                truncation_reason,
                 max_elements,
                 max_depth,
+                deadline,
                 mode,
             );
             CFRelease(child as CFTypeRef);
@@ -537,6 +680,7 @@ unsafe fn walk_element(
 
     if nodes.len() >= max_elements {
         *truncated = true;
+        *truncation_reason = Some("max_elements".to_owned());
         return;
     }
 
@@ -592,8 +736,10 @@ unsafe fn walk_element(
             counter,
             visited_count,
             truncated,
+            truncation_reason,
             max_elements,
             max_depth,
+            deadline,
             mode,
         );
         CFRelease(child as CFTypeRef);
@@ -814,6 +960,22 @@ mod tests {
         assert!(!truncated);
         assert!(depth_limit_reached(21, 20, &mut truncated));
         assert!(truncated);
+    }
+
+    #[test]
+    fn timed_walk_bounds_each_ax_message_timeout() {
+        assert_eq!(
+            messaging_timeout_seconds(std::time::Duration::ZERO),
+            MIN_AX_MESSAGE_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            messaging_timeout_seconds(std::time::Duration::from_secs(1)),
+            MAX_AX_MESSAGE_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            messaging_timeout_seconds(std::time::Duration::from_millis(50)),
+            0.05
+        );
     }
 
     #[test]
