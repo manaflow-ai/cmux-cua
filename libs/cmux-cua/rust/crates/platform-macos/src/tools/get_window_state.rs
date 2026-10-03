@@ -23,11 +23,17 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "get_window_state".into(),
-        description: "Walk a running app's AX tree and return BOTH a structured \
+        description: "Read a running app's window-scoped AX tree and return BOTH a structured \
             `elements` array (preferred) AND a Markdown rendering of the same tree \
             (back-compat). Every actionable element is tagged with [element_index N] \
             in the markdown and as `element_index` in the structured array — pass \
             those indices to click, type_text, press_key, etc.\n\n\
+            Per-window snapshots are cached and refreshed incrementally from AX \
+            notifications. Clean cache hits perform no AX descriptor reads. \
+            `ax_snapshot.compact` contains actionable or labeled nodes with \
+            stable IDs, window-local frames and an explicit revision diff. \
+            Use `role`, `label` or `region` to query a subset without changing \
+            the action indices.\n\n\
             INVARIANT: call get_window_state once per turn per (pid, window_id) before any \
             element-indexed action. The index map is replaced by the next snapshot.\n\n\
             PREFERRED CONSUMERS read `structuredContent.elements` (actionable rows \
@@ -57,10 +63,9 @@ fn def() -> &'static ToolDef {
             filtering only trims the rendered Markdown.\n\n\
             Pass `include_accessibility:false` for screenshot-only state; this \
             invalidates the old element index map for that window. Optional \
-            `max_ax_time_ms` / `max_elements` / `max_depth` bound the AX walk to mitigate \
-            context-window blow-up on Electron / Obsidian / large web apps that \
-            produce 10k+ element trees. When applied, BOTH the markdown \
-            and the structured elements are truncated identically. Omit both for \
+            `max_ax_time_ms` / `max_elements` / `max_depth` provide last-resort \
+            safety bounds for a cold or dirty walk. When applied, BOTH the markdown \
+            and the structured elements are truncated identically. Omit them for \
             current default behaviour (≤2 000 elements, depth ≤64, 2 000 ms).".into(),
         input_schema: serde_json::json!({
             "type": "object",
