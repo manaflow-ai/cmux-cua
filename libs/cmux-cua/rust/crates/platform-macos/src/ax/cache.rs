@@ -8,8 +8,9 @@
 //! for the same (pid, window_id) replaces the entire entry.
 //!
 //! Memory contract:
-//!   tree::walk_element retains each actionable element before storing its ptr.
-//!   CachedSnapshot::drop releases those retains so we have no AX leaks.
+//!   tree::walk_element retains each emitted element before storing its ptr;
+//!   the window snapshot guard also retains collapsed watcher roots.
+//!   CachedSnapshot::drop releases action retains so we have no AX leaks.
 //!
 //! The locked-HashMap plumbing lives in `cmux_cua_core::element_cache` — see
 //! `docs/dedup-audit.md` item #3. This module owns the macOS-specific
@@ -221,6 +222,18 @@ impl Default for WindowEntry {
     }
 }
 
+impl WindowEntry {
+    fn for_key(key: WindowCacheKey) -> Self {
+        let mut entry = Self {
+            key,
+            ..Self::default()
+        };
+        entry.identity_registry =
+            IdentityRegistry::with_scope(key.pid, key.window_id, key.process_generation, 4096);
+        entry
+    }
+}
+
 /// Cached snapshot for one (pid, window_id) pair.
 pub struct CachedSnapshot {
     /// element_index → raw AXUIElementRef pointer (retained, as usize for Send).
@@ -336,13 +349,14 @@ impl ElementCache {
             return DirtyFlags::default();
         }
         let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = windows.entry(key).or_insert_with(|| WindowEntry {
-            key,
-            ..WindowEntry::default()
-        });
+        let entry = windows
+            .entry(key)
+            .or_insert_with(|| WindowEntry::for_key(key));
         if entry.key != key {
             entry.identity_registry =
                 IdentityRegistry::with_scope(key.pid, key.window_id, key.process_generation, 4096);
+            entry.identity_ids.clear();
+            entry.next_identity = 0;
         }
         for event in events {
             entry.dirty.mark(event.kind);
@@ -495,13 +509,14 @@ impl ElementCache {
             return transient_window_state(pid, window_id, nodes, ax_reads, owned_elements);
         };
         let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = windows.entry(key).or_insert_with(|| WindowEntry {
-            key,
-            ..WindowEntry::default()
-        });
+        let entry = windows
+            .entry(key)
+            .or_insert_with(|| WindowEntry::for_key(key));
         if entry.key != key {
             entry.identity_registry =
                 IdentityRegistry::with_scope(key.pid, key.window_id, key.process_generation, 4096);
+            entry.identity_ids.clear();
+            entry.next_identity = 0;
         }
         let previous = entry.compact_nodes.clone();
         entry.revision = entry.revision.saturating_add(1);
@@ -880,10 +895,11 @@ fn compact_nodes(nodes: &[AXNode], entry: &mut WindowEntry) -> Vec<CompactNode> 
 }
 
 fn stable_id(node: &AXNode, entry: &mut WindowEntry) -> String {
-    if node.element_index.is_some() && node.element_ptr != 0 {
-        // The walker retains actionable nodes. IdentityRegistry adds one
-        // bounded retain of its own and compares AX handles with CFEqual, so
-        // wrapper addresses and mutable labels do not churn the serialized ID.
+    if node.element_ptr != 0 {
+        // Every retained emitted node, including non-indexed labelled text and
+        // layout nodes, goes through the same bounded CFEqual registry. This
+        // keeps IDs stable across wrapper refreshes while preserving distinct
+        // controls that happen to share labels or identifiers.
         return unsafe {
             entry.identity_registry.stable_id(
                 node.element_ptr as AXUIElementRef,
@@ -1030,16 +1046,10 @@ fn transient_window_state(
         window_id,
         process_generation: 0,
     };
-    let mut entry = WindowEntry {
-        key,
-        revision: 1,
-        observer_supported: false,
-        dirty: DirtyFlags {
-            children: true,
-            ..DirtyFlags::default()
-        },
-        ..WindowEntry::default()
-    };
+    let mut entry = WindowEntry::for_key(key);
+    entry.revision = 1;
+    entry.observer_supported = false;
+    entry.dirty.children = true;
     entry.nodes = nodes.to_vec();
     entry.compact_nodes = compact_nodes(nodes, &mut entry);
     entry.diff = diff_nodes(entry.revision, &[], &entry.compact_nodes);
@@ -1081,6 +1091,23 @@ mod tests {
             value: None,
             description: None,
             identifier: None,
+            help: None,
+            actions: Vec::new(),
+            element_ptr: ptr,
+            depth: 0,
+            parent_element_index: None,
+            frame: None,
+        }
+    }
+
+    fn labeled_node(ptr: usize, title: &str) -> AXNode {
+        AXNode {
+            element_index: None,
+            role: "AXStaticText".into(),
+            title: Some(title.into()),
+            value: None,
+            description: None,
+            identifier: Some("duplicate-id".into()),
             help: None,
             actions: Vec::new(),
             element_ptr: ptr,
@@ -1171,6 +1198,47 @@ mod tests {
         assert_eq!(diff.updated, vec!["ax-node:1"]);
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
+    }
+
+    #[test]
+    fn compact_identity_is_scoped_to_the_live_window() {
+        let first = CFString::new("identity scope first");
+        let second = CFString::new("identity scope second");
+        let first_ptr = first.as_concrete_TypeRef() as usize;
+        let second_ptr = second.as_concrete_TypeRef() as usize;
+        let mut entry = WindowEntry::for_key(WindowCacheKey {
+            pid: 41,
+            window_id: 9,
+            process_generation: 77,
+        });
+        let nodes = vec![labeled_node(first_ptr, "same label")];
+        let first_id = compact_nodes(&nodes, &mut entry)[0].id.clone();
+        assert!(
+            first_id.starts_with("ax-41-9-77-"),
+            "unexpected scoped id: {first_id}"
+        );
+
+        let duplicate = vec![labeled_node(second_ptr, "same label")];
+        let second_id = compact_nodes(&duplicate, &mut entry)[0].id.clone();
+        assert_ne!(first_id, second_id, "distinct AX objects must not collapse");
+    }
+
+    #[test]
+    fn nonindexed_identity_survives_label_refresh() {
+        let element = CFString::new("refresh identity");
+        let ptr = element.as_concrete_TypeRef() as usize;
+        let mut entry = WindowEntry::for_key(WindowCacheKey {
+            pid: 42,
+            window_id: 10,
+            process_generation: 78,
+        });
+        let before = compact_nodes(&[labeled_node(ptr, "before")], &mut entry)[0]
+            .id
+            .clone();
+        let after = compact_nodes(&[labeled_node(ptr, "after")], &mut entry)[0]
+            .id
+            .clone();
+        assert_eq!(before, after, "label changes must preserve AX identity");
     }
 
     #[test]
