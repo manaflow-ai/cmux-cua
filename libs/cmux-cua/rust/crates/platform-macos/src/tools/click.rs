@@ -170,14 +170,20 @@ impl AxObservation {
     }
 }
 
+fn click_target_label(title: Option<String>, description: Option<String>) -> Option<String> {
+    title.or(description)
+}
+
 unsafe fn read_ax_observation(element: AXUIElementRef) -> AxObservation {
     AxObservation {
         role: copy_string_attr(element, "AXRole"),
         // Web/Electron controls commonly expose aria-label as AXDescription
         // while leaving AXTitle empty. Treat either as the target's visible
         // label for settled semantic readback.
-        title: copy_string_attr(element, "AXTitle")
-            .or_else(|| copy_string_attr(element, "AXDescription")),
+        title: click_target_label(
+            copy_string_attr(element, "AXTitle"),
+            copy_string_attr(element, "AXDescription"),
+        ),
         value: crate::ax::bindings::copy_stringified_attr(element, "AXValue"),
         selected: copy_stringified_attr(element, "AXSelected"),
         expanded: copy_stringified_attr(element, "AXExpanded"),
@@ -1771,6 +1777,25 @@ mod tests {
             let s = args.str_or("button", "left").to_lowercase();
             assert_eq!(s, v);
         }
+    }
+
+    #[test]
+    fn chromium_empty_title_does_not_hide_target_label_changes() {
+        let before = AxObservation {
+            title: click_target_label(Some(String::new()), Some("Probe 0".into())),
+            role: None,
+            value: None,
+            selected: None,
+            expanded: None,
+            focused: None,
+            selected_range: None,
+        };
+        let after = AxObservation {
+            title: click_target_label(Some(String::new()), Some("Clicked 0 (1)".into())),
+            ..before.clone()
+        };
+        assert!(before.has_semantic_signal());
+        assert!(after.changed_from(&before));
     }
 
     #[test]
