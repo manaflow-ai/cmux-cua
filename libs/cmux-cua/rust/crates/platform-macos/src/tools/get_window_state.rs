@@ -266,6 +266,8 @@ impl Tool for GetWindowStateTool {
                 })
         } else if !include_accessibility {
             None
+        } else {
+            None
         };
 
         // Always walk the AX tree on a cold/dirty read (perception returns

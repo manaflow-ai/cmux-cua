@@ -641,8 +641,8 @@ fn bundle_info_is_dictionary(
     bundle: &objc2_foundation::NSBundle,
     key: &objc2_foundation::NSString,
 ) -> bool {
-    use objc2::{msg_send, ClassType};
-    use objc2_foundation::NSDictionary;
+    use objc2::{msg_send, runtime::AnyObject, ClassType};
+    use objc2_foundation::{NSDictionary, NSString};
     let Some(value) = (unsafe {
         bundle
             .infoDictionary()
@@ -650,7 +650,12 @@ fn bundle_info_is_dictionary(
     }) else {
         return false;
     };
-    unsafe { msg_send![&*value, isKindOfClass: NSDictionary::class()] }
+    unsafe {
+        msg_send![
+            &*value,
+            isKindOfClass: NSDictionary::<NSString, AnyObject>::class()
+        ]
+    }
 }
 
 /// Return the localized application name for a running process by PID.

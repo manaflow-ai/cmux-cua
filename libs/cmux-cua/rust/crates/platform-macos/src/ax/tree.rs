@@ -995,6 +995,7 @@ unsafe fn walk_element(
                 nodes,
                 lines,
                 counter,
+                visited_count,
                 truncated,
                 truncation_reason,
                 max_elements,

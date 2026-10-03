@@ -130,6 +130,7 @@ impl DirtyEvent {
     }
 }
 
+#[derive(Debug)]
 struct RetainedElement(usize);
 
 unsafe impl Send for RetainedElement {}
@@ -394,7 +395,7 @@ fn observer_thread(rx: Receiver<Command>, queue: Arc<DirtyQueue>) {
         unsafe {
             // This timeout is only the command polling cadence.  AX calls
             // never run in the callback and are not bounded by this loop.
-            let _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+            let _ = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, 0);
         }
     }
     registrations.clear();

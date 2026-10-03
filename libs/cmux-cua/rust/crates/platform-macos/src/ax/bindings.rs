@@ -210,12 +210,13 @@ pub unsafe fn copy_descriptor_strings(element: AXUIElementRef) -> AXDescriptorSt
     );
     if error == kAXErrorSuccess && !raw_values.is_null() {
         let values = CFArray::<CFTypeRef>::wrap_under_create_rule(raw_values as _);
-        if values.len() == DESCRIPTOR_ATTRIBUTE_NAMES.len() {
+        let value_count = values.len() as usize;
+        if value_count == DESCRIPTOR_ATTRIBUTE_NAMES.len() {
             let mut decoded = AXDescriptorStrings {
                 complete: true,
                 ..Default::default()
             };
-            for index in 0..values.len() {
+            for index in 0..value_count {
                 let Some(value) = values.get(index) else {
                     continue;
                 };
