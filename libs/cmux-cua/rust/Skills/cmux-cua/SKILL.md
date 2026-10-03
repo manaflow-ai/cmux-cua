@@ -303,8 +303,9 @@ capture, no mode flip.
 > effect** on the explicit inclusion flags. Default returns both regardless
 > of its value. On macOS, use `include_accessibility:false` to return a
 > screenshot without walking AX; this clears the prior element indices for
-> that window. `max_ax_time_ms` (default 2,000 ms), `max_elements`, and
-> `max_depth` bound AX snapshots. Read `ax_walk.truncated` and
+> that window. macOS reuses an observer-backed per-window tree instead of
+> walking it again for every snapshot. `max_ax_time_ms`, `max_elements`, and
+> `max_depth` are safety bounds. Read `ax_walk.truncated` and
 > `ax_walk.truncation_reason` before assuming the tree is complete.
 
 ### The modality is chosen at ACTION time — `ax` vs `px`

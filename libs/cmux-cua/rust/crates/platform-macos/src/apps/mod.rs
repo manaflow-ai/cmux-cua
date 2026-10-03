@@ -583,29 +583,74 @@ pub fn has_chromium_framework(pid: i32) -> bool {
 }
 
 /// Pure bundle-content seam for tests and callers that already resolved an
-/// application bundle path.  Electron and Chromium variants use one of these
-/// framework bundle names under `Contents/Frameworks`.
+/// application bundle path. Electron and Chromium variants use one of these
+/// framework bundle names under `Contents/Frameworks`; renamed Electron
+/// bundles are identified from their own runtime metadata and `app.asar`.
 pub fn bundle_path_has_chromium_framework(path: &std::path::Path) -> bool {
     let frameworks = path.join("Contents").join("Frameworks");
-    let Ok(entries) = std::fs::read_dir(frameworks) else {
+    let has_framework = std::fs::read_dir(frameworks)
+        .ok()
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if !entry.path().is_dir() || !name.ends_with(".framework") {
+                    return false;
+                }
+                // Electron uses "Electron Framework.framework". Branded Chromium
+                // distributions use names such as "Google Chrome Framework.framework",
+                // "Brave Browser Framework.framework", and "Microsoft Edge Framework.framework".
+                // Match the framework identity, never the app's display name.
+                name.contains("electron")
+                    || name.contains("chromium")
+                    || name.contains("chrome framework")
+                    || name.contains("brave browser framework")
+                    || name.contains("edge framework")
+                    || name.contains("arc framework")
+                    || (name.ends_with(" framework.framework")
+                        && electron_bundle_metadata(path))
+            })
+        })
+        .unwrap_or(false);
+    has_framework || electron_bundle_metadata(path)
+}
+
+/// Updated Electron bundles may rename the framework and omit the literal
+/// `Electron Framework.framework` name. Confirm runtime identity from the
+/// bundle's metadata and packaged ASAR resource instead of guessing from the
+/// app's display or process name.
+fn electron_bundle_metadata(path: &std::path::Path) -> bool {
+    use objc2_foundation::ns_string;
+
+    if !path.join("Contents/Resources/app.asar").is_file() {
+        return false;
+    }
+    let Some(bundle) = app_bundle(path) else {
         return false;
     };
-    entries.flatten().any(|entry| {
-        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        if !entry.path().is_dir() || !name.ends_with(".framework") {
-            return false;
-        }
-        // Electron uses "Electron Framework.framework". Branded Chromium
-        // distributions use names such as "Google Chrome Framework.framework",
-        // "Brave Browser Framework.framework", and "Microsoft Edge Framework.framework".
-        // Match the framework identity, never the app's display name.
-        name.contains("electron")
-            || name.contains("chromium")
-            || name.contains("chrome framework")
-            || name.contains("brave browser framework")
-            || name.contains("edge framework")
-            || name.contains("arc framework")
-    })
+    let principal = bundle_info_string(&bundle, ns_string!("NSPrincipalClass"));
+    if principal.as_deref() != Some("BrowserCrApplication") {
+        return false;
+    }
+    bundle_info_is_dictionary(
+        &bundle,
+        ns_string!("ElectronAsarIntegrity"),
+    )
+}
+
+fn bundle_info_is_dictionary(
+    bundle: &objc2_foundation::NSBundle,
+    key: &objc2_foundation::NSString,
+) -> bool {
+    use objc2::{msg_send, ClassType};
+    use objc2_foundation::NSDictionary;
+    let Some(value) = (unsafe {
+        bundle
+            .infoDictionary()
+            .and_then(|dict| dict.objectForKey(key))
+    }) else {
+        return false;
+    };
+    unsafe { msg_send![&*value, isKindOfClass: NSDictionary::class()] }
 }
 
 /// Return the localized application name for a running process by PID.
@@ -771,6 +816,36 @@ mod tests {
         std::fs::create_dir_all(&name_only).unwrap();
         assert!(!bundle_path_has_chromium_framework(&name_only));
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chromium_detection_accepts_renamed_electron_framework_with_runtime_metadata() {
+        let root = std::env::temp_dir().join(format!(
+            "cmux-cua-renamed-electron-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let app = root.join("Renamed.app");
+        let contents = app.join("Contents");
+        std::fs::create_dir_all(contents.join("Frameworks/Codex Framework.framework")).unwrap();
+        std::fs::create_dir_all(contents.join("Resources")).unwrap();
+        std::fs::write(contents.join("Resources/app.asar"), b"asar").unwrap();
+        std::fs::write(
+            contents.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>dev.example.renamed-electron</string>
+<key>NSPrincipalClass</key><string>BrowserCrApplication</string>
+<key>ElectronAsarIntegrity</key><dict><key>Resources/app.asar</key><string>hash</string></dict>
+</dict></plist>"#,
+        )
+        .unwrap();
+        assert!(bundle_path_has_chromium_framework(&app));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -5,6 +5,15 @@ button.hit{background:#87dd9d}input{position:absolute;left:560px;top:360px;width
 </style></head><body><h1>CUA click delivery</h1><input aria-label="Text probe" value="before"><script>
 const {ipcRenderer}=require('electron');
 const requireFocus = new URLSearchParams(location.search).get('requireFocus') !== '0';
+const panel=document.createElement('div');
+panel.setAttribute('role','group');panel.setAttribute('aria-label','Mutation panel');
+Object.assign(panel.style,{position:'absolute',left:'20px',top:'360px',width:'450px',height:'100px'});
+document.body.appendChild(panel);
+ipcRenderer.on('mutation',(_,message)=>{
+ if(message.kind==='value') { const input=document.querySelector('input');input.value=message.value;input.dispatchEvent(new Event('input',{bubbles:true})); }
+ if(message.kind==='children') { panel.replaceChildren();if(message.add) { const child=document.createElement('button');child.textContent='Added control';child.setAttribute('aria-label','Added control');panel.appendChild(child); } }
+ if(message.kind==='layout') { panel.style.left=message.x+'px'; }
+});
 for(let i=0;i<20;i++) {let b=document.createElement('button');b.textContent='Probe '+i;
 b.setAttribute('aria-label','Probe '+i);b.style.left=(20+(i%5)*145)+'px';
 b.style.top=(85+Math.floor(i/5)*65)+'px';b.onclick=()=>{if (requireFocus && !document.hasFocus()) return; ipcRenderer.send('hit',String(i));

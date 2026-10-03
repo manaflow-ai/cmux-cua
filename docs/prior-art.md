@@ -17,6 +17,10 @@ closed Codex desktop app implements accessibility.
 
 ## Reuse and remaining gaps
 
+Peekaboo classifies Electron metadata and AXorcist broadens hierarchy roots;
+neither inspected implementation sets AXManualAccessibility or
+AXEnhancedUserInterface. CUA is the direct source for Chromium opt-in.
+
 Port the compatible upstream CUA enablement and exact-target verification
 approach rather than extending ad hoc timers. Preserve this fork's native
 branding, permission attribution and window scoping; a whole-branch rebase

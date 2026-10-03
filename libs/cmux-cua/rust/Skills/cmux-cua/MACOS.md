@@ -29,11 +29,20 @@ fallback during work that must preserve the user's frontmost app.
 For a screenshot-only snapshot, use `get_window_state` with
 `include_accessibility:false`. This skips the AX walk and invalidates the old
 indices for that window; use screenshot coordinates for the next action.
-For an AX snapshot, `max_ax_time_ms`, `max_elements`, and `max_depth` bound the
-walk (default time budget: 2,000 ms). Inspect `ax_walk.truncated` and
-`ax_walk.truncation_reason` before assuming a missing
-control does not exist. The time budget is cooperative: an individual AX call
-can still take up to its messaging timeout.
+AX snapshots reuse a per-window tree and refresh it from accessibility
+notifications. Collection reads attributes in batches, starts with visible and
+focused content, and removes unlabeled wrapper groups from the output.
+`max_elements`, `max_depth`, and `max_ax_time_ms` remain last-resort safety
+bounds. Inspect `ax_walk.truncated` and `ax_walk.truncation_reason` before
+assuming a missing control does not exist. An individual AX call can still
+take up to its messaging timeout.
+
+Use `role`, `label`, or `region:{x,y,w,h}` to request a compact view of the
+window. Region coordinates are window-local; filtering preserves the action
+indices. `ax_snapshot` includes stable node IDs, window-local frames, cache
+read counts, and a revision-scoped `diff` with added, removed, and updated IDs.
+Stable IDs identify controls across refreshes; action tokens still belong to
+one snapshot and must be refreshed before an indexed action.
 
 ## The no-foreground contract
 
