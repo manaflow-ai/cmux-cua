@@ -270,6 +270,16 @@ impl Tool for LaunchAppTool {
             Ok::<_, anyhow::Error>((pid, app_info, windows))
         }).await;
 
+        // Attach Chromium/Electron accessibility as soon as LaunchServices
+        // gives us the real pid. Detection is bundle-framework based and the
+        // helper is idempotent, so native apps and repeated launches are cheap.
+        if let Ok(Ok((pid, _, _))) = &launch_result {
+            let launched_pid = *pid;
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::ax::tree::enable_chromium_accessibility_for_pid(launched_pid)
+            }).await;
+        }
+
         // Upgrade to targeted suppression now that we know the real pid.
         // Keep the wildcard lease alive until immediately AFTER we've
         // armed the targeted one — that's the PR #1521 overlap window.

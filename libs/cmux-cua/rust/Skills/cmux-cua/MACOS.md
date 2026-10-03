@@ -6,6 +6,44 @@ behavior matrix, canonical loop, pixel-click contract, common error
 patterns) is in `SKILL.md`. Read this in addition to `SKILL.md` when
 you're driving an app on macOS.
 
+## Electron and Chromium apps
+
+The driver enables accessibility when attaching to an app that bundles an
+Electron or Chromium framework. Detection uses the app bundle, rather than the
+app name. This helps populate lazy AX trees; indices still require a fresh
+`get_window_state` snapshot before each indexed action.
+
+Background delivery remains the default. For Electron controls, check the
+click result and verify the intended change in the next snapshot. A background
+click with no observed change is reported as `not_landed`; an unchanged control
+may also be a legitimate no-op, so this result is not proof that no event arrived.
+
+When bringing the target forward is acceptable, pass `fallback:"foreground"`
+to `click`. The driver checks the background attempt, retries once with
+foreground delivery if it observes no change, and reports the retry in its
+result. **This opt-in can activate and raise the target window.** For a known
+Electron pixel target that needs foreground delivery, use
+`delivery_mode:"foreground"` directly. Do not enable foreground delivery or
+fallback during work that must preserve the user's frontmost app.
+
+For a screenshot-only snapshot, use `get_window_state` with
+`include_accessibility:false`. This skips the AX walk and invalidates the old
+indices for that window; use screenshot coordinates for the next action.
+AX snapshots reuse a per-window tree and refresh it from accessibility
+notifications. Collection reads attributes in batches, starts with visible and
+focused content, and removes unlabeled wrapper groups from the output.
+`max_elements`, `max_depth`, and `max_ax_time_ms` remain last-resort safety
+bounds. Inspect `ax_walk.truncated` and `ax_walk.truncation_reason` before
+assuming a missing control does not exist. An individual AX call can still
+take up to its messaging timeout.
+
+Use `role`, `label`, or `region:{x,y,w,h}` to request a compact view of the
+window. Region coordinates are window-local; filtering preserves the action
+indices. `ax_snapshot` includes stable node IDs, window-local frames, cache
+read counts, and a revision-scoped `diff` with added, removed, and updated IDs.
+Stable IDs identify controls across refreshes; action tokens still belong to
+one snapshot and must be refreshed before an indexed action.
+
 ## The no-foreground contract
 
 **The user's frontmost app MUST NOT change.** This is the whole
@@ -313,8 +351,10 @@ breadth Windows and Linux already exposed (`type_text` / `press_key` /
 no raise, no focus steal. `"foreground"` briefly fronts the owning app,
 acts, then restores the prior frontmost — the explicit last resort for a
 surface that only accepts events while frontmost (the canvas/viewport/game
-case below). Element-indexed (AX) actions are inherently background and
-hold the no-foreground contract without the flag.
+case below). Element-indexed (AX) actions default to background delivery.
+`click` also supports `fallback:"foreground"` for one opt-in retry after an
+unchanged background attempt; it briefly fronts the target and restores the
+prior app, and reports `fallback_attempted:true`.
 
 macOS-specific residuals worth knowing (the rest of the capture/dispatch/
 addressing params are a shared cross-platform contract — see `SKILL.md` →

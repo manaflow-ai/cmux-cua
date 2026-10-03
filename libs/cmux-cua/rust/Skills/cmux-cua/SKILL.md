@@ -12,6 +12,13 @@ invariant is not optional and silently breaks if you skip it.
 
 ## Platform-specific reading — read this first
 
+On macOS, Electron/Chromium apps may ignore background clicks. Read
+`MACOS.md` → "Electron and Chromium apps" for accessibility attachment,
+screenshot-only state, and click verification. `click({...,fallback:"foreground"})`
+opts into one foreground retry after an unchanged background attempt; it can
+bring the window forward. Keep the default background delivery when the user's
+frontmost app must stay unchanged.
+
 This file is the **cross-platform core**: snapshot invariant, CLI vs
 MCP choice, tool surface naming, behavior matrix, canonical loop,
 pixel-click contract, common failure modes. The platform-specific
@@ -264,7 +271,7 @@ returns.
 
 ## Behavior matrix
 
-### Perception is mode-agnostic — `get_window_state` returns BOTH
+### Perception returns both tree and screenshot by default
 
 `get_window_state(pid, window_id)` **returns both the accessibility
 tree AND a screenshot by default.** There is no capture mode to pick
@@ -284,7 +291,7 @@ wrong you look at the pixels **in the same response** — no second
 capture, no mode flip.
 
 > **Perf opt-out — `include_screenshot`.** `include_screenshot`
-> (boolean, default `true`) is the one knob, and it is a **perf** knob,
+> (boolean, default `true`) is a **perf** knob,
 > not a modality choice. Default returns both (grounding-first). Pass
 > `include_screenshot:false` to skip the screen grab and get the tree
 > only — the cheap path when you're just **re-indexing before an
@@ -293,11 +300,13 @@ capture, no mode flip.
 
 > **`capture_mode` is DEPRECATED and ignored.** It is still *accepted*
 > on `get_window_state` so old callers don't error, but it has **no
-> effect** — both the tree and the screenshot come back regardless of
-> what you pass (`ax`, `vision`, `som`, anything). There is no
-> `ax`/`vision`/`som` capture choice anymore. Drop the word "vision"
-> for perception entirely. (The tool named `screenshot` is separate —
-> raw PNG, no AX walk — and unrelated.)
+> effect** on the explicit inclusion flags. Default returns both regardless
+> of its value. On macOS, use `include_accessibility:false` to return a
+> screenshot without walking AX; this clears the prior element indices for
+> that window. macOS reuses an observer-backed per-window tree instead of
+> walking it again for every snapshot. `max_ax_time_ms`, `max_elements`, and
+> `max_depth` are safety bounds. Read `ax_walk.truncated` and
+> `ax_walk.truncation_reason` before assuming the tree is complete.
 
 ### The modality is chosen at ACTION time — `ax` vs `px`
 
@@ -315,7 +324,7 @@ on the action call, and that one choice selects the rung:
 
 `ax`↔`element_index`, `px`↔pixel `x,y`. We retired the word "vision"
 for the *dispatch* path — it conflated perception with dispatch.
-Perception is always both; dispatch is `ax` or `px`.
+Perception defaults to both; dispatch is `ax` or `px`.
 
 **The keyboard family has both forms too.** `type_text`, `press_key`,
 and `hotkey` take `element_index` (ax) **or** `x,y` (px) — mutually
@@ -353,10 +362,15 @@ post-condition?) and adds two machine-readable fields so you know
 whether — and where — to climb the ladder:
 
 - `effect`: one of
-  - `"confirmed"` — the driver read back the effect (`ax` rung only).
+  - `"confirmed"` — the driver observed an effect. On macOS, background
+    clicks compare the target and focused element before and after delivery.
   - `"unverifiable"` — dispatched, but the driver has no handle to
-    read back (every `px`/CGEvent path; foreground rung). **You**
+    read back (including the foreground rung). **You**
     confirm it off the screenshot — it is not a failure.
+  - `"not_landed"` — on macOS, no focused-element or AX control-state
+    change was observed after a background click. Verify the intended effect;
+    an unchanged state may also be a legitimate no-op. `fallback:"foreground"`
+    opts into one retry and reports `fallback_attempted:true`.
   - `"suspected_noop"` — the `ax` action **likely did nothing** (the
     element didn't actually advertise the action, or you hit a passive
     label). This is the explicit **"cross to `px`"** trigger.
@@ -381,14 +395,14 @@ window cannot be pixel-targeted in the background (libei →
 
 ## The verify-then-escalate ladder (algorithm)
 
-Every snapshot already hands you both the tree and the screenshot, so
+A default snapshot hands you both the tree and the screenshot, so
 verifying never means "go take a screenshot" — it means cross-check
 the tree against the pixels you already have, and only change
 *dispatch rung* on a real signal. Walk the rungs:
 
 ```
 # Rung 1 — element ax action, backgrounded (the cheap default)
-get_window_state(pid, window_id)            # tree + screenshot, both, always
+get_window_state(pid, window_id)            # tree + screenshot by default
 resp = click(pid, window_id, element_index) # or type_text / set_value / press_key
 get_window_state(pid, window_id)            # re-snapshot — did the tree change?
 

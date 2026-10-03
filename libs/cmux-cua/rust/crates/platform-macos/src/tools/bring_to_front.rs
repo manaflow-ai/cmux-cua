@@ -20,9 +20,75 @@
 //! foreground — it is an explicit opt-in, never called by the input ladder.
 
 use async_trait::async_trait;
-use cmux_cua_core::{protocol::ToolResult, tool::{Tool, ToolDef}};
+use cmux_cua_core::{
+    protocol::ToolResult,
+    tool::{Tool, ToolDef},
+};
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 use serde_json::Value;
+use std::time::Duration;
+
+const WINDOW_DISCOVERY_ATTEMPTS: usize = 20;
+const WINDOW_DISCOVERY_DELAY: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WindowTargetError {
+    NotFound {
+        pid: i32,
+        requested: Option<u32>,
+    },
+    OwnerMismatch {
+        window_id: u32,
+        requested_pid: i32,
+        owner_pid: i32,
+    },
+}
+
+/// Wait for a freshly launched process to publish its first WindowServer
+/// record. The closure is injected so the retry policy is unit-testable without
+/// touching WindowServer or foreground state.
+fn wait_for_window_target<F>(
+    pid: i32,
+    requested: Option<u32>,
+    attempts: usize,
+    delay: Duration,
+    mut list: F,
+) -> Result<Option<u32>, WindowTargetError>
+where
+    F: FnMut() -> Vec<(u32, i32)>,
+{
+    let attempts = attempts.max(1);
+    for attempt in 0..attempts {
+        let windows = list();
+        if let Some(window_id) = requested {
+            if let Some((_, owner_pid)) = windows.iter().find(|(id, _)| *id == window_id) {
+                if *owner_pid != pid {
+                    return Err(WindowTargetError::OwnerMismatch {
+                        window_id,
+                        requested_pid: pid,
+                        owner_pid: *owner_pid,
+                    });
+                }
+                return Ok(Some(window_id));
+            }
+        } else if let Some((window_id, _)) = windows.iter().find(|(_, owner_pid)| *owner_pid == pid)
+        {
+            return Ok(Some(*window_id));
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(delay);
+        }
+    }
+    match requested {
+        Some(requested) => Err(WindowTargetError::NotFound {
+            pid,
+            requested: Some(requested),
+        }),
+        // App-level activation remains valid for processes that have no
+        // WindowServer record yet (or are menu-bar/background-only apps).
+        None => Ok(None),
+    }
+}
 
 pub struct BringToFrontTool;
 
@@ -31,8 +97,7 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "bring_to_front".into(),
-        description:
-            "Persistently activate an app so it genuinely holds macOS foreground, \
+        description: "Persistently activate an app so it genuinely holds macOS foreground, \
              then leave it there. Most input does NOT need this — every macOS \
              dispatch reaches backgrounded windows, and `dispatch:\"foreground\"` \
              does its own brief front→act→restore. Reach for `bring_to_front` only \
@@ -62,7 +127,9 @@ fn def() -> &'static ToolDef {
 
 #[async_trait]
 impl Tool for BringToFrontTool {
-    fn def(&self) -> &ToolDef { def() }
+    fn def(&self) -> &ToolDef {
+        def()
+    }
 
     async fn invoke(&self, args: Value) -> ToolResult {
         let pid = match args.get("pid").and_then(Value::as_i64) {
@@ -80,7 +147,96 @@ impl Tool for BringToFrontTool {
             },
             None => return ToolResult::error("Missing required integer field: pid".to_string()),
         };
-        let window_id = args.get("window_id").and_then(Value::as_i64);
+        let requested_window_id = match args.get("window_id").and_then(Value::as_i64) {
+            None => None,
+            Some(window_id) if window_id > 0 && window_id <= u32::MAX as i64 => {
+                Some(window_id as u32)
+            }
+            Some(window_id) => {
+                return ToolResult::error(format!(
+                    "bring_to_front: `window_id` {window_id} is not a valid window identifier."
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "bring_to_front_window_id_invalid",
+                    "window_id": window_id,
+                }));
+            }
+        };
+
+        // Preserve the original PID-not-found result before waiting on
+        // WindowServer: command-line and background-only apps may have no
+        // windows, while an exited process should still report the PID error.
+        let app_exists =
+            unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid).is_some() };
+        if !app_exists {
+            return ToolResult::error(format!(
+                "bring_to_front: no running application for pid {pid} \
+                 (process not found or already exited)."
+            ))
+            .with_structured(serde_json::json!({
+                "code": "bring_to_front_pid_not_found",
+                "pid": pid,
+            }));
+        }
+
+        let target_window_id = match tokio::task::spawn_blocking(move || {
+            wait_for_window_target(
+                pid,
+                requested_window_id,
+                WINDOW_DISCOVERY_ATTEMPTS,
+                WINDOW_DISCOVERY_DELAY,
+                || {
+                    crate::windows::all_windows()
+                        .into_iter()
+                        .filter(|window| {
+                            requested_window_id.is_some()
+                                || (window.layer == 0
+                                    && window.bounds.width > 0.0
+                                    && window.bounds.height > 0.0)
+                        })
+                        .map(|window| (window.window_id, window.pid))
+                        .collect()
+                },
+            )
+        })
+        .await
+        {
+            Ok(Ok(window_id)) => window_id,
+            Ok(Err(WindowTargetError::OwnerMismatch {
+                window_id,
+                requested_pid,
+                owner_pid,
+            })) => {
+                return ToolResult::error(format!(
+                    "bring_to_front: window_id={window_id} belongs to pid={owner_pid}, not pid={requested_pid}."
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "bring_to_front_window_owner_mismatch",
+                    "window_id": window_id,
+                    "pid": requested_pid,
+                    "owner_pid": owner_pid,
+                }));
+            }
+            Ok(Err(WindowTargetError::NotFound { pid, requested })) => {
+                return ToolResult::error(format!(
+                    "bring_to_front: no window for pid {pid} became available before activation."
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "window_target_not_found",
+                    "pid": pid,
+                    "window_id": requested,
+                }));
+            }
+            Err(join) => {
+                return ToolResult::error(format!(
+                    "bring_to_front: window discovery task failed: {join}"
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "bring_to_front_window_discovery_failed",
+                    "pid": pid,
+                }));
+            }
+        };
 
         // `-[NSRunningApplication activateWithOptions:]` is documented
         // thread-safe. ActivateAllWindows brings the app's windows forward (not
@@ -122,11 +278,76 @@ impl Tool for BringToFrontTool {
             }));
         }
 
-        ToolResult::text(format!("Brought pid {pid} to the foreground."))
-            .with_structured(serde_json::json!({
+        ToolResult::text(format!("Brought pid {pid} to the foreground.")).with_structured(
+            serde_json::json!({
                 "pid": pid,
-                "window_id": window_id,
+                "window_id": target_window_id,
                 "activated": true,
-            }))
+            }),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn window_discovery_retries_until_fresh_window_registers() {
+        let mut observations = VecDeque::from([Vec::new(), Vec::new(), vec![(7001, 321)]]);
+        let result = wait_for_window_target(321, None, 5, Duration::ZERO, || {
+            observations.pop_front().unwrap_or_default()
+        });
+        assert_eq!(result, Ok(Some(7001)));
+        assert!(observations.is_empty());
+    }
+
+    #[test]
+    fn window_discovery_times_out_with_structured_target_error() {
+        let result =
+            wait_for_window_target(321, None, 3, Duration::ZERO, || Vec::<(u32, i32)>::new());
+        assert_eq!(result, Ok(None));
+    }
+
+    #[test]
+    fn explicit_window_discovery_times_out_with_structured_target_error() {
+        let result = wait_for_window_target(321, Some(7001), 3, Duration::ZERO, || {
+            Vec::<(u32, i32)>::new()
+        });
+        assert_eq!(
+            result,
+            Err(WindowTargetError::NotFound {
+                pid: 321,
+                requested: Some(7001),
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_window_owner_mismatch_is_not_retried_as_missing() {
+        let mut calls = 0;
+        let result = wait_for_window_target(321, Some(7001), 5, Duration::ZERO, || {
+            calls += 1;
+            vec![(7001, 999)]
+        });
+        assert_eq!(
+            result,
+            Err(WindowTargetError::OwnerMismatch {
+                window_id: 7001,
+                requested_pid: 321,
+                owner_pid: 999,
+            })
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn explicit_window_id_waits_for_its_owner() {
+        let mut observations = VecDeque::from([vec![], vec![(7001, 321)]]);
+        let result = wait_for_window_target(321, Some(7001), 3, Duration::ZERO, || {
+            observations.pop_front().unwrap_or_default()
+        });
+        assert_eq!(result, Ok(Some(7001)));
     }
 }

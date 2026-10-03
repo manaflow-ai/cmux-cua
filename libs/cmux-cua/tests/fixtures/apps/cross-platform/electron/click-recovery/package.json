@@ -1,0 +1,8 @@
+{
+  "name": "cua-electron-click-recovery-fixture",
+  "private": true,
+  "version": "1.0.0",
+  "main": "main.js",
+  "scripts": {"start": "electron ."},
+  "devDependencies": {"electron": "38.2.0"}
+}

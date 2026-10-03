@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use cmux_cua_core::{protocol::{ToolResult, Content}, tool::{Tool, ToolDef}};
+use cmux_cua_core::{
+    protocol::{Content, ToolResult},
+    tool::{Tool, ToolDef},
+};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -10,7 +13,9 @@ pub struct GetWindowStateTool {
 }
 
 impl GetWindowStateTool {
-    pub fn new(state: Arc<ToolState>) -> Self { Self { state } }
+    pub fn new(state: Arc<ToolState>) -> Self {
+        Self { state }
+    }
 }
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
@@ -18,11 +23,19 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "get_window_state".into(),
-        description: "Walk a running app's AX tree and return BOTH a structured \
+        description: "Read a running app's window-scoped AX tree and return BOTH a structured \
             `elements` array (preferred) AND a Markdown rendering of the same tree \
             (back-compat). Every actionable element is tagged with [element_index N] \
             in the markdown and as `element_index` in the structured array — pass \
             those indices to click, type_text, press_key, etc.\n\n\
+            Per-window snapshots are cached and refreshed incrementally from AX \
+            notifications. Clean cache hits perform no AX descriptor reads; \
+            structural child/frame guards may still perform bounded AX reads, \
+            reported separately as `ax_snapshot.structural_reads`. \
+            `ax_snapshot.compact` contains actionable or labeled nodes with \
+            stable IDs, window-local frames and an explicit revision diff. \
+            Use `role`, `label` or `region` to query a subset without changing \
+            the action indices.\n\n\
             INVARIANT: call get_window_state once per turn per (pid, window_id) before any \
             element-indexed action. The index map is replaced by the next snapshot.\n\n\
             PREFERRED CONSUMERS read `structuredContent.elements` (actionable rows \
@@ -37,7 +50,7 @@ fn def() -> &'static ToolDef {
             `tree_markdown` stays available \
             and unchanged in shape for existing text-parsing callers — but new \
             fields will only be added to the structured side.\n\n\
-            Always returns BOTH the element tree AND a screenshot — ground on \
+            By default returns BOTH the element tree AND a screenshot — ground on \
             both and cross-check (the tree lies on some surfaces: Electron \
             echo-confirms, Catalyst null values, virtualized off-viewport rows \
             with `h:1` frames). You choose the modality at ACTION time, not here: \
@@ -50,11 +63,12 @@ fn def() -> &'static ToolDef {
             Optional `query` filters the tree_markdown to matching lines plus their ancestor \
             chain (case-insensitive substring). The element_index values are unchanged — \
             filtering only trims the rendered Markdown.\n\n\
-            Optional `max_elements` / `max_depth` bound the AX walk to mitigate \
-            context-window blow-up on Electron / Obsidian / large web apps that \
-            produce 10k+ element trees. When applied, BOTH the markdown \
-            and the structured elements are truncated identically. Omit both for \
-            current default behaviour (≤2 000 elements, depth ≤25).".into(),
+            Pass `include_accessibility:false` for screenshot-only state; this \
+            invalidates the old element index map for that window. Optional \
+            `max_ax_time_ms` / `max_elements` / `max_depth` provide last-resort \
+            safety bounds for a cold or dirty walk. When applied, BOTH the markdown \
+            and the structured elements are truncated identically. Omit them for \
+            current default behaviour (≤2 000 elements, depth ≤64, 2 000 ms).".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["pid", "window_id"],
@@ -63,10 +77,30 @@ fn def() -> &'static ToolDef {
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "window_id": { "type": "integer", "description": "Target window ID from list_windows." },
                 "query": { "type": "string", "description": "Case-insensitive filter for tree_markdown." },
+                "role": { "type": "string", "description": "Optional AX role filter applied to every emitted view." },
+                "label": { "type": "string", "description": "Optional case-insensitive label filter applied to every emitted view." },
+                "region": {
+                    "type": "object",
+                    "properties": {
+                        "x": { "type": "number" }, "y": { "type": "number" },
+                        "w": { "type": "number" }, "h": { "type": "number" }
+                    },
+                    "required": ["x", "y", "w", "h"],
+                    "additionalProperties": false,
+                    "description": "Optional window-local region filter for every emitted view."
+                },
                 "capture_mode": cmux_cua_core::capture_mode::capture_mode_schema(),
                 "include_screenshot": {
                     "type": "boolean",
                     "description": "Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return the tree only (the cheap path when you're just re-indexing before an element ax action; saves the image tokens + screen-grab latency). screenshot_out_file still forces a capture to disk."
+                },
+                "include_accessibility": {
+                    "type": "boolean",
+                    "description": "Default true. Set false for a screenshot-only snapshot; this skips AX and invalidates element indices for the window."
+                },
+                "include_accessibility_tree": {
+                    "type": "boolean",
+                    "description": "Compatibility alias for include_accessibility. Set false for a screenshot-only snapshot."
                 },
                 "screenshot_out_file": {
                     "type": "string",
@@ -80,7 +114,12 @@ fn def() -> &'static ToolDef {
                 "max_depth": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Cap on the AX-tree walk depth. Nodes whose rendered indent would exceed this are omitted. Omit for the default (25). Lower this for deep menu/Electron trees."
+                    "description": "Cap on the AX-tree walk depth. Nodes whose rendered indent would exceed this are omitted. Omit for the default (64). Lower this for unusually deep or context-sensitive trees."
+                },
+                "max_ax_time_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Cooperative wall-time budget for the AX walk in milliseconds. The result reports truncation when the budget expires; an individual AX IPC call may still run until its messaging timeout."
                 }
             },
             "additionalProperties": false
@@ -94,13 +133,33 @@ fn def() -> &'static ToolDef {
 
 #[async_trait]
 impl Tool for GetWindowStateTool {
-    fn def(&self) -> &ToolDef { def() }
+    fn def(&self) -> &ToolDef {
+        def()
+    }
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cmux_cua_core::tool_args::ArgsExt;
-        let pid = match args.require_i32("pid") { Ok(v) => v, Err(e) => return e };
-        let window_id = match args.require_u32("window_id") { Ok(v) => v, Err(e) => return e };
+        let pid = match args.require_i32("pid") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let window_id = match args.require_u32("window_id") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
         let query = args.opt_str("query");
+        let role_filter = args.opt_str("role");
+        let label_filter = args
+            .opt_str("label")
+            .map(|value| value.to_ascii_lowercase());
+        let region_filter = args.get("region").and_then(|value| {
+            Some([
+                value.get("x")?.as_f64()?,
+                value.get("y")?.as_f64()?,
+                value.get("w")?.as_f64()?,
+                value.get("h")?.as_f64()?,
+            ])
+        });
         let screenshot_out_file = args.opt_str("screenshot_out_file").map(|s| {
             // Expand ~ prefix.
             if s.starts_with("~/") {
@@ -115,7 +174,9 @@ impl Tool for GetWindowStateTool {
         let session_id = args.opt_str("_session_id");
         let effective_max_dim = {
             let cfg = self.state.config.read().unwrap();
-            self.state.session_config.effective_max_image_dimension(session_id.as_deref(), &cfg)
+            self.state
+                .session_config
+                .effective_max_image_dimension(session_id.as_deref(), &cfg)
         };
         // `capture_mode` is DEPRECATED and ignored — get_window_state always
         // returns BOTH the tree and a screenshot now, so the agent grounds on
@@ -131,6 +192,26 @@ impl Tool for GetWindowStateTool {
         // still forces a capture (an explicit "write the frame to disk").
         let include_screenshot = args.get("include_screenshot").and_then(|v| v.as_bool());
         let should_capture = include_screenshot != Some(false) || screenshot_out_file.is_some();
+        let accessibility_alias = args
+            .get("include_accessibility_tree")
+            .and_then(|value| value.as_bool());
+        let accessibility_flag = args
+            .get("include_accessibility")
+            .and_then(|value| value.as_bool());
+        if accessibility_alias.is_some()
+            && accessibility_flag.is_some()
+            && accessibility_alias != accessibility_flag
+        {
+            return ToolResult::error(
+                "include_accessibility and include_accessibility_tree disagree.",
+            );
+        }
+        let include_accessibility = accessibility_alias.or(accessibility_flag).unwrap_or(true);
+        if !include_accessibility && !should_capture {
+            return ToolResult::error(
+                "get_window_state needs a requested modality: enable a screenshot or accessibility tree.",
+            );
+        }
         // Optional caps — when omitted, fall back to the defaults baked into
         // the AX walker (#22865). minimum:1 keyed in the schema, but defend
         // against 0 here as well so a misbehaving client can't disable the
@@ -145,6 +226,11 @@ impl Tool for GetWindowStateTool {
             .and_then(|v| v.as_u64())
             .map(|v| v.max(1) as usize)
             .unwrap_or(crate::ax::tree::DEFAULT_MAX_DEPTH);
+        let max_ax_time_ms = args
+            .get("max_ax_time_ms")
+            .and_then(|value| value.as_u64())
+            .map(|value| value.max(1))
+            .or(Some(crate::ax::tree::DEFAULT_MAX_AX_TIME_MS));
         // Internal-only compatibility mode. It is deliberately absent from
         // this native tool's public schema so the default action-only map and
         // collapsed layout shape remain unchanged for existing consumers.
@@ -153,29 +239,69 @@ impl Tool for GetWindowStateTool {
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
 
-        // Always walk the AX tree (perception returns both tree + screenshot).
-        let tree_result = {
-            let q = query.clone();
+        if !crate::windows::all_windows()
+            .iter()
+            .any(|window| window.window_id == window_id && window.pid == pid)
+        {
+            return ToolResult::error(format!(
+                "window_id={window_id} is not currently owned by pid={pid}"
+            ));
+        }
+
+        // Reuse a clean observer-backed snapshot before touching AX. The
+        // WindowServer ownership check above prevents a stale cache entry for
+        // a recycled window id from crossing process boundaries.
+        let mut cached_state = if include_accessibility {
+            self.state
+                .element_cache
+                .refresh_window(
+                    pid,
+                    window_id,
+                    max_elements,
+                    max_depth,
+                    codex_full_ax_map,
+                    max_ax_time_ms,
+                )
+                .or_else(|| {
+                    self.state.element_cache.cached_window_for_policy(
+                        pid,
+                        window_id,
+                        max_elements,
+                        max_depth,
+                        codex_full_ax_map,
+                    )
+                })
+        } else if !include_accessibility {
+            None
+        } else {
+            None
+        };
+
+        // Always walk the AX tree on a cold/dirty read (perception returns
+        // both the tree and a screenshot).
+        let tree_result = if include_accessibility && cached_state.is_none() {
             // Wrap the blocking AX walk in a 30-second timeout. Heavy webview apps
             // (Arc, Safari with many tabs, Electron) can block
             // AXUIElementCopyAttributeValue indefinitely via XPC — without a
             // deadline the MCP server hangs forever (issue #1537).
             let walk_future = tokio::task::spawn_blocking(move || {
                 if codex_full_ax_map {
-                    crate::ax::tree::walk_tree_bounded_full_map(
+                    crate::ax::tree::walk_tree_bounded_full_map_with_timeout(
                         pid,
                         Some(window_id),
-                        q.as_deref(),
+                        None,
                         max_elements,
                         max_depth,
+                        max_ax_time_ms,
                     )
                 } else {
-                    crate::ax::tree::walk_tree_bounded(
+                    crate::ax::tree::walk_tree_bounded_with_timeout(
                         pid,
                         Some(window_id),
-                        q.as_deref(),
+                        None,
                         max_elements,
                         max_depth,
+                        max_ax_time_ms,
                     )
                 }
             });
@@ -193,10 +319,55 @@ impl Tool for GetWindowStateTool {
                     ));
                 }
             }
+        } else if !include_accessibility {
+            // A screenshot-only snapshot is a deliberate new perception
+            // boundary. Existing AX pointers and tokens must not remain
+            // actionable after the caller chose to skip accessibility.
+            self.state.element_cache.invalidate_process(pid);
+            self.state.element_cache.update(pid, window_id, &[]);
+            cmux_cua_core::element_token::global().invalidate_window(pid, window_id);
+            None
+        } else {
+            // A clean cache hit or an observer-driven incremental refresh is
+            // already represented by `cached_state`; keep its retained AX
+            // handles and indexed action snapshot intact.
+            None
         };
+
+        // Incremental observer refreshes update the rich window cache but do
+        // not produce a `TreeWalkResult`. Republish their actionable handles
+        // to the legacy indexed action cache before the response is built.
+        // Clean cache hits already have the same snapshot installed and need
+        // no extra retain/release churn.
+        if let Some(state) = cached_state.as_ref().filter(|state| !state.cache_hit) {
+            self.state
+                .element_cache
+                .update(pid, window_id, &state.nodes);
+        }
 
         // Update element cache.
         if let Some(ref r) = tree_result {
+            // A partial AX walk is useful for this response and for immediate
+            // indexed dispatch, but must not become a clean persistent cache
+            // snapshot that silently hides controls on the next turn.
+            if !r.truncated {
+                let owned = r.retain_nodes();
+                cached_state = Some(
+                    self.state
+                        .element_cache
+                        .update_window_owned_with_policy_and_watch(
+                            pid,
+                            window_id,
+                            &r.nodes,
+                            r.nodes_visited as u64,
+                            owned,
+                            r.retain_watch_elements(),
+                            max_elements,
+                            max_depth,
+                            codex_full_ax_map,
+                        ),
+                );
+            }
             self.state.element_cache.update(pid, window_id, &r.nodes);
         }
 
@@ -228,7 +399,9 @@ impl Tool for GetWindowStateTool {
                     // Record resize ratio so ClickTool can scale coordinates back up.
                     if let Some(ow) = orig_w {
                         if w > 0 {
-                            self.state.resize_registry.set_ratio(pid, ow as f64 / w as f64);
+                            self.state
+                                .resize_registry
+                                .set_ratio(pid, ow as f64 / w as f64);
                         }
                     } else {
                         self.state.resize_registry.clear_ratio(pid);
@@ -252,6 +425,33 @@ impl Tool for GetWindowStateTool {
         let screenshot_dims = screenshot.as_ref().map(|(_, _, w, h)| (*w, *h));
         let screenshot_file_path = screenshot.as_ref().and_then(|(_, fp, _, _)| fp.clone());
 
+        let response_nodes = tree_result
+            .as_ref()
+            .map(|result| result.nodes.clone())
+            .or_else(|| cached_state.as_ref().map(|state| state.nodes.clone()))
+            .unwrap_or_default();
+        let window_origin = crate::windows::window_bounds_by_id(window_id)
+            .map(|bounds| [bounds.x, bounds.y])
+            .unwrap_or([0.0, 0.0]);
+        let filtered_nodes = response_nodes
+            .iter()
+            .filter(|node| {
+                node_matches_query(
+                    node,
+                    role_filter.as_deref(),
+                    label_filter.as_deref(),
+                    region_filter,
+                    window_origin,
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let rendered_tree = crate::ax::tree::render_nodes_markdown(&filtered_nodes);
+        let response_tree_markdown = query
+            .as_deref()
+            .map(|needle| crate::ax::tree::filter_tree_markdown(&rendered_tree, needle))
+            .unwrap_or(rendered_tree);
+
         // Build response.
         let mut content: Vec<Content> = Vec::new();
 
@@ -262,29 +462,33 @@ impl Tool for GetWindowStateTool {
 
             // Summary text line (matching Swift reference format).
             let element_count = self.state.element_cache.element_count(pid, window_id);
-            let summary = if let Some(ref r) = tree_result {
+            let summary = if tree_result.is_some() || cached_state.is_some() {
                 format!(
                     "window_id={window_id} pid={pid} size={}x{} elements={element_count}\n\n{}",
-                    w, h, r.tree_markdown
+                    w,
+                    h,
+                    response_tree_markdown.clone()
                 )
             } else {
                 format!("window_id={window_id} pid={pid} size={}x{}", w, h)
             };
             content.push(Content::text(summary));
-        } else if let Some(ref r) = tree_result {
+        } else if tree_result.is_some() || cached_state.is_some() {
             let element_count = self.state.element_cache.element_count(pid, window_id);
             content.push(Content::text(format!(
                 "window_id={window_id} pid={pid} elements={element_count}\n\n{}",
-                r.tree_markdown
+                response_tree_markdown
             )));
         }
 
         if content.is_empty() {
-            return ToolResult::error("No content produced (neither AX tree nor screenshot succeeded)");
+            return ToolResult::error(
+                "No content produced (neither AX tree nor screenshot succeeded)",
+            );
         }
 
         let element_count = self.state.element_cache.element_count(pid, window_id);
-        let tree_md = tree_result.as_ref().map(|r| r.tree_markdown.clone()).unwrap_or_default();
+        let tree_md = response_tree_markdown.clone();
 
         // Surface 6: register a snapshot in the global token registry so
         // every actionable element gets an opaque `element_token` keyed
@@ -293,12 +497,15 @@ impl Tool for GetWindowStateTool {
         // generated even when the walk returned no elements so consumers
         // calling `get_window_state` and then immediately re-snapshotting
         // get a clean LRU step every time.
-        let elem_count_for_snapshot = tree_result
-            .as_ref()
-            .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
-            .unwrap_or(0);
-        let snapshot_id = cmux_cua_core::element_token::global()
-            .register_snapshot(pid, window_id, elem_count_for_snapshot);
+        let elem_count_for_snapshot = response_nodes
+            .iter()
+            .filter(|n| n.element_index.is_some())
+            .count();
+        let snapshot_id = cmux_cua_core::element_token::global().register_snapshot(
+            pid,
+            window_id,
+            elem_count_for_snapshot,
+        );
 
         // Build the structured `elements` array — every actionable node plus
         // value-bearing read-only text nodes, in markdown/DFS order. Only the
@@ -307,17 +514,89 @@ impl Tool for GetWindowStateTool {
         // alongside for back-compat with existing text-parsing callers
         // (Hermes' regex parser, Codex, Claude Code) and is signalled as
         // preferred-for-back-compat-only via the `_note` field below.
-        let elements_json: Vec<serde_json::Value> = tree_result
+        let elements_json =
+            build_elements_array_with_token_origin(&filtered_nodes, snapshot_id, window_origin);
+        let cache_hit = cached_state.as_ref().is_some_and(|state| state.cache_hit);
+        let revision = cached_state
             .as_ref()
-            .map(|r| build_elements_array_with_token(&r.nodes, snapshot_id))
+            .map(|state| state.revision)
+            .unwrap_or(0);
+        let ax_reads = tree_result
+            .as_ref()
+            .map(|result| result.nodes_visited as u64)
+            .unwrap_or_else(|| {
+                cached_state
+                    .as_ref()
+                    .map(|state| state.ax_reads)
+                    .unwrap_or(0)
+            });
+        let structural_reads = cached_state
+            .as_ref()
+            .map(|state| state.structural_reads)
+            .unwrap_or(0);
+        let compact_nodes = cached_state
+            .as_ref()
+            .map(|state| {
+                state
+                    .compact_nodes
+                    .iter()
+                    .filter(|node| {
+                        compact_node_matches_query(
+                            node,
+                            role_filter.as_deref(),
+                            label_filter.as_deref(),
+                            region_filter,
+                            window_origin,
+                        )
+                    })
+                    .map(|node| node.to_json(window_origin))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
 
         let mut structured = serde_json::json!({
             "window_id": window_id,
             "pid": pid,
+            "coordinate_space": {
+                "kind": "window-local",
+                "unit": "logical_points",
+                "origin": {"x": window_origin[0], "y": window_origin[1]},
+            },
             "element_count": element_count,
             "tree_markdown": tree_md,
             "elements": elements_json,
+            "ax_snapshot": {
+                "revision": revision,
+                "cache_hit": cache_hit,
+                "ax_reads": ax_reads,
+                "structural_reads": structural_reads,
+                "window_origin": {"x": window_origin[0], "y": window_origin[1]},
+                "compact": compact_nodes,
+                "diff": cached_state.as_ref().map(|state| serde_json::json!({
+                    "from_revision": state.diff.from_revision,
+                    "to_revision": state.diff.to_revision,
+                    "added": state.diff.added,
+                    "removed": state.diff.removed,
+                    "updated": state.diff.updated,
+                })).unwrap_or_else(|| serde_json::json!({})),
+            },
+            "ax_walk": {
+                "requested": include_accessibility,
+                "cache_hit": cache_hit,
+                "revision": revision,
+                "ax_reads": ax_reads,
+                "structural_reads": structural_reads,
+                "observer_supported": cached_state.as_ref().map(|state| state.observer_supported).unwrap_or(false),
+                "truncated": tree_result.as_ref().map(|r| r.truncated).unwrap_or(false),
+                "truncation_reason": tree_result.as_ref().and_then(|r| r.truncation_reason.clone()),
+                "nodes_visited": tree_result.as_ref().map(|r| r.nodes_visited).unwrap_or(0),
+                "elapsed_ms": tree_result.as_ref().map(|r| r.elapsed_ms).unwrap_or(0),
+                "max_elements": max_elements,
+                "max_depth": max_depth,
+                "max_ax_time_ms": max_ax_time_ms,
+            },
+            "ax_truncated": tree_result.as_ref().map(|r| r.truncated).unwrap_or(false),
+            "ax_truncation_reason": tree_result.as_ref().and_then(|r| r.truncation_reason.clone()),
             // Surface 6: an opaque snapshot identifier consumers can log
             // alongside the per-element tokens for debug correlation.
             // Same value embedded in every `element_token` emitted in
@@ -372,8 +651,71 @@ impl Tool for GetWindowStateTool {
         if let Some(ref fp) = screenshot_file_path {
             structured["screenshot_file_path"] = serde_json::json!(fp);
         }
-        ToolResult { content, is_error: None, structured_content: Some(structured) }
+        ToolResult {
+            content,
+            is_error: None,
+            structured_content: Some(structured),
+        }
     }
+}
+
+fn node_matches_query(
+    node: &crate::ax::tree::AXNode,
+    role: Option<&str>,
+    label: Option<&str>,
+    region: Option<[f64; 4]>,
+    origin: [f64; 2],
+) -> bool {
+    if role.is_some_and(|wanted| !node.role.eq_ignore_ascii_case(wanted)) {
+        return false;
+    }
+    if label.is_some_and(|wanted| {
+        !crate::ax::tree::preferred_label(
+            node.title.as_deref(),
+            node.description.as_deref(),
+            node.value.as_deref(),
+            node.identifier.as_deref(),
+        )
+        .is_some_and(|value| value.to_ascii_lowercase().contains(wanted))
+    }) {
+        return false;
+    }
+    region.is_none_or(|wanted| {
+        node.frame.is_some_and(|[x, y, w, h]| {
+            x - origin[0] < wanted[0] + wanted[2]
+                && x - origin[0] + w > wanted[0]
+                && y - origin[1] < wanted[1] + wanted[3]
+                && y - origin[1] + h > wanted[1]
+        })
+    })
+}
+
+fn compact_node_matches_query(
+    node: &crate::ax::cache::CompactNode,
+    role: Option<&str>,
+    label: Option<&str>,
+    region: Option<[f64; 4]>,
+    origin: [f64; 2],
+) -> bool {
+    if role.is_some_and(|wanted| !node.role.eq_ignore_ascii_case(wanted)) {
+        return false;
+    }
+    if label.is_some_and(|wanted| {
+        !node
+            .label
+            .as_deref()
+            .is_some_and(|value| value.to_ascii_lowercase().contains(wanted))
+    }) {
+        return false;
+    }
+    region.is_none_or(|wanted| {
+        node.frame.is_some_and(|[x, y, w, h]| {
+            x - origin[0] < wanted[0] + wanted[2]
+                && x - origin[0] + w > wanted[0]
+                && y - origin[1] < wanted[1] + wanted[3]
+                && y - origin[1] + h > wanted[1]
+        })
+    })
 }
 
 /// Render actionable nodes and value-bearing read-only text nodes from the AX
@@ -386,12 +728,28 @@ pub(crate) fn build_elements_array_with_token(
     nodes: &[crate::ax::tree::AXNode],
     snapshot_id: u32,
 ) -> Vec<serde_json::Value> {
+    build_elements_array_with_token_origin(nodes, snapshot_id, [0.0, 0.0])
+}
+
+/// Build the structured element rows while translating AX screen-coordinate
+/// frames into the window-local coordinate space advertised by the tool.
+/// `AXNode::frame` remains screen absolute internally because action dispatch
+/// and viewport pruning use that space; only the serialized perception result
+/// is localized here.
+pub(crate) fn build_elements_array_with_token_origin(
+    nodes: &[crate::ax::tree::AXNode],
+    snapshot_id: u32,
+    origin: [f64; 2],
+) -> Vec<serde_json::Value> {
     nodes
         .iter()
         .filter_map(|node| {
             let include_read_only_value = node.element_index.is_none()
                 && node.value.as_ref().is_some_and(|value| !value.is_empty())
-                && matches!(node.role.as_str(), "AXStaticText" | "AXTextField" | "AXTextArea");
+                && matches!(
+                    node.role.as_str(),
+                    "AXStaticText" | "AXTextField" | "AXTextArea"
+                );
             if node.element_index.is_none() && !include_read_only_value {
                 return None;
             }
@@ -401,9 +759,15 @@ pub(crate) fn build_elements_array_with_token(
                 node.description.as_deref(),
                 node.value.as_deref(),
                 node.identifier.as_deref(),
-            ).map(str::to_owned);
+            )
+            .map(str::to_owned);
             let frame = node.frame.map(|[x, y, w, h]| {
-                serde_json::json!({ "x": x, "y": y, "w": w, "h": h })
+                serde_json::json!({
+                    "x": x - origin[0],
+                    "y": y - origin[1],
+                    "w": w,
+                    "h": h,
+                })
             });
             let mut entry = serde_json::json!({
                 "role": node.role,
@@ -477,7 +841,14 @@ mod tests {
     use super::*;
     use crate::ax::tree::AXNode;
 
-    fn node(idx: Option<usize>, role: &str, title: Option<&str>, depth: usize, parent: Option<usize>, frame: Option<[f64; 4]>) -> AXNode {
+    fn node(
+        idx: Option<usize>,
+        role: &str,
+        title: Option<&str>,
+        depth: usize,
+        parent: Option<usize>,
+        frame: Option<[f64; 4]>,
+    ) -> AXNode {
         AXNode {
             element_index: idx,
             role: role.into(),
@@ -498,25 +869,59 @@ mod tests {
     fn elements_match_indexed_node_count() {
         // Mix of indexed + non-indexed nodes; only indexed should surface.
         let nodes = vec![
-            node(Some(0), "AXWindow", Some("Doc"), 0, None, Some([0.0, 0.0, 800.0, 600.0])),
+            node(
+                Some(0),
+                "AXWindow",
+                Some("Doc"),
+                0,
+                None,
+                Some([0.0, 0.0, 800.0, 600.0]),
+            ),
             node(None, "AXStaticText", Some("hint"), 1, Some(0), None),
-            node(Some(1), "AXButton", Some("OK"), 1, Some(0), Some([10.0, 20.0, 60.0, 24.0])),
-            node(Some(2), "AXButton", Some("Cancel"), 1, Some(0), Some([80.0, 20.0, 60.0, 24.0])),
+            node(
+                Some(1),
+                "AXButton",
+                Some("OK"),
+                1,
+                Some(0),
+                Some([10.0, 20.0, 60.0, 24.0]),
+            ),
+            node(
+                Some(2),
+                "AXButton",
+                Some("Cancel"),
+                1,
+                Some(0),
+                Some([80.0, 20.0, 60.0, 24.0]),
+            ),
         ];
         let elements = build_elements_array(&nodes);
-        assert_eq!(elements.len(), 3, "non-actionable rows must be filtered out");
+        assert_eq!(
+            elements.len(),
+            3,
+            "non-actionable rows must be filtered out"
+        );
         let indices: Vec<u64> = elements
             .iter()
             .map(|e| e["element_index"].as_u64().unwrap())
             .collect();
-        assert_eq!(indices, vec![0, 1, 2], "ordering must match DFS / element_index assignment");
+        assert_eq!(
+            indices,
+            vec![0, 1, 2],
+            "ordering must match DFS / element_index assignment"
+        );
     }
 
     #[test]
     fn elements_shape_carries_role_label_frame_parent_depth() {
-        let nodes = vec![
-            node(Some(7), "AXButton", Some("Go"), 3, Some(2), Some([1.5, 2.5, 33.0, 44.0])),
-        ];
+        let nodes = vec![node(
+            Some(7),
+            "AXButton",
+            Some("Go"),
+            3,
+            Some(2),
+            Some([1.5, 2.5, 33.0, 44.0]),
+        )];
         let entry = &build_elements_array(&nodes)[0];
         assert_eq!(entry["element_index"], 7);
         assert_eq!(entry["role"], "AXButton");
@@ -535,13 +940,21 @@ mod tests {
         // A field with BOTH a title and a value (e.g. WhatsApp's "Compose
         // message" box holding typed text): label is the title, but the typed
         // value must ALSO be exposed so the caller can verify what landed.
-        let mut nodes = vec![
-            node(Some(0), "AXTextArea", Some("Compose message"), 1, None, None),
-        ];
+        let mut nodes = vec![node(
+            Some(0),
+            "AXTextArea",
+            Some("Compose message"),
+            1,
+            None,
+            None,
+        )];
         nodes[0].value = Some("i love u".into());
         let entry = &build_elements_array(&nodes)[0];
         assert_eq!(entry["label"], "Compose message", "label stays the title");
-        assert_eq!(entry["value"], "i love u", "value must be surfaced separately");
+        assert_eq!(
+            entry["value"], "i love u",
+            "value must be surfaced separately"
+        );
     }
 
     #[test]
@@ -564,7 +977,14 @@ mod tests {
     #[test]
     fn elements_include_value_bearing_read_only_text_without_addressability() {
         for role in ["AXStaticText", "AXTextField", "AXTextArea"] {
-            let mut nodes = vec![node(None, role, None, 2, Some(4), Some([1.0, 2.0, 3.0, 4.0]))];
+            let mut nodes = vec![node(
+                None,
+                role,
+                None,
+                2,
+                Some(4),
+                Some([1.0, 2.0, 3.0, 4.0]),
+            )];
             nodes[0].value = Some("80".into());
             let entries = build_elements_array_with_token(&nodes, 9);
             assert_eq!(entries.len(), 1, "{role} should be surfaced");
@@ -582,7 +1002,10 @@ mod tests {
     fn long_values_are_unicode_safely_truncated_for_structured_and_markdown_use() {
         let value = "🧮".repeat(crate::ax::tree::MAX_AX_VALUE_CHARS + 10);
         let truncated = crate::ax::tree::truncate_ax_value(value);
-        assert_eq!(truncated.chars().count(), crate::ax::tree::MAX_AX_VALUE_CHARS + 1);
+        assert_eq!(
+            truncated.chars().count(),
+            crate::ax::tree::MAX_AX_VALUE_CHARS + 1
+        );
         assert!(truncated.ends_with('…'));
 
         let mut nodes = vec![node(Some(0), "AXTextArea", Some("Input"), 0, None, None)];
@@ -603,13 +1026,20 @@ mod tests {
 
     #[test]
     fn elements_omit_optional_fields_when_missing() {
-        let nodes = vec![
-            node(Some(0), "AXUnknown", None, 0, None, None),
-        ];
+        let nodes = vec![node(Some(0), "AXUnknown", None, 0, None, None)];
         let entry = &build_elements_array(&nodes)[0];
-        assert!(entry.get("label").is_none(), "label must be omitted when title/value/desc/id are all empty");
-        assert!(entry.get("frame").is_none(), "frame must be omitted when no rect was captured");
-        assert!(entry.get("parent_index").is_none(), "parent_index must be omitted at the root");
+        assert!(
+            entry.get("label").is_none(),
+            "label must be omitted when title/value/desc/id are all empty"
+        );
+        assert!(
+            entry.get("frame").is_none(),
+            "frame must be omitted when no rect was captured"
+        );
+        assert!(
+            entry.get("parent_index").is_none(),
+            "parent_index must be omitted at the root"
+        );
         assert_eq!(entry["role"], "AXUnknown");
         assert_eq!(entry["depth"], 0);
     }
@@ -649,8 +1079,13 @@ mod tests {
         assert_eq!(entries.len(), 3);
         // Every entry must have BOTH fields (additive contract).
         for e in &entries {
-            assert!(e.get("element_index").is_some(), "element_index must remain");
-            let tok = e.get("element_token").and_then(|v| v.as_str())
+            assert!(
+                e.get("element_index").is_some(),
+                "element_index must remain"
+            );
+            let tok = e
+                .get("element_token")
+                .and_then(|v| v.as_str())
                 .expect("element_token must be a string");
             assert!(tok.starts_with('s'), "token must use the 's' prefix: {tok}");
             assert!(tok.contains(':'), "token must be `s{{hex}}:{{idx}}`: {tok}");
@@ -671,9 +1106,7 @@ mod tests {
     /// through get a clean shape.
     #[test]
     fn build_elements_array_shim_skips_element_token() {
-        let nodes = vec![
-            node(Some(0), "AXButton", Some("A"), 1, None, None),
-        ];
+        let nodes = vec![node(Some(0), "AXButton", Some("A"), 1, None, None)];
         let entries = build_elements_array(&nodes);
         assert_eq!(entries.len(), 1);
         assert!(
@@ -697,12 +1130,18 @@ mod tests {
         // exercises the early-return path; the assertion is that the call
         // honors the cap without overflowing or panicking.
         assert!(r1.nodes.len() <= 5, "max_elements=5 must cap nodes ≤ 5");
-        assert!(r1.nodes.iter().all(|n| n.depth <= 2), "max_depth=2 must cap depth ≤ 2");
+        assert!(
+            r1.nodes.iter().all(|n| n.depth <= 2),
+            "max_depth=2 must cap depth ≤ 2"
+        );
         // And the uncapped variant — same dead-pid path, just validating
         // walk_tree(...) (which delegates to walk_tree_bounded with
         // DEFAULT_MAX_*) returns the same empty/safe shape.
         let r2 = crate::ax::tree::walk_tree(i32::MAX, None, None);
-        assert_eq!(r1.nodes.len(), r2.nodes.len(),
-            "no-pid case: both bounded and unbounded must agree on the empty result");
+        assert_eq!(
+            r1.nodes.len(),
+            r2.nodes.len(),
+            "no-pid case: both bounded and unbounded must agree on the empty result"
+        );
     }
 }

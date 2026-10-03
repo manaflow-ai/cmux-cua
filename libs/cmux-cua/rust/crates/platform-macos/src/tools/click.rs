@@ -19,18 +19,414 @@ use cmux_cua_core::{
     tool::{Tool, ToolDef},
 };
 use serde_json::Value;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_action_names, copy_children, copy_string_attr, element_at_screen_position,
-    element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction, AXUIElementRef,
+    _AXUIElementGetWindow, copy_action_names, copy_children, copy_element_attr, copy_string_attr,
+    copy_stringified_attr, element_at_screen_position, element_screen_rect, focused_element_of_pid,
+    kAXErrorSuccess, AXUIElementPerformAction, AXUIElementRef,
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
-use core_foundation::base::{CFRelease, TCFType};
+use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef, TCFType};
 
 use super::ToolState;
+
+/// Cheap, read-only state used to determine whether a background click had an
+/// observable effect.  This deliberately reads only the hit-tested element and
+/// the application's focused element.  It never walks the accessibility tree.
+#[derive(Clone, Debug)]
+struct ClickObservation {
+    target: Option<AxObservation>,
+    /// The AX object identity returned by the hit-test.  A post-click hit-test
+    /// that resolves to another object (even at the same point) is not evidence
+    /// about the requested target.
+    target_identity: Option<RetainedAxIdentity>,
+    focused: Option<AxObservation>,
+}
+
+/// A retained AX reference used for collision-safe identity checks. AX wrappers
+/// for one native object can have different addresses across hit-tests, so raw
+/// pointer equality is insufficient. Keeping a retain here also ensures the
+/// reference remains valid until verification completes.
+#[derive(Debug)]
+struct RetainedAxIdentity(usize);
+
+impl RetainedAxIdentity {
+    unsafe fn new(element: AXUIElementRef) -> Self {
+        CFRetain(element as CFTypeRef);
+        Self(element as usize)
+    }
+
+    fn as_element(&self) -> AXUIElementRef {
+        self.0 as AXUIElementRef
+    }
+
+    fn equal(&self, other: &Self) -> bool {
+        unsafe {
+            CFEqual(
+                self.as_element() as CFTypeRef,
+                other.as_element() as CFTypeRef,
+            ) != 0
+        }
+    }
+}
+
+impl Clone for RetainedAxIdentity {
+    fn clone(&self) -> Self {
+        unsafe { Self::new(self.as_element()) }
+    }
+}
+
+impl Drop for RetainedAxIdentity {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.as_element() as CFTypeRef) };
+    }
+}
+
+// AX references are retained Core Foundation objects and are routinely passed
+// between the blocking AX worker and the async caller in this module.
+unsafe impl Send for RetainedAxIdentity {}
+unsafe impl Sync for RetainedAxIdentity {}
+
+fn same_target_identity(before: &ClickObservation, after: &ClickObservation) -> bool {
+    match (&before.target_identity, &after.target_identity) {
+        (Some(before), Some(after)) => before.equal(after),
+        (None, None) => false,
+        _ => false,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AxObservation {
+    role: Option<String>,
+    title: Option<String>,
+    value: Option<String>,
+    selected: Option<String>,
+    expanded: Option<String>,
+    focused: Option<String>,
+    selected_range: Option<(isize, isize)>,
+}
+
+impl ClickObservation {
+    /// Only target-bound AX state can confirm a click. The process-global
+    /// focused element is useful for diagnostics and focus-only actions, but a
+    /// focus transition alone can happen without the target's handler running.
+    /// If AX exposes no target signal, callers report `not_landed` instead of
+    /// claiming an unverifiable success.
+    fn changed_from(&self, before: &Self) -> bool {
+        fn changed(after: &Option<AxObservation>, before: &Option<AxObservation>) -> bool {
+            match (before, after) {
+                (Some(before), Some(after)) => after.changed_from(before),
+                // A missing baseline or post-click element is indeterminate:
+                // it may simply mean the AX tree was refreshed or the read
+                // timed out, rather than that the action ran.
+                _ => false,
+            }
+        }
+        changed(&self.target, &before.target)
+    }
+}
+
+impl AxObservation {
+    /// State that can plausibly encode a click result. AXFocused and AXRole
+    /// are deliberately excluded: focus/role changes are not proof that the
+    /// control's action handler ran.
+    fn has_semantic_signal(&self) -> bool {
+        fn nonempty(value: &Option<String>) -> bool {
+            value.as_deref().is_some_and(|value| !value.is_empty())
+        }
+        nonempty(&self.title)
+            || nonempty(&self.value)
+            || nonempty(&self.selected)
+            || nonempty(&self.expanded)
+            || self.selected_range.is_some()
+    }
+
+    fn settled_state_eq(&self, other: &Self) -> bool {
+        self.title == other.title
+            && self.value == other.value
+            && self.selected == other.selected
+            && self.expanded == other.expanded
+            && self.selected_range == other.selected_range
+    }
+
+    fn changed_from(&self, before: &Self) -> bool {
+        macro_rules! changed_if_observed {
+            ($field:ident) => {
+                match (&before.$field, &self.$field) {
+                    (Some(before), Some(after)) if before != after => true,
+                    _ => false,
+                }
+            };
+        }
+        changed_if_observed!(title)
+            || changed_if_observed!(value)
+            || changed_if_observed!(selected)
+            || changed_if_observed!(expanded)
+            || changed_if_observed!(selected_range)
+    }
+}
+
+fn click_target_label(title: Option<String>, description: Option<String>) -> Option<String> {
+    crate::ax::tree::preferred_label(title.as_deref(), description.as_deref(), None, None)
+        .map(str::to_owned)
+}
+
+unsafe fn read_ax_observation(element: AXUIElementRef) -> AxObservation {
+    AxObservation {
+        role: copy_string_attr(element, "AXRole"),
+        // Web/Electron controls commonly expose aria-label as AXDescription
+        // while leaving AXTitle empty. Treat either as the target's visible
+        // label for settled semantic readback.
+        title: click_target_label(
+            copy_string_attr(element, "AXTitle"),
+            copy_string_attr(element, "AXDescription"),
+        ),
+        value: crate::ax::bindings::copy_stringified_attr(element, "AXValue"),
+        selected: copy_stringified_attr(element, "AXSelected"),
+        expanded: copy_stringified_attr(element, "AXExpanded"),
+        focused: copy_stringified_attr(element, "AXFocused"),
+        selected_range: crate::ax::bindings::copy_range_attr(element, "AXSelectedTextRange")
+            .map(|range| (range.location, range.length)),
+    }
+}
+
+/// Read the target and focused-element signals without enumerating descendants.
+/// `target` is borrowed for the duration of the call; `focused_element_of_pid`
+/// returns a retained value which is released here.
+unsafe fn read_click_observation(pid: i32, target: Option<AXUIElementRef>) -> ClickObservation {
+    let target_identity = target.map(|element| RetainedAxIdentity::new(element));
+    let target = target.map(|element| read_ax_observation(element));
+    let focused = focused_element_of_pid(pid).map(|element| {
+        let observation = read_ax_observation(element);
+        CFRelease(element as _);
+        observation
+    });
+    ClickObservation {
+        target,
+        target_identity,
+        focused,
+    }
+}
+
+/// Check that an AX element belongs to the exact requested CGWindow.  AX
+/// hit-testing is process-scoped, so a point can resolve to another window of
+/// the same process after a click opens a sheet or popup.
+unsafe fn target_belongs_to_window(element: AXUIElementRef, window_id: Option<u32>) -> bool {
+    let Some(window_id) = window_id else {
+        return true;
+    };
+    let mut resolved = 0;
+    if _AXUIElementGetWindow(element, &mut resolved) == kAXErrorSuccess {
+        return resolved == window_id;
+    }
+    // Some AX implementations expose the private SPI only on AXWindow
+    // objects. Follow the standard AXWindow relationship before giving up,
+    // while retaining and releasing the copied object correctly.
+    let Some(window) = copy_element_attr(element, "AXWindow") else {
+        return false;
+    };
+    let result =
+        _AXUIElementGetWindow(window, &mut resolved) == kAXErrorSuccess && resolved == window_id;
+    CFRelease(window as _);
+    result
+}
+
+async fn observe_click(
+    pid: i32,
+    target: Option<usize>,
+    screen_point: Option<(f64, f64)>,
+    window_id: Option<u32>,
+) -> Option<ClickObservation> {
+    tokio::task::spawn_blocking(move || unsafe {
+        let hit_tested = match (target, screen_point) {
+            (Some(pointer), _) => Some(pointer as AXUIElementRef),
+            (None, Some((x, y))) => element_at_screen_position(pid, x, y),
+            _ => None,
+        };
+        if !hit_tested
+            .map(|element| target_belongs_to_window(element, window_id))
+            .unwrap_or(target.is_some())
+        {
+            if target.is_none() {
+                if let Some(element) = hit_tested {
+                    CFRelease(element as _);
+                }
+            }
+            return None;
+        }
+        let observation = read_click_observation(pid, hit_tested);
+        if target.is_none() {
+            if let Some(element) = hit_tested {
+                CFRelease(element as _);
+            }
+        }
+        Some(observation)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Renderer-backed AX state may publish one transient value before settling.
+/// Require two equal reads after a short grace period before accepting a
+/// target-bound change. A missing or unstable second read is indeterminate and
+/// must not be reported as a landed click.
+async fn observe_click_settled(
+    pid: i32,
+    target: Option<usize>,
+    screen_point: Option<(f64, f64)>,
+    window_id: Option<u32>,
+) -> Option<ClickObservation> {
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    let first = observe_click(pid, target, screen_point, window_id).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let second = observe_click(pid, target, screen_point, window_id).await?;
+    (same_target_identity(&first, &second)
+        && match (&first.target, &second.target) {
+            (Some(first), Some(second)) => first.settled_state_eq(second),
+            (None, None) => true,
+            _ => false,
+        })
+    .then_some(first)
+}
+
+/// Hash a small region around a window-local logical point.  This is a
+/// localized fallback for custom-drawn controls that expose no useful AX
+/// value/selection/title.  Capture/decode failures deliberately return None:
+/// an unavailable read cannot confirm an input.
+fn click_region_fingerprint(window_id: u32, local_x: f64, local_y: f64) -> Option<u64> {
+    let png = crate::capture::screenshot_window_bytes(window_id).ok()?;
+    let image = image::load_from_memory(&png).ok()?.to_rgba8();
+    let bounds = crate::windows::window_bounds_by_id(window_id)?;
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return None;
+    }
+    let scale = image.width() as f64 / bounds.width;
+    let center_x = (local_x * scale).round() as i64;
+    let center_y = (local_y * scale).round() as i64;
+    let radius: i64 = 24;
+    let x0 = (center_x - radius).max(0) as u32;
+    let y0 = (center_y - radius).max(0) as u32;
+    let x1 = (center_x + radius + 1)
+        .min(image.width() as i64)
+        .max(x0 as i64) as u32;
+    let y1 = (center_y + radius + 1)
+        .min(image.height() as i64)
+        .max(y0 as i64) as u32;
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+
+    // Quantize and stride the pixels to ignore tiny compositor noise while
+    // still detecting the normal button/label/menu changes around the click.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (x1 - x0).hash(&mut hasher);
+    (y1 - y0).hash(&mut hasher);
+    for y in (y0..y1).step_by(2) {
+        for x in (x0..x1).step_by(2) {
+            let pixel = image.get_pixel(x, y).0;
+            (pixel[0] >> 3, pixel[1] >> 3, pixel[2] >> 3, pixel[3] >> 3).hash(&mut hasher);
+        }
+    }
+    Some(hasher.finish())
+}
+
+async fn click_region_fingerprint_settled(
+    window_id: u32,
+    local_x: f64,
+    local_y: f64,
+) -> Option<u64> {
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    let first =
+        tokio::task::spawn_blocking(move || click_region_fingerprint(window_id, local_x, local_y))
+            .await
+            .ok()
+            .flatten()?;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let second =
+        tokio::task::spawn_blocking(move || click_region_fingerprint(window_id, local_x, local_y))
+            .await
+            .ok()
+            .flatten()?;
+    (first == second).then_some(first)
+}
+
+fn click_verification_with_pixel(
+    before: Option<ClickObservation>,
+    after: Option<ClickObservation>,
+    before_pixel: Option<u64>,
+    after_pixel: Option<u64>,
+) -> (bool, &'static str) {
+    if let (Some(before), Some(after)) = (before.as_ref(), after.as_ref()) {
+        if same_target_identity(before, after) && after.changed_from(before) {
+            return (true, "confirmed");
+        }
+    }
+    // A pixel diff is useful only when both captures succeeded and settled.
+    // Missing or failed captures remain indeterminate and never confirm.
+    let ax_signal_unavailable = before
+        .as_ref()
+        .and_then(|observation| observation.target.as_ref())
+        .map_or(true, |target| !target.has_semantic_signal());
+    if !ax_signal_unavailable {
+        return (false, "not_landed");
+    }
+    match (before_pixel, after_pixel) {
+        (Some(before), Some(after)) if before != after => (true, "confirmed"),
+        _ => (false, "not_landed"),
+    }
+}
+
+fn click_verification(
+    before: Option<ClickObservation>,
+    after: Option<ClickObservation>,
+) -> (bool, &'static str) {
+    match (before, after) {
+        (Some(before), Some(after))
+            if same_target_identity(&before, &after) && after.changed_from(&before) =>
+        {
+            (true, "confirmed")
+        }
+        _ => (false, "not_landed"),
+    }
+}
+
+fn foreground_retry_args(args: &Value) -> Value {
+    let mut retry = args.clone();
+    if let Some(object) = retry.as_object_mut() {
+        object.insert(
+            "delivery_mode".to_owned(),
+            Value::String("foreground".to_owned()),
+        );
+        object.remove("fallback");
+    }
+    retry
+}
+
+fn mark_foreground_fallback(mut result: ToolResult) -> ToolResult {
+    if let Some(structured) = result.structured_content.as_mut() {
+        if let Some(object) = structured.as_object_mut() {
+            object.insert(
+                "fallback".to_owned(),
+                Value::String("foreground".to_owned()),
+            );
+            object.insert("fallback_attempted".to_owned(), Value::Bool(true));
+        }
+    } else {
+        result.structured_content = Some(serde_json::json!({
+            "fallback": "foreground",
+            "fallback_attempted": true,
+        }));
+    }
+    if let Some(cmux_cua_core::protocol::Content::Text { text, .. }) = result.content.first_mut() {
+        text.push_str(" Background click was not observed; retried once with foreground delivery.");
+    }
+    result
+}
 
 pub struct ClickTool {
     state: Arc<ToolState>,
@@ -116,7 +512,12 @@ fn def() -> &'static ToolDef {
                 "delivery_mode": {
                     "type": "string",
                     "enum": ["background", "foreground"],
-                    "description": "Best-effort-background ladder rung (default \"background\"). \"background\": perform the AX action or post the CGEvent without fronting; pixel dispatch with pid+window_id fails with structured error=\"obstructed\", code=\"background_occluded\" when a different visible window owns the screen point. \"foreground\": briefly front the window, act, let transient UI settle, then restore the prior frontmost app; foreground skips the obstruction check because fronting resolves Z order. Requires window_id. A click that is dispatched remains verified:false — confirm its effect via get_window_state."
+                    "description": "Best-effort-background ladder rung (default \"background\"). \"background\": perform the AX action or post the CGEvent without fronting; pixel dispatch with pid+window_id fails with structured error=\"obstructed\", code=\"background_occluded\" when a different visible window owns the screen point. \"foreground\": briefly front the window, act, let transient UI settle, then restore the prior frontmost app; foreground skips the obstruction check because fronting resolves Z order. Requires window_id. A dispatched click is verified only after a settled target-bound state or localized visual change; otherwise effect is not_landed. Confirm navigation effects with get_window_state."
+                },
+                "fallback": {
+                    "type": "string",
+                    "enum": ["foreground"],
+                    "description": "Optional recovery for a background click blocked by another window or whose target-bound AX state or localized visual region shows no settled change. Retries exactly once with foreground delivery, briefly bringing the target window forward, then restores the prior app. Omit to report effect=not_landed without changing focus."
                 },
                 "scope": {
                     "type": "string",
@@ -229,13 +630,8 @@ impl Tool for ClickTool {
             let count = args.u64_or("count", 1) as usize;
             // Glide the session's agent cursor to the screen point for visibility.
             let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
-            crate::cursor::overlay::animate_cursor_for_action(
-                cursor_key.clone(),
-                sx,
-                sy,
-                &args,
-            )
-            .await;
+            crate::cursor::overlay::animate_cursor_for_action(cursor_key.clone(), sx, sy, &args)
+                .await;
             self.state
                 .cursor_registry
                 .update_position(&cursor_key, sx, sy);
@@ -316,6 +712,15 @@ impl Tool for ClickTool {
         // delivery_mode: per-call ladder rung. Foreground briefly activates the
         // target for both AX and pixel paths, then restores the prior app.
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
+        let fallback_foreground = match args.opt_str("fallback").as_deref() {
+            None => false,
+            Some(value) if value.eq_ignore_ascii_case("foreground") => true,
+            Some(value) => {
+                return ToolResult::error(format!(
+                    "click: unsupported fallback \"{value}\" — expected \"foreground\"."
+                ));
+            }
+        };
         // Reject unknown buttons explicitly so silent left-click fall-through can't
         // mask a typo. Keep "" → default left for old clients that never sent the field.
         if !matches!(button_str.as_str(), "" | "left" | "right" | "middle") {
@@ -461,6 +866,11 @@ impl Tool for ClickTool {
             // and stomp default for a non-default session).
             let ck = cursor_key.clone();
             let gate = dispatch_gate.clone();
+            let before_observation = if !foreground {
+                observe_click(pid, Some(element_ptr), None, Some(wid)).await
+            } else {
+                None
+            };
             let result = focus_guard::with_focus_suppressed(
                 if foreground { None } else { Some(pid) },
                 prior_front,
@@ -491,15 +901,7 @@ impl Tool for ClickTool {
                             })?;
                             Ok((outcome, fronted))
                         } else {
-                            perform_ax_click(
-                                element_ptr,
-                                idx,
-                                pid,
-                                wid,
-                                &action_clone,
-                                &ck,
-                                &gate,
-                            )
+                            perform_ax_click(element_ptr, idx, pid, wid, &action_clone, &ck, &gate)
                                 .map(|outcome| (outcome, false))
                         }
                     })
@@ -528,12 +930,37 @@ impl Tool for ClickTool {
                     //     so the press likely did nothing → cross to vision/pixel.
                     //   * unverifiable — dispatched fine, driver just can't confirm;
                     //     the caller verifies via screenshot.
+                    let (verified, verification_effect) = if foreground {
+                        (false, "unverifiable")
+                    } else {
+                        let after =
+                            observe_click_settled(pid, Some(element_ptr), None, Some(wid)).await;
+                        click_verification(before_observation, after)
+                    };
+                    if !foreground && !verified && fallback_foreground {
+                        return mark_foreground_fallback(
+                            self.invoke(foreground_retry_args(&args)).await,
+                        );
+                    }
+                    if !foreground && !verified {
+                        msg.push_str(
+                            " Background AX click had no settled target-state or localized visual change; ",
+                        );
+                        msg.push_str("reported as not landed.");
+                    }
+                    let effect = if verified {
+                        "confirmed"
+                    } else if suspected_noop {
+                        "not_landed"
+                    } else {
+                        verification_effect
+                    };
                     let mut structured = serde_json::json!({
                         "path": if fronted { "ax_fg" } else { "ax" },
-                        "verified": false,
-                        "effect": if suspected_noop { "suspected_noop" } else { "unverifiable" },
+                        "verified": verified,
+                        "effect": effect,
                     });
-                    if suspected_noop {
+                    if suspected_noop || (!foreground && !verified) {
                         structured["escalation"] = serde_json::json!({
                             "recommended": "px",
                             "reason": "element does not advertise this action — the \
@@ -661,8 +1088,11 @@ impl Tool for ClickTool {
                     // Window-local screenshot pixel → GLOBAL top-left-origin
                     // screen point; this is the coordinate space the cursor
                     // feed emits in (see cmux_cua_core::cursor_feed).
-                    let (gx, gy) =
-                        cmux_cua_core::cursor_feed::window_local_to_global((b.x, b.y), scale, (cx, cy));
+                    let (gx, gy) = cmux_cua_core::cursor_feed::window_local_to_global(
+                        (b.x, b.y),
+                        scale,
+                        (cx, cy),
+                    );
                     (gx, gy, wx, wy)
                 } else {
                     // window_id not found — fall back to treating x,y as screen coords.
@@ -671,6 +1101,20 @@ impl Tool for ClickTool {
             } else {
                 // No window_id → treat x,y as screen coordinates (legacy behaviour).
                 (cx, cy, cx, cy)
+            };
+
+            // Keep a localized visual baseline for custom-drawn controls. This
+            // is only a fallback when AX exposes no semantic target state; it
+            // is never allowed to override a target-bound AX readback.
+            let before_pixel = if let Some(wid) = window_id {
+                tokio::task::spawn_blocking(move || {
+                    click_region_fingerprint(wid, win_local_x, win_local_y)
+                })
+                .await
+                .ok()
+                .flatten()
+            } else {
+                None
             };
 
             // A background PX action can still use an accessibility delivery
@@ -710,10 +1154,26 @@ impl Tool for ClickTool {
                         .cursor_registry
                         .update_position(&cursor_key, screen_x, screen_y);
                 }
+                let before_observation = if focus_only {
+                    None
+                } else {
+                    observe_click(pid, None, Some((screen_x, screen_y)), window_id).await
+                };
+                let before_target = before_observation
+                    .as_ref()
+                    .and_then(|observation| observation.target_identity.clone());
                 let ax_result = tokio::task::spawn_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
                     };
+                    if !target_belongs_to_window(element, window_id)
+                        || before_target.as_ref().is_some_and(|identity| {
+                            CFEqual(identity.as_element() as CFTypeRef, element as CFTypeRef) == 0
+                        })
+                    {
+                        CFRelease(element as _);
+                        return Ok(false);
+                    }
                     let delivered = if focus_only {
                         crate::input::ax_actions::focus_element(element as usize).is_ok()
                     } else {
@@ -728,6 +1188,34 @@ impl Tool for ClickTool {
                 match ax_result {
                     Ok(Ok(true)) => {
                         let label = if focus_only { "focused" } else { "pressed" };
+                        let (verified, verification_effect) = if focus_only {
+                            (false, "unverifiable")
+                        } else {
+                            let after_observation = observe_click_settled(
+                                pid,
+                                None,
+                                Some((screen_x, screen_y)),
+                                window_id,
+                            )
+                            .await;
+                            let after_pixel = if let Some(wid) = window_id {
+                                click_region_fingerprint_settled(wid, win_local_x, win_local_y)
+                                    .await
+                            } else {
+                                None
+                            };
+                            click_verification_with_pixel(
+                                before_observation,
+                                after_observation,
+                                before_pixel,
+                                after_pixel,
+                            )
+                        };
+                        if !focus_only && !verified && fallback_foreground {
+                            return mark_foreground_fallback(
+                                self.invoke(foreground_retry_args(&args)).await,
+                            );
+                        }
                         if !focus_only {
                             // The press landed — pulse the cursor at the click
                             // point exactly like the CGEvent and element paths.
@@ -739,13 +1227,17 @@ impl Tool for ClickTool {
                                 },
                             );
                         }
-                        return ToolResult::text(format!(
-                            "✅ PX hit-test {label} the background element via AX."
-                        ))
-                        .with_structured(serde_json::json!({
+                        let mut text =
+                            format!("✅ PX hit-test {label} the background element via AX.");
+                        if !focus_only && !verified {
+                            text.push_str(
+                                " No settled target-state or localized visual change was observed; reported as not landed.",
+                            );
+                        }
+                        return ToolResult::text(text).with_structured(serde_json::json!({
                             "path": "ax",
-                            "verified": false,
-                            "effect": "unverifiable"
+                            "verified": verified,
+                            "effect": if verified { "confirmed" } else { verification_effect }
                         }));
                     }
                     Ok(Ok(false)) if focus_only => {
@@ -775,6 +1267,14 @@ impl Tool for ClickTool {
                     if let Some(error) =
                         super::pixel_obstruction_error(pid, wid, screen_x, screen_y, None)
                     {
+                        // A blocked background dispatch also made no change.
+                        // The caller's explicit foreground opt-in resolves the
+                        // obstruction; retry once with fallback removed.
+                        if fallback_foreground && action != "focus" {
+                            return mark_foreground_fallback(
+                                self.invoke(foreground_retry_args(&args)).await,
+                            );
+                        }
                         return error;
                     }
                 }
@@ -816,6 +1316,11 @@ impl Tool for ClickTool {
             // shape as the AX path, so we wrap identically.
             let prior_front = apps::frontmost_pid();
             let snapshot = WindowChangeDetector::snapshot(prior_front);
+            let before_observation = if delivery_mode.is_foreground() {
+                None
+            } else {
+                observe_click(pid, None, Some((screen_x, screen_y)), window_id).await
+            };
 
             let mods_owned = modifiers.clone();
             // Surface 5: route to the right/middle CGEvent primitives when
@@ -917,12 +1422,46 @@ impl Tool for ClickTool {
                     } else {
                         ("cgevent", "background CGEvent")
                     };
+                    let (verified, verification_effect) = if fg {
+                        (false, "unverifiable")
+                    } else {
+                        let after_observation =
+                            observe_click_settled(pid, None, Some((screen_x, screen_y)), window_id)
+                                .await;
+                        let after_pixel = if let Some(wid) = window_id {
+                            click_region_fingerprint_settled(wid, win_local_x, win_local_y).await
+                        } else {
+                            None
+                        };
+                        click_verification_with_pixel(
+                            before_observation,
+                            after_observation,
+                            before_pixel,
+                            after_pixel,
+                        )
+                    };
+                    if !fg && !verified && fallback_foreground {
+                        return mark_foreground_fallback(
+                            self.invoke(foreground_retry_args(&args)).await,
+                        );
+                    }
+                    let effect = if verified {
+                        "confirmed"
+                    } else {
+                        verification_effect
+                    };
+                    let verification_text = if verified {
+                        "verified"
+                    } else if fg {
+                        "not driver-verified"
+                    } else {
+                        "not landed: no settled target-state or localized visual change observed"
+                    };
                     ToolResult::text(format!(
-                        "✅ Posted {button_label} to pid {pid} ({mode_label}; \
-                         not driver-verified — confirm via screenshot).{}",
+                        "✅ Posted {button_label} to pid {pid} ({mode_label}; {verification_text}).{}",
                         changes.result_suffix()
                     ))
-                    .with_structured(serde_json::json!({ "path": path, "verified": false, "effect": "unverifiable" }))
+                    .with_structured(serde_json::json!({ "path": path, "verified": verified, "effect": effect }))
                 }
                 Ok(Err(e)) => ToolResult::error(format!("{button_label} failed: {e}")),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -1123,6 +1662,51 @@ fn map_action(action: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    /// The identity guard only calls Core Foundation retain/equality/release,
+    /// so CFString objects provide a real native lifetime/equality oracle.
+    fn test_identity(value: &str) -> RetainedAxIdentity {
+        let value = core_foundation::string::CFString::new(value);
+        unsafe { RetainedAxIdentity::new(value.as_concrete_TypeRef() as AXUIElementRef) }
+    }
+
+    #[test]
+    fn click_identity_matches_distinct_equal_wrappers_and_retains_lifetime() {
+        let first = test_identity("same native identity across wrappers");
+        let second = test_identity("same native identity across wrappers");
+        assert_ne!(first.0, second.0, "fixture must use distinct CF wrappers");
+        assert!(first.equal(&second));
+        let cloned = first.clone();
+        drop(first);
+        // The original CFString and first guard are gone; retained clone is
+        // still a valid native object, compared by CFEqual rather than address.
+        assert!(cloned.equal(&second));
+        assert!(!cloned.equal(&test_identity("another native object")));
+    }
+
+    #[test]
+    fn click_verification_accepts_distinct_equal_native_wrappers() {
+        let before = ClickObservation {
+            target: Some(AxObservation {
+                role: Some("AXButton".to_owned()),
+                title: Some("Run".to_owned()),
+                value: Some("0".to_owned()),
+                selected: None,
+                expanded: None,
+                focused: None,
+                selected_range: None,
+            }),
+            target_identity: Some(test_identity("same native identity across wrappers")),
+            focused: None,
+        };
+        let mut after = before.clone();
+        after.target_identity = Some(test_identity("same native identity across wrappers"));
+        after.target.as_mut().unwrap().value = Some("1".to_owned());
+        assert_eq!(
+            click_verification(Some(before), Some(after)),
+            (true, "confirmed")
+        );
+    }
+
     /// Surface 5: schema must advertise the new `button` field with the three
     /// canonical values and default to "left". Hermes / Codex / Claude Code
     /// consumers branch on this enum being present.
@@ -1194,5 +1778,239 @@ mod tests {
             let s = args.str_or("button", "left").to_lowercase();
             assert_eq!(s, v);
         }
+    }
+
+    #[test]
+    fn chromium_empty_title_does_not_hide_target_label_changes() {
+        let before = AxObservation {
+            title: click_target_label(Some(String::new()), Some("Probe 0".into())),
+            role: None,
+            value: None,
+            selected: None,
+            expanded: None,
+            focused: None,
+            selected_range: None,
+        };
+        let after = AxObservation {
+            title: click_target_label(Some(String::new()), Some("Clicked 0 (1)".into())),
+            ..before.clone()
+        };
+        assert!(before.has_semantic_signal());
+        assert!(after.changed_from(&before));
+    }
+
+    #[test]
+    fn schema_advertises_opt_in_foreground_fallback() {
+        let fallback = def()
+            .input_schema
+            .get("properties")
+            .and_then(|properties| properties.get("fallback"))
+            .expect("fallback field present");
+        assert_eq!(fallback.get("type").and_then(Value::as_str), Some("string"));
+        let values = fallback
+            .get("enum")
+            .and_then(Value::as_array)
+            .expect("fallback enum present");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0], Value::String("foreground".to_owned()));
+        assert!(fallback
+            .get("description")
+            .and_then(Value::as_str)
+            .is_some_and(|description| description.contains("exactly once")));
+    }
+
+    #[test]
+    fn foreground_retry_is_single_use_and_preserves_target() {
+        let args = serde_json::json!({
+            "pid": 42,
+            "window_id": 7,
+            "x": 12,
+            "y": 34,
+            "fallback": "foreground"
+        });
+        let retry = foreground_retry_args(&args);
+        assert_eq!(retry["delivery_mode"], "foreground");
+        assert!(retry.get("fallback").is_none());
+        assert_eq!(retry["pid"], 42);
+        assert_eq!(retry["window_id"], 7);
+    }
+
+    #[test]
+    fn click_verification_distinguishes_no_change_from_observed_focus_or_value() {
+        let before = ClickObservation {
+            target: Some(AxObservation {
+                role: Some("AXButton".to_owned()),
+                title: Some("Run".to_owned()),
+                value: Some("0".to_owned()),
+                selected: Some("false".to_owned()),
+                expanded: None,
+                focused: Some("false".to_owned()),
+                selected_range: None,
+            }),
+            target_identity: Some(test_identity("target-one")),
+            focused: None,
+        };
+        assert_eq!(
+            click_verification(Some(before.clone()), Some(before.clone())),
+            (false, "not_landed")
+        );
+
+        let mut after = before.clone();
+        after.target.as_mut().unwrap().value = Some("1".to_owned());
+        assert_eq!(
+            click_verification(Some(before), Some(after)),
+            (true, "confirmed")
+        );
+    }
+
+    #[test]
+    fn click_verification_ignores_focus_only_changes() {
+        let before = ClickObservation {
+            target: Some(AxObservation {
+                role: Some("AXButton".to_owned()),
+                title: Some("Run".to_owned()),
+                value: Some("0".to_owned()),
+                selected: Some("false".to_owned()),
+                expanded: None,
+                focused: Some("false".to_owned()),
+                selected_range: None,
+            }),
+            target_identity: Some(test_identity("target-seven")),
+            focused: None,
+        };
+        let mut after = before.clone();
+        after.target.as_mut().unwrap().focused = Some("true".to_owned());
+        assert_eq!(
+            click_verification(Some(before), Some(after)),
+            (false, "not_landed")
+        );
+    }
+
+    #[test]
+    fn click_verification_ignores_role_only_or_missing_baseline_changes() {
+        let before = ClickObservation {
+            target: None,
+            target_identity: None,
+            focused: None,
+        };
+        let after = ClickObservation {
+            target: Some(AxObservation {
+                role: Some("AXButton".to_owned()),
+                title: None,
+                value: None,
+                selected: None,
+                expanded: None,
+                focused: Some("true".to_owned()),
+                selected_range: None,
+            }),
+            target_identity: Some(test_identity("target-one")),
+            focused: None,
+        };
+        assert_eq!(
+            click_verification(Some(before), Some(after)),
+            (false, "not_landed")
+        );
+
+        let before = ClickObservation {
+            target: Some(AxObservation {
+                role: Some("AXButton".to_owned()),
+                title: Some("Run".to_owned()),
+                value: None,
+                selected: None,
+                expanded: None,
+                focused: None,
+                selected_range: None,
+            }),
+            target_identity: Some(test_identity("target-one")),
+            focused: None,
+        };
+        let mut after = before.clone();
+        after.target.as_mut().unwrap().role = Some("AXCheckBox".to_owned());
+        assert_eq!(
+            click_verification(Some(before), Some(after)),
+            (false, "not_landed")
+        );
+    }
+
+    #[test]
+    fn click_verification_rejects_a_different_hit_test_target() {
+        let before = ClickObservation {
+            target: Some(AxObservation {
+                role: Some("AXButton".to_owned()),
+                title: Some("Run".to_owned()),
+                value: Some("0".to_owned()),
+                selected: None,
+                expanded: None,
+                focused: None,
+                selected_range: None,
+            }),
+            target_identity: Some(test_identity("target-one")),
+            focused: None,
+        };
+        let mut after = before.clone();
+        after.target_identity = Some(test_identity("target-two"));
+        after.target.as_mut().unwrap().value = Some("1".to_owned());
+        assert_eq!(
+            click_verification(Some(before), Some(after)),
+            (false, "not_landed")
+        );
+    }
+
+    #[test]
+    fn pixel_diff_confirms_only_when_ax_has_no_semantic_target_state() {
+        assert_eq!(
+            click_verification_with_pixel(None, None, Some(10), Some(11)),
+            (true, "confirmed")
+        );
+
+        let target = AxObservation {
+            role: Some("AXButton".to_owned()),
+            title: Some("Open".to_owned()),
+            value: None,
+            selected: None,
+            expanded: None,
+            focused: Some("false".to_owned()),
+            selected_range: None,
+        };
+        let observed = ClickObservation {
+            target: Some(target),
+            target_identity: Some(test_identity("target-one")),
+            focused: None,
+        };
+        assert_eq!(
+            click_verification_with_pixel(
+                Some(observed.clone()),
+                Some(observed),
+                Some(10),
+                Some(11),
+            ),
+            (false, "not_landed")
+        );
+    }
+
+    #[test]
+    fn click_verification_does_not_treat_lost_ax_data_as_a_landing() {
+        let before = ClickObservation {
+            target: Some(AxObservation {
+                role: Some("AXButton".to_owned()),
+                title: Some("Run".to_owned()),
+                value: Some("0".to_owned()),
+                selected: None,
+                expanded: None,
+                focused: None,
+                selected_range: None,
+            }),
+            target_identity: Some(test_identity("target-one")),
+            focused: None,
+        };
+        let after = ClickObservation {
+            target: None,
+            target_identity: None,
+            focused: None,
+        };
+        assert_eq!(
+            click_verification(Some(before), Some(after)),
+            (false, "not_landed")
+        );
     }
 }

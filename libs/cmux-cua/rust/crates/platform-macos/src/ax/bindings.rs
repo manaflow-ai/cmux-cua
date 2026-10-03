@@ -30,6 +30,8 @@ pub const kAXErrorSuccess: AXError = 0;
 pub const kAXErrorFailure: AXError = -25200;
 pub const kAXErrorInvalidUIElement: AXError = -25202;
 pub const kAXErrorAttributeUnsupported: AXError = -25205;
+pub const kAXErrorNotImplemented: AXError = -25206;
+pub const kAXErrorParameterizedAttributeUnsupported: AXError = -25207;
 pub const kAXErrorNoValue: AXError = -25212;
 pub const kAXErrorAPIDisabled: AXError = -25211;
 
@@ -44,6 +46,7 @@ pub const kAXValueCGPointType: AXValueType = 1;
 pub const kAXValueCGSizeType: AXValueType = 2;
 pub const kAXValueCGRectType: AXValueType = 3;
 pub const kAXValueCFRangeType: AXValueType = 4;
+pub const kAXValueAXErrorType: AXValueType = 5;
 pub const kAXValueIllegalType: AXValueType = 1_000;
 
 // ── Link to AXUIElement functions ────────────────────────────────────────────
@@ -54,6 +57,12 @@ extern "C" {
         element: AXUIElementRef,
         attribute: CFStringRef,
         value: *mut CFTypeRef,
+    ) -> AXError;
+    pub fn AXUIElementCopyMultipleAttributeValues(
+        element: AXUIElementRef,
+        attributes: CFArrayRef,
+        options: usize,
+        values: *mut CFArrayRef,
     ) -> AXError;
     pub fn AXUIElementCopyAttributeNames(
         element: AXUIElementRef,
@@ -72,6 +81,11 @@ extern "C" {
         attribute: CFStringRef,
         value: CFTypeRef,
     ) -> AXError;
+    /// Bound one AX IPC request. The timeout is in seconds and applies to
+    /// subsequent messaging for this element. This is cooperative with the
+    /// walk deadline: calls already in flight still return when this limit or
+    /// the system's own AX messaging timeout is reached.
+    pub fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout: f32) -> AXError;
     pub fn AXUIElementGetTypeID() -> CFTypeID;
     pub fn AXIsProcessTrusted() -> bool;
     /// `AXIsProcessTrustedWithOptions(options)` — when called with
@@ -131,6 +145,237 @@ pub unsafe fn copy_string_attr(element: AXUIElementRef, attr_name: &str) -> Opti
     }
     let s = CFStr::wrap_under_create_rule(value as _);
     Some(s.to_string())
+}
+
+/// The small, scalar descriptor surface needed to render and route an AX node.
+/// The values are decoded while the temporary AX array is alive, so callers do
+/// not have to manage Core Foundation retains for each batch member.
+#[derive(Debug, Default, Clone)]
+pub struct AXDescriptorStrings {
+    pub position: Option<(f64, f64)>,
+    pub size: Option<(f64, f64)>,
+    pub role: Option<String>,
+    pub label: Option<String>,
+    pub title: Option<String>,
+    pub value: Option<String>,
+    pub description: Option<String>,
+    pub identifier: Option<String>,
+    pub help: Option<String>,
+    pub role_description: Option<String>,
+    pub placeholder: Option<String>,
+    pub enabled: Option<bool>,
+    pub selected: Option<bool>,
+    pub focused: Option<bool>,
+    pub expanded: Option<bool>,
+    pub hidden: Option<bool>,
+    pub complete: bool,
+}
+
+const DESCRIPTOR_ATTRIBUTE_NAMES: [&str; 16] = [
+    "AXPosition",
+    "AXSize",
+    "AXRole",
+    "AXTitle",
+    "AXLabel",
+    "AXValue",
+    "AXDescription",
+    "AXIdentifier",
+    "AXHelp",
+    "AXRoleDescription",
+    "AXPlaceholderValue",
+    "AXEnabled",
+    "AXSelected",
+    "AXFocused",
+    "AXExpanded",
+    "AXHidden",
+];
+
+/// Read the descriptor attributes in one AX IPC request when the target
+/// implements `AXUIElementCopyMultipleAttributeValues`. Older or partial AX
+/// implementations return an unsupported/malformed response; those fall back
+/// to the existing single-attribute helpers. Missing optional values remain
+/// sparse rather than invalidating the entire node.
+pub unsafe fn copy_descriptor_strings(element: AXUIElementRef) -> AXDescriptorStrings {
+    let names: Vec<CFStr> = DESCRIPTOR_ATTRIBUTE_NAMES
+        .iter()
+        .map(|name| CFStr::new(name))
+        .collect();
+    let names_array = CFArray::from_CFTypes(&names);
+    let mut raw_values: CFArrayRef = std::ptr::null();
+    let error = AXUIElementCopyMultipleAttributeValues(
+        element,
+        names_array.as_concrete_TypeRef(),
+        0,
+        &mut raw_values,
+    );
+    if error == kAXErrorSuccess && !raw_values.is_null() {
+        let values = CFArray::<CFTypeRef>::wrap_under_create_rule(raw_values as _);
+        let value_count = values.len() as usize;
+        if value_count == DESCRIPTOR_ATTRIBUTE_NAMES.len() {
+            let mut decoded = AXDescriptorStrings {
+                complete: true,
+                ..Default::default()
+            };
+            for index in 0..value_count {
+                let Some(value) = values.get(index as isize) else {
+                    continue;
+                };
+                let value = *value;
+                if value.is_null() {
+                    continue;
+                }
+                if embedded_ax_error(value).is_some() {
+                    // AXRole is required to identify a node. Position and
+                    // size are required for visibility/pruning when present;
+                    // an embedded error means the batch did not complete.
+                    if matches!(index, 0 | 1 | 2) {
+                        decoded.complete = false;
+                    }
+                    continue;
+                }
+                match index {
+                    0 => decoded.position = cf_point_value(value, kAXValueCGPointType),
+                    1 => decoded.size = cf_point_value(value, kAXValueCGSizeType),
+                    2 => decoded.role = cf_string_value(value),
+                    3 => decoded.title = cf_string_value(value),
+                    4 => decoded.label = cf_string_value(value),
+                    5 => decoded.value = cf_scalar_string_value(value),
+                    6 => decoded.description = cf_string_value(value),
+                    7 => decoded.identifier = cf_string_value(value),
+                    8 => decoded.help = cf_string_value(value),
+                    9 => decoded.role_description = cf_string_value(value),
+                    10 => decoded.placeholder = cf_string_value(value),
+                    11 => decoded.enabled = cf_bool_value(value),
+                    12 => decoded.selected = cf_bool_value(value),
+                    13 => decoded.focused = cf_bool_value(value),
+                    14 => decoded.expanded = cf_bool_value(value),
+                    15 => decoded.hidden = cf_bool_value(value),
+                    _ => unreachable!(),
+                }
+            }
+            // AXRole is the only descriptor required to identify a node. A
+            // sparse role means the batch was incomplete, so use the reliable
+            // single-attribute path instead of manufacturing AXUnknown.
+            if decoded.complete && decoded.role.is_some() {
+                return decoded;
+            }
+        }
+        // `values` releases the returned array here. No child values were
+        // retained, so there is no per-member cleanup on the fallback path.
+    }
+
+    AXDescriptorStrings {
+        position: None,
+        size: None,
+        role: copy_string_attr(element, "AXRole"),
+        label: copy_string_attr(element, "AXLabel"),
+        title: copy_string_attr(element, "AXTitle"),
+        value: copy_stringified_attr(element, "AXValue"),
+        description: copy_string_attr(element, "AXDescription"),
+        identifier: copy_string_attr(element, "AXIdentifier"),
+        help: copy_string_attr(element, "AXHelp"),
+        role_description: copy_string_attr(element, "AXRoleDescription"),
+        placeholder: copy_string_attr(element, "AXPlaceholderValue"),
+        enabled: copy_bool_attr(element, "AXEnabled"),
+        selected: copy_bool_attr(element, "AXSelected"),
+        focused: copy_bool_attr(element, "AXFocused"),
+        expanded: copy_bool_attr(element, "AXExpanded"),
+        hidden: copy_bool_attr(element, "AXHidden"),
+        complete: false,
+    }
+}
+
+unsafe fn embedded_ax_error(value: CFTypeRef) -> Option<AXError> {
+    if core_foundation::base::CFGetTypeID(value) != AXValueGetTypeID()
+        || AXValueGetType(value as AXValueRef) != kAXValueAXErrorType
+    {
+        return None;
+    }
+    let mut error = kAXErrorFailure;
+    AXValueGetValue(
+        value as AXValueRef,
+        kAXValueAXErrorType,
+        &mut error as *mut _ as *mut c_void,
+    )
+    .then_some(error)
+}
+
+unsafe fn cf_string_value(value: CFTypeRef) -> Option<String> {
+    (core_foundation::base::CFGetTypeID(value) == CFStr::type_id())
+        .then(|| CFStr::wrap_under_get_rule(value as _).to_string())
+}
+
+unsafe fn cf_point_value(value: CFTypeRef, value_type: AXValueType) -> Option<(f64, f64)> {
+    if core_foundation::base::CFGetTypeID(value) != AXValueGetTypeID()
+        || AXValueGetType(value as AXValueRef) != value_type
+    {
+        return None;
+    }
+    #[repr(C)]
+    struct Pair {
+        first: f64,
+        second: f64,
+    }
+    let mut pair = Pair {
+        first: 0.0,
+        second: 0.0,
+    };
+    AXValueGetValue(
+        value as AXValueRef,
+        value_type,
+        &mut pair as *mut _ as *mut c_void,
+    )
+    .then_some((pair.first, pair.second))
+}
+
+unsafe fn cf_scalar_string_value(value: CFTypeRef) -> Option<String> {
+    use core_foundation::{boolean::CFBoolean, number::CFNumber};
+    if let Some(value) = cf_string_value(value) {
+        return Some(value);
+    }
+    let type_id = core_foundation::base::CFGetTypeID(value);
+    if type_id == CFNumber::type_id() {
+        return CFNumber::wrap_under_get_rule(value as _)
+            .to_f64()
+            .map(|number| {
+                if number.fract() == 0.0 {
+                    format!("{number:.0}")
+                } else {
+                    number.to_string()
+                }
+            });
+    }
+    if type_id == CFBoolean::type_id() {
+        return Some(bool::from(CFBoolean::wrap_under_get_rule(value as _)).to_string());
+    }
+    None
+}
+
+unsafe fn cf_bool_value(value: CFTypeRef) -> Option<bool> {
+    use core_foundation::{boolean::CFBoolean, number::CFNumber};
+    let type_id = core_foundation::base::CFGetTypeID(value);
+    if type_id == CFBoolean::type_id() {
+        return Some(bool::from(CFBoolean::wrap_under_get_rule(value as _)));
+    }
+    if type_id == CFNumber::type_id() {
+        return CFNumber::wrap_under_get_rule(value as _)
+            .to_f64()
+            .map(|n| n != 0.0);
+    }
+    None
+}
+
+/// Read a boolean-valued AX attribute (CFBoolean or numeric 0/1).
+pub unsafe fn copy_bool_attr(element: AXUIElementRef, attr_name: &str) -> Option<bool> {
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if error != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    let decoded = cf_bool_value(value);
+    CFRelease(value);
+    decoded
 }
 
 /// Copy any scalar AX attribute and render it as text. Unlike
@@ -364,6 +609,86 @@ pub unsafe fn focused_element_of_pid(pid: i32) -> Option<AXUIElementRef> {
     Some(value as AXUIElementRef)
 }
 
+/// Copy the structural attributes used by the incremental cache in one AX IPC
+/// request. Chromium often omits native children-changed notifications, so the
+/// cache probes retained container roots. Keeping AXChildren, AXPosition, and
+/// AXSize in one `AXUIElementCopyMultipleAttributeValues` call makes that
+/// probe cheap while preserving the retained-child ownership contract.
+pub unsafe fn copy_structural_probe(
+    element: AXUIElementRef,
+) -> (Vec<AXUIElementRef>, Option<[f64; 4]>, bool) {
+    let names = [
+        CFStr::new("AXChildren"),
+        CFStr::new("AXPosition"),
+        CFStr::new("AXSize"),
+    ];
+    let names_array = CFArray::from_CFTypes(&names);
+    let mut raw_values: CFArrayRef = std::ptr::null();
+    let error = AXUIElementCopyMultipleAttributeValues(
+        element,
+        names_array.as_concrete_TypeRef(),
+        0,
+        &mut raw_values,
+    );
+    if error == kAXErrorSuccess && !raw_values.is_null() {
+        let values = CFArray::<CFTypeRef>::wrap_under_create_rule(raw_values as _);
+        if values.len() as usize == names.len() {
+            let child_value = values.get(0).map(|value| *value);
+            let children_valid = child_value.is_some_and(|value| {
+                !value.is_null()
+                    && embedded_ax_error(value).is_none()
+                    && core_foundation::base::CFGetTypeID(value) == CFArray::<CFTypeRef>::type_id()
+            });
+            if !children_valid {
+                let children = copy_children(element);
+                let frame = element_screen_rect(element);
+                return (children, frame, false);
+            }
+            let children = values
+                .get(0)
+                .map(|value| *value)
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    let array = CFArray::<CFTypeRef>::wrap_under_get_rule(value as _);
+                    let ax_type_id = AXUIElementGetTypeID();
+                    (0..array.len())
+                        .filter_map(|index| {
+                            let child = *array.get(index)?;
+                            (core_foundation::base::CFGetTypeID(child) == ax_type_id).then(|| {
+                                CFRetain(child);
+                                child as AXUIElementRef
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let position = values
+                .get(1)
+                .map(|value| *value)
+                .filter(|value| !value.is_null())
+                .and_then(|value| cf_point_value(value, kAXValueCGPointType));
+            let size = values
+                .get(2)
+                .map(|value| *value)
+                .filter(|value| !value.is_null())
+                .and_then(|value| cf_point_value(value, kAXValueCGSizeType));
+            let geometry_valid = position.is_some_and(|(x, y)| x.is_finite() && y.is_finite())
+                && size
+                    .is_some_and(|(w, h)| w.is_finite() && h.is_finite() && w >= 0.0 && h >= 0.0);
+            let frame = position
+                .zip(size)
+                .and_then(|((x, y), (w, h))| (w >= 1.0 && h >= 1.0).then_some([x, y, w, h]));
+            return (children, frame, geometry_valid);
+        }
+    }
+
+    // Older AX bridges may reject the batched call. Preserve the old helpers
+    // as a compatibility fallback; callers still receive owned children.
+    let children = copy_children(element);
+    let frame = element_screen_rect(element);
+    (children, frame, false)
+}
+
 /// Get the children of an AX element.
 pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
     copy_element_array_attr(element, "AXChildren")
@@ -470,18 +795,29 @@ pub unsafe fn set_bool_attr_true(element: AXUIElementRef, attr_name: &str) -> AX
 /// effects; `AXEnhancedUserInterface` is the legacy fallback some Electron
 /// builds expose instead (the modern attribute returns
 /// `kAXErrorAttributeUnsupported` on those builds).
-pub unsafe fn enable_chromium_accessibility(app_element: AXUIElementRef) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessibilityOptIn {
+    NotAccepted,
+    ManualAccessibility,
+    EnhancedUserInterface,
+}
+
+pub unsafe fn enable_chromium_accessibility(app_element: AXUIElementRef) -> AccessibilityOptIn {
     let manual = set_bool_attr_true(app_element, "AXManualAccessibility");
     if manual == kAXErrorSuccess {
-        return true;
+        return AccessibilityOptIn::ManualAccessibility;
     }
     if manual != kAXErrorAttributeUnsupported {
         // A transient error (e.g. timeout / app busy) rather than a hard
         // "this app has no such attribute" — don't bother with the legacy
         // fallback, and don't claim enablement happened.
-        return false;
+        return AccessibilityOptIn::NotAccepted;
     }
-    set_bool_attr_true(app_element, "AXEnhancedUserInterface") == kAXErrorSuccess
+    if set_bool_attr_true(app_element, "AXEnhancedUserInterface") == kAXErrorSuccess {
+        AccessibilityOptIn::EnhancedUserInterface
+    } else {
+        AccessibilityOptIn::NotAccepted
+    }
 }
 
 /// Get the CGWindowID of an AX window element via the private `_AXUIElementGetWindow` SPI.
