@@ -171,7 +171,8 @@ impl AxObservation {
 }
 
 fn click_target_label(title: Option<String>, description: Option<String>) -> Option<String> {
-    title.or(description)
+    crate::ax::tree::preferred_label(title.as_deref(), description.as_deref(), None, None)
+        .map(str::to_owned)
 }
 
 unsafe fn read_ax_observation(element: AXUIElementRef) -> AxObservation {

@@ -26,7 +26,6 @@ use cmux_cua_core::{
 };
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 use serde_json::Value;
-
 use std::time::Duration;
 
 const WINDOW_DISCOVERY_ATTEMPTS: usize = 20;
@@ -58,7 +57,7 @@ fn wait_for_window_target<F>(
 where
     F: FnMut() -> Vec<(u32, i32)>,
 {
-    let attempts = attempts.min(1).max(1);
+    let attempts = attempts.max(1);
     for attempt in 0..attempts {
         let windows = list();
         if let Some(window_id) = requested {
@@ -148,7 +147,90 @@ impl Tool for BringToFrontTool {
             },
             None => return ToolResult::error("Missing required integer field: pid".to_string()),
         };
-        let window_id = args.get("window_id").and_then(Value::as_i64);
+        let requested_window_id = match args.get("window_id").and_then(Value::as_i64) {
+            None => None,
+            Some(window_id) if window_id > 0 && window_id <= u32::MAX as i64 => {
+                Some(window_id as u32)
+            }
+            Some(window_id) => {
+                return ToolResult::error(format!(
+                    "bring_to_front: `window_id` {window_id} is not a valid window identifier."
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "bring_to_front_window_id_invalid",
+                    "window_id": window_id,
+                }));
+            }
+        };
+
+        // Preserve the original PID-not-found result before waiting on
+        // WindowServer: command-line and background-only apps may have no
+        // windows, while an exited process should still report the PID error.
+        let app_exists =
+            unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid).is_some() };
+        if !app_exists {
+            return ToolResult::error(format!(
+                "bring_to_front: no running application for pid {pid} \
+                 (process not found or already exited)."
+            ))
+            .with_structured(serde_json::json!({
+                "code": "bring_to_front_pid_not_found",
+                "pid": pid,
+            }));
+        }
+
+        let target_window_id = match tokio::task::spawn_blocking(move || {
+            wait_for_window_target(
+                pid,
+                requested_window_id,
+                WINDOW_DISCOVERY_ATTEMPTS,
+                WINDOW_DISCOVERY_DELAY,
+                || {
+                    crate::windows::all_windows()
+                        .into_iter()
+                        .map(|window| (window.window_id, window.pid))
+                        .collect()
+                },
+            )
+        })
+        .await
+        {
+            Ok(Ok(window_id)) => window_id,
+            Ok(Err(WindowTargetError::OwnerMismatch {
+                window_id,
+                requested_pid,
+                owner_pid,
+            })) => {
+                return ToolResult::error(format!(
+                    "bring_to_front: window_id={window_id} belongs to pid={owner_pid}, not pid={requested_pid}."
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "bring_to_front_window_owner_mismatch",
+                    "window_id": window_id,
+                    "pid": requested_pid,
+                    "owner_pid": owner_pid,
+                }));
+            }
+            Ok(Err(WindowTargetError::NotFound { pid, requested })) => {
+                return ToolResult::error(format!(
+                    "bring_to_front: no window for pid {pid} became available before activation."
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "window_target_not_found",
+                    "pid": pid,
+                    "window_id": requested,
+                }));
+            }
+            Err(join) => {
+                return ToolResult::error(format!(
+                    "bring_to_front: window discovery task failed: {join}"
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "bring_to_front_window_discovery_failed",
+                    "pid": pid,
+                }));
+            }
+        };
 
         // `-[NSRunningApplication activateWithOptions:]` is documented
         // thread-safe. ActivateAllWindows brings the app's windows forward (not
@@ -193,12 +275,13 @@ impl Tool for BringToFrontTool {
         ToolResult::text(format!("Brought pid {pid} to the foreground.")).with_structured(
             serde_json::json!({
                 "pid": pid,
-                "window_id": window_id,
+                "window_id": target_window_id,
                 "activated": true,
             }),
         )
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
