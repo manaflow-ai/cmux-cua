@@ -217,7 +217,7 @@ pub unsafe fn copy_descriptor_strings(element: AXUIElementRef) -> AXDescriptorSt
                 ..Default::default()
             };
             for index in 0..value_count {
-                let Some(value) = values.get(index) else {
+                let Some(value) = values.get(index as isize) else {
                     continue;
                 };
                 let value = *value;
