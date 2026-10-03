@@ -45,5 +45,6 @@ try:
  report=json.loads((root/(mode+'-results.json')).read_text())
  print(json.dumps({k:report[k] for k in (('mode','assertions_passed') if mode=='cache' else ('mode','successes','attempts','snapshot_ms'))}))
 finally:
+ signal.alarm(0)
  cleanup()
  print(json.dumps(receipt))

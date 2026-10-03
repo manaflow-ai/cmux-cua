@@ -17,10 +17,10 @@
 //! `CacheKey`, `CachedSnapshot`, and the `Drop` impl that fires `CFRelease`
 //! when an entry is replaced or removed.
 
-use super::bindings::AXUIElementRef;
+use super::bindings::{copy_structural_probe, AXUIElementRef};
 use super::identity::IdentityRegistry;
 use super::observer::{DirtyEvent, DirtyKind, ObserverHub, ObserverKey};
-use super::tree::{AXNode, RetainedNodeGuard};
+use super::tree::{AXNode, RetainedNodeGuard, DEFAULT_MAX_AX_TIME_MS};
 use cmux_cua_core::element_cache::ElementCacheCore;
 use core_foundation::base::{CFRelease, CFRetain, CFTypeRef};
 use serde_json::Value;
@@ -171,6 +171,9 @@ pub struct CachedWindowState {
     /// Descriptor reads performed to produce this state. A clean cache hit is
     /// explicitly zero, which is the latency regression guard for Electron.
     pub ax_reads: u64,
+    /// Lightweight AXChildren/geometry probes used to detect Chromium DOM
+    /// mutations that Chromium intentionally does not announce natively.
+    pub structural_reads: u64,
     /// Keeps every raw AX handle referenced by `nodes` alive after the cache
     /// lock is released.  Consumers may retain this state while dispatching
     /// an action; replacing the cache entry cannot free those handles out
@@ -194,6 +197,26 @@ struct WindowEntry {
     max_elements: usize,
     max_depth: usize,
     full_map: bool,
+    structural: HashMap<usize, StructuralSnapshot>,
+    structural_reads: u64,
+}
+
+struct StructuralSnapshot {
+    root: RetainedChildren,
+    children: RetainedChildren,
+    frame: Option<[f64; 4]>,
+}
+
+struct RetainedChildren(Vec<usize>);
+
+impl Drop for RetainedChildren {
+    fn drop(&mut self) {
+        for ptr in self.0.drain(..) {
+            if ptr != 0 {
+                unsafe { CFRelease(ptr as AXUIElementRef as CFTypeRef) };
+            }
+        }
+    }
 }
 
 impl Default for WindowEntry {
@@ -218,6 +241,8 @@ impl Default for WindowEntry {
             max_elements: usize::MAX,
             max_depth: usize::MAX,
             full_map: false,
+            structural: HashMap::new(),
+            structural_reads: 0,
         }
     }
 }
@@ -365,6 +390,107 @@ impl ElementCache {
         entry.dirty
     }
 
+    /// Chromium's AX bridge invalidates its internal child cache for DOM
+    /// mutations but deliberately emits no native subtree-created event. Probe
+    /// retained container roots cheaply so those mutations still invalidate
+    /// the incremental snapshot without a full tree walk.
+    fn poll_structural(&self, pid: i32, window_id: u32, max_ax_time_ms: Option<u64>) -> u64 {
+        let Some(key) = self.window_key(pid, window_id) else {
+            return 0;
+        };
+        let (roots, owner, revision) = {
+            let windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(entry) = windows.get(&key) else {
+                return 0;
+            };
+            let roots = entry
+                .structural
+                .iter()
+                .map(|(ptr, snapshot)| {
+                    // Keep the previous children alive while AX IPC runs
+                    // outside the cache lock. The cache owner protects roots;
+                    // this extra retain protects the comparison vector.
+                    (
+                        *ptr,
+                        RetainedChildren::retain(&[*ptr]),
+                        RetainedChildren::retain(&snapshot.children.0),
+                        snapshot.frame,
+                    )
+                })
+                .collect::<Vec<_>>();
+            (roots, entry.owned_elements.clone(), entry.revision)
+        };
+        if roots.is_empty() {
+            return 0;
+        }
+        let deadline = max_ax_time_ms
+            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+        let mut reads = 0_u64;
+        let mut next = HashMap::new();
+        let mut changed = Vec::new();
+        let mut complete = true;
+        for (root, root_owner, previous_children, previous_frame) in roots {
+            if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+                complete = false;
+                break;
+            }
+            let (children, frame, valid) = unsafe { copy_structural_probe(root as AXUIElementRef) };
+            reads = reads.saturating_add(1);
+            if !valid {
+                // Do not interpret an unsupported/malformed AXChildren
+                // response as an empty container. Release any fallback
+                // retains and force the existing bounded cold walk.
+                drop(RetainedChildren::from_owned(children));
+                complete = false;
+                break;
+            }
+            let same_children = children_equal(&children, &previous_children.0);
+            let same_frame = frame == previous_frame;
+            if !same_children || !same_frame {
+                changed.push(root);
+            }
+            next.insert(
+                root,
+                StructuralSnapshot {
+                    root: root_owner,
+                    children: RetainedChildren::from_owned(children),
+                    frame,
+                },
+            );
+        }
+        let observer_key = ObserverKey {
+            pid: key.pid,
+            window_id: key.window_id,
+            process_generation: key.process_generation,
+        };
+        let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = windows.get_mut(&key) else {
+            return reads;
+        };
+        if entry.revision != revision
+            || !matches!((&entry.owned_elements, &owner), (Some(current), Some(previous)) if Arc::ptr_eq(current, previous))
+        {
+            return reads;
+        }
+        // An incomplete probe must never be reported as a clean cache hit. A
+        // bounded full walk will retry it on the next caller turn.
+        entry.structural_reads = reads;
+        if complete {
+            entry.structural = next;
+            for root in changed {
+                entry.dirty.mark(DirtyKind::Children);
+                entry.pending_events.push(DirtyEvent::synthetic(
+                    observer_key,
+                    root,
+                    DirtyKind::Children,
+                ));
+            }
+        } else {
+            entry.dirty.mark(DirtyKind::Children);
+        }
+        reads
+    }
+
     /// Take queued events for a window so the caller can refresh only the
     /// affected descriptor or subtree. Each event owns an AX retain until the
     /// returned vector is dropped.
@@ -406,7 +532,22 @@ impl ElementCache {
         max_depth: usize,
         full_map: bool,
     ) -> Option<CachedWindowState> {
+        self.cached_window_for_policy_impl(pid, window_id, max_elements, max_depth, full_map, true)
+    }
+
+    fn cached_window_for_policy_impl(
+        &self,
+        pid: i32,
+        window_id: u32,
+        max_elements: usize,
+        max_depth: usize,
+        full_map: bool,
+        probe_structural: bool,
+    ) -> Option<CachedWindowState> {
         let key = self.window_key(pid, window_id)?;
+        if probe_structural {
+            self.poll_structural(pid, window_id, Some(DEFAULT_MAX_AX_TIME_MS));
+        }
         self.poll_dirty(pid, window_id);
         let windows = self.windows.lock().ok()?;
         let entry = windows.get(&key)?;
@@ -439,6 +580,7 @@ impl ElementCache {
             observer_supported: entry.observer_supported,
             cache_hit: true,
             ax_reads: 0,
+            structural_reads: entry.structural_reads,
             owned_elements,
         };
         Some(state)
@@ -508,6 +650,12 @@ impl ElementCache {
         let Some(key) = self.window_key(pid, window_id) else {
             return transient_window_state(pid, window_id, nodes, ax_reads, owned_elements);
         };
+        // Capture the actual AXChildren list for container roots. Deriving it
+        // from the rendered node vector misses Chromium wrappers that are
+        // intentionally collapsed by the serializer, while probing here gives
+        // the next request a real structural baseline.
+        let (structural, structural_reads, structural_complete) =
+            capture_structural(nodes, &owned_elements);
         let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
         let entry = windows
             .entry(key)
@@ -522,9 +670,14 @@ impl ElementCache {
         entry.revision = entry.revision.saturating_add(1);
         entry.key = key;
         entry.nodes = nodes.to_vec();
+        entry.structural = structural;
+        entry.structural_reads = structural_reads;
         entry.compact_nodes = compact_nodes(nodes, entry);
         entry.diff = diff_nodes(entry.revision, &previous, &entry.compact_nodes);
         entry.dirty = DirtyFlags::default();
+        if !structural_complete {
+            entry.dirty.children = true;
+        }
         let owned_elements = Arc::new(owned_elements);
         entry.owned_elements = Some(owned_elements.clone());
         let observer_elements = owned_elements
@@ -564,6 +717,7 @@ impl ElementCache {
             observer_supported,
             cache_hit: false,
             ax_reads,
+            structural_reads: entry.structural_reads,
             owned_elements,
         }
     }
@@ -645,14 +799,16 @@ impl ElementCache {
         full_map: bool,
         max_ax_time_ms: Option<u64>,
     ) -> Option<CachedWindowState> {
+        self.poll_structural(pid, window_id, max_ax_time_ms);
         let events = self.take_dirty_events(pid, window_id);
         if events.is_empty() {
-            return self.cached_window_for_policy(
+            return self.cached_window_for_policy_impl(
                 pid,
                 window_id,
                 max_elements,
                 max_depth,
                 full_map,
+                false,
             );
         }
         if events.iter().any(|event| {
@@ -686,21 +842,30 @@ impl ElementCache {
         let mut ax_reads = 0_u64;
         let mut refresh_guards = Vec::new();
         let mut refresh_watch_guards = Vec::new();
-        let visible_bounds = nodes
-            .iter()
-            .find(|node| node.role == "AXWindow")
-            .and_then(|node| node.frame);
+        let visible_bounds = crate::windows::window_bounds_by_id(window_id)
+            .map(|bounds| [bounds.x, bounds.y, bounds.width, bounds.height])
+            .or_else(|| {
+                nodes
+                    .iter()
+                    .find(|node| node.role == "AXWindow")
+                    .and_then(|node| node.frame)
+            });
         for event in events {
-            let Some(index) = nodes
-                .iter()
-                .position(|node| same_ax_element(node.element_ptr, event.element))
-            else {
-                return None;
+            let index = {
+                let windows = self.windows.lock().ok()?;
+                let entry = windows.get(&key)?;
+                if matches!(event.kind, DirtyKind::Children | DirtyKind::Layout) {
+                    find_refresh_root(&nodes, &entry.structural, event.element)?
+                } else {
+                    nodes
+                        .iter()
+                        .position(|node| elements_equal(node.element_ptr, event.element))?
+                }
             };
             let subtree = matches!(event.kind, DirtyKind::Children | DirtyKind::Layout);
             let refreshed = unsafe {
                 super::tree::walk_subtree_with_options(
-                    event.element as AXUIElementRef,
+                    nodes[index].element_ptr as AXUIElementRef,
                     if subtree { max_elements } else { 1 },
                     if subtree { max_depth } else { 0 },
                     full_map,
@@ -739,6 +904,20 @@ impl ElementCache {
             }
         }
 
+        let mut probing_owner = owner.as_ref().clone_retained();
+        for guard in refresh_guards {
+            probing_owner.append(guard);
+        }
+        for guard in refresh_watch_guards {
+            probing_owner.append(guard);
+        }
+        let (structural, structural_reads, structural_complete) =
+            capture_structural(&nodes, &probing_owner);
+        let mut refreshed_owner = RetainedNodeGuard::retain_nodes(&nodes);
+        refreshed_owner.append(RetainedNodeGuard::retain_pointers(
+            &structural.keys().copied().collect::<Vec<_>>(),
+        ));
+        let refreshed_owner = Arc::new(refreshed_owner);
         let mut windows = self.windows.lock().ok()?;
         let entry = windows.get_mut(&key)?;
         // A full-walk publisher may have won the race while AX IPC was in
@@ -749,19 +928,16 @@ impl ElementCache {
         entry.revision = entry.revision.saturating_add(1);
         entry.nodes = nodes;
         let refreshed_nodes = entry.nodes.clone();
+        entry.structural = structural;
+        entry.structural_reads = structural_reads;
         entry.compact_nodes = compact_nodes(&refreshed_nodes, entry);
         entry.diff = diff_nodes(entry.revision, &previous, &entry.compact_nodes);
         entry.dirty = DirtyFlags::default();
+        if !structural_complete {
+            entry.dirty.children = true;
+        }
         // Rebuild ownership from the final vector. This drops obsolete
         // handles instead of accumulating every historical subtree pointer.
-        let mut refreshed_owner = owner.as_ref().clone_retained();
-        for guard in refresh_guards {
-            refreshed_owner.append(guard);
-        }
-        for guard in refresh_watch_guards {
-            refreshed_owner.append(guard);
-        }
-        let refreshed_owner = Arc::new(refreshed_owner);
         entry.owned_elements = Some(refreshed_owner.clone());
         let mut state = CachedWindowState {
             key,
@@ -773,6 +949,7 @@ impl ElementCache {
             observer_supported: entry.observer_supported,
             cache_hit: false,
             ax_reads,
+            structural_reads: entry.structural_reads,
             owned_elements: refreshed_owner,
         };
         let observer_elements = state
@@ -892,6 +1069,178 @@ fn compact_nodes(nodes: &[AXNode], entry: &mut WindowEntry) -> Vec<CompactNode> 
         });
     }
     compact
+}
+
+fn elements_equal(a: usize, b: usize) -> bool {
+    a != 0
+        && b != 0
+        && unsafe { core_foundation::base::CFEqual(a as CFTypeRef, b as CFTypeRef) != 0 }
+}
+
+/// Map notifications from collapsed containers through actual AXChildren edges.
+/// Flattened serialized parent indices cannot represent these wrapper roots.
+fn find_refresh_root(
+    nodes: &[AXNode],
+    structural: &HashMap<usize, StructuralSnapshot>,
+    element: usize,
+) -> Option<usize> {
+    let mut current = element;
+    let mut visited = Vec::new();
+    for _ in 0..=structural.len() {
+        if let Some(index) = nodes
+            .iter()
+            .position(|node| elements_equal(node.element_ptr, current))
+        {
+            return Some(index);
+        }
+        if visited.iter().any(|ptr| elements_equal(*ptr, current)) {
+            return None;
+        }
+        visited.push(current);
+        current = *structural
+            .iter()
+            .find(|(_, snapshot)| {
+                snapshot
+                    .children
+                    .0
+                    .iter()
+                    .any(|child| elements_equal(*child, current))
+            })?
+            .0;
+    }
+    None
+}
+
+fn capture_structural(
+    nodes: &[AXNode],
+    owner: &RetainedNodeGuard,
+) -> (HashMap<usize, StructuralSnapshot>, u64, bool) {
+    let mut snapshots = HashMap::new();
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(DEFAULT_MAX_AX_TIME_MS);
+    let mut reads = 0_u64;
+    let mut complete = true;
+    // Prefer current emitted wrappers over historical equivalent handles.
+    let mut candidates = nodes
+        .iter()
+        .map(|node| node.element_ptr)
+        .collect::<Vec<_>>();
+    candidates.extend_from_slice(owner.pointers());
+    let mut seen = Vec::new();
+    for ptr in candidates {
+        if ptr == 0 || seen.iter().any(|previous| elements_equal(*previous, ptr)) {
+            continue;
+        }
+        seen.push(ptr);
+        if deadline <= std::time::Instant::now() {
+            complete = false;
+            break;
+        }
+        // Tests use CFString stand-ins. Never dispatch AX IPC to a non-AX object.
+        if unsafe { core_foundation::base::CFGetTypeID(ptr as CFTypeRef) }
+            != unsafe { super::bindings::AXUIElementGetTypeID() }
+        {
+            continue;
+        }
+        let role = nodes
+            .iter()
+            .find(|node| node.element_ptr == ptr)
+            .map(|node| node.role.clone())
+            .or_else(|| unsafe {
+                super::bindings::copy_string_attr(ptr as AXUIElementRef, "AXRole")
+            });
+        if !role.as_deref().is_some_and(is_structural_role) {
+            continue;
+        }
+        let (children, frame, valid) = unsafe { copy_structural_probe(ptr as AXUIElementRef) };
+        reads = reads.saturating_add(1);
+        if !valid {
+            drop(RetainedChildren::from_owned(children));
+            complete = false;
+            break;
+        }
+        snapshots.insert(
+            ptr,
+            StructuralSnapshot {
+                root: RetainedChildren::retain(&[ptr]),
+                children: RetainedChildren::from_owned(children),
+                frame,
+            },
+        );
+    }
+    // Discard replaced watcher roots: only current nodes and containers reachable
+    // from them through the real AX child edges belong to this snapshot.
+    let mut reachable = nodes
+        .iter()
+        .map(|node| node.element_ptr)
+        .collect::<Vec<_>>();
+    for _ in 0..snapshots.len() {
+        let mut added = Vec::new();
+        for (ptr, snapshot) in &snapshots {
+            if reachable.iter().any(|root| elements_equal(*root, *ptr)) {
+                for child in &snapshot.children.0 {
+                    if !reachable
+                        .iter()
+                        .chain(&added)
+                        .any(|root| elements_equal(*root, *child))
+                    {
+                        added.push(*child);
+                    }
+                }
+            }
+        }
+        if added.is_empty() {
+            break;
+        }
+        reachable.extend(added);
+    }
+    snapshots.retain(|ptr, _| reachable.iter().any(|root| elements_equal(*root, *ptr)));
+    (snapshots, reads, complete)
+}
+
+fn is_structural_role(role: &str) -> bool {
+    matches!(
+        role,
+        "AXGroup"
+            | "AXWebArea"
+            | "AXWindow"
+            | "AXScrollArea"
+            | "AXList"
+            | "AXOutline"
+            | "AXTable"
+            | "AXCollection"
+    )
+}
+
+fn children_equal(current: &[AXUIElementRef], previous: &[usize]) -> bool {
+    current.len() == previous.len()
+        && current
+            .iter()
+            .zip(previous)
+            .all(|(current, previous)| unsafe {
+                core_foundation::base::CFEqual(
+                    *current as CFTypeRef,
+                    *previous as AXUIElementRef as CFTypeRef,
+                ) != 0
+            })
+}
+
+impl RetainedChildren {
+    fn from_owned(ptrs: Vec<AXUIElementRef>) -> Self {
+        Self(
+            ptrs.into_iter()
+                .filter(|ptr| !ptr.is_null())
+                .map(|ptr| ptr as usize)
+                .collect(),
+        )
+    }
+
+    fn retain(ptrs: &[usize]) -> Self {
+        for ptr in ptrs.iter().copied().filter(|ptr| *ptr != 0) {
+            unsafe { CFRetain(ptr as AXUIElementRef as CFTypeRef) };
+        }
+        Self(ptrs.iter().copied().filter(|ptr| *ptr != 0).collect())
+    }
 }
 
 fn stable_id(node: &AXNode, entry: &mut WindowEntry) -> String {
@@ -1064,6 +1413,7 @@ fn transient_window_state(
         observer_supported: false,
         cache_hit: false,
         ax_reads,
+        structural_reads: entry.structural_reads,
         owned_elements: owner,
     }
 }
@@ -1239,6 +1589,53 @@ mod tests {
             .id
             .clone();
         assert_eq!(before, after, "label changes must preserve AX identity");
+    }
+
+    #[test]
+    fn structural_child_probe_compares_cf_identity_and_order() {
+        let first = CFString::new("child-a");
+        let second = CFString::new("child-b");
+        let first_ptr = first.as_concrete_TypeRef() as usize;
+        let second_ptr = second.as_concrete_TypeRef() as usize;
+        let current = [first_ptr as AXUIElementRef, second_ptr as AXUIElementRef];
+        assert!(children_equal(&current, &[first_ptr, second_ptr]));
+        assert!(!children_equal(&current, &[second_ptr, first_ptr]));
+        assert!(!children_equal(&current[..1], &[first_ptr, second_ptr]));
+    }
+
+    #[test]
+    fn collapsed_container_notifications_map_to_emitted_ancestor() {
+        let root = CFString::new("emitted-root");
+        let wrapper = CFString::new("collapsed-wrapper");
+        let child = CFString::new("changed-child");
+        let unknown = CFString::new("unrelated");
+        let ptr = |value: &CFString| value.as_concrete_TypeRef() as usize;
+        let mut structural = HashMap::new();
+        structural.insert(
+            ptr(&root),
+            StructuralSnapshot {
+                root: RetainedChildren::retain(&[ptr(&root)]),
+                children: RetainedChildren::retain(&[ptr(&wrapper)]),
+                frame: None,
+            },
+        );
+        structural.insert(
+            ptr(&wrapper),
+            StructuralSnapshot {
+                root: RetainedChildren::retain(&[ptr(&wrapper)]),
+                children: RetainedChildren::retain(&[ptr(&child)]),
+                frame: None,
+            },
+        );
+        let nodes = [node_with_ptr(ptr(&root))];
+        assert_eq!(find_refresh_root(&nodes, &structural, ptr(&child)), Some(0));
+        assert_eq!(
+            find_refresh_root(&nodes, &structural, ptr(&wrapper)),
+            Some(0)
+        );
+        assert_eq!(find_refresh_root(&nodes, &structural, ptr(&unknown)), None);
+        structural.get_mut(&ptr(&root)).unwrap().children = RetainedChildren::retain(&[ptr(&root)]);
+        assert_eq!(find_refresh_root(&[], &structural, ptr(&root)), None);
     }
 
     #[test]

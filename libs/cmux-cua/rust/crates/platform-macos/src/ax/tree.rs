@@ -239,6 +239,18 @@ impl RetainedNodeGuard {
         Self(ptrs)
     }
 
+    pub(crate) fn retain_pointers(ptrs: &[usize]) -> Self {
+        let ptrs = ptrs
+            .iter()
+            .copied()
+            .filter(|ptr| *ptr != 0)
+            .collect::<Vec<_>>();
+        for ptr in &ptrs {
+            unsafe { CFRetain(*ptr as AXUIElementRef as CFTypeRef) };
+        }
+        Self(ptrs)
+    }
+
     pub(crate) fn append(&mut self, mut other: RetainedNodeGuard) {
         for ptr in other.0.drain(..) {
             if !self.0.contains(&ptr) {

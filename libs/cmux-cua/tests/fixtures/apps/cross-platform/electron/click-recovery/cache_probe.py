@@ -71,6 +71,7 @@ time.sleep(.25)
 second=state()
 assert second['ax_snapshot']['cache_hit'], second['ax_snapshot']
 assert second['ax_snapshot']['ax_reads']==0
+assert second['ax_snapshot']['structural_reads']>0, 'Chromium structure must be guarded even on clean hits'
 assert not any(second['ax_snapshot']['diff'][key] for key in ('added','removed','updated'))
 original=find(second,'Probe 0')
 filtered=state({'role':'AXButton','label':'Probe 0'})

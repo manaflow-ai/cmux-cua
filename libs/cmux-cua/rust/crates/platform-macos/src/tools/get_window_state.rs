@@ -29,7 +29,9 @@ fn def() -> &'static ToolDef {
             in the markdown and as `element_index` in the structured array — pass \
             those indices to click, type_text, press_key, etc.\n\n\
             Per-window snapshots are cached and refreshed incrementally from AX \
-            notifications. Clean cache hits perform no AX descriptor reads. \
+            notifications. Clean cache hits perform no AX descriptor reads; \
+            structural child/frame guards may still perform bounded AX reads, \
+            reported separately as `ax_snapshot.structural_reads`. \
             `ax_snapshot.compact` contains actionable or labeled nodes with \
             stable IDs, window-local frames and an explicit revision diff. \
             Use `role`, `label` or `region` to query a subset without changing \
@@ -528,6 +530,10 @@ impl Tool for GetWindowStateTool {
                     .map(|state| state.ax_reads)
                     .unwrap_or(0)
             });
+        let structural_reads = cached_state
+            .as_ref()
+            .map(|state| state.structural_reads)
+            .unwrap_or(0);
         let compact_nodes = cached_state
             .as_ref()
             .map(|state| {
@@ -563,6 +569,7 @@ impl Tool for GetWindowStateTool {
                 "revision": revision,
                 "cache_hit": cache_hit,
                 "ax_reads": ax_reads,
+                "structural_reads": structural_reads,
                 "window_origin": {"x": window_origin[0], "y": window_origin[1]},
                 "compact": compact_nodes,
                 "diff": cached_state.as_ref().map(|state| serde_json::json!({
@@ -578,6 +585,7 @@ impl Tool for GetWindowStateTool {
                 "cache_hit": cache_hit,
                 "revision": revision,
                 "ax_reads": ax_reads,
+                "structural_reads": structural_reads,
                 "observer_supported": cached_state.as_ref().map(|state| state.observer_supported).unwrap_or(false),
                 "truncated": tree_result.as_ref().map(|r| r.truncated).unwrap_or(false),
                 "truncation_reason": tree_result.as_ref().and_then(|r| r.truncation_reason.clone()),

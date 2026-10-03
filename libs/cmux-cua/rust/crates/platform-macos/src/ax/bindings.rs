@@ -609,6 +609,86 @@ pub unsafe fn focused_element_of_pid(pid: i32) -> Option<AXUIElementRef> {
     Some(value as AXUIElementRef)
 }
 
+/// Copy the structural attributes used by the incremental cache in one AX IPC
+/// request. Chromium often omits native children-changed notifications, so the
+/// cache probes retained container roots. Keeping AXChildren, AXPosition, and
+/// AXSize in one `AXUIElementCopyMultipleAttributeValues` call makes that
+/// probe cheap while preserving the retained-child ownership contract.
+pub unsafe fn copy_structural_probe(
+    element: AXUIElementRef,
+) -> (Vec<AXUIElementRef>, Option<[f64; 4]>, bool) {
+    let names = [
+        CFStr::new("AXChildren"),
+        CFStr::new("AXPosition"),
+        CFStr::new("AXSize"),
+    ];
+    let names_array = CFArray::from_CFTypes(&names);
+    let mut raw_values: CFArrayRef = std::ptr::null();
+    let error = AXUIElementCopyMultipleAttributeValues(
+        element,
+        names_array.as_concrete_TypeRef(),
+        0,
+        &mut raw_values,
+    );
+    if error == kAXErrorSuccess && !raw_values.is_null() {
+        let values = CFArray::<CFTypeRef>::wrap_under_create_rule(raw_values as _);
+        if values.len() as usize == names.len() {
+            let child_value = values.get(0).map(|value| *value);
+            let children_valid = child_value.is_some_and(|value| {
+                !value.is_null()
+                    && embedded_ax_error(value).is_none()
+                    && core_foundation::base::CFGetTypeID(value) == CFArray::<CFTypeRef>::type_id()
+            });
+            if !children_valid {
+                let children = copy_children(element);
+                let frame = element_screen_rect(element);
+                return (children, frame, false);
+            }
+            let children = values
+                .get(0)
+                .map(|value| *value)
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    let array = CFArray::<CFTypeRef>::wrap_under_get_rule(value as _);
+                    let ax_type_id = AXUIElementGetTypeID();
+                    (0..array.len())
+                        .filter_map(|index| {
+                            let child = *array.get(index)?;
+                            (core_foundation::base::CFGetTypeID(child) == ax_type_id).then(|| {
+                                CFRetain(child);
+                                child as AXUIElementRef
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let position = values
+                .get(1)
+                .map(|value| *value)
+                .filter(|value| !value.is_null())
+                .and_then(|value| cf_point_value(value, kAXValueCGPointType));
+            let size = values
+                .get(2)
+                .map(|value| *value)
+                .filter(|value| !value.is_null())
+                .and_then(|value| cf_point_value(value, kAXValueCGSizeType));
+            let geometry_valid = position.is_some_and(|(x, y)| x.is_finite() && y.is_finite())
+                && size
+                    .is_some_and(|(w, h)| w.is_finite() && h.is_finite() && w >= 0.0 && h >= 0.0);
+            let frame = position
+                .zip(size)
+                .and_then(|((x, y), (w, h))| (w >= 1.0 && h >= 1.0).then_some([x, y, w, h]));
+            return (children, frame, geometry_valid);
+        }
+    }
+
+    // Older AX bridges may reject the batched call. Preserve the old helpers
+    // as a compatibility fallback; callers still receive owned children.
+    let children = copy_children(element);
+    let frame = element_screen_rect(element);
+    (children, frame, false)
+}
+
 /// Get the children of an AX element.
 pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
     copy_element_array_attr(element, "AXChildren")

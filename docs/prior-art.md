@@ -38,3 +38,11 @@ unlabeled one-child wrappers, stable serialized identities, window-relative
 frames, compact actionable/labeled output, and explicit diffs and role/label/
 region queries. A deadline remains a final safety bound, not the performance
 strategy. Focus changes must not produce false click-effect confirmations.
+
+Native validation exposed a Chromium bridge limitation: its
+[`SUBTREE_CREATED` handler](https://github.com/chromium/chromium/blob/9840ec26a8bb0e4d40e5e18d7baf7673fb1a13f0/ui/accessibility/platform/browser_accessibility_manager_mac.mm)
+returns without posting a native AX notification. Observers therefore need a
+thin check of retained container children and geometry. A changed container
+refreshes its own subtree; it does not force a fresh whole-window walk. Report
+these structural checks separately from descriptor reads. Compare retained AX
+objects with CFEqual, since wrapper addresses can change between observations.

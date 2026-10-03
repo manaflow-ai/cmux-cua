@@ -106,6 +106,19 @@ pub struct DirtyEvent {
 }
 
 impl DirtyEvent {
+    pub(crate) fn synthetic(key: ObserverKey, element: usize, kind: DirtyKind) -> Self {
+        let retained = (element != 0).then(|| {
+            unsafe { core_foundation::base::CFRetain(element as AXUIElementRef as CFTypeRef) };
+            RetainedElement(element)
+        });
+        Self {
+            key,
+            element,
+            kind,
+            retained,
+        }
+    }
+
     fn from_callback(key: ObserverKey, element: AXUIElementRef, kind: DirtyKind) -> Self {
         let retained = (!element.is_null()).then(|| {
             // The retain is intentionally the only Core Foundation operation
