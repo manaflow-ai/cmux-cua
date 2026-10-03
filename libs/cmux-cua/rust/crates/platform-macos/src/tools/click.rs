@@ -510,7 +510,7 @@ fn def() -> &'static ToolDef {
                 "fallback": {
                     "type": "string",
                     "enum": ["foreground"],
-                    "description": "Optional recovery for a background click whose target-bound AX state or localized visual region shows no settled change. Retries exactly once with foreground delivery, briefly bringing the target window forward, then restores the prior app. Omit to report effect=not_landed without changing focus."
+                    "description": "Optional recovery for a background click blocked by another window or whose target-bound AX state or localized visual region shows no settled change. Retries exactly once with foreground delivery, briefly bringing the target window forward, then restores the prior app. Omit to report effect=not_landed without changing focus."
                 },
                 "scope": {
                     "type": "string",
@@ -1260,6 +1260,14 @@ impl Tool for ClickTool {
                     if let Some(error) =
                         super::pixel_obstruction_error(pid, wid, screen_x, screen_y, None)
                     {
+                        // A blocked background dispatch also made no change.
+                        // The caller's explicit foreground opt-in resolves the
+                        // obstruction; retry once with fallback removed.
+                        if fallback_foreground && action != "focus" {
+                            return mark_foreground_fallback(
+                                self.invoke(foreground_retry_args(&args)).await,
+                            );
+                        }
                         return error;
                     }
                 }
