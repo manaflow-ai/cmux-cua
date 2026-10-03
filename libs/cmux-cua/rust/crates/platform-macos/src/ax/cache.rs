@@ -4,8 +4,8 @@
 //! is cached by element_index. Subsequent `click`, `type_text`, etc. look up
 //! the element_index to get the raw pointer and perform AX actions on it.
 //!
-//! Cache is scoped per (pid, window_id) — a new `get_window_state` call
-//! for the same (pid, window_id) replaces the entire entry.
+//! Tree snapshots are scoped by process lifetime and window, then refreshed
+//! from observer notifications. Clean `get_window_state` calls reuse the tree.
 //!
 //! Memory contract:
 //!   tree::walk_element retains each emitted element before storing its ptr;

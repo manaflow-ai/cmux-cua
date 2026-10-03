@@ -61,7 +61,7 @@ fn def() -> &'static ToolDef {
             context-window blow-up on Electron / Obsidian / large web apps that \
             produce 10k+ element trees. When applied, BOTH the markdown \
             and the structured elements are truncated identically. Omit both for \
-            current default behaviour (≤2 000 elements, depth ≤25, 2 000 ms).".into(),
+            current default behaviour (≤2 000 elements, depth ≤64, 2 000 ms).".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["pid", "window_id"],
@@ -107,7 +107,7 @@ fn def() -> &'static ToolDef {
                 "max_depth": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Cap on the AX-tree walk depth. Nodes whose rendered indent would exceed this are omitted. Omit for the default (25). Lower this for deep menu/Electron trees."
+                    "description": "Cap on the AX-tree walk depth. Nodes whose rendered indent would exceed this are omitted. Omit for the default (64). Lower this for unusually deep or context-sensitive trees."
                 },
                 "max_ax_time_ms": {
                     "type": "integer",

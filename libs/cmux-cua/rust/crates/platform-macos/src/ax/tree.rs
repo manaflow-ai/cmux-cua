@@ -14,14 +14,16 @@ use super::bindings::*;
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
 use std::collections::HashSet;
 
-/// Default maximum depth for AX tree walks. Deep menus and complex web views
-/// can nest deeply; 25 covers realistic app chrome without exploding on
-/// pathological trees (mirrors Swift reference implementation).
+/// Default maximum depth for AX tree walks. Chromium/Electron renderer trees
+/// commonly add several dozen layout and semantic-wrapper levels before the
+/// visible controls; 64 reaches the complete visible Codex surface while the
+/// separate element, cooperative-time, and IPC-message bounds still protect
+/// pathological trees.
 ///
 /// Callers can override per-call via `walk_tree`'s `max_depth` parameter to
 /// trade fidelity for context-window budget on AX-heavy apps (Electron,
 /// Obsidian, large web apps — issue #22865).
-pub const DEFAULT_MAX_DEPTH: usize = 25;
+pub const DEFAULT_MAX_DEPTH: usize = 64;
 
 /// Default maximum total nodes visited during a single AX walk. Chromium-family
 /// apps (Arc, VS Code, Chrome) can expose thousands of nodes; capping at 2 000

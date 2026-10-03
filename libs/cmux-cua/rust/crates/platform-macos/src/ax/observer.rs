@@ -77,14 +77,16 @@ impl DirtyKind {
             "AXValueChanged" | "AXTitleChanged" => Self::Value,
             "AXSelectedChildrenChanged"
             | "AXChildrenChanged"
+            | "AXUIElementCreated"
             | "AXCreated"
+            | "AXSelectedRowsChanged"
+            | "AXSelectedColumnsChanged"
             | "AXRowCountChanged"
             | "AXRowExpanded"
             | "AXRowCollapsed" => Self::Children,
             "AXFocusedUIElementChanged" | "AXFocusedWindowChanged" => Self::Focus,
-            "AXLayoutChanged" | "AXMoved" | "AXResized" | "AXWindowMoved" | "AXWindowResized" => {
-                Self::Layout
-            }
+            "AXLayoutChanged" | "AXLayoutComplete" | "AXLoadComplete" | "AXMoved" | "AXResized"
+            | "AXWindowMoved" | "AXWindowResized" => Self::Layout,
             "AXUIElementDestroyed" => Self::Destroyed,
             _ => Self::Unknown,
         }
@@ -445,11 +447,16 @@ fn create_registration(
             "AXTitleChanged",
             "AXSelectedChildrenChanged",
             "AXChildrenChanged",
+            "AXUIElementCreated",
             "AXCreated",
+            "AXSelectedRowsChanged",
+            "AXSelectedColumnsChanged",
             "AXUIElementDestroyed",
             "AXFocusedUIElementChanged",
             "AXFocusedWindowChanged",
             "AXLayoutChanged",
+            "AXLayoutComplete",
+            "AXLoadComplete",
             "AXMoved",
             "AXResized",
             "AXWindowMoved",
@@ -572,6 +579,10 @@ mod tests {
         );
         assert_eq!(
             DirtyKind::from_notification("AXCreated"),
+            DirtyKind::Children
+        );
+        assert_eq!(
+            DirtyKind::from_notification("AXUIElementCreated"),
             DirtyKind::Children
         );
     }
