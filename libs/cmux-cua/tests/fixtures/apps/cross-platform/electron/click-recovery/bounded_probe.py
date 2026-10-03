@@ -32,6 +32,7 @@ def deadline(*_): raise TimeoutError('fixture probe deadline')
 signal.signal(signal.SIGALRM,deadline)
 signal.alarm(235)
 try:
+ (root/'mutation.json').unlink(missing_ok=True)
  fixture=subprocess.Popen([str(root/'node_modules/.bin/electron'),str(root)],
   stdout=open(root/(mode+'-fixture.log'),'w'),stderr=subprocess.STDOUT,stdin=subprocess.DEVNULL,start_new_session=True)
  receipt['fixture_launcher_pid']=fixture.pid
