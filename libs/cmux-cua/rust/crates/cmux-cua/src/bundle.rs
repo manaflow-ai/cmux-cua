@@ -207,7 +207,7 @@ mod tests {
             "/Library/Application Support/cmux/computer-use/helper/tag/cmux Computer Use.app/Contents/MacOS/cmux-cua"
         )));
         assert!(!is_cmux_branded_executable_path(std::path::Path::new(
-            "/Applications/cmux Computer Use.app/Contents/MacOS/cmux-cua"
+            "/Applications/Cua.app/Contents/MacOS/cua-driver"
         )));
     }
 
