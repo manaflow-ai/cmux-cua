@@ -1593,6 +1593,31 @@ fn map_action(action: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn click_verification_accepts_distinct_equal_native_wrappers() {
+        let first = core_foundation::string::CFString::new("same native identity across wrappers");
+        let second = core_foundation::string::CFString::new("same native identity across wrappers");
+        assert_ne!(first.as_concrete_TypeRef(), second.as_concrete_TypeRef());
+        let before = ClickObservation {
+            target: Some(AxObservation {
+                role: Some("AXButton".to_owned()),
+                title: Some("Run".to_owned()),
+                value: Some("0".to_owned()),
+                selected: None,
+                expanded: None,
+                focused: None,
+                selected_range: None,
+            }),
+            target_identity: Some(first.as_concrete_TypeRef() as usize),
+            focused: None,
+        };
+        let mut after = before.clone();
+        after.target_identity = Some(second.as_concrete_TypeRef() as usize);
+        after.target.as_mut().unwrap().value = Some("1".to_owned());
+        assert_eq!(click_verification(Some(before), Some(after)), (true, "confirmed"));
+    }
+
+
     /// Surface 5: schema must advertise the new `button` field with the three
     /// canonical values and default to "left". Hermes / Codex / Claude Code
     /// consumers branch on this enum being present.
