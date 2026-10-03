@@ -114,7 +114,10 @@ pub(crate) fn preferred_label<'a>(
     value: Option<&'a str>,
     identifier: Option<&'a str>,
 ) -> Option<&'a str> {
-    title.or(description).or(value).or(identifier)
+    [title, description, value, identifier]
+        .into_iter()
+        .flatten()
+        .find(|label| !label.trim().is_empty())
 }
 
 /// Enable the lazy web-content AX tree for an Electron/Chromium application.
