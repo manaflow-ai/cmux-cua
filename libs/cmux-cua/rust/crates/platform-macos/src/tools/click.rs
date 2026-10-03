@@ -30,21 +30,73 @@ use crate::ax::bindings::{
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
-use core_foundation::base::{CFRelease, TCFType};
+use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef, TCFType};
 
 use super::ToolState;
 
 /// Cheap, read-only state used to determine whether a background click had an
 /// observable effect.  This deliberately reads only the hit-tested element and
 /// the application's focused element.  It never walks the accessibility tree.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct ClickObservation {
     target: Option<AxObservation>,
     /// The AX object identity returned by the hit-test.  A post-click hit-test
     /// that resolves to another object (even at the same point) is not evidence
     /// about the requested target.
-    target_identity: Option<usize>,
+    target_identity: Option<RetainedAxIdentity>,
     focused: Option<AxObservation>,
+}
+
+/// A retained AX reference used for collision-safe identity checks. AX wrappers
+/// for one native object can have different addresses across hit-tests, so raw
+/// pointer equality is insufficient. Keeping a retain here also ensures the
+/// reference remains valid until verification completes.
+#[derive(Debug)]
+struct RetainedAxIdentity(usize);
+
+impl RetainedAxIdentity {
+    unsafe fn new(element: AXUIElementRef) -> Self {
+        CFRetain(element as CFTypeRef);
+        Self(element as usize)
+    }
+
+    fn as_element(&self) -> AXUIElementRef {
+        self.0 as AXUIElementRef
+    }
+
+    fn equal(&self, other: &Self) -> bool {
+        unsafe {
+            CFEqual(
+                self.as_element() as CFTypeRef,
+                other.as_element() as CFTypeRef,
+            ) != 0
+        }
+    }
+}
+
+impl Clone for RetainedAxIdentity {
+    fn clone(&self) -> Self {
+        unsafe { Self::new(self.as_element()) }
+    }
+}
+
+impl Drop for RetainedAxIdentity {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.as_element() as CFTypeRef) };
+    }
+}
+
+// AX references are retained Core Foundation objects and are routinely passed
+// between the blocking AX worker and the async caller in this module.
+unsafe impl Send for RetainedAxIdentity {}
+unsafe impl Sync for RetainedAxIdentity {}
+
+fn same_target_identity(before: &ClickObservation, after: &ClickObservation) -> bool {
+    match (&before.target_identity, &after.target_identity) {
+        (Some(before), Some(after)) => before.equal(after),
+        (None, None) => false,
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,7 +191,7 @@ unsafe fn read_ax_observation(element: AXUIElementRef) -> AxObservation {
 /// `target` is borrowed for the duration of the call; `focused_element_of_pid`
 /// returns a retained value which is released here.
 unsafe fn read_click_observation(pid: i32, target: Option<AXUIElementRef>) -> ClickObservation {
-    let target_identity = target.map(|element| element as usize);
+    let target_identity = target.map(|element| RetainedAxIdentity::new(element));
     let target = target.map(|element| read_ax_observation(element));
     let focused = focused_element_of_pid(pid).map(|element| {
         let observation = read_ax_observation(element);
@@ -226,7 +278,7 @@ async fn observe_click_settled(
     let first = observe_click(pid, target, screen_point, window_id).await?;
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     let second = observe_click(pid, target, screen_point, window_id).await?;
-    (first.target_identity == second.target_identity
+    (same_target_identity(&first, &second)
         && match (&first.target, &second.target) {
             (Some(first), Some(second)) => first.settled_state_eq(second),
             (None, None) => true,
@@ -303,7 +355,7 @@ fn click_verification_with_pixel(
     after_pixel: Option<u64>,
 ) -> (bool, &'static str) {
     if let (Some(before), Some(after)) = (before.as_ref(), after.as_ref()) {
-        if before.target_identity == after.target_identity && after.changed_from(before) {
+        if same_target_identity(before, after) && after.changed_from(before) {
             return (true, "confirmed");
         }
     }
@@ -328,7 +380,7 @@ fn click_verification(
 ) -> (bool, &'static str) {
     match (before, after) {
         (Some(before), Some(after))
-            if before.target_identity == after.target_identity && after.changed_from(&before) =>
+            if same_target_identity(&before, &after) && after.changed_from(&before) =>
         {
             (true, "confirmed")
         }
@@ -453,7 +505,7 @@ fn def() -> &'static ToolDef {
                 "delivery_mode": {
                     "type": "string",
                     "enum": ["background", "foreground"],
-                    "description": "Best-effort-background ladder rung (default \"background\"). \"background\": perform the AX action or post the CGEvent without fronting; pixel dispatch with pid+window_id fails with structured error=\"obstructed\", code=\"background_occluded\" when a different visible window owns the screen point. \"foreground\": briefly front the window, act, let transient UI settle, then restore the prior frontmost app; foreground skips the obstruction check because fronting resolves Z order. Requires window_id. A click that is dispatched remains verified:false — confirm its effect via get_window_state."
+                    "description": "Best-effort-background ladder rung (default \"background\"). \"background\": perform the AX action or post the CGEvent without fronting; pixel dispatch with pid+window_id fails with structured error=\"obstructed\", code=\"background_occluded\" when a different visible window owns the screen point. \"foreground\": briefly front the window, act, let transient UI settle, then restore the prior frontmost app; foreground skips the obstruction check because fronting resolves Z order. Requires window_id. A dispatched click is verified only after a settled target-bound state or localized visual change; otherwise effect is not_landed. Confirm navigation effects with get_window_state."
                 },
                 "fallback": {
                     "type": "string",
@@ -1102,13 +1154,15 @@ impl Tool for ClickTool {
                 };
                 let before_target = before_observation
                     .as_ref()
-                    .and_then(|observation| observation.target_identity);
+                    .and_then(|observation| observation.target_identity.clone());
                 let ax_result = tokio::task::spawn_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
                     };
                     if !target_belongs_to_window(element, window_id)
-                        || before_target.is_some_and(|identity| identity != element as usize)
+                        || before_target.as_ref().is_some_and(|identity| {
+                            CFEqual(identity.as_element() as CFTypeRef, element as CFTypeRef) == 0
+                        })
                     {
                         CFRelease(element as _);
                         return Ok(false);
@@ -1593,11 +1647,29 @@ fn map_action(action: &str) -> &'static str {
 mod tests {
     use super::*;
 
+    /// The identity guard only calls Core Foundation retain/equality/release,
+    /// so CFString objects provide a real native lifetime/equality oracle.
+    fn test_identity(value: &str) -> RetainedAxIdentity {
+        let value = core_foundation::string::CFString::new(value);
+        unsafe { RetainedAxIdentity::new(value.as_concrete_TypeRef() as AXUIElementRef) }
+    }
+
+    #[test]
+    fn click_identity_matches_distinct_equal_wrappers_and_retains_lifetime() {
+        let first = test_identity("same native identity across wrappers");
+        let second = test_identity("same native identity across wrappers");
+        assert_ne!(first.0, second.0, "fixture must use distinct CF wrappers");
+        assert!(first.equal(&second));
+        let cloned = first.clone();
+        drop(first);
+        // The original CFString and first guard are gone; retained clone is
+        // still a valid native object, compared by CFEqual rather than address.
+        assert!(cloned.equal(&second));
+        assert!(!cloned.equal(&test_identity("another native object")));
+    }
+
     #[test]
     fn click_verification_accepts_distinct_equal_native_wrappers() {
-        let first = core_foundation::string::CFString::new("same native identity across wrappers");
-        let second = core_foundation::string::CFString::new("same native identity across wrappers");
-        assert_ne!(first.as_concrete_TypeRef(), second.as_concrete_TypeRef());
         let before = ClickObservation {
             target: Some(AxObservation {
                 role: Some("AXButton".to_owned()),
@@ -1608,15 +1680,17 @@ mod tests {
                 focused: None,
                 selected_range: None,
             }),
-            target_identity: Some(first.as_concrete_TypeRef() as usize),
+            target_identity: Some(test_identity("same native identity across wrappers")),
             focused: None,
         };
         let mut after = before.clone();
-        after.target_identity = Some(second.as_concrete_TypeRef() as usize);
+        after.target_identity = Some(test_identity("same native identity across wrappers"));
         after.target.as_mut().unwrap().value = Some("1".to_owned());
-        assert_eq!(click_verification(Some(before), Some(after)), (true, "confirmed"));
+        assert_eq!(
+            click_verification(Some(before), Some(after)),
+            (true, "confirmed")
+        );
     }
-
 
     /// Surface 5: schema must advertise the new `button` field with the three
     /// canonical values and default to "left". Hermes / Codex / Claude Code
@@ -1739,7 +1813,7 @@ mod tests {
                 focused: Some("false".to_owned()),
                 selected_range: None,
             }),
-            target_identity: Some(1),
+            target_identity: Some(test_identity("target-one")),
             focused: None,
         };
         assert_eq!(
@@ -1767,7 +1841,7 @@ mod tests {
                 focused: Some("false".to_owned()),
                 selected_range: None,
             }),
-            target_identity: Some(7),
+            target_identity: Some(test_identity("target-seven")),
             focused: None,
         };
         let mut after = before.clone();
@@ -1795,7 +1869,7 @@ mod tests {
                 focused: Some("true".to_owned()),
                 selected_range: None,
             }),
-            target_identity: Some(1),
+            target_identity: Some(test_identity("target-one")),
             focused: None,
         };
         assert_eq!(
@@ -1813,7 +1887,7 @@ mod tests {
                 focused: None,
                 selected_range: None,
             }),
-            target_identity: Some(1),
+            target_identity: Some(test_identity("target-one")),
             focused: None,
         };
         let mut after = before.clone();
@@ -1836,11 +1910,11 @@ mod tests {
                 focused: None,
                 selected_range: None,
             }),
-            target_identity: Some(1),
+            target_identity: Some(test_identity("target-one")),
             focused: None,
         };
         let mut after = before.clone();
-        after.target_identity = Some(2);
+        after.target_identity = Some(test_identity("target-two"));
         after.target.as_mut().unwrap().value = Some("1".to_owned());
         assert_eq!(
             click_verification(Some(before), Some(after)),
@@ -1866,7 +1940,7 @@ mod tests {
         };
         let observed = ClickObservation {
             target: Some(target),
-            target_identity: Some(1),
+            target_identity: Some(test_identity("target-one")),
             focused: None,
         };
         assert_eq!(
@@ -1892,7 +1966,7 @@ mod tests {
                 focused: None,
                 selected_range: None,
             }),
-            target_identity: Some(1),
+            target_identity: Some(test_identity("target-one")),
             focused: None,
         };
         let after = ClickObservation {
