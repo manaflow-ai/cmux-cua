@@ -280,8 +280,24 @@ jobs:
             VERSION="${{ inputs.version }}"
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      # The Developer ID certificate lives only in the cmux-next release lanes
+      # (decision 2026-10-04): without it this job SKIPS signing and
+      # notarization and publishes the unsigned build, named *-unsigned-*, as a
+      # build input for the cmux lane, which signs and notarizes the helper.
+      - name: Signing credentials
+        id: signing
+        shell: bash
+        env:
+          APPLICATION_CERT_BASE64: ${{ secrets.APPLICATION_CERT_BASE64 }}
+        run: |
+          if [[ "$DO_NOTARIZE" == "true" && -n "$APPLICATION_CERT_BASE64" ]]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=macOS build unsigned::no Developer ID certificate (or notarize off): signing and notarization skipped; assets are named *-unsigned-*"
+          fi
       - name: Import code-signing certificate
-        if: env.DO_NOTARIZE == 'true'
+        if: steps.signing.outputs.signed == 'true'
         env:
           APPLICATION_CERT_BASE64: ${{ secrets.APPLICATION_CERT_BASE64 }}
           CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
@@ -334,7 +350,7 @@ jobs:
           lipo -create "$ARM64" "$X86" -output release/universal/cmux-cua
           lipo -info release/universal/cmux-cua
       - name: Codesign universal binary (hardened runtime)
-        if: env.DO_NOTARIZE == 'true'
+        if: steps.signing.outputs.signed == 'true'
         working-directory: libs/cmux-cua/rust
         env:
           DEVELOPER_NAME: ${{ secrets.DEVELOPER_NAME }}
@@ -382,7 +398,7 @@ jobs:
           ls -la release/cmux Computer Use.app/Contents/MacOS
           plutil -p release/cmux Computer Use.app/Contents/Info.plist | grep -E 'CFBundle(Short)?Version'
       - name: Codesign + notarize + staple cmux Computer Use.app
-        if: env.DO_NOTARIZE == 'true'
+        if: steps.signing.outputs.signed == 'true'
         working-directory: libs/cmux-cua/rust
         env:
           DEVELOPER_NAME: ${{ secrets.DEVELOPER_NAME }}
@@ -420,9 +436,20 @@ jobs:
           rm -f release/cmux Computer Use.app.zip
       - name: Package
         working-directory: libs/cmux-cua/rust
+        env:
+          SIGNED: ${{ steps.signing.outputs.signed }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          for LABEL in darwin-arm64 darwin-x86_64 darwin-universal; do
+          # Unsigned: one universal bundle tarball and the bare binary, both
+          # named *-unsigned-* so install.sh never picks them up by the signed
+          # names; the cmux release lane consumes them.
+          LABELS="darwin-arm64 darwin-x86_64 darwin-universal"
+          SUFFIX=""
+          if [[ "$SIGNED" != "true" ]]; then
+            LABELS="darwin-universal-unsigned"
+            SUFFIX="-unsigned"
+          fi
+          for LABEL in $LABELS; do
             STAGE="cmux-cua-${VERSION}-${LABEL}"
             mkdir -p "release/${STAGE}"
             # Same universal binary in all three named tarballs — callers
@@ -441,7 +468,7 @@ jobs:
           # `cmux-cua-${VERSION}-darwin-universal-binary.tar.gz`. NO
           # bundle here: callers that fetch the bare tarball deliberately
           # skipped the .app workflow.
-          tar -czf "release/cmux-cua-${VERSION}-darwin-universal-binary.tar.gz" \
+          tar -czf "release/cmux-cua-${VERSION}-darwin-universal${SUFFIX}-binary.tar.gz" \
             -C release/universal cmux-cua
           ls -lh release/*.tar.gz
       - uses: actions/upload-artifact@v4
@@ -645,6 +672,7 @@ jobs:
             ### Artifacts
 
             **macOS (universal — arm64 + x86_64 in one binary, like the Swift cmux-cua)**
+            - If the macOS assets are named `*-darwin-universal-unsigned*`, this release had no Developer ID certificate: they are unsigned build inputs for the cmux release lane (which signs and notarizes the helper), not for install.sh.
             - `cmux-cua-${{ steps.version.outputs.version }}-darwin-universal.tar.gz` — directory tarball with LICENSE + `cmux Computer Use.app` bundle (install.sh expects this layout)
             - `cmux-cua-${{ steps.version.outputs.version }}-darwin-arm64.tar.gz` — same payload, named for arm64 callers
             - `cmux-cua-${{ steps.version.outputs.version }}-darwin-x86_64.tar.gz` — same payload, named for x86_64 callers
