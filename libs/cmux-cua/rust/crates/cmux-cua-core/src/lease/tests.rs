@@ -150,3 +150,14 @@ fn on_behalf_of_is_kept_and_rendered() {
     let lease = outcome.frames[0].lease.as_ref().expect("lease frame");
     assert_eq!(lease.on_behalf_of.as_deref(), Some("agent:chief"));
 }
+
+#[test]
+fn vendored_vectors_match_the_pinned_cmux_file() {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(VECTORS.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+        hex, VECTORS_SHA256,
+        "lease/vectors.json drifted from {VECTORS_SOURCE}; copy the cmux file again and update both constants"
+    );
+}
