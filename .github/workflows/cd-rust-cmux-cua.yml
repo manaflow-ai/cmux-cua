@@ -86,16 +86,37 @@ jobs:
       # actions/checkout needs git inside the container; the bullseye image
       # is bare. Install git + the build toolchain before anything else.
       - name: Install base tooling (container is bare)
+        shell: bash
         run: |
-          apt-get update
           # PipeWire ScreenCast capture remains Nix/modern-build only because
           # bullseye's 0.3.19 headers are too old for libspa-sys 0.8. Portal
           # RemoteDesktop/libei input is pure Rust plus libxkbcommon and ships
           # in these portable release binaries.
-          apt-get install -y --no-install-recommends \
-            git ca-certificates curl build-essential pkg-config \
-            libx11-dev libxi-dev libxtst-dev libxext-dev libwayland-dev \
-            libxkbcommon-dev
+          packages=(git ca-certificates curl build-essential pkg-config
+            libx11-dev libxi-dev libxtst-dev libxext-dev libwayland-dev
+            libxkbcommon-dev)
+          apt_install() {
+            apt-get update && apt-get install -y --no-install-recommends "${packages[@]}"
+          }
+          # Bounded retry with backoff: run 37216360921 (tag cmux-cua-v0.8.0,
+          # 2026-10-04) failed on 404s from deb.debian.org bullseye-security
+          # (perl 5.32.1-4+deb11u5 listed in the index, gone from the pool).
+          for attempt in 1 2 3; do
+            apt_install && exit 0
+            echo "apt attempt $attempt failed; retrying in $((attempt * 20)) s" >&2
+            sleep $((attempt * 20))
+          done
+          # Bullseye's LTS ended 2026-08-31: once its packages leave the live
+          # mirrors, the frozen archive still has them (glibc 2.31 stays the floor).
+          echo "deb.debian.org failed 3 times; using archive.debian.org" >&2
+          cat > /etc/apt/sources.list <<'EOF'
+          deb http://archive.debian.org/debian bullseye main
+          deb http://archive.debian.org/debian bullseye-updates main
+          deb http://archive.debian.org/debian-security bullseye-security main
+          EOF
+          rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
+          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99archive
+          apt_install
       - uses: actions/checkout@v4
       - name: Determine version
         id: version
