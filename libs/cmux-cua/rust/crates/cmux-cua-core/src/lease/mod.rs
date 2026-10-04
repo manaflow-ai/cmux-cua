@@ -196,8 +196,9 @@ impl LeaseTable {
         self.leases.get(target).is_some_and(|entry| entry.needs_fresh_observe)
     }
 
-    pub fn is_stopped(&self, session: &str) -> bool {
-        self.stopped.contains(session)
+    /// Whether the user stopped this principal (`on_behalf_of`, else `actor`).
+    pub fn is_stopped(&self, principal: &str) -> bool {
+        self.stopped.contains(principal)
     }
 
     /// Applies one operation and returns its result plus one frame for each
@@ -239,8 +240,8 @@ impl LeaseTable {
 
     fn reduce(&mut self, op: LeaseOp) -> Result<(), LeaseError> {
         match op {
-            LeaseOp::Acquire { target, who, now_ms, .. } => self.drive(target, who, now_ms, false),
-            LeaseOp::Act { target, who, now_ms, .. } => self.drive(target, who, now_ms, true),
+            LeaseOp::Acquire { target, engine, who, now_ms } => self.drive(target, engine, who, now_ms, false),
+            LeaseOp::Act { target, engine, who, now_ms } => self.drive(target, engine, who, now_ms, true),
             LeaseOp::Observe { target, session } => {
                 if let Some(entry) = self.leases.get_mut(&target) {
                     if entry.lease.session == session && entry.lease.state == LeaseState::Driving {
@@ -288,23 +289,34 @@ impl LeaseTable {
             LeaseOp::Stop { target, origin } => {
                 require_user(&origin)?;
                 let entry = self.leases.remove(&target).ok_or(LeaseError::NoLease)?;
-                self.stopped.insert(entry.lease.session);
+                let principal = entry.lease.on_behalf_of.unwrap_or(entry.lease.actor);
+                self.stopped.insert(principal);
                 Ok(())
             }
-            LeaseOp::Allow { actor: session, origin } => {
+            LeaseOp::Allow { actor, origin } => {
                 require_user(&origin)?;
-                self.stopped.remove(&session);
+                self.stopped.remove(&actor);
                 Ok(())
             }
         }
     }
 
     /// `acquire` (is_act = false) and `act` (is_act = true).
-    fn drive(&mut self, target: String, who: AgentIdentity, now_ms: u64, is_act: bool) -> Result<(), LeaseError> {
+    fn drive(
+        &mut self,
+        target: String,
+        engine: TargetEngine,
+        who: AgentIdentity,
+        now_ms: u64,
+        is_act: bool,
+    ) -> Result<(), LeaseError> {
         if who.origin == USER_ORIGIN {
             return Err(LeaseError::AgentOriginRequired);
         }
-        if self.stopped.contains(&who.session) {
+        if who.implicit_session && engine.requires_explicit_session() {
+            return Err(LeaseError::SessionRequired);
+        }
+        if self.stopped.contains(who.stop_key()) {
             return Err(LeaseError::StoppedByUser);
         }
         let Some(entry) = self.leases.get(&target) else {
