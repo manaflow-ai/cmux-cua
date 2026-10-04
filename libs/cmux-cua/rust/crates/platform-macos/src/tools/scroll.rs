@@ -676,7 +676,7 @@ impl Tool for ScrollTool {
             );
 
             let prior_front = apps::frontmost_pid();
-            let snapshot = WindowChangeDetector::snapshot(prior_front);
+            let snapshot = WindowChangeDetector::snapshot_for_session(prior_front, &super::cursor_tools::resolve_cursor_key(&args));
 
             let WheelTarget {
                 screen_x,
@@ -789,7 +789,7 @@ impl Tool for ScrollTool {
         // any reflex activations it triggers are caught by both the wildcard
         // snapshot suppressor and the targeted FocusGuard lease.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let snapshot = WindowChangeDetector::snapshot_for_session(prior_front, &super::cursor_tools::resolve_cursor_key(&args));
         let focus_gate = dispatch_gate.clone();
         let key_gate = dispatch_gate.clone();
         let before = if window_id.is_some() {

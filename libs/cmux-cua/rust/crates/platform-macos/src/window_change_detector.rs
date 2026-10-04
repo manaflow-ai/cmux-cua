@@ -82,6 +82,9 @@ pub struct Snapshot {
     front_pid: Option<i32>,
     _lease: Option<SuppressionLease>,
     taken_at: Instant,
+    /// Agent session key (the agent cursor key); guards and late windows
+    /// are kept per session.
+    session: String,
 }
 
 /// Result of `detect()` — what changed during the action window.
@@ -194,22 +197,33 @@ impl WindowChangeDetector {
     /// Safe to call from any thread — `CGWindowListCopyWindowInfo` is
     /// documented as thread-safe.
     pub fn snapshot(prior_front: Option<i32>) -> Snapshot {
-        Self::capture(prior_front, true)
+        Self::capture(prior_front, true, "")
+    }
+
+    /// [`Self::snapshot`] for an agent session (the agent cursor key), so the
+    /// guard and late windows of this action stay with that session.
+    pub fn snapshot_for_session(prior_front: Option<i32>, session: &str) -> Snapshot {
+        Self::capture(prior_front, true, session)
     }
 
     /// Capture the same before-state without arming reactive focus suppression.
     /// Foreground delivery owns its temporary activation and restoration, so a
     /// wildcard lease would race the target while the action is settling.
     pub fn snapshot_without_suppression(prior_front: Option<i32>) -> Snapshot {
-        Self::capture(prior_front, false)
+        Self::capture(prior_front, false, "")
     }
 
-    fn capture(prior_front: Option<i32>, suppress_focus: bool) -> Snapshot {
-        // A new action is about to fire: settle the previous action's guard
-        // first so its late windows are attributed to it, not to this one.
-        let previous = lock(&GUARD).flush();
+    /// [`Self::snapshot_without_suppression`] for an agent session.
+    pub fn snapshot_without_suppression_for_session(prior_front: Option<i32>, session: &str) -> Snapshot {
+        Self::capture(prior_front, false, session)
+    }
+
+    fn capture(prior_front: Option<i32>, suppress_focus: bool, session: &str) -> Snapshot {
+        // This session's next action is about to fire: settle its previous
+        // guard first so those late windows are attributed to that action.
+        let previous = lock(&GUARDS).flush(session);
         if let Some(previous) = previous {
-            settle(previous);
+            settle(session, previous);
         }
 
         let window_ids: HashSet<u32> = windows::visible_windows()
@@ -236,6 +250,7 @@ impl WindowChangeDetector {
             front_pid: prior_front,
             _lease: lease,
             taken_at: Instant::now(),
+            session: session.to_owned(),
         }
     }
 }
@@ -282,6 +297,7 @@ impl Snapshot {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let deadline = self.taken_at + DEFAULT_TIMEOUT;
+        let session = self.session.clone();
         let observed = tokio::task::spawn_blocking(move || self.observe_now()).await;
         let mut changes = match observed {
             Ok((changes, guard)) => {
@@ -290,13 +306,13 @@ impl Snapshot {
                 // actions keep it armed until the deadline or the next action,
                 // without making this reply wait for it.
                 if !fast {
-                    arm_guard(guard, deadline);
+                    arm_guard(session.clone(), guard, deadline);
                 }
                 changes
             }
             Err(_) => Changes::no_change(),
         };
-        changes.late_new_windows = take_late_windows();
+        changes.late_new_windows = take_late_windows(&session);
         changes
     }
 
@@ -475,6 +491,7 @@ impl<T> SettleSlot<T> {
 
     /// Stores `value` as the pending guard. Returns its generation and the
     /// guard it replaced, which the caller must settle now.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn arm(&mut self, value: T) -> (u64, Option<T>) {
         self.generation = self.generation.wrapping_add(1);
         (self.generation, self.pending.replace(value))
@@ -495,6 +512,49 @@ impl<T> SettleSlot<T> {
     }
 }
 
+/// One [`SettleSlot`] per agent session, so one agent's next action never
+/// ends another agent's guard or takes its late windows.
+pub(crate) struct SessionSettleSlots<T> {
+    slots: std::collections::HashMap<String, SettleSlot<T>>,
+    /// Generations come from one counter so a removed and re-created slot
+    /// never reuses a generation a stale deadline task still holds.
+    next_generation: u64,
+}
+
+impl<T> SessionSettleSlots<T> {
+    pub(crate) fn new() -> Self {
+        Self { slots: std::collections::HashMap::new(), next_generation: 0 }
+    }
+
+    pub(crate) fn arm(&mut self, session: &str, value: T) -> (u64, Option<T>) {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        let slot = self.slots.entry(session.to_owned()).or_insert_with(SettleSlot::new);
+        slot.generation = generation;
+        (generation, slot.pending.replace(value))
+    }
+
+    pub(crate) fn flush(&mut self, session: &str) -> Option<T> {
+        let taken = self.slots.get_mut(session)?.flush();
+        self.slots.remove(session);
+        taken
+    }
+
+    pub(crate) fn expire(&mut self, session: &str, generation: u64) -> Option<T> {
+        let slot = self.slots.get_mut(session)?;
+        let taken = slot.expire(generation);
+        if taken.is_some() {
+            self.slots.remove(session);
+        }
+        taken
+    }
+
+    /// Sessions with a pending guard (bounded by live agents).
+    pub(crate) fn len(&self) -> usize {
+        self.slots.len()
+    }
+}
+
 /// The guard of the last native action: the wildcard focus-steal lease and
 /// the windows visible when its reply was sent.
 struct PendingGuard {
@@ -506,8 +566,20 @@ struct PendingGuard {
 /// the buffer between two tool calls.
 const MAX_LATE_WINDOWS: usize = 32;
 
-static GUARD: std::sync::Mutex<SettleSlot<PendingGuard>> = std::sync::Mutex::new(SettleSlot::new());
-static LATE_WINDOWS: std::sync::Mutex<Vec<WindowEvent>> = std::sync::Mutex::new(Vec::new());
+/// Late-window buffers are kept for at most this many sessions.
+const MAX_LATE_SESSIONS: usize = 64;
+
+static GUARDS: std::sync::LazyLock<std::sync::Mutex<SessionSettleSlots<PendingGuard>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(SessionSettleSlots::new()));
+static LATE_WINDOWS: std::sync::LazyLock<std::sync::Mutex<LateWindows>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(LateWindows::default()));
+
+/// Late windows per session, oldest-touched session evicted first.
+#[derive(Default)]
+struct LateWindows {
+    by_session: std::collections::HashMap<String, (u64, Vec<WindowEvent>)>,
+    touches: u64,
+}
 
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -515,44 +587,66 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Ends a guard: one diff against the windows visible at reply time, then the
 /// lease drops (with `guard`).
-fn settle(guard: PendingGuard) {
+fn settle(session: &str, guard: PendingGuard) {
     let current: Vec<WindowInfo> = windows::visible_windows()
         .into_iter()
         .filter(|w| w.layer == 0)
         .collect();
     let (opened, _closed) = Snapshot::diff(&guard.window_ids, &current);
-    if !opened.is_empty() {
-        let mut late = lock(&LATE_WINDOWS);
-        late.extend(opened);
-        let overflow = late.len().saturating_sub(MAX_LATE_WINDOWS);
-        late.drain(..overflow);
+    if opened.is_empty() {
+        return;
+    }
+    let mut late = lock(&LATE_WINDOWS);
+    late.touches += 1;
+    let touch = late.touches;
+    let entry = late.by_session.entry(session.to_owned()).or_insert_with(|| (touch, Vec::new()));
+    entry.0 = touch;
+    entry.1.extend(opened);
+    let overflow = entry.1.len().saturating_sub(MAX_LATE_WINDOWS);
+    entry.1.drain(..overflow);
+    while late.by_session.len() > MAX_LATE_SESSIONS {
+        let oldest = late
+            .by_session
+            .iter()
+            .min_by_key(|(_, (touched, _))| *touched)
+            .map(|(key, _)| key.clone());
+        match oldest {
+            Some(key) => {
+                late.by_session.remove(&key);
+            }
+            None => break,
+        }
     }
 }
 
-fn take_late_windows() -> Vec<WindowEvent> {
-    std::mem::take(&mut *lock(&LATE_WINDOWS))
+fn take_late_windows(session: &str) -> Vec<WindowEvent> {
+    lock(&LATE_WINDOWS)
+        .by_session
+        .remove(session)
+        .map(|(_, windows)| windows)
+        .unwrap_or_default()
 }
 
 /// Keeps `guard` armed until `deadline` (a one-shot timer, no polling) unless
 /// the next action settles it first.
-fn arm_guard(guard: PendingGuard, deadline: Instant) {
-    let (generation, replaced) = lock(&GUARD).arm(guard);
+fn arm_guard(session: String, guard: PendingGuard, deadline: Instant) {
+    let (generation, replaced) = lock(&GUARDS).arm(&session, guard);
     if let Some(replaced) = replaced {
-        settle(replaced);
+        settle(&session, replaced);
     }
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        let expired = lock(&GUARD).expire(generation);
+        let expired = lock(&GUARDS).expire(&session, generation);
         if let Some(guard) = expired {
-            settle(guard);
+            settle(&session, guard);
         }
         return;
     };
     let remaining = deadline.saturating_duration_since(Instant::now());
     runtime.spawn(async move {
         tokio::time::sleep(remaining).await;
-        let expired = lock(&GUARD).expire(generation);
+        let expired = lock(&GUARDS).expire(&session, generation);
         if let Some(guard) = expired {
-            let _ = tokio::task::spawn_blocking(move || settle(guard)).await;
+            let _ = tokio::task::spawn_blocking(move || settle(&session, guard)).await;
         }
     });
 }
@@ -778,5 +872,27 @@ mod tests {
             elapsed < Duration::from_millis(300),
             "a native action reply must not wait for the 1 s guard window (took {elapsed:?})"
         );
+    }
+
+    #[test]
+    fn one_session_never_settles_another_sessions_guard() {
+        let mut slots = SessionSettleSlots::new();
+        let (a_gen, _) = slots.arm("agent-a", "guard-a");
+        let (b_gen, replaced) = slots.arm("agent-b", "guard-b");
+        assert_eq!(replaced, None, "agent B's action must not replace agent A's guard");
+        assert_eq!(slots.flush("agent-b"), Some("guard-b"));
+        assert_eq!(slots.expire("agent-b", b_gen), None);
+        assert_eq!(slots.expire("agent-a", a_gen), Some("guard-a"), "A's deadline still ends A's guard");
+        assert_eq!(slots.len(), 0, "settled sessions leave no entry behind");
+    }
+
+    #[test]
+    fn a_session_rearm_replaces_only_its_own_guard() {
+        let mut slots = SessionSettleSlots::new();
+        let (first, _) = slots.arm("agent-a", 1);
+        let (_, replaced) = slots.arm("agent-a", 2);
+        assert_eq!(replaced, Some(1));
+        assert_eq!(slots.expire("agent-a", first), None, "a stale deadline must not end the newer guard");
+        assert_eq!(slots.flush("agent-a"), Some(2));
     }
 }

@@ -195,7 +195,7 @@ impl Tool for SetValueTool {
         // in Chromium-based apps; the AXPopUpButton path also AXPresses a
         // child option which can trigger app activation in some setups.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let snapshot = WindowChangeDetector::snapshot_for_session(prior_front, &super::cursor_tools::resolve_cursor_key(&args));
         let blocking_gate = dispatch_gate.clone();
         let js_gate = dispatch_gate.clone();
 
