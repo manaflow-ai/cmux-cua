@@ -88,6 +88,9 @@ pub struct Snapshot {
 pub struct Changes {
     pub new_windows: Vec<WindowEvent>,
     pub foreground_changed: bool,
+    /// Windows that an earlier action opened after its tool result was
+    /// returned (seen when that action's guard window settled).
+    pub late_new_windows: Vec<WindowEvent>,
 }
 
 impl Changes {
@@ -95,6 +98,7 @@ impl Changes {
         Self {
             new_windows: Vec::new(),
             foreground_changed: false,
+            late_new_windows: Vec::new(),
         }
     }
 
@@ -318,6 +322,7 @@ impl Snapshot {
                 return Changes {
                     new_windows,
                     foreground_changed,
+                    late_new_windows: Vec::new(),
                 };
             }
             if Instant::now() >= deadline {
@@ -355,6 +360,7 @@ impl Snapshot {
         Changes {
             new_windows,
             foreground_changed,
+            late_new_windows: Vec::new(),
         }
     }
 
@@ -394,6 +400,45 @@ impl Snapshot {
             .filter(|id| !current_ids.contains(id))
             .collect();
         (opened, closed)
+    }
+}
+
+// ── Guard window settle slot ─────────────────────────────────────────────────
+
+/// Holds the guard window of the most recent native action after its tool
+/// result was returned. The guard keeps the wildcard focus-steal lease armed
+/// and remembers the before-state, so windows the action opens late are
+/// reported on the next tool result instead of making every action wait.
+///
+/// One slot per process: a new action flushes the previous guard (its late
+/// windows are diffed before the new action fires), and the guard's one-shot
+/// deadline task expires it only if no newer action replaced it.
+pub(crate) struct SettleSlot<T> {
+    generation: u64,
+    pending: Option<T>,
+}
+
+impl<T> SettleSlot<T> {
+    pub(crate) const fn new() -> Self {
+        Self { generation: 0, pending: None }
+    }
+
+    /// Stores `value` as the pending guard. Returns its generation and the
+    /// guard it replaced, which the caller must settle now.
+    pub(crate) fn arm(&mut self, value: T) -> (u64, Option<T>) {
+        let _ = value;
+        unimplemented!("settle slot")
+    }
+
+    /// Takes the pending guard (a new action is about to fire).
+    pub(crate) fn flush(&mut self) -> Option<T> {
+        unimplemented!("settle slot")
+    }
+
+    /// Takes the pending guard only if it is still `generation`.
+    pub(crate) fn expire(&mut self, generation: u64) -> Option<T> {
+        let _ = generation;
+        unimplemented!("settle slot")
     }
 }
 
@@ -479,6 +524,7 @@ mod tests {
                 title: "New Tab".into(),
             }],
             foreground_changed: false,
+            late_new_windows: Vec::new(),
         };
         assert!(c.needs_restore());
         assert_eq!(
@@ -511,6 +557,7 @@ mod tests {
                 },
             ],
             foreground_changed: true,
+            late_new_windows: Vec::new(),
         };
         let suffix = c.result_suffix();
         // BTreeMap sort order is alphabetical by app name → Chrome before Mail.
@@ -525,6 +572,7 @@ mod tests {
         let c = Changes {
             new_windows: vec![],
             foreground_changed: true,
+            late_new_windows: Vec::new(),
         };
         assert!(c.needs_restore());
         assert_eq!(
@@ -543,6 +591,7 @@ mod tests {
                 title: "".into(),
             }],
             foreground_changed: false,
+            late_new_windows: Vec::new(),
         };
         // No title → just the app name, no parentheses.
         assert_eq!(
@@ -566,5 +615,53 @@ mod tests {
         // panicking (no frontmost to restore to).
         let snap_none = WindowChangeDetector::snapshot(None);
         assert_eq!(snap_none.front_pid(), None);
+    }
+
+    #[test]
+    fn settle_slot_expires_only_its_own_generation() {
+        let mut slot = SettleSlot::new();
+        let (first, replaced) = slot.arm("a");
+        assert_eq!(replaced, None);
+        let (second, replaced) = slot.arm("b");
+        assert_eq!(replaced, Some("a"), "arming hands back the guard it replaced");
+        assert_eq!(slot.expire(first), None, "a stale deadline must not take the newer guard");
+        assert_eq!(slot.expire(second), Some("b"));
+        assert_eq!(slot.expire(second), None);
+    }
+
+    #[test]
+    fn settle_slot_flush_takes_the_pending_guard() {
+        let mut slot = SettleSlot::new();
+        let (generation, _) = slot.arm(7);
+        assert_eq!(slot.flush(), Some(7));
+        assert_eq!(slot.flush(), None);
+        assert_eq!(slot.expire(generation), None, "a flushed guard is settled exactly once");
+    }
+
+    #[test]
+    fn result_suffix_reports_windows_an_earlier_action_opened() {
+        let mut c = Changes::no_change();
+        c.late_new_windows.push(WindowEvent {
+            window_id: 5,
+            pid: 42,
+            app_name: "Safari".into(),
+            title: "Sign In".into(),
+        });
+        let suffix = c.result_suffix();
+        assert!(suffix.contains("earlier action"), "{suffix}");
+        assert!(suffix.contains("Safari (\"Sign In\")"), "{suffix}");
+        assert!(!c.needs_restore(), "late windows were already guarded; no restore now");
+    }
+
+    #[tokio::test]
+    async fn native_detect_replies_without_waiting_for_the_guard_window() {
+        let snapshot = WindowChangeDetector::snapshot(None);
+        let started = Instant::now();
+        let _ = snapshot.detect_async_for_args(&serde_json::json!({})).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "a native action reply must not wait for the 1 s guard window (took {elapsed:?})"
+        );
     }
 }

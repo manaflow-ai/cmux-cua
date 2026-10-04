@@ -376,6 +376,13 @@ impl Tool for GetWindowStateTool {
     }
 }
 
+/// Structured reason for a requested screenshot that could not be captured.
+/// Callers asked for pixels; a silent text-only reply hides the failure.
+pub(crate) fn screenshot_unavailable(error: &str, screen_recording_granted: bool) -> serde_json::Value {
+    let _ = (error, screen_recording_granted);
+    unimplemented!("screenshot_unavailable")
+}
+
 /// Render actionable nodes and value-bearing read-only text nodes from the AX
 /// walk into the `structuredContent.elements` array shape described on the
 /// tool. Addressable entries carry `element_index` plus the matching opaque
@@ -474,6 +481,20 @@ pub(crate) fn build_elements_array(nodes: &[crate::ax::tree::AXNode]) -> Vec<ser
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_screen_recording_is_named_in_the_reply() {
+        let v = super::screenshot_unavailable("SCStream failed", false);
+        assert_eq!(v["code"], "screen_recording_not_granted");
+        assert!(v["message"].as_str().unwrap().contains("Screen Recording"), "{v}");
+    }
+
+    #[test]
+    fn other_capture_failures_carry_the_error() {
+        let v = super::screenshot_unavailable("window 42 is not on screen", true);
+        assert_eq!(v["code"], "capture_failed");
+        assert!(v["message"].as_str().unwrap().contains("window 42 is not on screen"), "{v}");
+    }
+
     use super::*;
     use crate::ax::tree::AXNode;
 
