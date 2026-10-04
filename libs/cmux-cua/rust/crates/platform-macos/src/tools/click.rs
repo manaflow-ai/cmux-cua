@@ -544,7 +544,19 @@ impl Tool for ClickTool {
                     }
                     ToolResult::text(msg).with_structured(structured)
                 }
-                Ok(Err(e)) => ToolResult::error(format!("AX action failed: {e}")),
+                Ok(Err(e)) => match e.downcast_ref::<AxActionFailure>() {
+                    Some(failure) => {
+                        let mut result = ToolResult::error(format!("AX action failed: {failure}"));
+                        result.structured_content = Some(serde_json::json!({
+                            "path": "ax",
+                            "verified": false,
+                            "effect": failure.effect,
+                            "error_code": failure.code,
+                        }));
+                        result
+                    }
+                    None => ToolResult::error(format!("AX action failed: {e}")),
+                },
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             }
         } else if let (Some(mut cx), Some(mut cy)) = (x, y) {
@@ -1017,8 +1029,44 @@ impl std::error::Error for AxActionFailure {}
 /// A press is not idempotent, so an error that leaves the effect unknown is
 /// never retried here: the agent must observe before it acts again.
 pub(crate) fn classify_ax_action_error(action: &str, err: i32) -> AxActionFailure {
-    let _ = (action, err);
-    unimplemented!("classify_ax_action_error")
+    match err {
+        // kAXErrorCannotComplete: the app did not answer in time. The action
+        // may still have been delivered.
+        -25204 => AxActionFailure {
+            code: "ax_cannot_complete",
+            effect: "unknown",
+            message: format!(
+                "{action} returned -25204 (the app did not answer in time). The action may \
+                 or may not have landed: observe the window (get_window_state) before you \
+                 retry, or a retry can act twice."
+            ),
+        },
+        // kAXErrorActionUnsupported
+        -25205 => AxActionFailure {
+            code: "ax_action_unsupported",
+            effect: "not_landed",
+            message: format!(
+                "{action} returned -25205: the element does not support this action. Use a \
+                 pixel click (x,y) from the get_window_state screenshot."
+            ),
+        },
+        // kAXErrorInvalidUIElement
+        -25202 => AxActionFailure {
+            code: "ax_element_invalid",
+            effect: "not_landed",
+            message: format!(
+                "{action} returned -25202: the element is gone. Call get_window_state again \
+                 and use the new element_index."
+            ),
+        },
+        other => AxActionFailure {
+            code: "ax_error",
+            effect: "unknown",
+            message: format!(
+                "{action} returned {other}. Observe the window before you retry."
+            ),
+        },
+    }
 }
 
 fn perform_ax_click(
@@ -1040,7 +1088,7 @@ fn perform_ax_click(
     gate.check()?;
     let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
     if err != crate::ax::bindings::kAXErrorSuccess {
-        anyhow::bail!("AXUIElementPerformAction({ax_action}) returned {err}");
+        return Err(classify_ax_action_error(ax_action, err).into());
     }
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();

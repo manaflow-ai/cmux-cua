@@ -207,6 +207,7 @@ impl Tool for GetWindowStateTool {
         // surface the path instead of embedding base64; otherwise embed base64.
         let max_dim = effective_max_dim;
         // Returns (b64_or_path, final_w, final_h, Option<original_w>, is_file_path)
+        let mut screenshot_error: Option<serde_json::Value> = None;
         let screenshot = if should_capture {
             let out_file = screenshot_out_file.clone();
             let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(Option<String>, Option<String>, u32, u32, Option<u32>)> {
@@ -237,10 +238,15 @@ impl Tool for GetWindowStateTool {
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("Screenshot failed for window {window_id}: {e}");
+                    screenshot_error = Some(screenshot_unavailable(
+                        &e.to_string(),
+                        crate::permissions::status::screen_recording_granted(),
+                    ));
                     None
                 }
                 Err(e) => {
                     tracing::warn!("Screenshot task error for window {window_id}: {e}");
+                    screenshot_error = Some(screenshot_unavailable(&e.to_string(), true));
                     None
                 }
             }
@@ -281,6 +287,9 @@ impl Tool for GetWindowStateTool {
 
         if content.is_empty() {
             return ToolResult::error("No content produced (neither AX tree nor screenshot succeeded)");
+        }
+        if let Some(message) = screenshot_error.as_ref().and_then(|e| e["message"].as_str()) {
+            content.push(Content::text(format!("⚠️ {message}")));
         }
 
         let element_count = self.state.element_cache.element_count(pid, window_id);
@@ -372,6 +381,9 @@ impl Tool for GetWindowStateTool {
         if let Some(ref fp) = screenshot_file_path {
             structured["screenshot_file_path"] = serde_json::json!(fp);
         }
+        if let Some(error) = screenshot_error {
+            structured["screenshot_error"] = error;
+        }
         ToolResult { content, is_error: None, structured_content: Some(structured) }
     }
 }
@@ -379,8 +391,19 @@ impl Tool for GetWindowStateTool {
 /// Structured reason for a requested screenshot that could not be captured.
 /// Callers asked for pixels; a silent text-only reply hides the failure.
 pub(crate) fn screenshot_unavailable(error: &str, screen_recording_granted: bool) -> serde_json::Value {
-    let _ = (error, screen_recording_granted);
-    unimplemented!("screenshot_unavailable")
+    if screen_recording_granted {
+        serde_json::json!({
+            "code": "capture_failed",
+            "message": format!("The screenshot failed: {error}. The AX tree is still valid."),
+        })
+    } else {
+        serde_json::json!({
+            "code": "screen_recording_not_granted",
+            "message": "No screenshot: the cmux Computer Use helper has no Screen Recording \
+                        permission (System Settings > Privacy & Security > Screen & System \
+                        Audio Recording). The AX tree is still valid; element actions work.",
+        })
+    }
 }
 
 /// Render actionable nodes and value-bearing read-only text nodes from the AX
