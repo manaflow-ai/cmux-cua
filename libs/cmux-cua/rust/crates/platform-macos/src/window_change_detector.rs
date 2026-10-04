@@ -495,6 +495,38 @@ impl<T> SettleSlot<T> {
     }
 }
 
+/// One [`SettleSlot`] per agent session, so one agent's next action never
+/// ends another agent's guard or takes its late windows.
+pub(crate) struct SessionSettleSlots<T> {
+    slots: std::collections::HashMap<String, SettleSlot<T>>,
+}
+
+impl<T> SessionSettleSlots<T> {
+    pub(crate) fn new() -> Self {
+        Self { slots: std::collections::HashMap::new() }
+    }
+
+    pub(crate) fn arm(&mut self, session: &str, value: T) -> (u64, Option<T>) {
+        let _ = (session, value);
+        unimplemented!("session settle slots")
+    }
+
+    pub(crate) fn flush(&mut self, session: &str) -> Option<T> {
+        let _ = session;
+        unimplemented!("session settle slots")
+    }
+
+    pub(crate) fn expire(&mut self, session: &str, generation: u64) -> Option<T> {
+        let _ = (session, generation);
+        unimplemented!("session settle slots")
+    }
+
+    /// Sessions with a pending guard (bounded by live agents).
+    pub(crate) fn len(&self) -> usize {
+        self.slots.len()
+    }
+}
+
 /// The guard of the last native action: the wildcard focus-steal lease and
 /// the windows visible when its reply was sent.
 struct PendingGuard {
@@ -778,5 +810,27 @@ mod tests {
             elapsed < Duration::from_millis(300),
             "a native action reply must not wait for the 1 s guard window (took {elapsed:?})"
         );
+    }
+
+    #[test]
+    fn one_session_never_settles_another_sessions_guard() {
+        let mut slots = SessionSettleSlots::new();
+        let (a_gen, _) = slots.arm("agent-a", "guard-a");
+        let (b_gen, replaced) = slots.arm("agent-b", "guard-b");
+        assert_eq!(replaced, None, "agent B's action must not replace agent A's guard");
+        assert_eq!(slots.flush("agent-b"), Some("guard-b"));
+        assert_eq!(slots.expire("agent-b", b_gen), None);
+        assert_eq!(slots.expire("agent-a", a_gen), Some("guard-a"), "A's deadline still ends A's guard");
+        assert_eq!(slots.len(), 0, "settled sessions leave no entry behind");
+    }
+
+    #[test]
+    fn a_session_rearm_replaces_only_its_own_guard() {
+        let mut slots = SessionSettleSlots::new();
+        let (first, _) = slots.arm("agent-a", 1);
+        let (_, replaced) = slots.arm("agent-a", 2);
+        assert_eq!(replaced, Some(1));
+        assert_eq!(slots.expire("agent-a", first), None, "a stale deadline must not end the newer guard");
+        assert_eq!(slots.flush("agent-a"), Some(2));
     }
 }
