@@ -419,7 +419,7 @@ Mapping: by='page' → larger step; by='line' → smaller step; amount = number 
 
 **Arguments:**
 
-- `amount` (integer, optional): Pixel-wheel path: number of wheel notches. Keystroke path: number of keystroke repetitions. Default: 3.
+- `amount` (integer, optional): Pixel-wheel path: number of wheel notches. Keystroke path: number of keystroke repetitions. Larger requests are clamped to the maximum. Default: 3.
 - `by` (string, optional): Scroll granularity. Default: line.
 - `delivery_mode` (string, optional): Default background. Background targeted-wheel dispatch with pid+window_id checks WindowServer Z order and returns structured error="obstructed", code="background_occluded" without posting when another window owns the target point. Foreground fronts the target, skips that check, scrolls, then restores the prior app. Successful scrolls report verified plus observed_delta when AX exposes a readable scroll metric.
 - `direction` (string, required): Scroll direction.
@@ -573,6 +573,7 @@ Note: capture_mode is a per-call param (on get_window_state / click), not a stor
 
 **Arguments:**
 
+- `allow_unrestricted_app_state` (boolean, optional): Allow Codex-compatible get_app_state to inspect every app, including protected host and terminal apps. Defaults to true.
 - `capture_scope` (string, optional): Capture scope: "window" (default) or "desktop". Desktop scope enables get_desktop_state (full-display capture) and window-less screen-absolute click/scroll. Global setting; takes effect immediately.
 - `experimental_pip` (boolean, optional): Enable the experimental picture-in-picture preview window. Applies on next daemon restart.
 - `experimental_pip_geometry` (string, optional): PiP window size + optional position in `WxH` or `WxH+X+Y` form (e.g. `320x200+24+24`). Applies on next daemon restart.

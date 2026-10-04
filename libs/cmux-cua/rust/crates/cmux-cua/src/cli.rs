@@ -140,6 +140,11 @@ pub enum Command {
     /// subcommand) and is purely additive: never removes a field,
     /// never renames an existing one.
     Manifest { pretty: bool },
+    /// `cmux-cua complain <text>`: an agent records a problem it hit in
+    /// the opt-in local reliability journal (see `journal.rs`).
+    Complain { text: String, tool: Option<String>, session: Option<String> },
+    /// `cmux-cua journal {status|enable|disable|path|tail|summary}`.
+    Journal { subcommand: String, args: Vec<String> },
     /// `cmux-cua skills {install|update|uninstall|status|path}` —
     /// agent skill-pack management. The verb is the ONLY way a user
     /// installs or updates the cmux-cua skill pack into their agent
@@ -315,6 +320,18 @@ pub fn parse_command() -> Command {
         println!("                                  hardcoded launch argv like _CMUX_CUA_ARGS = [\"mcp\"].");
         println!("    --pretty / -p                 Pretty-print the JSON.");
         println!();
+        println!("reliability journal (opt-in, local only):");
+        println!("  cmux-cua complain <text> [--tool NAME] [--session ID]");
+        println!("                                Record a problem you hit with cmux-cua. Agents: use this");
+        println!("                                when a tool fails, hangs, or behaves wrongly. Reads stdin");
+        println!("                                when no text is given. No-op unless the journal is enabled.");
+        println!("  cmux-cua journal status|enable|disable|path");
+        println!("  cmux-cua journal tail [-n N] [--errors] [--follow] [--json]");
+        println!("  cmux-cua journal summary [--hours H] [--json]");
+        println!("                                The journal records every proxied tool call (tool, outcome,");
+        println!("                                duration, error text; never argument values) to");
+        println!("                                ~/Library/Logs/cmux-cua/journal.jsonl. Off by default.");
+        println!();
         println!("doctor options:");
         println!("  --json                  Emit the probe report as JSON for scripting.");
         println!();
@@ -399,6 +416,45 @@ pub fn parse_command() -> Command {
             claude_code_compat,
             codex_computer_use_compat,
         },
+        Some("complain") | Some("report-issue") => {
+            let tool = flag_value(&args, "--tool");
+            let session = flag_value(&args, "--session");
+            let mut words: Vec<String> = Vec::new();
+            let mut skip_next = false;
+            for a in args.iter().skip_while(|a| *a != "complain" && *a != "report-issue").skip(1) {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if a == "--tool" || a == "--session" {
+                    skip_next = true;
+                    continue;
+                }
+                if a.starts_with("--tool=") || a.starts_with("--session=") {
+                    continue;
+                }
+                words.push(a.clone());
+            }
+            let mut text = words.join(" ");
+            if text.trim().is_empty() {
+                let mut stdin = String::new();
+                if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin);
+                }
+                text = stdin;
+            }
+            Command::Complain { text, tool, session }
+        }
+        Some("journal") => {
+            let subcommand = pos.next().unwrap_or("status").to_string();
+            let rest: Vec<String> = args
+                .iter()
+                .skip_while(|a| *a != "journal")
+                .skip(2)
+                .cloned()
+                .collect();
+            Command::Journal { subcommand, args: rest }
+        }
         Some("list-tools") => Command::ListTools,
         Some("mcp-config") => Command::McpConfig { client: mcp_client },
         Some("serve") => Command::Serve {
@@ -3267,7 +3323,7 @@ pub fn run_config_cmd(
                 Some(k) => k,
                 None => {
                     eprintln!("Usage: cmux-cua config get <key>");
-                    eprintln!("Keys: capture_mode, max_image_dimension, version, platform");
+                    eprintln!("Keys: allow_unrestricted_app_state, capture_mode, max_image_dimension, version, platform");
                     process::exit(64);
                 }
             };
@@ -3326,7 +3382,7 @@ pub fn run_config_cmd(
                 println!("{}", match &v { serde_json::Value::String(s) => s.clone(), other => other.to_string() });
             } else {
                 eprintln!("Unknown config key: {key}");
-                eprintln!("Available keys: capture_mode, max_image_dimension, version, platform, agent_cursor.enabled");
+                eprintln!("Available keys: allow_unrestricted_app_state, capture_mode, max_image_dimension, version, platform, agent_cursor.enabled");
                 process::exit(64);
             }
         }
@@ -3414,7 +3470,8 @@ pub fn run_config_cmd(
             // so we send the known defaults explicitly.
             let defaults = serde_json::json!({
                 "capture_mode": "ax",
-                "max_image_dimension": 0
+                "max_image_dimension": 0,
+                "allow_unrestricted_app_state": true
             });
             let result = rt.block_on(async {
                 registry.invoke("set_config", defaults).await
@@ -3544,6 +3601,8 @@ pub fn telemetry_entry_event(cmd: &Command) -> Option<String> {
         }
         Command::McpConfig { .. } => "cmux_cua_mcp_config".to_owned(),
         Command::Manifest { .. } => "cmux_cua_manifest".to_owned(),
+        Command::Complain { .. } => "cmux_cua_complain".to_owned(),
+        Command::Journal { .. } => "cmux_cua_journal".to_owned(),
         Command::Recording { .. } => event::RECORDING.to_owned(),
         Command::Config { .. } => event::CONFIG.to_owned(),
         Command::DumpDocs { .. } => "cmux_cua_dump_docs".to_owned(),
