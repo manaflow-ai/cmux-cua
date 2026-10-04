@@ -171,8 +171,145 @@ impl LeaseTable {
         self.stopped.contains(session)
     }
 
+    /// Applies one operation and returns its result plus one frame for each
+    /// target whose rendered lease changed.
     pub fn apply(&mut self, op: LeaseOp) -> LeaseOutcome {
-        let _ = op;
-        unimplemented!("automation lease reducer")
+        let affected = self.affected_targets(&op);
+        let before: Vec<Option<Lease>> = affected.iter().map(|t| self.lease(t).cloned()).collect();
+        let result = self.reduce(op);
+        let frames = affected
+            .into_iter()
+            .zip(before)
+            .filter_map(|(target, before)| {
+                let after = self.lease(&target).cloned();
+                (after != before).then_some(LeaseFrame { target, lease: after })
+            })
+            .collect();
+        LeaseOutcome { result, frames }
+    }
+
+    fn affected_targets(&self, op: &LeaseOp) -> Vec<String> {
+        match op {
+            LeaseOp::SessionEnd { session } => self
+                .leases
+                .iter()
+                .filter(|(_, entry)| &entry.lease.session == session)
+                .map(|(target, _)| target.clone())
+                .collect(),
+            LeaseOp::Allow { .. } => Vec::new(),
+            LeaseOp::Acquire { target, .. }
+            | LeaseOp::Act { target, .. }
+            | LeaseOp::Observe { target, .. }
+            | LeaseOp::Release { target, .. }
+            | LeaseOp::UserInput { target }
+            | LeaseOp::TakeOver { target, .. }
+            | LeaseOp::HandBack { target, .. }
+            | LeaseOp::Stop { target, .. } => vec![target.clone()],
+        }
+    }
+
+    fn reduce(&mut self, op: LeaseOp) -> Result<(), LeaseError> {
+        match op {
+            LeaseOp::Acquire { target, who, now_ms } => self.drive(target, who, now_ms, false),
+            LeaseOp::Act { target, who, now_ms } => self.drive(target, who, now_ms, true),
+            LeaseOp::Observe { target, session } => {
+                if let Some(entry) = self.leases.get_mut(&target) {
+                    if entry.lease.session == session && entry.lease.state == LeaseState::Driving {
+                        entry.needs_fresh_observe = false;
+                    }
+                }
+                Ok(())
+            }
+            LeaseOp::Release { target, session } => match self.leases.get(&target) {
+                None => Ok(()),
+                Some(entry) if entry.lease.session != session => Err(LeaseError::NotLeaseHolder),
+                Some(_) => {
+                    self.leases.remove(&target);
+                    Ok(())
+                }
+            },
+            LeaseOp::SessionEnd { session } => {
+                self.leases.retain(|_, entry| entry.lease.session != session);
+                Ok(())
+            }
+            LeaseOp::UserInput { target } => {
+                if let Some(entry) = self.leases.get_mut(&target) {
+                    if entry.lease.state == LeaseState::Driving {
+                        entry.lease.state = LeaseState::Paused;
+                    }
+                }
+                Ok(())
+            }
+            LeaseOp::TakeOver { target, origin } => {
+                require_user(&origin)?;
+                let entry = self.leases.get_mut(&target).ok_or(LeaseError::NoLease)?;
+                entry.lease.state = LeaseState::UserDriving;
+                Ok(())
+            }
+            LeaseOp::HandBack { target, origin } => {
+                require_user(&origin)?;
+                let entry = self.leases.get_mut(&target).ok_or(LeaseError::NoLease)?;
+                if entry.lease.state == LeaseState::Driving {
+                    return Err(LeaseError::NotPaused);
+                }
+                entry.lease.state = LeaseState::Driving;
+                entry.needs_fresh_observe = true;
+                Ok(())
+            }
+            LeaseOp::Stop { target, origin } => {
+                require_user(&origin)?;
+                let entry = self.leases.remove(&target).ok_or(LeaseError::NoLease)?;
+                self.stopped.insert(entry.lease.session);
+                Ok(())
+            }
+            LeaseOp::Allow { session, origin } => {
+                require_user(&origin)?;
+                self.stopped.remove(&session);
+                Ok(())
+            }
+        }
+    }
+
+    /// `acquire` (is_act = false) and `act` (is_act = true).
+    fn drive(&mut self, target: String, who: AgentIdentity, now_ms: u64, is_act: bool) -> Result<(), LeaseError> {
+        if who.origin == USER_ORIGIN {
+            return Err(LeaseError::AgentOriginRequired);
+        }
+        if self.stopped.contains(&who.session) {
+            return Err(LeaseError::StoppedByUser);
+        }
+        let Some(entry) = self.leases.get(&target) else {
+            let lease = Lease {
+                session: who.session,
+                actor: who.actor,
+                on_behalf_of: who.on_behalf_of,
+                origin: who.origin,
+                label: who.label,
+                since_ms: now_ms,
+                state: LeaseState::Driving,
+            };
+            self.leases.insert(target, Entry { lease, needs_fresh_observe: false });
+            return Ok(());
+        };
+        if entry.lease.session != who.session {
+            return Err(LeaseError::LeaseHeld);
+        }
+        if !is_act {
+            return Ok(());
+        }
+        match entry.lease.state {
+            LeaseState::Paused => Err(LeaseError::PausedByUser),
+            LeaseState::UserDriving => Err(LeaseError::UserDriving),
+            LeaseState::Driving if entry.needs_fresh_observe => Err(LeaseError::StaleAfterHandBack),
+            LeaseState::Driving => Ok(()),
+        }
+    }
+}
+
+fn require_user(origin: &str) -> Result<(), LeaseError> {
+    if origin == USER_ORIGIN {
+        Ok(())
+    } else {
+        Err(LeaseError::UserOriginRequired)
     }
 }
