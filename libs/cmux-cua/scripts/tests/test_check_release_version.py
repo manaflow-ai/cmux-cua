@@ -17,7 +17,9 @@ def check(version_toml: str, *args: str) -> subprocess.CompletedProcess:
     with tempfile.TemporaryDirectory() as tmp:
         cargo = Path(tmp) / "Cargo.toml"
         cargo.write_text(f'[workspace]\nmembers = []\n\n[workspace.package]\nversion = "{version_toml}"\n')
-        return subprocess.run([sys.executable, str(SCRIPT), str(cargo), *args], capture_output=True, text=True)
+        import os
+        env = {**os.environ, "CMUX_CUA_CHECK_WORKSPACE_ONLY": "1"}
+        return subprocess.run([sys.executable, str(SCRIPT), str(cargo), *args], capture_output=True, text=True, env=env)
 
 
 class CheckReleaseVersionTest(unittest.TestCase):

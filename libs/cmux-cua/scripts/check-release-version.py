@@ -9,6 +9,7 @@ version in CARGO_TOML, and so must every other version string of the
 release (VERSION_STRINGS), or the release would ship parts that report
 another version. Exit 1 with the reason on a mismatch.
 """
+import os
 import re
 import sys
 import tomllib
@@ -42,9 +43,12 @@ def main(argv):
         sys.exit(f"release version {version} differs from {cargo} workspace version {workspace}")
     root = Path(cargo).resolve().parent.parent
     stale = []
-    for rel, pattern in VERSION_STRINGS:
+    # Unit fixtures of the tag/workspace rule alone set this; a release never does.
+    files = () if os.environ.get("CMUX_CUA_CHECK_WORKSPACE_ONLY") == "1" else VERSION_STRINGS
+    for rel, pattern in files:
         path = root / rel
-        if not path.exists():
+        if not path.is_file():
+            stale.append(f"{rel}: missing (renamed or removed? update VERSION_STRINGS)")
             continue
         m = re.search(pattern, path.read_text(), re.M)
         if not m:
