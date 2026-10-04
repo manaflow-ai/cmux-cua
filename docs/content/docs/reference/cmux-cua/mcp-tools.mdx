@@ -573,6 +573,7 @@ Note: capture_mode is a per-call param (on get_window_state / click), not a stor
 
 **Arguments:**
 
+- `allow_unrestricted_app_state` (boolean, optional): Allow Codex-compatible get_app_state to inspect every app, including protected host and terminal apps. Defaults to true.
 - `capture_scope` (string, optional): Capture scope: "window" (default) or "desktop". Desktop scope enables get_desktop_state (full-display capture) and window-less screen-absolute click/scroll. Global setting; takes effect immediately.
 - `experimental_pip` (boolean, optional): Enable the experimental picture-in-picture preview window. Applies on next daemon restart.
 - `experimental_pip_geometry` (string, optional): PiP window size + optional position in `WxH` or `WxH+X+Y` form (e.g. `320x200+24+24`). Applies on next daemon restart.
