@@ -8,13 +8,13 @@ on:
   pull_request:
     paths:
       - "libs/cmux-cua/swift/CmuxAgentCursor/**"
-      - "libs/cmux-cua/rust/crates/cursor-overlay/tests/glide_vectors.json"
+      - "libs/cmux-cua/rust/crates/cursor-overlay/**"
       - ".github/workflows/ci-swift-agent-cursor.yml"
   push:
     branches: [cmux-cua-native]
     paths:
       - "libs/cmux-cua/swift/CmuxAgentCursor/**"
-      - "libs/cmux-cua/rust/crates/cursor-overlay/tests/glide_vectors.json"
+      - "libs/cmux-cua/rust/crates/cursor-overlay/**"
       - ".github/workflows/ci-swift-agent-cursor.yml"
   workflow_dispatch:
 
