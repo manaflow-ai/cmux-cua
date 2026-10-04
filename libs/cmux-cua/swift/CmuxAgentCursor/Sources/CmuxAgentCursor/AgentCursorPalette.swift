@@ -37,9 +37,15 @@ public struct AgentCursorPalette: Sendable, Equatable {
     }
 
     private static func lerp(_ a: RGBA, _ b: RGBA, _ t: Double) -> RGBA {
-        (0..<3).map { i in
-            UInt8((Double(a[i]) + (Double(b[i]) - Double(a[i])) * t).rounded(.toNearestOrAwayFromZero))
-        } + [255]
+        var out: RGBA = []
+        for i in 0..<3 {
+            let from = Double(a[i])
+            let to = Double(b[i])
+            let value: Double = from + (to - from) * t
+            out.append(UInt8(value.rounded(.toNearestOrAwayFromZero)))
+        }
+        out.append(255)
+        return out
     }
 
     /// Rust `stable_index`: a numeric suffix n > 0 picks n-1, a one-letter
