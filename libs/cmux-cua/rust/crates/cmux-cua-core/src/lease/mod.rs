@@ -20,7 +20,7 @@ mod tests;
 
 /// Where the vendored `vectors.json` comes from. Update both together.
 pub const VECTORS_SOURCE: &str =
-    "manaflow-ai/cmux@79302d58409:schemas/automation-lease/vectors.json";
+    "manaflow-ai/cmux@029f1a8fc4b:schemas/automation-lease/vectors.json";
 
 /// SHA-256 of the vendored `vectors.json`, equal to the file at
 /// [`VECTORS_SOURCE`]. A test fails when the copy drifts.
