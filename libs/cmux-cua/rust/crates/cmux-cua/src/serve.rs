@@ -2684,6 +2684,12 @@ pub async fn run_serve(
                                             sid.to_owned(),
                                         );
                                     }
+                                    if control_session_id.as_deref() != Some(sid) {
+                                        if let Some(previous) = control_session_id.as_deref() {
+                                            cmux_cua_core::session::release_session(previous);
+                                        }
+                                        cmux_cua_core::session::hold_session(sid);
+                                    }
                                     control_session_id = Some(sid.to_owned());
                                     if approval_broker_requested
                                         && profile == DaemonProfile::CodexComputerUseCompat
@@ -2769,6 +2775,7 @@ pub async fn run_serve(
                     // idempotent, so racing a legacy explicit session_end is
                     // benign.
                     if let Some(sid) = control_session_id {
+                        cmux_cua_core::session::release_session(&sid);
                         let owns_cleanup = if profile == DaemonProfile::CodexComputerUseCompat {
                             match control_approval_token.take() {
                                 Some((owner, token))
@@ -3341,6 +3348,12 @@ pub async fn run_serve(
                                             sid.to_owned(),
                                         );
                                     }
+                                    if control_session_id.as_deref() != Some(sid) {
+                                        if let Some(previous) = control_session_id.as_deref() {
+                                            cmux_cua_core::session::release_session(previous);
+                                        }
+                                        cmux_cua_core::session::hold_session(sid);
+                                    }
                                     control_session_id = Some(sid.to_owned());
                                 }
                                 let resp = DaemonResponse::ok(
@@ -3399,6 +3412,7 @@ pub async fn run_serve(
                     // the full rationale). Per-call connections leave
                     // control_session_id None.
                     if let Some(sid) = control_session_id {
+                        cmux_cua_core::session::release_session(&sid);
                         // Run stop_owner off the reactor (see the unix branch):
                         // recording finalize can be a synchronous blocking call.
                         // fire_session_end stays inline (non-blocking hooks).

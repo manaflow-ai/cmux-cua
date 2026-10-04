@@ -928,10 +928,10 @@ mod tests {
         // Releases JSON contains both Swift-port tags and Rust-port tags;
         // only the Rust-port (`cmux-cua-v*`) tags must be considered.
         let body = serde_json::json!([
-            {"tag_name": "cmux-cua-v0.9.0", "draft": false, "prerelease": false},
+            {"tag_name": "v0.9.0", "draft": false, "prerelease": false},
             {"tag_name": "cmux-cua-v0.1.4", "draft": false, "prerelease": false},
             {"tag_name": "cmux-cua-v0.1.3", "draft": false, "prerelease": false},
-            {"tag_name": "cmux-cua-v9.9.9", "draft": false, "prerelease": false},
+            {"tag_name": "v9.9.9", "draft": false, "prerelease": false},
         ]);
         assert_eq!(pick_latest_release(&body).as_deref(), Some("0.1.4"));
     }

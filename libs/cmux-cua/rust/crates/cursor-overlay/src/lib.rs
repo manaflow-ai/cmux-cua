@@ -448,6 +448,8 @@ pub enum OverlayCommand {
     MoveTo { x: f64, y: f64, end_heading_radians: f64 },
     /// Snap the cursor immediately to a screen position, optionally updating heading.
     SnapTo { x: f64, y: f64, heading_radians: Option<f64> },
+    /// Track a posted drag action point, preserving the selected shape's hotspot.
+    DragTo { x: f64, y: f64, pressed: bool },
     /// Start the click-press visual.
     ClickPulse { x: f64, y: f64 },
     /// Toggle the held-button visual state.

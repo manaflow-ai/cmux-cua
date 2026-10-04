@@ -30,6 +30,7 @@ mod autostart;
 mod bundle;
 mod cli;
 mod doctor;
+mod journal;
 mod mcp_http;
 mod proxy;
 mod responsibility;
@@ -268,6 +269,14 @@ fn main() {
         }
         cli::Command::McpConfig { client } => {
             cli::run_mcp_config(client.as_deref());
+            return;
+        }
+        cli::Command::Complain { text, tool, session } => {
+            journal::run_complain(text, tool, session);
+            return;
+        }
+        cli::Command::Journal { subcommand, args } => {
+            journal::run_journal(&subcommand, &args);
             return;
         }
         cli::Command::Manifest { pretty } => {
@@ -727,6 +736,14 @@ fn main() -> anyhow::Result<()> {
         }
         cli::Command::McpConfig { client } => {
             cli::run_mcp_config(client.as_deref());
+            return Ok(());
+        }
+        cli::Command::Complain { text, tool, session } => {
+            journal::run_complain(text, tool, session);
+            return Ok(());
+        }
+        cli::Command::Journal { subcommand, args } => {
+            journal::run_journal(&subcommand, &args);
             return Ok(());
         }
         cli::Command::Manifest { pretty } => {
