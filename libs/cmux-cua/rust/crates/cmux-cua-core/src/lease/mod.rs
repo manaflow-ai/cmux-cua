@@ -20,11 +20,11 @@ mod tests;
 
 /// Where the vendored `vectors.json` comes from. Update both together.
 pub const VECTORS_SOURCE: &str =
-    "manaflow-ai/cmux@f3f431f4206:schemas/automation-lease/vectors.json";
+    "manaflow-ai/cmux@79302d58409:schemas/automation-lease/vectors.json";
 
 /// SHA-256 of the vendored `vectors.json`, equal to the file at
 /// [`VECTORS_SOURCE`]. A test fails when the copy drifts.
-pub const VECTORS_SHA256: &str = "003c49f1a7ff9793652a544929b982116f9605f6993d4213340949a87f13f987";
+pub const VECTORS_SHA256: &str = "bab2e9cacaa10a1f0f7d9c50993cc5617c99a37e64383db2764668750391f4f3";
 
 /// The origin value of the person's own authenticated client.
 pub const USER_ORIGIN: &str = "user";

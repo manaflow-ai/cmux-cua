@@ -79,7 +79,7 @@ fn snapshot_json(table: &LeaseTable, target: Option<&str>) -> Value {
 fn shared_vectors_replay_identically() {
     let vectors: Value = serde_json::from_str(VECTORS).expect("vectors parse");
     let cases = vectors["cases"].as_array().expect("cases");
-    assert!(cases.len() >= 21, "vendored vectors look truncated");
+    assert!(cases.len() >= 23, "vendored vectors look truncated");
     for case in cases {
         let name = case["name"].as_str().expect("name");
         let mut table = LeaseTable::new();
