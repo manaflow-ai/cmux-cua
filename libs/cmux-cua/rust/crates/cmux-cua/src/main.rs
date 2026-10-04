@@ -25,6 +25,7 @@
 //!
 //! On all other platforms `#[tokio::main]` is used directly.
 
+mod activity_daemon;
 mod autostart;
 mod bundle;
 mod cli;

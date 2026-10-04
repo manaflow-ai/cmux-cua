@@ -1643,6 +1643,7 @@ pub async fn run_serve(
     maybe_start_http_transport(registry.clone(), profile);
     register_recording_session_end_hook(registry.recording.clone());
     register_state_file_session_end_hook(&registry);
+    let activity = crate::activity_daemon::open(profile, socket_path);
     let mut authorized_root_health =
         tokio::time::interval(std::time::Duration::from_secs(1));
 
@@ -1693,6 +1694,12 @@ pub async fn run_serve(
                 let reg = registry.clone();
                 let shutdown_tx2 = shutdown_tx.clone();
                 let last_activity = last_activity.clone();
+                let activity = activity.clone();
+                let activity_peer_pid = stream
+                    .peer_cred()
+                    .ok()
+                    .and_then(|credentials| credentials.pid())
+                    .and_then(|pid| u32::try_from(pid).ok());
                 let approval_peer_pid = approval_broker_peer_pid(&stream);
                 let approval_brokers = approval_brokers.clone();
                 let external_permission_ready = external_permission_ready.clone();
@@ -2414,6 +2421,69 @@ pub async fn run_serve(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
                             }
+                            method if crate::activity_daemon::is_activity_method(method) => {
+                                let Some(activity) = activity.as_ref() else {
+                                    let resp = DaemonResponse::err("activity store is not available".to_owned(), 69);
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                    continue;
+                                };
+                                let caller = crate::activity_daemon::caller(
+                                    activity_peer_pid,
+                                    host_request_authorized,
+                                );
+                                let args = req.args.clone().unwrap_or(serde_json::Value::Null);
+                                if method == "activity_subscribe" {
+                                    // Stream until the client closes: an initial
+                                    // sessions snapshot, then pushed updates.
+                                    let sessions = args.get("sessions").and_then(serde_json::Value::as_bool).unwrap_or(true);
+                                    let events_for: Vec<String> = args
+                                        .get("events_for")
+                                        .and_then(serde_json::Value::as_array)
+                                        .map(|ids| ids.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+                                        .unwrap_or_default();
+                                    let mut updates = activity.subscribe();
+                                    let snapshot = cmux_cua_core::activity::host::ActivityUpdate::Sessions {
+                                        sessions: activity.sessions(None, None, 500),
+                                    };
+                                    if let Some(line) = crate::activity_daemon::stream_line(&snapshot, true, &events_for) {
+                                        if writer.write_all(line.as_bytes()).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    loop {
+                                        tokio::select! {
+                                            update = updates.recv() => {
+                                                let update = match update {
+                                                    Ok(update) => update,
+                                                    // A slow reader missed updates: resend the full list.
+                                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                                        cmux_cua_core::activity::host::ActivityUpdate::Sessions {
+                                                            sessions: activity.sessions(None, None, 500),
+                                                        }
+                                                    }
+                                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                                                };
+                                                if let Some(line) = crate::activity_daemon::stream_line(&update, sessions, &events_for) {
+                                                    if writer.write_all(line.as_bytes()).await.is_err() {
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            next = lines.next_line() => {
+                                                if !matches!(next, Ok(Some(_))) {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                let resp = crate::activity_daemon::handle(activity, method, &args, &caller);
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
                             "call" => {
                                 let raw_name = req.name.as_deref().unwrap_or("").to_owned();
                                 // Deprecated alias: `type_text_chars` → `type_text`.
@@ -2500,6 +2570,32 @@ pub async fn run_serve(
                                     ).await;
                                     continue;
                                 }
+                                // Activity log (computer-use.md section 4): the
+                                // gate refuses calls the user stopped or paused
+                                // and records every call that runs.
+                                let activity_label = crate::activity_daemon::label(
+                                    effective_session.as_deref(),
+                                    req.session_id.as_deref(),
+                                );
+                                let activity_start = match activity.as_ref() {
+                                    Some(host) => {
+                                        let caller = crate::activity_daemon::caller(activity_peer_pid, false);
+                                        match crate::activity_daemon::begin(host, &caller, &activity_label, &tool_name, &args) {
+                                            cmux_cua_core::activity::host::Gate::Run(start) => Some(start),
+                                            cmux_cua_core::activity::host::Gate::Refuse { code, message } => {
+                                                let resp = crate::activity_daemon::refusal(&code, &message);
+                                                let _ = writer.write_all(
+                                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                                ).await;
+                                                continue;
+                                            }
+                                            cmux_cua_core::activity::host::Gate::Replay(_)
+                                            | cmux_cua_core::activity::host::Gate::RunUntracked => None,
+                                        }
+                                    }
+                                    None => None,
+                                };
+                                let activity_args = activity_start.as_ref().map(|_| args.clone());
                                 let result = reg.invoke(&tool_name, args).await;
                                 let is_err = result.is_error.unwrap_or(false);
                                 let content: Vec<serde_json::Value> = result.content.iter().map(|c| {
@@ -2516,6 +2612,11 @@ pub async fn run_serve(
                                 });
                                 if let Some(sc) = result.structured_content {
                                     result_obj["structuredContent"] = sc;
+                                }
+                                if let (Some(host), Some(start), Some(call_args)) =
+                                    (activity.clone(), activity_start, activity_args)
+                                {
+                                    crate::activity_daemon::finish(host, start, &call_args, &result_obj).await;
                                 }
                                 // Preserve tool-level `isError` and structured
                                 // content inside a successful daemon transport.
