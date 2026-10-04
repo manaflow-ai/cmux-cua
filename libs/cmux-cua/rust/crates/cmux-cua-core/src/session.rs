@@ -46,6 +46,41 @@ fn is_trackable(id: &str) -> bool {
     !id.is_empty() && id != "default"
 }
 
+/// Session ids held by a live control connection, with a holder count. The
+/// idle-TTL sweep exists to reclaim sessions whose owner vanished; a session
+/// whose proxy still holds its control connection has a live owner, so the
+/// sweep must not end it however long the agent pauses between calls. The
+/// control-connection EOF releases the hold and reaps the session itself.
+static HELD_SESSIONS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+fn held() -> &'static Mutex<HashMap<String, usize>> {
+    HELD_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Mark `session_id` as owned by a live control connection.
+pub fn hold_session(session_id: &str) {
+    if !is_trackable(session_id) {
+        return;
+    }
+    *held().lock().unwrap().entry(session_id.to_owned()).or_insert(0) += 1;
+}
+
+/// Release one control-connection hold on `session_id`.
+pub fn release_session(session_id: &str) {
+    let mut map = held().lock().unwrap();
+    if let Some(count) = map.get_mut(session_id) {
+        *count -= 1;
+        if *count == 0 {
+            map.remove(session_id);
+        }
+    }
+}
+
+/// Whether a live control connection currently holds `session_id`.
+pub fn is_session_held(session_id: &str) -> bool {
+    held().lock().unwrap().contains_key(session_id)
+}
+
 /// Session ids that have already had their `session_end` fired. Dedupes the
 /// control-connection EOF teardown (the reaper) against any stray legacy
 /// `session_end` method that a mixed-version (new proxy / old proxy) rollout
@@ -195,8 +230,9 @@ pub fn evict_idle(ttl: Duration) -> Vec<String> {
     let now = Instant::now();
     let stale: Vec<String> = {
         let map = activity().lock().unwrap();
+        let held = held().lock().unwrap();
         map.iter()
-            .filter(|(_, last)| now.duration_since(**last) >= ttl)
+            .filter(|(id, last)| now.duration_since(**last) >= ttl && !held.contains_key(*id))
             .map(|(id, _)| id.clone())
             .collect()
     };
@@ -216,6 +252,19 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn held_session_survives_idle_sweep_until_released() {
+        let sid = "test-held-session-5F3A";
+        touch_session(sid);
+        hold_session(sid);
+        assert!(evict_idle(Duration::ZERO).iter().all(|id| id != sid));
+        assert!(!is_session_ended(sid));
+        release_session(sid);
+        assert!(!is_session_held(sid));
+        assert!(evict_idle(Duration::ZERO).iter().any(|id| id == sid));
+        assert!(is_session_ended(sid));
+    }
 
     #[test]
     fn fire_session_end_is_idempotent_per_id() {

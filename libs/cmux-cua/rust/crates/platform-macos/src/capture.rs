@@ -81,7 +81,7 @@ fn screenshot_window_bytes_core_graphics(window_id: u32) -> anyhow::Result<Vec<u
 fn screenshot_window_bytes_screencapture(window_id: u32) -> anyhow::Result<Vec<u8>> {
     let tmp_path = format!("/tmp/cmux-cua-capture-{}.png", window_id);
 
-    let output = Command::new("screencapture")
+    let output = Command::new("/usr/sbin/screencapture")
         .args([
             "-l",
             &window_id.to_string(),
@@ -181,7 +181,7 @@ fn screenshot_display_bytes_screencapture() -> anyhow::Result<Vec<u8>> {
     // Use a pid-unique path so concurrent cmux-cua processes don't step on each other.
     let tmp_path = format!("/tmp/cmux-cua-display-{}.png", std::process::id());
 
-    let output = Command::new("screencapture")
+    let output = Command::new("/usr/sbin/screencapture")
         .args(["-x", &*tmp_path])
         .output()?;
 
