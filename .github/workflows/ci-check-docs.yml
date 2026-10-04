@@ -144,6 +144,20 @@ jobs:
           fi
         working-directory: .
 
+      # Agents without a local macOS cargo can download the regenerated
+      # cmux-cua reference from this artifact and commit it.
+      - name: Regenerate cmux-cua docs on drift
+        if: failure() && contains(steps.changed.outputs.generators, 'cmux-cua')
+        run: npx tsx scripts/docs-generators/runner.ts --library cmux-cua
+        working-directory: .
+
+      - name: Upload regenerated cmux-cua docs
+        if: failure() && contains(steps.changed.outputs.generators, 'cmux-cua')
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmux-cua-docs-regenerated
+          path: docs/content/docs/reference/cmux-cua/
+
       - name: Show help if check failed
         if: failure()
         run: |
