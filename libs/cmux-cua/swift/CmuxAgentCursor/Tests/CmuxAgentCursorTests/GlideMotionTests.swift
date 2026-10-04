@@ -10,6 +10,7 @@ private func glideVectors() throws -> [String: Any] {
         .deletingLastPathComponent() // Tests
         .deletingLastPathComponent() // CmuxAgentCursor
         .deletingLastPathComponent() // swift
+        .deletingLastPathComponent() // cmux-cua
         .appendingPathComponent("rust/crates/cursor-overlay/tests/glide_vectors.json")
     return try #require(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
 }
