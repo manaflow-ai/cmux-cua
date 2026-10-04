@@ -5,7 +5,11 @@
 use cursor_overlay::{CursorConfig, OverlayCommand, RenderStateCore};
 use serde_json::Value;
 
-const VECTORS: &str = include_str!("glide_vectors.json");
+// The vectors live in the Swift package so the package stays self-contained
+// when the cmux app vendors it (plans/cmux-next/agent-cursor.md).
+const VECTORS: &str = include_str!(
+    "../../../../swift/CmuxAgentCursor/Tests/CmuxAgentCursorTests/Resources/glide_vectors.json"
+);
 
 #[test]
 fn macos_motion_matches_the_shared_glide_vectors() {

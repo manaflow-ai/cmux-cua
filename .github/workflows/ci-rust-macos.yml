@@ -14,6 +14,7 @@ on:
       - "libs/cmux-cua/rust/crates/cmux-cua-core/**"
       - "libs/cmux-cua/rust/crates/cmux-cua-testkit/**"
       - "libs/cmux-cua/rust/crates/cursor-overlay/**"
+      - "libs/cmux-cua/swift/CmuxAgentCursor/Tests/CmuxAgentCursorTests/Resources/glide_vectors.json"
       - "libs/cmux-cua/rust/crates/platform-macos/**"
       - ".github/workflows/ci-rust-macos.yml"
   push:
