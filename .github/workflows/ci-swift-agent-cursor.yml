@@ -1,0 +1,38 @@
+name: "CI: Swift agent cursor"
+
+# CmuxAgentCursor: the agent cursor package the cmux app and the cmux
+# Computer Use helper share. Replays the glide vectors (the same file the
+# Rust cursor-overlay test replays) and the automation.input vectors.
+
+on:
+  pull_request:
+    paths:
+      - "libs/cmux-cua/swift/CmuxAgentCursor/**"
+      - "libs/cmux-cua/rust/crates/cursor-overlay/tests/glide_vectors.json"
+      - ".github/workflows/ci-swift-agent-cursor.yml"
+  push:
+    branches: [cmux-cua-native]
+    paths:
+      - "libs/cmux-cua/swift/CmuxAgentCursor/**"
+      - "libs/cmux-cua/rust/crates/cursor-overlay/tests/glide_vectors.json"
+      - ".github/workflows/ci-swift-agent-cursor.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-swift-agent-cursor-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Swift agent cursor tests
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Show toolchain
+        run: swift --version
+      - name: Test
+        run: swift test --package-path libs/cmux-cua/swift/CmuxAgentCursor
