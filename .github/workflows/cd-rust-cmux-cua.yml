@@ -30,6 +30,19 @@ permissions:
   contents: write
 
 jobs:
+  # The tag (or the dispatch version) must name the Rust workspace version, or
+  # the release ships binaries that report another one.
+  version-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the workspace version
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: python3 libs/cmux-cua/scripts/check-release-version.py libs/cmux-cua/rust/Cargo.toml "$GITHUB_REF" "$DISPATCH_VERSION"
+
   # ── Linux (x86_64 + arm64) ───────────────────────────────────────────────────
   # One matrixed job per Linux target. x86_64 builds on the standard
   # ubuntu-latest host; arm64 builds NATIVELY on GitHub's hosted ARM runner
@@ -39,6 +52,7 @@ jobs:
   # runner keeps the build identical to the x86_64 path. install.sh picks the
   # matching tarball at install time based on the host's `uname -m`.
   build-linux:
+    needs: version-check
     name: linux-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -135,6 +149,7 @@ jobs:
   # for that cross, so no separate arm64 runner is needed. install.ps1 picks
   # the matching zip at install time based on the host's OS architecture.
   build-windows:
+    needs: version-check
     name: windows-${{ matrix.arch }}
     runs-on: windows-latest
     strategy:
@@ -223,6 +238,7 @@ jobs:
   # `.lodBias`). The macos-15 runner ships a macOS 15 SDK that doesn't
   # expose those symbols, so the transitive Swift bridge fails to compile.
   build-macos-universal:
+    needs: version-check
     name: darwin-universal
     runs-on: macos-26
     # Notarize on tag push (real release); on workflow_dispatch honor the
