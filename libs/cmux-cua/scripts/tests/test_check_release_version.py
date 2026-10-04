@@ -17,7 +17,9 @@ def check(version_toml: str, *args: str) -> subprocess.CompletedProcess:
     with tempfile.TemporaryDirectory() as tmp:
         cargo = Path(tmp) / "Cargo.toml"
         cargo.write_text(f'[workspace]\nmembers = []\n\n[workspace.package]\nversion = "{version_toml}"\n')
-        return subprocess.run([sys.executable, str(SCRIPT), str(cargo), *args], capture_output=True, text=True)
+        import os
+        env = {**os.environ, "CMUX_CUA_CHECK_WORKSPACE_ONLY": "1"}
+        return subprocess.run([sys.executable, str(SCRIPT), str(cargo), *args], capture_output=True, text=True, env=env)
 
 
 class CheckReleaseVersionTest(unittest.TestCase):
@@ -59,6 +61,29 @@ class EveryVersionStringTest(unittest.TestCase):
             self.assertNotEqual(done.returncode, 0)
             self.assertIn("pyproject.toml", done.stderr)
 
+
+class VersionFilesExistTest(unittest.TestCase):
+    """CU lead review of ca4b5800: the check skipped a listed file that does not
+    exist, so a renamed file in the real repo would go unchecked."""
+
+    def test_every_listed_version_file_exists_in_the_repo(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("crv", SCRIPT)
+        crv = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(crv)
+        root = SCRIPT.parents[1]
+        missing = [rel for rel, _ in crv.VERSION_STRINGS if not (root / rel).is_file()]
+        self.assertEqual(missing, [])
+
+    def test_a_missing_listed_file_fails_the_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "rust").mkdir()
+            (root / "rust" / "Cargo.toml").write_text('[workspace.package]\nversion = "0.8.0"\n')
+            done = subprocess.run([sys.executable, str(SCRIPT), str(root / "rust" / "Cargo.toml"),
+                                   "refs/tags/cmux-cua-v0.8.0"], capture_output=True, text=True)
+            self.assertNotEqual(done.returncode, 0, "a release whose version files are missing passed")
+            self.assertIn("missing", done.stderr)
 
 if __name__ == "__main__":
     unittest.main()
