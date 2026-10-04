@@ -104,7 +104,7 @@ Capture a full-display vision screenshot in true screen pixels (no downscale), f
 
 ### `get_screen_size`
 
-Return the logical size of the main display in points plus its backing scale factor. Agents click in points; Retina displays have scale_factor 2.0. Requires no TCC permissions.
+Return the logical size of the main display in points plus its backing scale factor. Agents click in points; Retina displays have scale_factor 2.0. Structured output also lists every active display as `displays` (id, uuid, bounds, is_main, index) in the order `launch_display` selectors use. Requires no TCC permissions.
 
 **Arguments:** none.
 
@@ -155,6 +155,8 @@ Optional `creates_new_application_instance`: when true, forces a new app instanc
 
 Optional `additional_arguments`: extra argv strings appended after --args.
 
+Optional `display`: where to put windows this call opens, overriding the `launch_display` config (default ["secondary"]: move to the first non-main display when more than one is attached, else leave in place). A selector or ordered list: none|off, main|primary, secondary, index:N, id:N, uuid:X. Only windows that did not exist before the call are moved, so an already-open user window is never relocated. The response reports the move as `placement`.
+
 Returns the launched app's pid, bundle_id, name, and a `windows` array (same shape as `list_windows`) so callers can skip an extra round-trip before `get_window_state(pid, window_id)`. When the focus-steal belt-and-braces demotion check ran (target pid ≠ prior frontmost), the response also includes `self_activation_suppressed: bool` — true if focus stayed with the prior frontmost, false if the launched app held focus despite the re-demote attempt.
 
 **Arguments:**
@@ -163,6 +165,7 @@ Returns the launched app's pid, bundle_id, name, and a `windows` array (same sha
 - `bundle_id` (string, optional): App bundle identifier, e.g. com.apple.calculator. Preferred over name.
 - `cdp_debugging_port` (integer, optional): Open a Chrome DevTools Protocol server on this port (appends --remote-debugging-port=N).
 - `creates_new_application_instance` (boolean, optional): When true, force a new app instance even if already running (open -n). Use for concurrent multi-agent/multi-session work so each session gets an isolated instance + window instead of sharing one — on single-instance apps (e.g. Calculator) every caller otherwise gets the same window and the sessions clobber each other.
+- `display` (string,array, optional): Display for windows this call opens; overrides the launch_display config. Selector or ordered preference list: none|off, main|primary, secondary, index:N, id:N, uuid:X. See get_screen_size `displays`.
 - `name` (string, optional): App display name. Used only when bundle_id is absent.
 - `urls` (array of string, optional): Optional file paths or URLs to open with the app (e.g. a folder path for Finder).
 - `webkit_inspector_port` (integer, optional): Open a WebKit inspector server on this port (sets WEBKIT_INSPECTOR_SERVER env var).
@@ -564,16 +567,18 @@ Caveats:
 
 ### `set_config`
 
-Update cmux-cua configuration. Changes to max_image_dimension and capture_scope take effect immediately. The experimental_pip keys are persisted to ~/.cmux-cua/config.json and take effect on the next daemon restart (the PiP backend is initialised once at startup).
+Update cmux-cua configuration. Changes to max_image_dimension, capture_scope, and launch_display take effect immediately. The experimental_pip keys are persisted to ~/.cmux-cua/config.json and take effect on the next daemon restart (the PiP backend is initialised once at startup).
 
 Note: capture_mode is a per-call param (on get_window_state / click), not a stored setting. capture_scope IS a global setting: it gates get_desktop_state (full-display capture requires capture_scope=desktop).
 
 **Arguments:**
 
+- `allow_unrestricted_app_state` (boolean, optional): Allow Codex-compatible get_app_state to inspect every app, including protected host and terminal apps. Defaults to true.
 - `capture_scope` (string, optional): Capture scope: "window" (default) or "desktop". Desktop scope enables get_desktop_state (full-display capture) and window-less screen-absolute click/scroll. Global setting; takes effect immediately.
 - `experimental_pip` (boolean, optional): Enable the experimental picture-in-picture preview window. Applies on next daemon restart.
 - `experimental_pip_geometry` (string, optional): PiP window size + optional position in `WxH` or `WxH+X+Y` form (e.g. `320x200+24+24`). Applies on next daemon restart.
 - `key` (string, optional): Name of a single config field to write (&#123;key, value&#125; shape, matching the CLI `config set` and the Windows/Linux tools). Pair with `value`. Equivalent to passing the field directly.
+- `launch_display` (string,array,null, optional): Display that launch_app moves newly opened windows to. A selector or an ordered preference list; the first attached match wins. Selectors: none|off, main|primary, secondary (first non-main display), index:N (0 = main, then left-to-right), id:N (CGDirectDisplayID), uuid:X (stable across reboots; see get_screen_size `displays`). Default ["secondary"]. Global setting; takes effect immediately.
 - `max_image_dimension` (integer, optional): Max dimension for screenshot resizing (0 = no limit).
 - `value` (undefined, optional): New value for `key`. JSON type depends on the key.
 

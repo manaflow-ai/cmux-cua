@@ -56,7 +56,14 @@ impl Tool for GetConfigTool {
         // response reflects whatever set_config (or a direct JSON edit)
         // last wrote.
         let (pip_enabled, pip_geometry) = pip_preview::read_pip_keys_from_file();
-        let capture_scope = self.state.config.read().unwrap().capture_scope.clone();
+        let (capture_scope, launch_display, allow_unrestricted_app_state) = {
+            let cfg = self.state.config.read().unwrap();
+            (
+                cfg.capture_scope.clone(),
+                cfg.launch_display.to_json(),
+                cfg.allow_unrestricted_app_state,
+            )
+        };
         ToolResult::text("cmux-cua configuration")
             .with_structured(serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
@@ -65,6 +72,8 @@ impl Tool for GetConfigTool {
                 // setting that gates get_desktop_state.
                 "max_image_dimension": max_image_dimension,
                 "capture_scope": capture_scope,
+                "launch_display": launch_display,
+                "allow_unrestricted_app_state": allow_unrestricted_app_state,
                 "agent_cursor": {
                     "enabled": cursor_enabled,
                 },

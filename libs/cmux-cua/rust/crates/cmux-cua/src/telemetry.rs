@@ -234,6 +234,11 @@ fn migrate_legacy_telemetry_home() {
         return;
     }
     let new_dir = PathBuf::from(&home_root).join(HOME_SUBDIRECTORY);
+    // Rebranding can make the legacy and current locations identical.
+    // In that case there is nothing to migrate or remove.
+    if legacy_dir == new_dir {
+        return;
+    }
     let _ = std::fs::create_dir_all(&new_dir);
 
     // Move the two known telemetry markers if they exist + the new

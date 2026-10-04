@@ -3323,7 +3323,7 @@ pub fn run_config_cmd(
                 Some(k) => k,
                 None => {
                     eprintln!("Usage: cmux-cua config get <key>");
-                    eprintln!("Keys: capture_mode, max_image_dimension, version, platform");
+                    eprintln!("Keys: allow_unrestricted_app_state, capture_mode, max_image_dimension, version, platform");
                     process::exit(64);
                 }
             };
@@ -3382,7 +3382,7 @@ pub fn run_config_cmd(
                 println!("{}", match &v { serde_json::Value::String(s) => s.clone(), other => other.to_string() });
             } else {
                 eprintln!("Unknown config key: {key}");
-                eprintln!("Available keys: capture_mode, max_image_dimension, version, platform, agent_cursor.enabled");
+                eprintln!("Available keys: allow_unrestricted_app_state, capture_mode, max_image_dimension, version, platform, agent_cursor.enabled");
                 process::exit(64);
             }
         }
@@ -3470,7 +3470,8 @@ pub fn run_config_cmd(
             // so we send the known defaults explicitly.
             let defaults = serde_json::json!({
                 "capture_mode": "ax",
-                "max_image_dimension": 0
+                "max_image_dimension": 0,
+                "allow_unrestricted_app_state": true
             });
             let result = rt.block_on(async {
                 registry.invoke("set_config", defaults).await

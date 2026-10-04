@@ -19,6 +19,8 @@ pub(crate) mod code_identity;
 #[cfg(target_os = "macos")]
 pub mod windows;
 #[cfg(target_os = "macos")]
+pub mod displays;
+#[cfg(target_os = "macos")]
 pub mod input;
 #[cfg(target_os = "macos")]
 pub mod cursor;
