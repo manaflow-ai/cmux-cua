@@ -25,14 +25,25 @@ fn identity(step: &Value) -> AgentIdentity {
         on_behalf_of: step.get("on_behalf_of").and_then(Value::as_str).map(str::to_owned),
         origin: text(step, "origin"),
         label: text(step, "label"),
+        implicit_session: step.get("implicit_session").and_then(Value::as_bool).unwrap_or(false),
+    }
+}
+
+fn engine(step: &Value) -> TargetEngine {
+    match step.get("engine").and_then(Value::as_str).unwrap_or("headless") {
+        "cef" => TargetEngine::Cef,
+        "webkit" => TargetEngine::Webkit,
+        "desktop" => TargetEngine::Desktop,
+        "headless" => TargetEngine::Headless,
+        other => panic!("unknown engine {other}"),
     }
 }
 
 fn op_from_step(step: &Value) -> LeaseOp {
     let now_ms = || step.get("now_ms").and_then(Value::as_u64).expect("now_ms");
     match text(step, "op").as_str() {
-        "acquire" => LeaseOp::Acquire { target: text(step, "target"), who: identity(step), now_ms: now_ms() },
-        "act" => LeaseOp::Act { target: text(step, "target"), who: identity(step), now_ms: now_ms() },
+        "acquire" => LeaseOp::Acquire { target: text(step, "target"), engine: engine(step), who: identity(step), now_ms: now_ms() },
+        "act" => LeaseOp::Act { target: text(step, "target"), engine: engine(step), who: identity(step), now_ms: now_ms() },
         "observe" => LeaseOp::Observe { target: text(step, "target"), session: text(step, "session") },
         "release" => LeaseOp::Release { target: text(step, "target"), session: text(step, "session") },
         "session_end" => LeaseOp::SessionEnd { session: text(step, "session") },
@@ -40,7 +51,7 @@ fn op_from_step(step: &Value) -> LeaseOp {
         "take_over" => LeaseOp::TakeOver { target: text(step, "target"), origin: opt_text(step, "origin") },
         "hand_back" => LeaseOp::HandBack { target: text(step, "target"), origin: opt_text(step, "origin") },
         "stop" => LeaseOp::Stop { target: text(step, "target"), origin: opt_text(step, "origin") },
-        "allow" => LeaseOp::Allow { session: text(step, "session"), origin: opt_text(step, "origin") },
+        "allow" => LeaseOp::Allow { actor: text(step, "actor"), origin: opt_text(step, "origin") },
         other => panic!("unknown op {other}"),
     }
 }
@@ -68,7 +79,7 @@ fn snapshot_json(table: &LeaseTable, target: Option<&str>) -> Value {
 fn shared_vectors_replay_identically() {
     let vectors: Value = serde_json::from_str(VECTORS).expect("vectors parse");
     let cases = vectors["cases"].as_array().expect("cases");
-    assert!(cases.len() >= 17, "vendored vectors look truncated");
+    assert!(cases.len() >= 21, "vendored vectors look truncated");
     for case in cases {
         let name = case["name"].as_str().expect("name");
         let mut table = LeaseTable::new();
@@ -97,6 +108,7 @@ fn error_codes_match_the_contract_list() {
         LeaseError::UserDriving,
         LeaseError::StaleAfterHandBack,
         LeaseError::StoppedByUser,
+        LeaseError::SessionRequired,
         LeaseError::NotLeaseHolder,
         LeaseError::NoLease,
         LeaseError::NotPaused,
@@ -112,6 +124,7 @@ fn error_codes_match_the_contract_list() {
             "user_driving",
             "stale_after_hand_back",
             "stopped_by_user",
+            "session_required",
             "not_lease_holder",
             "no_lease",
             "not_paused",
@@ -130,9 +143,21 @@ fn on_behalf_of_is_kept_and_rendered() {
         on_behalf_of: Some("agent:chief".into()),
         origin: "mcp".into(),
         label: "fill form".into(),
+        implicit_session: false,
     };
-    let outcome = table.apply(LeaseOp::Act { target: "w1".into(), who, now_ms: 7 });
+    let outcome = table.apply(LeaseOp::Act { target: "w1".into(), engine: TargetEngine::Desktop, who, now_ms: 7 });
     assert_eq!(outcome.result, Ok(()));
     let lease = outcome.frames[0].lease.as_ref().expect("lease frame");
     assert_eq!(lease.on_behalf_of.as_deref(), Some("agent:chief"));
+}
+
+#[test]
+fn vendored_vectors_match_the_pinned_cmux_file() {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(VECTORS.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+        hex, VECTORS_SHA256,
+        "lease/vectors.json drifted from {VECTORS_SOURCE}; copy the cmux file again and update both constants"
+    );
 }

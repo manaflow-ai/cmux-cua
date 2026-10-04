@@ -20,7 +20,11 @@ mod tests;
 
 /// Where the vendored `vectors.json` comes from. Update both together.
 pub const VECTORS_SOURCE: &str =
-    "manaflow-ai/cmux@6ba78d24069:schemas/automation-lease/vectors.json";
+    "manaflow-ai/cmux@f3f431f4206:schemas/automation-lease/vectors.json";
+
+/// SHA-256 of the vendored `vectors.json`, equal to the file at
+/// [`VECTORS_SOURCE`]. A test fails when the copy drifts.
+pub const VECTORS_SHA256: &str = "003c49f1a7ff9793652a544929b982116f9605f6993d4213340949a87f13f987";
 
 /// The origin value of the person's own authenticated client.
 pub const USER_ORIGIN: &str = "user";
@@ -54,14 +58,39 @@ pub struct AgentIdentity {
     pub on_behalf_of: Option<String>,
     pub origin: String,
     pub label: String,
+    /// The caller named no session; the host substituted its default.
+    pub implicit_session: bool,
+}
+
+impl AgentIdentity {
+    /// The principal a user stop applies to.
+    pub fn stop_key(&self) -> &str {
+        self.on_behalf_of.as_deref().unwrap_or(&self.actor)
+    }
+}
+
+/// The engine behind a target. Provider engines (the person's own tabs)
+/// refuse the implicit default session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetEngine {
+    Cef,
+    Webkit,
+    Headless,
+    Desktop,
+}
+
+impl TargetEngine {
+    pub fn requires_explicit_session(self) -> bool {
+        matches!(self, Self::Cef | Self::Webkit)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseOp {
     /// Take the lease without acting.
-    Acquire { target: String, who: AgentIdentity, now_ms: u64 },
+    Acquire { target: String, engine: TargetEngine, who: AgentIdentity, now_ms: u64 },
     /// Any input to the target (click, type, key, scroll, drag, set value).
-    Act { target: String, who: AgentIdentity, now_ms: u64 },
+    Act { target: String, engine: TargetEngine, who: AgentIdentity, now_ms: u64 },
     /// Any read (snapshot, screenshot). Never blocked, never leases.
     Observe { target: String, session: String },
     Release { target: String, session: String },
@@ -71,7 +100,8 @@ pub enum LeaseOp {
     TakeOver { target: String, origin: String },
     HandBack { target: String, origin: String },
     Stop { target: String, origin: String },
-    Allow { session: String, origin: String },
+    /// Lift a stop for one principal (`on_behalf_of`, else `actor`).
+    Allow { actor: String, origin: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +111,7 @@ pub enum LeaseError {
     UserDriving,
     StaleAfterHandBack,
     StoppedByUser,
+    SessionRequired,
     NotLeaseHolder,
     NoLease,
     NotPaused,
@@ -97,6 +128,7 @@ impl LeaseError {
             Self::UserDriving => "user_driving",
             Self::StaleAfterHandBack => "stale_after_hand_back",
             Self::StoppedByUser => "stopped_by_user",
+            Self::SessionRequired => "session_required",
             Self::NotLeaseHolder => "not_lease_holder",
             Self::NoLease => "no_lease",
             Self::NotPaused => "not_paused",
@@ -111,7 +143,8 @@ impl LeaseError {
             Self::PausedByUser => "the person used this target; wait for hand back, do not retry",
             Self::UserDriving => "the person took over this target; wait for hand back, do not retry",
             Self::StaleAfterHandBack => "the person handed back control; observe the target before acting",
-            Self::StoppedByUser => "the person stopped this session",
+            Self::StoppedByUser => "the person stopped this agent; wait until they allow it again",
+            Self::SessionRequired => "name a session to drive the person's own tabs",
             Self::NotLeaseHolder => "this session does not hold the lease",
             Self::NoLease => "no agent holds this target",
             Self::NotPaused => "the agent is already driving this target",
@@ -167,8 +200,9 @@ impl LeaseTable {
         self.leases.get(target).is_some_and(|entry| entry.needs_fresh_observe)
     }
 
-    pub fn is_stopped(&self, session: &str) -> bool {
-        self.stopped.contains(session)
+    /// Whether the user stopped this principal (`on_behalf_of`, else `actor`).
+    pub fn is_stopped(&self, principal: &str) -> bool {
+        self.stopped.contains(principal)
     }
 
     /// Applies one operation and returns its result plus one frame for each
@@ -210,8 +244,8 @@ impl LeaseTable {
 
     fn reduce(&mut self, op: LeaseOp) -> Result<(), LeaseError> {
         match op {
-            LeaseOp::Acquire { target, who, now_ms } => self.drive(target, who, now_ms, false),
-            LeaseOp::Act { target, who, now_ms } => self.drive(target, who, now_ms, true),
+            LeaseOp::Acquire { target, engine, who, now_ms } => self.drive(target, engine, who, now_ms, false),
+            LeaseOp::Act { target, engine, who, now_ms } => self.drive(target, engine, who, now_ms, true),
             LeaseOp::Observe { target, session } => {
                 if let Some(entry) = self.leases.get_mut(&target) {
                     if entry.lease.session == session && entry.lease.state == LeaseState::Driving {
@@ -259,23 +293,34 @@ impl LeaseTable {
             LeaseOp::Stop { target, origin } => {
                 require_user(&origin)?;
                 let entry = self.leases.remove(&target).ok_or(LeaseError::NoLease)?;
-                self.stopped.insert(entry.lease.session);
+                let principal = entry.lease.on_behalf_of.unwrap_or(entry.lease.actor);
+                self.stopped.insert(principal);
                 Ok(())
             }
-            LeaseOp::Allow { session, origin } => {
+            LeaseOp::Allow { actor, origin } => {
                 require_user(&origin)?;
-                self.stopped.remove(&session);
+                self.stopped.remove(&actor);
                 Ok(())
             }
         }
     }
 
     /// `acquire` (is_act = false) and `act` (is_act = true).
-    fn drive(&mut self, target: String, who: AgentIdentity, now_ms: u64, is_act: bool) -> Result<(), LeaseError> {
+    fn drive(
+        &mut self,
+        target: String,
+        engine: TargetEngine,
+        who: AgentIdentity,
+        now_ms: u64,
+        is_act: bool,
+    ) -> Result<(), LeaseError> {
         if who.origin == USER_ORIGIN {
             return Err(LeaseError::AgentOriginRequired);
         }
-        if self.stopped.contains(&who.session) {
+        if who.implicit_session && engine.requires_explicit_session() {
+            return Err(LeaseError::SessionRequired);
+        }
+        if self.stopped.contains(who.stop_key()) {
             return Err(LeaseError::StoppedByUser);
         }
         let Some(entry) = self.leases.get(&target) else {
