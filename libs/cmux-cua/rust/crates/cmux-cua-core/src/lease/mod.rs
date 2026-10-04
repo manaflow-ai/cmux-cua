@@ -20,11 +20,11 @@ mod tests;
 
 /// Where the vendored `vectors.json` comes from. Update both together.
 pub const VECTORS_SOURCE: &str =
-    "manaflow-ai/cmux@f3f431f4206:schemas/automation-lease/vectors.json";
+    "manaflow-ai/cmux@029f1a8fc4b:schemas/automation-lease/vectors.json";
 
 /// SHA-256 of the vendored `vectors.json`, equal to the file at
 /// [`VECTORS_SOURCE`]. A test fails when the copy drifts.
-pub const VECTORS_SHA256: &str = "003c49f1a7ff9793652a544929b982116f9605f6993d4213340949a87f13f987";
+pub const VECTORS_SHA256: &str = "bab2e9cacaa10a1f0f7d9c50993cc5617c99a37e64383db2764668750391f4f3";
 
 /// The origin value of the person's own authenticated client.
 pub const USER_ORIGIN: &str = "user";
@@ -63,7 +63,7 @@ pub struct AgentIdentity {
 }
 
 impl AgentIdentity {
-    /// The principal a user stop applies to.
+    /// The name a user stop of this agent's lease adds to the stopped set.
     pub fn stop_key(&self) -> &str {
         self.on_behalf_of.as_deref().unwrap_or(&self.actor)
     }
@@ -320,7 +320,11 @@ impl LeaseTable {
         if who.implicit_session && engine.requires_explicit_session() {
             return Err(LeaseError::SessionRequired);
         }
-        if self.stopped.contains(who.stop_key()) {
+        // v3: the agent stops whoever it claims to act for, and every agent
+        // acting for a stopped principal stops too.
+        let actor_stopped = self.stopped.contains(&who.actor);
+        let principal_stopped = who.on_behalf_of.as_ref().is_some_and(|p| self.stopped.contains(p));
+        if actor_stopped || principal_stopped {
             return Err(LeaseError::StoppedByUser);
         }
         let Some(entry) = self.leases.get(&target) else {
