@@ -81,6 +81,7 @@ pub struct Snapshot {
     window_ids: HashSet<u32>,
     front_pid: Option<i32>,
     _lease: Option<SuppressionLease>,
+    taken_at: Instant,
 }
 
 /// Result of `detect()` — what changed during the action window.
@@ -88,6 +89,9 @@ pub struct Snapshot {
 pub struct Changes {
     pub new_windows: Vec<WindowEvent>,
     pub foreground_changed: bool,
+    /// Windows that an earlier action opened after its tool result was
+    /// returned (seen when that action's guard window settled).
+    pub late_new_windows: Vec<WindowEvent>,
 }
 
 impl Changes {
@@ -95,6 +99,7 @@ impl Changes {
         Self {
             new_windows: Vec::new(),
             foreground_changed: false,
+            late_new_windows: Vec::new(),
         }
     }
 
@@ -112,40 +117,48 @@ impl Changes {
     /// **verbatim** so MCP callers that key off the suffix wording
     /// don't need a per-binary special case.
     pub fn result_suffix(&self) -> String {
-        if !self.needs_restore() {
-            return String::new();
-        }
-
-        if !self.new_windows.is_empty() {
-            // Group by app name (stable order), join titles per app.
-            let mut by_app: std::collections::BTreeMap<&str, Vec<&str>> =
-                std::collections::BTreeMap::new();
-            for w in &self.new_windows {
-                by_app.entry(&w.app_name).or_default().push(&w.title);
-            }
-            let summaries: Vec<String> = by_app
-                .into_iter()
-                .map(|(app, titles)| {
-                    let titles: Vec<String> = titles
-                        .into_iter()
-                        .filter(|t| !t.is_empty())
-                        .map(|t| format!("\"{t}\""))
-                        .collect();
-                    if titles.is_empty() {
-                        app.to_string()
-                    } else {
-                        format!("{app} ({})", titles.join(", "))
-                    }
-                })
-                .collect();
+        let mut suffix = if !self.new_windows.is_empty() {
             format!(
                 "\n\n🪟 Action opened new window(s): {}.",
-                summaries.join("; ")
+                summarize_windows(&self.new_windows)
             )
-        } else {
+        } else if self.foreground_changed {
             "\n\n🔀 Action caused a different app to become frontmost.".to_string()
+        } else {
+            String::new()
+        };
+        if !self.late_new_windows.is_empty() {
+            suffix.push_str(&format!(
+                "\n\n🪟 An earlier action opened new window(s) after it returned: {}.",
+                summarize_windows(&self.late_new_windows)
+            ));
         }
+        suffix
     }
+}
+
+/// "App (\"Title\", ...); Other" — grouped by app name in stable order.
+fn summarize_windows(windows: &[WindowEvent]) -> String {
+    let mut by_app: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for w in windows {
+        by_app.entry(&w.app_name).or_default().push(&w.title);
+    }
+    by_app
+        .into_iter()
+        .map(|(app, titles)| {
+            let titles: Vec<String> = titles
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("\"{t}\""))
+                .collect();
+            if titles.is_empty() {
+                app.to_string()
+            } else {
+                format!("{app} ({})", titles.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Default poll deadline — new windows triggered by a click typically
@@ -192,6 +205,13 @@ impl WindowChangeDetector {
     }
 
     fn capture(prior_front: Option<i32>, suppress_focus: bool) -> Snapshot {
+        // A new action is about to fire: settle the previous action's guard
+        // first so its late windows are attributed to it, not to this one.
+        let previous = lock(&GUARD).flush();
+        if let Some(previous) = previous {
+            settle(previous);
+        }
+
         let window_ids: HashSet<u32> = windows::visible_windows()
             .into_iter()
             .filter(|w| w.layer == 0)
@@ -215,6 +235,7 @@ impl WindowChangeDetector {
             window_ids,
             front_pid: prior_front,
             _lease: lease,
+            taken_at: Instant::now(),
         }
     }
 }
@@ -260,10 +281,49 @@ impl Snapshot {
             .get("_codex_compat_fast_action")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if fast {
-            return self.detect_async_fast().await;
-        }
-        self.detect_async().await
+        let deadline = self.taken_at + DEFAULT_TIMEOUT;
+        let observed = tokio::task::spawn_blocking(move || self.observe_now()).await;
+        let mut changes = match observed {
+            Ok((changes, guard)) => {
+                // Codex-compat actions verify with an explicit screenshot, so
+                // they end the guard now (the lease drops with `guard`). Native
+                // actions keep it armed until the deadline or the next action,
+                // without making this reply wait for it.
+                if !fast {
+                    arm_guard(guard, deadline);
+                }
+                changes
+            }
+            Err(_) => Changes::no_change(),
+        };
+        changes.late_new_windows = take_late_windows();
+        changes
+    }
+
+    /// One observation right after the action. Returns the changes seen now
+    /// and the guard (lease + every window visible now) for later settling.
+    fn observe_now(self) -> (Changes, PendingGuard) {
+        let current: Vec<WindowInfo> = windows::visible_windows()
+            .into_iter()
+            .filter(|w| w.layer == 0)
+            .collect();
+        let (new_windows, _closed) = Self::diff(&self.window_ids, &current);
+        let foreground_changed = match (self.front_pid, apps::frontmost_pid()) {
+            (Some(orig), Some(cur)) => orig != cur,
+            _ => false,
+        };
+        let guard = PendingGuard {
+            window_ids: current.iter().map(|w| w.window_id).collect(),
+            _lease: self._lease,
+        };
+        (
+            Changes {
+                new_windows,
+                foreground_changed,
+                late_new_windows: Vec::new(),
+            },
+            guard,
+        )
     }
 
     /// Perform one immediate post-action observation and release suppression.
@@ -318,6 +378,7 @@ impl Snapshot {
                 return Changes {
                     new_windows,
                     foreground_changed,
+                    late_new_windows: Vec::new(),
                 };
             }
             if Instant::now() >= deadline {
@@ -355,6 +416,7 @@ impl Snapshot {
         Changes {
             new_windows,
             foreground_changed,
+            late_new_windows: Vec::new(),
         }
     }
 
@@ -366,13 +428,7 @@ impl Snapshot {
     /// list of currently-visible windows, return the (opened, closed)
     /// classification.
     ///
-    /// `#[allow(dead_code)]`: today only the `#[cfg(test)]` block below
-    /// constructs this — production callers `wait_for_window_change` /
-    /// `wait_for_window_close` keep the (opened, closed) split inline.
-    /// Kept `pub(crate)` because the doc comment near the top of this
-    /// `impl` block calls it out as the entry point for unit-testing the
-    /// diff logic without driving the live window enumerator.
-    #[allow(dead_code)]
+    /// Used by the reply observation and by guard settling.
     pub(crate) fn diff(
         snapshot_ids: &HashSet<u32>,
         current: &[WindowInfo],
@@ -395,6 +451,110 @@ impl Snapshot {
             .collect();
         (opened, closed)
     }
+}
+
+// ── Guard window settle slot ─────────────────────────────────────────────────
+
+/// Holds the guard window of the most recent native action after its tool
+/// result was returned. The guard keeps the wildcard focus-steal lease armed
+/// and remembers the before-state, so windows the action opens late are
+/// reported on the next tool result instead of making every action wait.
+///
+/// One slot per process: a new action flushes the previous guard (its late
+/// windows are diffed before the new action fires), and the guard's one-shot
+/// deadline task expires it only if no newer action replaced it.
+pub(crate) struct SettleSlot<T> {
+    generation: u64,
+    pending: Option<T>,
+}
+
+impl<T> SettleSlot<T> {
+    pub(crate) const fn new() -> Self {
+        Self { generation: 0, pending: None }
+    }
+
+    /// Stores `value` as the pending guard. Returns its generation and the
+    /// guard it replaced, which the caller must settle now.
+    pub(crate) fn arm(&mut self, value: T) -> (u64, Option<T>) {
+        self.generation = self.generation.wrapping_add(1);
+        (self.generation, self.pending.replace(value))
+    }
+
+    /// Takes the pending guard (a new action is about to fire).
+    pub(crate) fn flush(&mut self) -> Option<T> {
+        self.pending.take()
+    }
+
+    /// Takes the pending guard only if it is still `generation`.
+    pub(crate) fn expire(&mut self, generation: u64) -> Option<T> {
+        if generation == self.generation {
+            self.pending.take()
+        } else {
+            None
+        }
+    }
+}
+
+/// The guard of the last native action: the wildcard focus-steal lease and
+/// the windows visible when its reply was sent.
+struct PendingGuard {
+    window_ids: HashSet<u32>,
+    _lease: Option<SuppressionLease>,
+}
+
+/// Late windows are reported once; cap them so a busy desktop cannot grow
+/// the buffer between two tool calls.
+const MAX_LATE_WINDOWS: usize = 32;
+
+static GUARD: std::sync::Mutex<SettleSlot<PendingGuard>> = std::sync::Mutex::new(SettleSlot::new());
+static LATE_WINDOWS: std::sync::Mutex<Vec<WindowEvent>> = std::sync::Mutex::new(Vec::new());
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Ends a guard: one diff against the windows visible at reply time, then the
+/// lease drops (with `guard`).
+fn settle(guard: PendingGuard) {
+    let current: Vec<WindowInfo> = windows::visible_windows()
+        .into_iter()
+        .filter(|w| w.layer == 0)
+        .collect();
+    let (opened, _closed) = Snapshot::diff(&guard.window_ids, &current);
+    if !opened.is_empty() {
+        let mut late = lock(&LATE_WINDOWS);
+        late.extend(opened);
+        let overflow = late.len().saturating_sub(MAX_LATE_WINDOWS);
+        late.drain(..overflow);
+    }
+}
+
+fn take_late_windows() -> Vec<WindowEvent> {
+    std::mem::take(&mut *lock(&LATE_WINDOWS))
+}
+
+/// Keeps `guard` armed until `deadline` (a one-shot timer, no polling) unless
+/// the next action settles it first.
+fn arm_guard(guard: PendingGuard, deadline: Instant) {
+    let (generation, replaced) = lock(&GUARD).arm(guard);
+    if let Some(replaced) = replaced {
+        settle(replaced);
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        let expired = lock(&GUARD).expire(generation);
+        if let Some(guard) = expired {
+            settle(guard);
+        }
+        return;
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    runtime.spawn(async move {
+        tokio::time::sleep(remaining).await;
+        let expired = lock(&GUARD).expire(generation);
+        if let Some(guard) = expired {
+            let _ = tokio::task::spawn_blocking(move || settle(guard)).await;
+        }
+    });
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -479,6 +639,7 @@ mod tests {
                 title: "New Tab".into(),
             }],
             foreground_changed: false,
+            late_new_windows: Vec::new(),
         };
         assert!(c.needs_restore());
         assert_eq!(
@@ -511,6 +672,7 @@ mod tests {
                 },
             ],
             foreground_changed: true,
+            late_new_windows: Vec::new(),
         };
         let suffix = c.result_suffix();
         // BTreeMap sort order is alphabetical by app name → Chrome before Mail.
@@ -525,6 +687,7 @@ mod tests {
         let c = Changes {
             new_windows: vec![],
             foreground_changed: true,
+            late_new_windows: Vec::new(),
         };
         assert!(c.needs_restore());
         assert_eq!(
@@ -543,6 +706,7 @@ mod tests {
                 title: "".into(),
             }],
             foreground_changed: false,
+            late_new_windows: Vec::new(),
         };
         // No title → just the app name, no parentheses.
         assert_eq!(
@@ -566,5 +730,53 @@ mod tests {
         // panicking (no frontmost to restore to).
         let snap_none = WindowChangeDetector::snapshot(None);
         assert_eq!(snap_none.front_pid(), None);
+    }
+
+    #[test]
+    fn settle_slot_expires_only_its_own_generation() {
+        let mut slot = SettleSlot::new();
+        let (first, replaced) = slot.arm("a");
+        assert_eq!(replaced, None);
+        let (second, replaced) = slot.arm("b");
+        assert_eq!(replaced, Some("a"), "arming hands back the guard it replaced");
+        assert_eq!(slot.expire(first), None, "a stale deadline must not take the newer guard");
+        assert_eq!(slot.expire(second), Some("b"));
+        assert_eq!(slot.expire(second), None);
+    }
+
+    #[test]
+    fn settle_slot_flush_takes_the_pending_guard() {
+        let mut slot = SettleSlot::new();
+        let (generation, _) = slot.arm(7);
+        assert_eq!(slot.flush(), Some(7));
+        assert_eq!(slot.flush(), None);
+        assert_eq!(slot.expire(generation), None, "a flushed guard is settled exactly once");
+    }
+
+    #[test]
+    fn result_suffix_reports_windows_an_earlier_action_opened() {
+        let mut c = Changes::no_change();
+        c.late_new_windows.push(WindowEvent {
+            window_id: 5,
+            pid: 42,
+            app_name: "Safari".into(),
+            title: "Sign In".into(),
+        });
+        let suffix = c.result_suffix();
+        assert!(suffix.contains("earlier action"), "{suffix}");
+        assert!(suffix.contains("Safari (\"Sign In\")"), "{suffix}");
+        assert!(!c.needs_restore(), "late windows were already guarded; no restore now");
+    }
+
+    #[tokio::test]
+    async fn native_detect_replies_without_waiting_for_the_guard_window() {
+        let snapshot = WindowChangeDetector::snapshot(None);
+        let started = Instant::now();
+        let _ = snapshot.detect_async_for_args(&serde_json::json!({})).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "a native action reply must not wait for the 1 s guard window (took {elapsed:?})"
+        );
     }
 }

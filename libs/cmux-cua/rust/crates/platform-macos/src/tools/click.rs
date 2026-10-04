@@ -544,7 +544,19 @@ impl Tool for ClickTool {
                     }
                     ToolResult::text(msg).with_structured(structured)
                 }
-                Ok(Err(e)) => ToolResult::error(format!("AX action failed: {e}")),
+                Ok(Err(e)) => match e.downcast_ref::<AxActionFailure>() {
+                    Some(failure) => {
+                        let mut result = ToolResult::error(format!("AX action failed: {failure}"));
+                        result.structured_content = Some(serde_json::json!({
+                            "path": "ax",
+                            "verified": false,
+                            "effect": failure.effect,
+                            "error_code": failure.code,
+                        }));
+                        result
+                    }
+                    None => ToolResult::error(format!("AX action failed: {e}")),
+                },
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             }
         } else if let (Some(mut cx), Some(mut cy)) = (x, y) {
@@ -996,6 +1008,67 @@ fn click_dispatch_preflight(args: &Value) -> Result<(), ToolResult> {
 /// the driver's only signal that the press likely did nothing. The caller turns
 /// it into `effect: "suspected_noop"` + an escalation hint so the agent crosses
 /// to the vision/pixel path instead of trusting a hollow success.
+/// How a failed AX action is reported to the agent (code, effect, guidance).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AxActionFailure {
+    pub code: &'static str,
+    /// `unknown`: the press may have landed; `not_landed`: it did not.
+    pub effect: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for AxActionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for AxActionFailure {}
+
+/// Maps an `AXUIElementPerformAction` error to what the agent should do.
+/// A press is not idempotent, so an error that leaves the effect unknown is
+/// never retried here: the agent must observe before it acts again.
+pub(crate) fn classify_ax_action_error(action: &str, err: i32) -> AxActionFailure {
+    match err {
+        // kAXErrorCannotComplete: the app did not answer in time. The action
+        // may still have been delivered.
+        -25204 => AxActionFailure {
+            code: "ax_cannot_complete",
+            effect: "unknown",
+            message: format!(
+                "{action} returned -25204 (the app did not answer in time). The action may \
+                 or may not have landed: observe the window (get_window_state) before you \
+                 retry, or a retry can act twice."
+            ),
+        },
+        // kAXErrorActionUnsupported
+        -25205 => AxActionFailure {
+            code: "ax_action_unsupported",
+            effect: "not_landed",
+            message: format!(
+                "{action} returned -25205: the element does not support this action. Use a \
+                 pixel click (x,y) from the get_window_state screenshot."
+            ),
+        },
+        // kAXErrorInvalidUIElement
+        -25202 => AxActionFailure {
+            code: "ax_element_invalid",
+            effect: "not_landed",
+            message: format!(
+                "{action} returned -25202: the element is gone. Call get_window_state again \
+                 and use the new element_index."
+            ),
+        },
+        other => AxActionFailure {
+            code: "ax_error",
+            effect: "unknown",
+            message: format!(
+                "{action} returned {other}. Observe the window before you retry."
+            ),
+        },
+    }
+}
+
 fn perform_ax_click(
     element_ptr: usize,
     idx: usize,
@@ -1015,7 +1088,7 @@ fn perform_ax_click(
     gate.check()?;
     let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
     if err != crate::ax::bindings::kAXErrorSuccess {
-        anyhow::bail!("AXUIElementPerformAction({ax_action}) returned {err}");
+        return Err(classify_ax_action_error(ax_action, err).into());
     }
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
@@ -1121,6 +1194,26 @@ fn map_action(action: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ax_cannot_complete_reports_an_unknown_effect_and_asks_to_observe() {
+        let failure = super::classify_ax_action_error("AXPress", -25204);
+        assert_eq!(failure.code, "ax_cannot_complete");
+        assert_eq!(failure.effect, "unknown");
+        assert!(failure.message.contains("observe"), "{}", failure.message);
+        assert!(failure.message.contains("AXPress"), "{}", failure.message);
+    }
+
+    #[test]
+    fn unsupported_and_invalid_elements_did_not_land() {
+        let unsupported = super::classify_ax_action_error("AXPress", -25205);
+        assert_eq!((unsupported.code, unsupported.effect), ("ax_action_unsupported", "not_landed"));
+        let invalid = super::classify_ax_action_error("AXPress", -25202);
+        assert_eq!((invalid.code, invalid.effect), ("ax_element_invalid", "not_landed"));
+        assert!(invalid.message.contains("get_window_state"), "{}", invalid.message);
+        let other = super::classify_ax_action_error("AXPress", -25200);
+        assert_eq!((other.code, other.effect), ("ax_error", "unknown"));
+    }
+
     use super::*;
 
     /// Surface 5: schema must advertise the new `button` field with the three
