@@ -703,9 +703,26 @@ jobs:
       # on main. The default GITHUB_TOKEN (github-actions[bot]) is NOT on
       # the bypass list and gets rejected here. Mirror the Swift CD
       # workflow's auth setup so the bake-version push lands.
+      # The version-only release commit already bakes the installers
+      # (check-release-version.py enforces it). The push below only re-syncs
+      # them, so without the release App it is skipped, not failed.
+      - name: Bake push credentials
+        id: bake-creds
+        shell: bash
+        env:
+          RELEASE_APP_ID: ${{ secrets.RELEASE_APP_ID }}
+          RELEASE_APP_PRIVATE_KEY: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          if [[ -n "$RELEASE_APP_ID" && -n "$RELEASE_APP_PRIVATE_KEY" ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=bake push skipped::no release App credentials; the release commit already carries the baked version"
+          fi
+
       - name: Generate GitHub App token (for bake-version push)
         id: app-token
-        if: startsWith(github.ref, 'refs/tags/cmux-cua-v')
+        if: startsWith(github.ref, 'refs/tags/cmux-cua-v') && steps.bake-creds.outputs.present == 'true'
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
@@ -714,7 +731,7 @@ jobs:
           repositories: ${{ github.event.repository.name }}
 
       - name: Bake version into install scripts (commit + push)
-        if: startsWith(github.ref, 'refs/tags/cmux-cua-v')
+        if: startsWith(github.ref, 'refs/tags/cmux-cua-v') && steps.bake-creds.outputs.present == 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
