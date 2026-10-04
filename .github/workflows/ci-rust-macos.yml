@@ -52,6 +52,9 @@ jobs:
       - name: Run core and driver unit tests
         working-directory: libs/cmux-cua/rust
         run: cargo test -p cmux-cua-core -p cmux-cua --lib --bins --locked
+      - name: Run cursor-overlay tests (glide vectors shared with Swift)
+        working-directory: libs/cmux-cua/rust
+        run: cargo test -p cursor-overlay --locked
       - name: Run macOS platform unit tests
         working-directory: libs/cmux-cua/rust
         run: cargo test -p platform-macos --lib --locked
