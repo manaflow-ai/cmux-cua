@@ -378,25 +378,25 @@ jobs:
           # The bundle ships unsigned (notarization happens in the next step).
           # TCC keys grants on the bundle identity (com.cmuxterm.cua).
           VERSION="${{ steps.version.outputs.version }}"
-          mkdir -p release/cmux Computer Use.app
-          cp -R scripts/CmuxCuaBundle/Contents release/cmux Computer Use.app/Contents
+          mkdir -p "release/cmux Computer Use.app"
+          cp -R scripts/CmuxCuaBundle/Contents "release/cmux Computer Use.app/Contents"
           cp release/universal/cmux-cua \
-             release/cmux Computer Use.app/Contents/MacOS/cmux-cua
-          chmod +x release/cmux Computer Use.app/Contents/MacOS/cmux-cua
+             "release/cmux Computer Use.app/Contents/MacOS/cmux-cua"
+          chmod +x "release/cmux Computer Use.app/Contents/MacOS/cmux-cua"
           # Stamp the release version into Info.plist so the bundle
           # version tracks the tag instead of whatever was last
           # checked in. Without this the in-tree Info.plist's
           # CFBundleShortVersionString drifts from the release tag on
           # every cut. CodeRabbit #4.
           plutil -replace CFBundleShortVersionString -string "$VERSION" \
-            release/cmux Computer Use.app/Contents/Info.plist
+            "release/cmux Computer Use.app/Contents/Info.plist"
           plutil -replace CFBundleVersion -string "$VERSION" \
-            release/cmux Computer Use.app/Contents/Info.plist
+            "release/cmux Computer Use.app/Contents/Info.plist"
           # Remove the .gitkeep we use in source control — it's not
           # part of the runtime bundle.
-          rm -f release/cmux Computer Use.app/Contents/MacOS/.gitkeep
-          ls -la release/cmux Computer Use.app/Contents/MacOS
-          plutil -p release/cmux Computer Use.app/Contents/Info.plist | grep -E 'CFBundle(Short)?Version'
+          rm -f "release/cmux Computer Use.app/Contents/MacOS/.gitkeep"
+          ls -la "release/cmux Computer Use.app/Contents/MacOS"
+          plutil -p "release/cmux Computer Use.app/Contents/Info.plist" | grep -E 'CFBundle(Short)?Version'
       - name: Codesign + notarize + staple cmux Computer Use.app
         if: steps.signing.outputs.signed == 'true'
         working-directory: libs/cmux-cua/rust
@@ -414,26 +414,26 @@ jobs:
           # on the bundle wrapper.
           codesign --force --deep --timestamp --options runtime \
             --entitlements scripts/CmuxCua.entitlements \
-            --sign "$IDENTITY" release/cmux Computer Use.app
-          codesign --verify --strict --verbose=2 release/cmux Computer Use.app
+            --sign "$IDENTITY" "release/cmux Computer Use.app"
+          codesign --verify --strict --verbose=2 "release/cmux Computer Use.app"
 
           # notarytool wants a zip (or .dmg / .pkg). Build one next to
           # the .app, submit, wait, then staple the bundle in place.
-          /usr/bin/ditto -c -k --keepParent release/cmux Computer Use.app \
-            release/cmux Computer Use.app.zip
+          /usr/bin/ditto -c -k --keepParent "release/cmux Computer Use.app" \
+            "release/cmux Computer Use.app.zip"
 
-          xcrun notarytool submit release/cmux Computer Use.app.zip \
+          xcrun notarytool submit "release/cmux Computer Use.app.zip" \
             --apple-id "$APPLE_ID" \
             --team-id "$TEAM_ID" \
             --password "$APP_SPECIFIC_PASSWORD" \
             --wait --timeout 20m
 
-          xcrun stapler staple release/cmux Computer Use.app
-          spctl -a -vv -t exec release/cmux Computer Use.app
+          xcrun stapler staple "release/cmux Computer Use.app"
+          spctl -a -vv -t exec "release/cmux Computer Use.app"
 
           # The zip we used to submit is throwaway; the packaging step
           # below builds the final tarballs from the stapled .app.
-          rm -f release/cmux Computer Use.app.zip
+          rm -f "release/cmux Computer Use.app.zip"
       - name: Package
         working-directory: libs/cmux-cua/rust
         env:
@@ -460,7 +460,7 @@ jobs:
             # can drop it into /Applications/cmux Computer Use.app for TCC
             # attribution (issue #1525). Tarball callers that want only
             # the bare binary can grab the *-binary.tar.gz below.
-            cp -R release/cmux Computer Use.app "release/${STAGE}/cmux Computer Use.app"
+            cp -R "release/cmux Computer Use.app" "release/${STAGE}/cmux Computer Use.app"
             cp ../../LICENSE.md "release/${STAGE}/LICENSE" 2>/dev/null || true
             (cd release && tar -czf "${STAGE}.tar.gz" "${STAGE}")
           done
