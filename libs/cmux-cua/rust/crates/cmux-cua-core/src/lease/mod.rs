@@ -63,7 +63,7 @@ pub struct AgentIdentity {
 }
 
 impl AgentIdentity {
-    /// The principal a user stop applies to.
+    /// The name a user stop of this agent's lease adds to the stopped set.
     pub fn stop_key(&self) -> &str {
         self.on_behalf_of.as_deref().unwrap_or(&self.actor)
     }
@@ -320,7 +320,11 @@ impl LeaseTable {
         if who.implicit_session && engine.requires_explicit_session() {
             return Err(LeaseError::SessionRequired);
         }
-        if self.stopped.contains(who.stop_key()) {
+        // v3: the agent stops whoever it claims to act for, and every agent
+        // acting for a stopped principal stops too.
+        let actor_stopped = self.stopped.contains(&who.actor);
+        let principal_stopped = who.on_behalf_of.as_ref().is_some_and(|p| self.stopped.contains(p));
+        if actor_stopped || principal_stopped {
             return Err(LeaseError::StoppedByUser);
         }
         let Some(entry) = self.leases.get(&target) else {
