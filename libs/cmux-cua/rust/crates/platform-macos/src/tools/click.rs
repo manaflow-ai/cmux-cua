@@ -447,9 +447,9 @@ impl Tool for ClickTool {
             let prior_front = apps::frontmost_pid();
             let foreground = delivery_mode.is_foreground();
             let snapshot = if foreground {
-                WindowChangeDetector::snapshot_without_suppression(prior_front)
+                WindowChangeDetector::snapshot_without_suppression_for_session(prior_front, &super::cursor_tools::resolve_cursor_key(&args))
             } else {
-                WindowChangeDetector::snapshot(prior_front)
+                WindowChangeDetector::snapshot_for_session(prior_front, &super::cursor_tools::resolve_cursor_key(&args))
             };
 
             // Run AX work on a blocking thread (can't block async executor).
@@ -827,7 +827,7 @@ impl Tool for ClickTool {
             // or a Safari link that activates a new tab — same side-effect
             // shape as the AX path, so we wrap identically.
             let prior_front = apps::frontmost_pid();
-            let snapshot = WindowChangeDetector::snapshot(prior_front);
+            let snapshot = WindowChangeDetector::snapshot_for_session(prior_front, &super::cursor_tools::resolve_cursor_key(&args));
 
             let mods_owned = modifiers.clone();
             // Surface 5: route to the right/middle CGEvent primitives when

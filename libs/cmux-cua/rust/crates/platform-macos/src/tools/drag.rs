@@ -283,7 +283,7 @@ impl Tool for DragTool {
         // mouseDown half-event alone can activate the target app on some
         // Chromium builds. Wrap to catch + report both.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let snapshot = WindowChangeDetector::snapshot_for_session(prior_front, &super::cursor_tools::resolve_cursor_key(&args));
 
         // Dispatch blocking drag synthesis.
         let mods_owned = modifiers.clone();
