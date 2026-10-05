@@ -2,10 +2,11 @@
 """Check cmux-cua release archives and the published asset set.
 
 usage:
-  check-release-assets.py archive --license LICENSE ARCHIVE...
+  check-release-assets.py archive (--license FILE | --license-git REV:PATH) ARCHIVE...
   check-release-assets.py expected --version X.Y.Z --macos signed|unsigned
   check-release-assets.py sums DIR
-  check-release-assets.py release --version X.Y.Z --macos signed|unsigned --license LICENSE DIR
+  check-release-assets.py release --version X.Y.Z --macos signed|unsigned (--license FILE | --license-git REV:PATH) DIR
+  check-release-assets.py previous-tag --current TAG < TAGS
 
 archive   Open each archive. A directory archive (cmux-cua-V-LABEL.tar.gz or
           .zip) must hold only the top directory cmux-cua-V-LABEL, with the
@@ -18,6 +19,15 @@ sums      Print SHA256SUMS (sha256sum format) for every file in DIR except
 release   DIR holds the downloaded release assets. The names must equal the
           expected set, SHA256SUMS must list every other asset with its hash,
           and every archive must pass the archive check.
+previous-tag  Read tag names (one per line) on stdin and print the highest
+          cmux-cua-vX.Y.Z below TAG, or nothing. The workflow feeds it the
+          tags of published releases, so a tag without a release (the
+          orphan cmux-cua-v0.8.5) never starts the release notes.
+
+--license-git reads the committed blob (`git cat-file blob REV:PATH` in the
+current directory), so every job compares against the same bytes whatever
+its checkout did to line endings (tag run 37299717168: the Windows job
+compared its CRLF zip against its own CRLF checkout and passed).
 
 Exit 1 with every reason on failure. Python 3.9+ (the Linux build container
 is Debian 11).
@@ -26,6 +36,7 @@ import argparse
 import hashlib
 import re
 import stat
+import subprocess
 import sys
 import tarfile
 import zipfile
@@ -170,11 +181,42 @@ def check_release(directory, version, macos, license_bytes):
     return problems
 
 
+TAG_RE = re.compile(r"cmux-cua-v([0-9]+)\.([0-9]+)\.([0-9]+)")
+
+
+def previous_tag(current, tags):
+    m = TAG_RE.fullmatch(current)
+    if not m:
+        raise SystemExit(f"--current must be cmux-cua-vX.Y.Z (got {current!r})")
+    limit = tuple(map(int, m.groups()))
+    lower = []
+    for tag in tags:
+        t = TAG_RE.fullmatch(tag.strip())
+        if t and tuple(map(int, t.groups())) < limit:
+            lower.append((tuple(map(int, t.groups())), tag.strip()))
+    return max(lower)[1] if lower else ""
+
+
+def read_license(args):
+    if args.license is not None:
+        return args.license.read_bytes()
+    done = subprocess.run(["git", "cat-file", "blob", args.license_git], capture_output=True)
+    if done.returncode != 0:
+        raise SystemExit(f"cannot read {args.license_git}: {done.stderr.decode().strip()}")
+    return done.stdout
+
+
+def add_license_args(p):
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--license", type=Path)
+    g.add_argument("--license-git", metavar="REV:PATH")
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("archive")
-    a.add_argument("--license", required=True, type=Path)
+    add_license_args(a)
     a.add_argument("archives", nargs="+", type=Path)
     e = sub.add_parser("expected")
     e.add_argument("--version", required=True)
@@ -184,17 +226,24 @@ def main(argv):
     r = sub.add_parser("release")
     r.add_argument("--version", required=True)
     r.add_argument("--macos", required=True, choices=("signed", "unsigned"))
-    r.add_argument("--license", required=True, type=Path)
+    add_license_args(r)
     r.add_argument("dir", type=Path)
+    t = sub.add_parser("previous-tag")
+    t.add_argument("--current", required=True)
     args = parser.parse_args(argv)
 
     if args.cmd == "expected":
         print("\n".join(expected_assets(args.version, args.macos)))
         return 0
+    if args.cmd == "previous-tag":
+        prev = previous_tag(args.current, sys.stdin.read().splitlines())
+        if prev:
+            print(prev)
+        return 0
     if args.cmd == "sums":
         print("\n".join(sums_lines(args.dir)))
         return 0
-    license_bytes = args.license.read_bytes()
+    license_bytes = read_license(args)
     if args.cmd == "archive":
         problems = []
         for path in args.archives:

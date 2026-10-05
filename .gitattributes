@@ -1,2 +1,5 @@
 *	        text=auto
 *.sh		text eol=lf
+# Release archives ship LICENSE.md as LICENSE; every checkout (Windows too)
+# must give the committed LF bytes (tag run 37299717168).
+LICENSE.md	text eol=lf
