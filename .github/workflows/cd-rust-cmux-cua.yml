@@ -168,7 +168,7 @@ jobs:
           ls -lh "release/${STAGE}.tar.gz" "release/${STAGE}-binary.tar.gz"
       - name: Check archives (binary + LICENSE)
         run: |
-          python3 libs/cmux-cua/scripts/check-release-assets.py archive --license LICENSE.md \
+          python3 libs/cmux-cua/scripts/check-release-assets.py archive --license-git HEAD:LICENSE.md \
             libs/cmux-cua/rust/release/cmux-cua-*-linux-${{ matrix.arch }}*.tar.gz
       - uses: actions/upload-artifact@v4
         with:
@@ -255,7 +255,7 @@ jobs:
       - name: Check archives (binaries + LICENSE)
         shell: bash
         run: |
-          python libs/cmux-cua/scripts/check-release-assets.py archive --license LICENSE.md \
+          python libs/cmux-cua/scripts/check-release-assets.py archive --license-git HEAD:LICENSE.md \
             libs/cmux-cua/rust/release/cmux-cua-*-windows-${{ matrix.arch }}*.zip
       - uses: actions/upload-artifact@v4
         with:
@@ -495,7 +495,7 @@ jobs:
           ls -lh release/*.tar.gz
       - name: Check archives (binary + app + LICENSE)
         run: |
-          python3 libs/cmux-cua/scripts/check-release-assets.py archive --license LICENSE.md \
+          python3 libs/cmux-cua/scripts/check-release-assets.py archive --license-git HEAD:LICENSE.md \
             libs/cmux-cua/rust/release/cmux-cua-*-darwin-*.tar.gz
       - uses: actions/upload-artifact@v4
         with:
@@ -654,14 +654,20 @@ jobs:
           MACOS: ${{ needs.build-macos-universal.outputs.signed == 'true' && 'signed' || 'unsigned' }}
         run: |
           python3 libs/cmux-cua/scripts/check-release-assets.py release \
-            --version "$VERSION" --macos "$MACOS" --license LICENSE.md release-upload
+            --version "$VERSION" --macos "$MACOS" --license-git HEAD:LICENSE.md release-upload
 
+      # The notes start at the previous PUBLISHED release (non-draft, any
+      # pre-release flag), not the previous tag: cmux-cua-v0.8.5 is a tag
+      # whose run failed before upload and has no release.
       - name: Generate path-filtered release notes
         id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          PREV_TAG=$(git tag -l "cmux-cua-v*" --sort=-v:refname \
-            | grep -v "^${{ github.ref_name }}$" \
-            | head -n 1 || echo "")
+          PREV_TAG=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+              --jq '.[] | select(.draft == false) | .tag_name' \
+            | python3 libs/cmux-cua/scripts/check-release-assets.py previous-tag --current "$GITHUB_REF_NAME")
+          echo "Release notes start at: ${PREV_TAG:-<none>}"
           if [ -n "$PREV_TAG" ]; then
             NOTES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"* %s (%h) by @%an" -- "libs/cmux-cua/rust" | head -50)
           else
@@ -859,7 +865,7 @@ jobs:
           MACOS: ${{ needs.build-macos-universal.outputs.signed == 'true' && 'signed' || 'unsigned' }}
         run: |
           python3 libs/cmux-cua/scripts/check-release-assets.py release \
-            --version "$VERSION" --macos "$MACOS" --license LICENSE.md published
+            --version "$VERSION" --macos "$MACOS" --license-git HEAD:LICENSE.md published
           (cd published && sha256sum -c SHA256SUMS)
       - name: Mark the release as a full release
         env:
