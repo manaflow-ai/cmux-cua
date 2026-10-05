@@ -5,6 +5,8 @@ on:
     paths:
       - ".github/scripts/**"
       - ".github/workflows/ci-test-scripts.yml"
+      - "libs/cmux-cua/scripts/**"
+      - ".github/workflows/cd-rust-cmux-cua.yml"
 
 jobs:
   test:
@@ -28,3 +30,8 @@ jobs:
         run: |
           cd .github/scripts
           pytest tests/ -v
+
+      # The cmux-cua release scripts (version and archive gates) and their
+      # workflow wiring tests. The release workflow runs them too.
+      - name: Run cmux-cua release script tests
+        run: python -m unittest discover -s libs/cmux-cua/scripts/tests -v
