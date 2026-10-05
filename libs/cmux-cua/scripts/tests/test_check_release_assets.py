@@ -22,8 +22,9 @@ LICENSE = b"MIT License\n\nCopyright (c) 2025 Cua AI, Inc.\n"
 V = "0.8.5"
 
 
-def run(*args: str) -> subprocess.CompletedProcess:
-    return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True)
+def run(*args: str, cwd=None, stdin=None) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True,
+                          cwd=cwd, input=stdin)
 
 
 def write_tar(path: Path, members: dict) -> None:
@@ -270,6 +271,70 @@ class SumsTest(Fixture):
             f"{hashlib.sha256(b'a').hexdigest()}  a.zip",
             f"{hashlib.sha256(b'b').hexdigest()}  b.tar.gz",
         ])
+
+
+class LicenseFromGitTest(Fixture):
+    """Tag run 37299717168 (cmux-cua-v0.8.5): the Windows checkout turned
+    LICENSE.md into CRLF, the Windows job compared its zip against that same
+    CRLF copy and passed, and the release job (LF checkout) rejected it. Every
+    job now compares against the committed blob, not its working copy."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        git = ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.autocrlf=false"]
+        subprocess.run(git[:3] + ["init", "-q"], check=True)
+        (self.repo / "LICENSE.md").write_bytes(LICENSE)
+        subprocess.run(git + ["add", "LICENSE.md"], check=True)
+        subprocess.run(git + ["commit", "-qm", "license"], check=True)
+        # The working copy drifts (as a CRLF checkout does); the blob does not.
+        (self.repo / "LICENSE.md").write_bytes(LICENSE.replace(b"\n", b"\r\n"))
+
+    def archive_git(self, path: Path) -> subprocess.CompletedProcess:
+        return run("archive", "--license-git", "HEAD:LICENSE.md", str(path), cwd=str(self.repo))
+
+    def test_archive_matching_the_committed_blob_passes(self):
+        path = self.out / f"cmux-cua-{V}-linux-x86_64.tar.gz"
+        write_tar(path, linux_dir())
+        done = self.archive_git(path)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_archive_matching_only_the_crlf_working_copy_fails(self):
+        path = self.out / f"cmux-cua-{V}-windows-x86_64.zip"
+        members = win_dir("windows-x86_64")
+        members[f"cmux-cua-{V}-windows-x86_64/LICENSE"] = LICENSE.replace(b"\n", b"\r\n")
+        write_zip(path, members)
+        done = self.archive_git(path)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("differs from the repository license", done.stderr)
+
+    def test_release_check_reads_the_blob_too(self):
+        build_release(self.out)
+        done = run("release", "--version", V, "--macos", "unsigned", "--license-git", "HEAD:LICENSE.md",
+                   str(self.out), cwd=str(self.repo))
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+
+class PreviousTagTest(unittest.TestCase):
+    """Release notes start at the previous PUBLISHED cmux-cua release. The
+    orphan tag cmux-cua-v0.8.5 has no release and must never be picked."""
+
+    def previous(self, current: str, tags: str) -> str:
+        done = run("previous-tag", "--current", current, stdin=tags)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.strip()
+
+    def test_picks_the_highest_lower_release_tag(self):
+        tags = "cmux-cua-v0.8.3\ncmux-cua-v0.8.4\nlume-v0.9.9\ncmux-cua-v0.8.2\n"
+        self.assertEqual(self.previous("cmux-cua-v0.8.6", tags), "cmux-cua-v0.8.4")
+
+    def test_versions_sort_numerically_and_skip_current_and_newer(self):
+        tags = "cmux-cua-v0.8.9\ncmux-cua-v0.8.10\ncmux-cua-v0.8.11\ncmux-cua-v0.9.0\n"
+        self.assertEqual(self.previous("cmux-cua-v0.8.11", tags), "cmux-cua-v0.8.10")
+
+    def test_no_previous_release_prints_nothing(self):
+        self.assertEqual(self.previous("cmux-cua-v0.1.0", "lume-v1.0.0\n"), "")
 
 
 if __name__ == "__main__":
