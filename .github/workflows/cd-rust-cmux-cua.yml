@@ -14,6 +14,17 @@ on:
   push:
     tags:
       - "cmux-cua-v*"
+  # Dry run of the Linux release path (container, checkout, build, package,
+  # archive check) on PRs that change it. Windows, macOS, release and publish
+  # do not run on a PR. Tags cmux-cua-v0.8.5 and v0.8.6 failed in steps that
+  # PR CI never ran.
+  pull_request:
+    paths:
+      - ".github/workflows/cd-rust-cmux-cua.yml"
+      - "libs/cmux-cua/scripts/check-release-assets.py"
+      - "libs/cmux-cua/scripts/check-release-version.py"
+      - ".gitattributes"
+      - "LICENSE.md"
   workflow_dispatch:
     inputs:
       version:
@@ -36,12 +47,22 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - name: Tag matches the workspace version
+        id: check
         env:
           DISPATCH_VERSION: ${{ inputs.version }}
-        run: python3 libs/cmux-cua/scripts/check-release-version.py libs/cmux-cua/rust/Cargo.toml "$GITHUB_REF" "$DISPATCH_VERSION"
+        run: |
+          # A PR dry run has no tag and no input: it checks the workspace
+          # version against itself (the other version strings still count).
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            DISPATCH_VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("libs/cmux-cua/rust/Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          fi
+          VERSION=$(python3 libs/cmux-cua/scripts/check-release-version.py libs/cmux-cua/rust/Cargo.toml "$GITHUB_REF" "$DISPATCH_VERSION")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       # The version, archive and asset gates below are scripts; a broken gate
       # stops the release here, before any build.
       - name: Release script tests
@@ -59,6 +80,8 @@ jobs:
     needs: version-check
     name: linux-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -126,13 +149,11 @@ jobs:
       - name: Determine version
         id: version
         shell: bash
-        run: |
-          if [[ "$GITHUB_REF" == refs/tags/cmux-cua-v* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/cmux-cua-v}"
-          else
-            VERSION="${{ inputs.version }}"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        env:
+          # The checked version: the tag's, the dispatch input's, or (PR dry
+          # run) the workspace's.
+          VERSION: ${{ needs.version-check.outputs.version }}
+        run: echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -183,6 +204,7 @@ jobs:
   # the matching zip at install time based on the host's OS architecture.
   build-windows:
     needs: version-check
+    if: github.event_name != 'pull_request'
     name: windows-${{ matrix.arch }}
     runs-on: windows-latest
     strategy:
@@ -278,6 +300,7 @@ jobs:
   # expose those symbols, so the transitive Swift bridge fails to compile.
   build-macos-universal:
     needs: version-check
+    if: github.event_name != 'pull_request'
     name: darwin-universal
     runs-on: macos-26
     # The publish gate needs to know which macOS asset names to expect.
