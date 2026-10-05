@@ -189,6 +189,10 @@ jobs:
           ls -lh "release/${STAGE}.tar.gz" "release/${STAGE}-binary.tar.gz"
       - name: Check archives (binary + LICENSE)
         run: |
+          # The container runs as root and the workspace belongs to the runner
+          # user; actions/checkout marks it safe only during its own step, so
+          # git cat-file refused it (tag run 37302004544).
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           python3 libs/cmux-cua/scripts/check-release-assets.py archive --license-git HEAD:LICENSE.md \
             libs/cmux-cua/rust/release/cmux-cua-*-linux-${{ matrix.arch }}*.tar.gz
       - uses: actions/upload-artifact@v4
