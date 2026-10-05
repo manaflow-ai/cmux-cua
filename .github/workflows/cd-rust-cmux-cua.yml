@@ -42,6 +42,10 @@ jobs:
         env:
           DISPATCH_VERSION: ${{ inputs.version }}
         run: python3 libs/cmux-cua/scripts/check-release-version.py libs/cmux-cua/rust/Cargo.toml "$GITHUB_REF" "$DISPATCH_VERSION"
+      # The version, archive and asset gates below are scripts; a broken gate
+      # stops the release here, before any build.
+      - name: Release script tests
+        run: python3 -m unittest discover -s libs/cmux-cua/scripts/tests -v
 
   # ── Linux (x86_64 + arm64) ───────────────────────────────────────────────────
   # One matrixed job per Linux target. x86_64 builds on the standard
@@ -92,9 +96,10 @@ jobs:
           # bullseye's 0.3.19 headers are too old for libspa-sys 0.8. Portal
           # RemoteDesktop/libei input is pure Rust plus libxkbcommon and ships
           # in these portable release binaries.
+          # python3 runs check-release-assets.py on the built archives.
           packages=(git ca-certificates curl build-essential pkg-config
             libx11-dev libxi-dev libxtst-dev libxext-dev libwayland-dev
-            libxkbcommon-dev)
+            libxkbcommon-dev python3)
           apt_install() {
             apt-get update && apt-get install -y --no-install-recommends "${packages[@]}"
           }
@@ -152,12 +157,19 @@ jobs:
           STAGE="cmux-cua-${VERSION}-${LABEL}"
           mkdir -p "release/${STAGE}"
           cp "target/${TARGET}/release/cmux-cua" "release/${STAGE}/"
-          cp ../../LICENSE.md "release/${STAGE}/LICENSE" 2>/dev/null || true
+          # The repository license (MIT, LICENSE.md at the repo root; the
+          # crate says license = "MIT"). 0.8.2 to 0.8.4 copied ../../LICENSE.md
+          # (libs/LICENSE.md, absent) behind `|| true` and shipped without it.
+          cp ../../../LICENSE.md "release/${STAGE}/LICENSE"
           (cd release && tar -czf "${STAGE}.tar.gz" "${STAGE}")
           # Bare binary tarball — single file (cmux-cua) at the archive root,
           # mirroring the Swift cmux-cua `*-binary.tar.gz` convention.
           tar -czf "release/${STAGE}-binary.tar.gz" -C "release/${STAGE}" cmux-cua
           ls -lh "release/${STAGE}.tar.gz" "release/${STAGE}-binary.tar.gz"
+      - name: Check archives (binary + LICENSE)
+        run: |
+          python3 libs/cmux-cua/scripts/check-release-assets.py archive --license LICENSE.md \
+            libs/cmux-cua/rust/release/cmux-cua-*-linux-${{ matrix.arch }}*.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: cmux-cua-linux-${{ matrix.arch }}
@@ -223,7 +235,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path "release/$stage" | Out-Null
           Copy-Item "target/$target/release/cmux-cua.exe" "release/$stage/"
           Copy-Item "target/$target/release/cmux-cua-uia.exe" "release/$stage/"
-          if (Test-Path "../../LICENSE.md") { Copy-Item "../../LICENSE.md" "release/$stage/LICENSE" }
+          # Repository license at the repo root (see the Linux Package step).
+          Copy-Item "../../../LICENSE.md" "release/$stage/LICENSE" -ErrorAction Stop
           # Zip the directory itself (no trailing /*) so the archive contains
           # the top-level "$stage" wrapper dir — install.ps1 walks into
           # extracted/cmux-cua-<v>-<arch>/cmux-cua.exe to find the
@@ -239,6 +252,11 @@ jobs:
           # until signed.
           Compress-Archive -Path "release/$stage/cmux-cua.exe","release/$stage/cmux-cua-uia.exe" -DestinationPath "release/$stage-binary.zip" -Force
           Get-ChildItem "release/$stage*.zip"
+      - name: Check archives (binaries + LICENSE)
+        shell: bash
+        run: |
+          python libs/cmux-cua/scripts/check-release-assets.py archive --license LICENSE.md \
+            libs/cmux-cua/rust/release/cmux-cua-*-windows-${{ matrix.arch }}*.zip
       - uses: actions/upload-artifact@v4
         with:
           name: cmux-cua-windows-${{ matrix.arch }}
@@ -262,6 +280,9 @@ jobs:
     needs: version-check
     name: darwin-universal
     runs-on: macos-26
+    # The publish gate needs to know which macOS asset names to expect.
+    outputs:
+      signed: ${{ steps.signing.outputs.signed }}
     # Notarize on tag push (real release); on workflow_dispatch honor the
     # `notarize` input so we can iterate on the build pipeline without
     # touching the Apple notary service.
@@ -461,7 +482,8 @@ jobs:
             # attribution (issue #1525). Tarball callers that want only
             # the bare binary can grab the *-binary.tar.gz below.
             cp -R "release/cmux Computer Use.app" "release/${STAGE}/cmux Computer Use.app"
-            cp ../../LICENSE.md "release/${STAGE}/LICENSE" 2>/dev/null || true
+            # Repository license at the repo root (see the Linux Package step).
+            cp ../../../LICENSE.md "release/${STAGE}/LICENSE"
             (cd release && tar -czf "${STAGE}.tar.gz" "${STAGE}")
           done
           # Bare universal binary — single-file tarball matching Swift's
@@ -471,6 +493,10 @@ jobs:
           tar -czf "release/cmux-cua-${VERSION}-darwin-universal${SUFFIX}-binary.tar.gz" \
             -C release/universal cmux-cua
           ls -lh release/*.tar.gz
+      - name: Check archives (binary + app + LICENSE)
+        run: |
+          python3 libs/cmux-cua/scripts/check-release-assets.py archive --license LICENSE.md \
+            libs/cmux-cua/rust/release/cmux-cua-*-darwin-*.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: cmux-cua-darwin
@@ -482,6 +508,8 @@ jobs:
     needs: [build-linux, build-windows, build-macos-universal]
     if: startsWith(github.ref, 'refs/tags/cmux-cua-v')
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -529,6 +557,7 @@ jobs:
 
           echo "Baked version ${VERSION} into working-tree install scripts:"
           grep -E '^CMUX_CUA_BAKED_VERSION=' libs/cmux-cua/scripts/_install-rust.sh
+          # shellcheck disable=SC2016 # literal `$Script:` in the pattern
           grep -E '^\$Script:CmuxCuaBakedVersion = ' libs/cmux-cua/scripts/install.ps1
 
       - name: Stage release files
@@ -592,6 +621,15 @@ jobs:
           echo "Release files:"
           ls -lh release-upload/
 
+      # SHA256SUMS (sha256sum format) covers every asset, installers and
+      # skills included; consumers verify with `sha256sum -c --ignore-missing`.
+      # checksums.txt (Markdown) stays for build_wheel.py.
+      - name: Generate SHA256SUMS
+        run: |
+          python3 libs/cmux-cua/scripts/check-release-assets.py sums release-upload > SHA256SUMS
+          mv SHA256SUMS release-upload/SHA256SUMS
+          cat release-upload/SHA256SUMS
+
       - name: Generate SHA256 checksums
         id: checksums
         run: |
@@ -602,10 +640,21 @@ jobs:
             shasum -a 256 cmux-cua-*.{tar.gz,zip} 2>/dev/null | sort
             echo '```'
           } > checksums.txt
-          checksums=$(cat checksums.txt)
-          echo "checksums<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$checksums" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          {
+            echo "checksums<<EOF"
+            cat checksums.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # Gate before upload: the exact asset set, SHA256SUMS, and every
+      # archive's binary + LICENSE.
+      - name: Check release assets before upload
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          MACOS: ${{ needs.build-macos-universal.outputs.signed == 'true' && 'signed' || 'unsigned' }}
+        run: |
+          python3 libs/cmux-cua/scripts/check-release-assets.py release \
+            --version "$VERSION" --macos "$MACOS" --license LICENSE.md release-upload
 
       - name: Generate path-filtered release notes
         id: notes
@@ -614,7 +663,7 @@ jobs:
             | grep -v "^${{ github.ref_name }}$" \
             | head -n 1 || echo "")
           if [ -n "$PREV_TAG" ]; then
-            NOTES=$(git log ${PREV_TAG}..HEAD --pretty=format:"* %s (%h) by @%an" -- "libs/cmux-cua/rust" | head -50)
+            NOTES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"* %s (%h) by @%an" -- "libs/cmux-cua/rust" | head -50)
           else
             NOTES=$(git log --pretty=format:"* %s (%h) by @%an" -- "libs/cmux-cua/rust" | head -50)
           fi
@@ -627,6 +676,8 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # Created as a pre-release; the publish job marks it a full release
+      # only after it verifies the published assets.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -781,3 +832,39 @@ jobs:
           git add libs/cmux-cua/scripts/_install-rust.sh libs/cmux-cua/scripts/install.ps1
           git commit -m "chore(cmux-cua): bake version ${VERSION} into install scripts [skip ci]"
           git push origin bake-version:main
+
+  # ── Publish ──────────────────────────────────────────────────────────────────
+  # The last job. It downloads what the release job PUBLISHED (not the local
+  # build artifacts), checks the exact asset set against the expected list,
+  # verifies SHA256SUMS against the downloaded bytes, opens every archive for
+  # its binary and LICENSE, and only then clears the pre-release flag. Any
+  # failure leaves the release a pre-release, which no consumer pins.
+  # `--latest=false` keeps /releases/latest unchanged: this repository also
+  # publishes lume and other products under other tag prefixes.
+  publish:
+    needs: [release, build-linux, build-windows, build-macos-universal]
+    if: startsWith(github.ref, 'refs/tags/cmux-cua-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir published
+      - name: Verify the published assets
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          MACOS: ${{ needs.build-macos-universal.outputs.signed == 'true' && 'signed' || 'unsigned' }}
+        run: |
+          python3 libs/cmux-cua/scripts/check-release-assets.py release \
+            --version "$VERSION" --macos "$MACOS" --license LICENSE.md published
+          (cd published && sha256sum -c SHA256SUMS)
+      - name: Mark the release as a full release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest=false
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isPrerelease,isDraft \
+            --jq 'if .isPrerelease or .isDraft then error("release is still a pre-release or draft") else "full release" end'
