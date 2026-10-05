@@ -114,7 +114,7 @@ $BinaryName = "cmux-cua.exe"
 # where the baked line hasn't been updated yet.
 #
 # ~~~ BAKED_VERSION: auto-updated by CD workflow after each release — do not edit ~~~
-$Script:CmuxCuaBakedVersion = "0.8.4"
+$Script:CmuxCuaBakedVersion = "0.8.5"
 # ~~~ END_BAKED_VERSION ~~~
 
 # ---------- Path resolution ------------------------------------------------
