@@ -9,24 +9,44 @@ concurrency:
   group: lume-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Runner images: https://github.com/actions/runner-images
+# Runner images: https://docs.blacksmith.sh (GitHub-hosted labels are refused by scripts/ci/check-runner-labels.py)
 
 jobs:
   test:
     name: Test
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: actions/checkout@v4
       - run: uname -a
-      - run: sudo xcode-select -s /Applications/Xcode_16.3.app # Swift 6.1
+      # Prefer Xcode 16.3 (Swift 6.1) when the runner image has it. Blacksmith
+      # macOS 15 images may ship only newer Xcode; then the default is used.
+      - name: Select Xcode
+        run: |
+          if [ -d /Applications/Xcode_16.3.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.3.app
+          else
+            echo "Xcode 16.3 not installed; using $(xcode-select -p)"
+            ls -d /Applications/Xcode*.app || true
+          fi
+          swift --version
       - run: swift test
         working-directory: ./libs/lume
   build:
     name: Release build
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: actions/checkout@v4
       - run: uname -a
-      - run: sudo xcode-select -s /Applications/Xcode_16.3.app # Swift 6.1
+      # Prefer Xcode 16.3 (Swift 6.1) when the runner image has it. Blacksmith
+      # macOS 15 images may ship only newer Xcode; then the default is used.
+      - name: Select Xcode
+        run: |
+          if [ -d /Applications/Xcode_16.3.app ]; then
+            sudo xcode-select -s /Applications/Xcode_16.3.app
+          else
+            echo "Xcode 16.3 not installed; using $(xcode-select -p)"
+            ls -d /Applications/Xcode*.app || true
+          fi
+          swift --version
       - run: swift build --configuration release
         working-directory: ./libs/lume

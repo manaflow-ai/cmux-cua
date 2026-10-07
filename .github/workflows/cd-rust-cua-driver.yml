@@ -32,8 +32,8 @@ permissions:
 jobs:
   # ── Linux (x86_64 + arm64) ───────────────────────────────────────────────────
   # One matrixed job per Linux target. x86_64 builds on the standard
-  # ubuntu-latest host; arm64 builds NATIVELY on GitHub's hosted ARM runner
-  # (ubuntu-24.04-arm) rather than cross-compiling, because the native X11 /
+  # Blacksmith Ubuntu 24.04 host; arm64 builds NATIVELY on the Blacksmith ARM
+  # runner rather than cross-compiling, because the native X11 /
   # Wayland C deps (libx11-dev, libwayland-dev, …) would otherwise need their
   # arm64 multiarch variants + a cross linker wired up by hand. A native ARM
   # runner keeps the build identical to the x86_64 path. install.sh picks the
@@ -47,12 +47,12 @@ jobs:
         include:
           - arch: x86_64
             target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: blacksmith-4vcpu-ubuntu-2404
           - arch: arm64
             target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
     # Build INSIDE a Debian 11 (bullseye) container instead of directly on
-    # the host. ubuntu-latest is now Ubuntu 24.04, whose glibc is 2.39 — a
+    # the host. The host runs Ubuntu 24.04, whose glibc is 2.39 — a
     # binary linked there imports GLIBC_2.39 symbols (e.g. posix_spawn's
     # pidfd_spawnp/pidfd_getpid) and refuses to even run `--version` on older
     # distros:
@@ -131,12 +131,12 @@ jobs:
 
   # ── Windows (x86_64 + arm64) ─────────────────────────────────────────────────
   # One matrixed job per Windows target. The arm64 build cross-compiles from
-  # the x86_64 windows-latest runner — Rust + MSVC have first-class support
+  # the x86_64 Windows Server 2025 runner — Rust + MSVC have first-class support
   # for that cross, so no separate arm64 runner is needed. install.ps1 picks
   # the matching zip at install time based on the host's OS architecture.
   build-windows:
     name: windows-${{ matrix.arch }}
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     strategy:
       fail-fast: false
       matrix:
@@ -211,20 +211,20 @@ jobs:
 
   # ── macOS universal (arm64 + x86_64 → lipo) ─────────────────────────────────
   # Mirrors cd-swift-cua-driver.yml's approach: build both arches in one job
-  # on macos-26, then combine into a universal binary via `lipo -create`.
+  # on a macOS 26 runner, then combine into a universal binary via `lipo -create`.
   # The same universal binary is used in BOTH the arm64 and x86_64 named
   # tarballs (so callers that download by arch still get the universal
   # binary), plus a third `darwin-universal` tarball and a bare binary.
   #
-  # Runner pinned to macos-26 because `screencapturekit` (added in PR #1720
+  # Runner pinned to macOS 26 because `screencapturekit` (added in PR #1720
   # for the native ScreenCaptureKit recording backend) pulls in
   # `apple-metal v0.8.7`, whose Swift bridge references macOS 26 Metal
   # symbols (`MTLSamplerReductionMode`, `MTLSamplerDescriptor.reductionMode`,
-  # `.lodBias`). The macos-15 runner ships a macOS 15 SDK that doesn't
+  # `.lodBias`). A macOS 15 runner ships a macOS 15 SDK that doesn't
   # expose those symbols, so the transitive Swift bridge fails to compile.
   build-macos-universal:
     name: darwin-universal
-    runs-on: macos-26
+    runs-on: blacksmith-6vcpu-macos-26
     # Notarize on tag push (real release); on workflow_dispatch honor the
     # `notarize` input so we can iterate on the build pipeline without
     # touching the Apple notary service.
@@ -417,7 +417,7 @@ jobs:
   release:
     needs: [build-linux, build-windows, build-macos-universal]
     if: startsWith(github.ref, 'refs/tags/cua-driver-rs-v')
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
         with:
@@ -447,8 +447,8 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # GNU sed (ubuntu-latest). The Swift CD workflow runs on
-          # macos-15 and uses the BSD form (`sed -i ''`).
+          # GNU sed (Linux runner). The Swift CD workflow runs on
+          # macOS 15 and uses the BSD form (`sed -i ''`).
           # The Rust install logic now lives at
           # libs/cua-driver/scripts/_install-rust.sh (a private helper
           # invoked by libs/cua-driver/scripts/install.sh by default).
@@ -675,9 +675,9 @@ jobs:
           # whether the in-tree step ran (it's idempotent and the on-disk
           # working-tree edits got discarded by the checkout above).
           #
-          # The release job runs on ubuntu-latest, so this uses GNU sed
+          # The release job runs on a Linux runner, so this uses GNU sed
           # syntax (`sed -i` with no empty-string arg) — the Swift CD
-          # workflow's bake step runs on macos-15 and uses the BSD form
+          # workflow's bake step runs on macOS 15 and uses the BSD form
           # (`sed -i ''`).
           # Rust install logic lives at libs/cua-driver/scripts/_install-rust.sh
           # (private helper invoked by the canonical libs/cua-driver/scripts/install.sh

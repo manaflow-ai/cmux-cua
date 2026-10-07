@@ -10,7 +10,7 @@ on:
 jobs:
   test:
     name: Test ${{ matrix.package }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
 
     strategy:
       fail-fast: false # Test all packages even if one fails
@@ -79,7 +79,7 @@ jobs:
 
   summary:
     name: Test Summary
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: test
     if: always()
 

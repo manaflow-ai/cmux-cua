@@ -31,7 +31,7 @@ jobs:
   pull-request-build:
     name: Build ${{ matrix.platform }} (pull request)
     if: github.event_name == 'pull_request'
-    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'blacksmith-4vcpu-ubuntu-2404-arm' || 'blacksmith-4vcpu-ubuntu-2404' }}
     strategy:
       fail-fast: false
       matrix:
@@ -61,7 +61,7 @@ jobs:
       github.repository == 'manaflow-ai/cmux-cua' &&
       ((github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       timestamp: ${{ steps.timestamp.outputs.value }}
     steps:
@@ -79,7 +79,7 @@ jobs:
     permissions:
       contents: read
       id-token: write # OIDC is available only after the canonical-main event guard.
-    runs-on: ${{ matrix.platform == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.platform == 'linux/arm64' && 'blacksmith-4vcpu-ubuntu-2404-arm' || 'blacksmith-4vcpu-ubuntu-2404' }}
     strategy:
       fail-fast: false
       matrix:
@@ -167,7 +167,7 @@ jobs:
       actions: read # Download artifacts from this trusted run.
       contents: read # Read the trusted main checkout.
       id-token: write # Assume the ECR role only for this trusted job.
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1

@@ -33,7 +33,7 @@ jobs:
       actions: read # Read failed workflow metadata for the selected pull request.
       contents: read # Read repository metadata only.
       pull-requests: write # Post diagnostic links to the selected pull request.
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Find the pull request and failed checks
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
