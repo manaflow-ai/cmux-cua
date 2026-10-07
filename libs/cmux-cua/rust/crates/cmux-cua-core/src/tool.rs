@@ -477,7 +477,14 @@ pub struct ToolRegistry {
     /// front-once/dedupe state. Called with `(target_pid, session)`. May remain
     /// `None` on platforms that do not support visible foregrounding.
     target_front_hook: Option<fn(i64, Option<&str>)>,
+    /// Platform target guard (see [`crate::target_policy`]). Called with the
+    /// tool name, its args, and the trusted allow list before every call; an
+    /// `Err` is returned to the caller and the tool does not run.
+    target_policy_hook: Option<TargetPolicyHook>,
 }
+
+/// Signature of the platform target guard.
+pub type TargetPolicyHook = fn(&str, &Value, &[String]) -> Result<(), ToolResult>;
 
 impl ToolRegistry {
     pub fn new() -> Self {
@@ -488,7 +495,13 @@ impl ToolRegistry {
             state_file: crate::session_state::StateFile::from_env(),
             target_app_resolver: Some(crate::session_state::resolve_process_name),
             target_front_hook: None,
+            target_policy_hook: None,
         }
+    }
+
+    /// Install the platform target guard. See [`crate::target_policy`].
+    pub fn set_target_policy_hook(&mut self, hook: TargetPolicyHook) {
+        self.target_policy_hook = Some(hook);
     }
 
     pub fn set_target_app_resolver(&mut self, resolver: fn(i64) -> Option<String>) {
@@ -623,7 +636,10 @@ impl ToolRegistry {
     }
 
     /// Invoke a tool by name and (if recording is enabled) write its result to disk.
-    pub async fn invoke(&self, name: &str, args: Value) -> ToolResult {
+    pub async fn invoke(&self, name: &str, mut args: Value) -> ToolResult {
+        // The trusted allow list never reaches a tool; trusted entry points
+        // put it here with `target_policy::scope_target_args`.
+        let allowed_targets = crate::target_policy::take_allowed(&mut args);
         // Capture start time for recording timestamps.
         let start_ms = now_ms();
 
@@ -643,6 +659,14 @@ impl ToolRegistry {
         let Some(tool) = self.tools.get(resolved_name) else {
             return ToolResult::error(format!("Unknown tool: {name}"));
         };
+
+        // Target guard: a refused target is side-effect free (no recording
+        // turn, no fronting, no dispatch).
+        if let Some(hook) = self.target_policy_hook {
+            if let Err(refusal) = hook(resolved_name, &args, &allowed_targets) {
+                return refusal;
+            }
+        }
 
         // Reserve and capture the turn before dispatch so recorded evidence
         // shows the application immediately before the action changed it.
@@ -897,6 +921,91 @@ fn synthesize_action_label(tool_name: &str, args: &Value) -> String {
         tool_name.to_owned()
     } else {
         format!("{tool_name}: {summary}")
+    }
+}
+
+#[cfg(test)]
+mod target_policy_hook_tests {
+    //! The registry runs the platform target guard before every tool.
+    use super::*;
+    use crate::target_policy::ALLOWED_TARGET_BUNDLE_IDS_ARG;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    static DISPATCHED: AtomicUsize = AtomicUsize::new(0);
+    static SEEN_ARGS: Mutex<Option<Value>> = Mutex::new(None);
+    static SEEN_ALLOWED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    struct CountingTool(ToolDef);
+
+    #[async_trait::async_trait]
+    impl Tool for CountingTool {
+        fn def(&self) -> &ToolDef {
+            &self.0
+        }
+        async fn invoke(&self, args: Value) -> ToolResult {
+            DISPATCHED.fetch_add(1, Ordering::SeqCst);
+            *SEEN_ARGS.lock().unwrap() = Some(args);
+            ToolResult::text("dispatched")
+        }
+    }
+
+    /// pid 100 is the user's cmux; everything else is another app.
+    fn guard(tool: &str, args: &Value, allowed: &[String]) -> Result<(), ToolResult> {
+        *SEEN_ALLOWED.lock().unwrap() = allowed.to_vec();
+        let app_for_pid = |pid: i64| {
+            (pid == 100).then(|| crate::target_policy::TargetIdentity {
+                name: "cmux".to_owned(),
+                bundle_id: Some("com.cmuxterm.app".to_owned()),
+                pid: Some(pid),
+            })
+        };
+        let pid_for_window = |_window: u64| -> Option<i64> { None };
+        crate::target_policy::enforce(
+            tool,
+            args,
+            allowed,
+            &crate::target_policy::TargetResolver {
+                app_for_pid: &app_for_pid,
+                pid_for_window: &pid_for_window,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn the_registry_refuses_a_cmux_target_before_dispatch_and_strips_the_scope() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CountingTool(ToolDef {
+            name: "click".to_owned(),
+            description: "test".to_owned(),
+            input_schema: json!({"type": "object", "properties": {"pid": {"type": "integer"}}}),
+            read_only: false,
+            destructive: true,
+            idempotent: false,
+            open_world: true,
+        })));
+        registry.set_target_policy_hook(guard);
+
+        let refused = registry.invoke("click", json!({"pid": 100})).await;
+        assert_eq!(refused.is_error, Some(true));
+        assert_eq!(refused.structured_content.unwrap()["code"], "target_not_allowed");
+        assert_eq!(DISPATCHED.load(Ordering::SeqCst), 0, "a refused call must not run");
+
+        let ok = registry
+            .invoke(
+                "click",
+                json!({"pid": 7, ALLOWED_TARGET_BUNDLE_IDS_ARG: ["com.example.app"]}),
+            )
+            .await;
+        assert_ne!(ok.is_error, Some(true));
+        assert_eq!(DISPATCHED.load(Ordering::SeqCst), 1);
+        assert_eq!(*SEEN_ALLOWED.lock().unwrap(), vec!["com.example.app".to_owned()]);
+        let seen = SEEN_ARGS.lock().unwrap().clone().unwrap();
+        assert!(
+            seen.get(ALLOWED_TARGET_BUNDLE_IDS_ARG).is_none(),
+            "the private scope argument must not reach the tool"
+        );
     }
 }
 

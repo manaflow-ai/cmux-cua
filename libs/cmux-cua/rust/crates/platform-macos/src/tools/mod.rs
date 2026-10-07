@@ -583,6 +583,10 @@ pub fn register_all(registry: &mut ToolRegistry, compat: bool) {
     // before each targeted drive action only after host opt-in, so ordinary
     // embedded and daemon sessions preserve background delivery semantics.
     registry.set_target_front_hook(front_target_if_watchable);
+    // Native target guard: refuse the user's cmux, other terminals, the
+    // driver, and security surfaces in every profile, not only Codex
+    // compatibility. See cmux_cua_core::target_policy.
+    registry.set_target_policy_hook(crate::target_guard::enforce_native);
     let state = Arc::new(ToolState::default());
     // Share the element cache with the recording-hook layer so it can
     // resolve element_index → window-local screenshot coords for click.png.

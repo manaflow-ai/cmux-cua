@@ -50,6 +50,8 @@ pub mod pip;
 pub mod session;
 #[cfg(target_os = "macos")]
 pub(crate) mod dispatch_gate;
+#[cfg(target_os = "macos")]
+pub mod target_guard;
 
 use cmux_cua_core::tool::ToolRegistry;
 
