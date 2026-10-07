@@ -61,7 +61,7 @@ jobs:
   # we use that instead.
   resolve-version:
     name: Resolve release version
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       version: ${{ steps.pick.outputs.version }}
       binary_url: ${{ steps.pick.outputs.binary_url }}
@@ -117,7 +117,7 @@ jobs:
     needs: resolve-version
     # Don't block the PR if no release binary exists yet.
     continue-on-error: true
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     container:
       image: ${{ matrix.image }}
     strategy:
@@ -248,7 +248,7 @@ jobs:
     name: "Distro compat summary"
     needs: [resolve-version, distro-smoke]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Check results
         run: |

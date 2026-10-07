@@ -49,7 +49,7 @@ jobs:
           github.event.action == 'ready_for_review'
         )
       )
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04  # runner-policy-exception: CLA policy steps refuse non-GitHub-hosted runners (runner.environment check)
     timeout-minutes: 10
     permissions:
       contents: read # Read live commit and pull-request metadata.
@@ -193,7 +193,7 @@ jobs:
         github.event.action == 'synchronize' ||
         github.event.action == 'ready_for_review'
       )
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04  # runner-policy-exception: CLA policy steps refuse non-GitHub-hosted runners (runner.environment check)
     timeout-minutes: 15
     permissions:
       contents: write # Persist signatures through the pinned CLA action.
@@ -269,7 +269,7 @@ jobs:
         ) ||
         github.event.comment.body == 'recheck'
       )
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04  # runner-policy-exception: CLA policy steps refuse non-GitHub-hosted runners (runner.environment check)
     timeout-minutes: 15
     permissions:
       contents: write # Persist signatures through the pinned CLA action.
@@ -351,7 +351,7 @@ jobs:
           needs.CLASigner.outputs.cla_passed == 'true'
         )
       )
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04  # runner-policy-exception: CLA policy steps refuse non-GitHub-hosted runners (runner.environment check)
     timeout-minutes: 10
     permissions:
       actions: write # Rerun only the validated failed Actions job.
@@ -438,7 +438,7 @@ jobs:
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04  # runner-policy-exception: CLA policy steps refuse non-GitHub-hosted runners (runner.environment check)
     timeout-minutes: 10
     permissions:
       contents: read # Read the protected signature ledger for lock validation.

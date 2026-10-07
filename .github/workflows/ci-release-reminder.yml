@@ -16,7 +16,7 @@ concurrency:
 jobs:
   release-reminder:
     name: Release reminder
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: none # No checkout or repository contents are needed.
       pull-requests: write # Read the PR and update its reminder comment.

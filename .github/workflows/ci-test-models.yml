@@ -17,7 +17,7 @@ on:
 jobs:
   # Test all Cua models - runs on PRs, pushes to main, or when manually triggered
   test-all-models:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     strategy:
       fail-fast: false
       matrix:
@@ -260,7 +260,7 @@ jobs:
   test-summary:
     if: ${{ always() }}
     needs: test-all-models
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq

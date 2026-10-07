@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       version: ${{ steps.get-version.outputs.version }}
     steps:
@@ -78,11 +78,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: blacksmith-4vcpu-ubuntu-2404
             artifact_name: cua-computer-server-linux-x86_64
             zip_name: cua-computer-server-linux-x86_64.tar.gz
             dir_name: cua-computer-server
-          - os: windows-latest
+          - os: blacksmith-4vcpu-windows-2025
             artifact_name: cua-computer-server-windows-x86_64
             zip_name: cua-computer-server-windows-x86_64.zip
             dir_name: cua-computer-server
@@ -125,7 +125,7 @@ jobs:
 
   set-env-variables:
     needs: [prepare, publish]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Set environment variables for use in other jobs
         run: |

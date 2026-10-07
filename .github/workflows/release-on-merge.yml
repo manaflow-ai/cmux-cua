@@ -22,7 +22,7 @@ jobs:
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main' &&
       github.event.pull_request.base.repo.full_name == github.repository
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       should_release: ${{ steps.plan.outputs.should_release }}
       services: ${{ steps.plan.outputs.services }}
@@ -102,7 +102,7 @@ jobs:
     name: Dispatch approved release workflows
     needs: plan
     if: needs.plan.outputs.should_release == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       actions: write # Dispatch the already-reviewed release workflow only.
       contents: read # Read repository metadata only.

@@ -10,7 +10,7 @@ on:
       runner:
         description: "Runner label; use the Azure RDP runner label for VM e2e"
         required: true
-        default: "windows-latest"
+        default: "blacksmith-4vcpu-windows-2025"
 
 permissions:
   contents: read
@@ -19,7 +19,7 @@ permissions:
 jobs:
   source:
     name: "Resolve exact source"
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
     steps:
@@ -155,7 +155,7 @@ jobs:
     if: always()
     needs: [source, shared, native, capture]
     name: "Windows / matrix summary"
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

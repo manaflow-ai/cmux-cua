@@ -23,7 +23,7 @@ concurrency:
 jobs:
   validate-provenance:
     name: Validate source release provenance
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     # This expression is only an early filter.  The validator repeats every
     # check against the live GitHub API before any artifact is downloaded.
     if: >-
@@ -75,35 +75,35 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: blacksmith-6vcpu-macos-15
             platform: macos
             arch: universal
             provenance_key: darwin-universal
             archive_suffix: darwin-universal-binary.tar.gz
             wheel_tag: py3-none-macosx_11_0_universal2
             python_host_platform: ""
-          - os: ubuntu-latest
+          - os: blacksmith-4vcpu-ubuntu-2404
             platform: linux
             arch: x86_64
             provenance_key: linux-x86_64
             archive_suffix: linux-x86_64-binary.tar.gz
             wheel_tag: py3-none-manylinux_2_31_x86_64
             python_host_platform: ""
-          - os: ubuntu-24.04-arm
+          - os: blacksmith-4vcpu-ubuntu-2404-arm
             platform: linux
             arch: arm64
             provenance_key: linux-arm64
             archive_suffix: linux-arm64-binary.tar.gz
             wheel_tag: py3-none-manylinux_2_31_aarch64
             python_host_platform: ""
-          - os: windows-latest
+          - os: blacksmith-4vcpu-windows-2025
             platform: windows
             arch: x86_64
             provenance_key: windows-x86_64
             archive_suffix: windows-x86_64-binary.zip
             wheel_tag: py3-none-win_amd64
             python_host_platform: win-amd64
-          - os: windows-latest
+          - os: blacksmith-4vcpu-windows-2025
             platform: windows
             arch: arm64
             provenance_key: windows-arm64
@@ -282,7 +282,7 @@ jobs:
     name: Publish verified wheels to PyPI
     needs: [validate-provenance, build-wheels]
     if: needs.validate-provenance.result == 'success' && needs.build-wheels.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04  # runner-policy-exception: PyPI trusted publishing with attestations stays GitHub-hosted
     environment: pypi
     permissions:
       contents: read
