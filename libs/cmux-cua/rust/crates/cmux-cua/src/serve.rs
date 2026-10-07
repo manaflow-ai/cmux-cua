@@ -162,6 +162,17 @@ fn directory_status(
     Ok(status)
 }
 
+/// An ancestor may be owned by root, by us, or (inside a non-initial Linux
+/// user namespace only) by the overflow uid of an unmapped owner.
+#[cfg(unix)]
+fn ancestor_owner_is_trusted(
+    owner: libc::uid_t,
+    effective_uid: libc::uid_t,
+    unmapped_owner: Option<libc::uid_t>,
+) -> bool {
+    owner == 0 || owner == effective_uid || Some(owner) == unmapped_owner
+}
+
 /// An ancestor of the runtime directory must not let another user rename or
 /// replace the entry below it. It must be owned by root or by us, and it must
 /// not be writable by group or other users unless the sticky bit restricts
@@ -173,10 +184,7 @@ fn check_runtime_ancestor(
     effective_uid: libc::uid_t,
 ) -> anyhow::Result<()> {
     let status = directory_status(directory, display)?;
-    if status.st_uid != 0
-        && status.st_uid != effective_uid
-        && Some(status.st_uid) != unmapped_owner_uid()
-    {
+    if !ancestor_owner_is_trusted(status.st_uid, effective_uid, unmapped_owner_uid()) {
         anyhow::bail!(
             "runtime path ancestor {} is owned by uid {}, expected root or uid {}",
             display.display(),
@@ -202,14 +210,31 @@ fn check_runtime_ancestor(
 /// an ancestor is treated like a root-owned one; the mode check still applies.
 #[cfg(target_os = "linux")]
 fn unmapped_owner_uid() -> Option<libc::uid_t> {
-    let in_user_namespace = std::fs::read_to_string("/proc/self/uid_map")
+    unmapped_owner_uid_from(
+        std::fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .as_deref(),
+        std::fs::read_to_string("/proc/sys/kernel/overflowuid")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// `uid_map` is the text of `/proc/self/uid_map`; the initial namespace maps
+/// the full range `0 0 4294967295`. `overflowuid` is the text of
+/// `/proc/sys/kernel/overflowuid`.
+#[cfg(target_os = "linux")]
+fn unmapped_owner_uid_from(
+    uid_map: Option<&str>,
+    overflowuid: Option<&str>,
+) -> Option<libc::uid_t> {
+    let in_user_namespace = uid_map
         .map(|map| map.split_whitespace().collect::<Vec<_>>() != ["0", "0", "4294967295"])
         .unwrap_or(false);
     if !in_user_namespace {
         return None;
     }
-    std::fs::read_to_string("/proc/sys/kernel/overflowuid")
-        .ok()
+    overflowuid
         .and_then(|value| value.trim().parse().ok())
         .or(Some(65534))
 }
@@ -4277,6 +4302,62 @@ mod gate_tests {
         assert!(
             !socket.exists(),
             "no socket is bound under an unsafe ancestor"
+        );
+    }
+
+    #[test]
+    fn socket_directory_refuses_a_group_writable_ancestor() {
+        let root = tempfile::tempdir().expect("temp root");
+        // Our own ancestor, writable by its group and not sticky: a group
+        // member could rename the scope directory below it.
+        let grandparent = root.path().join("group-grandparent");
+        std::fs::create_dir(&grandparent).expect("create grandparent");
+        std::fs::set_permissions(&grandparent, std::fs::Permissions::from_mode(0o770))
+            .expect("make grandparent group-writable");
+        let scope = grandparent.join("scope");
+        std::fs::create_dir(&scope).expect("create scope");
+        std::fs::set_permissions(&scope, std::fs::Permissions::from_mode(0o700))
+            .expect("make scope private");
+
+        let error = super::open_private_runtime_directory(&scope, true)
+            .expect_err("a group-writable ancestor must fail closed");
+        assert!(
+            error.to_string().contains("writable by other users"),
+            "unexpected error: {error}"
+        );
+
+        std::fs::set_permissions(&grandparent, std::fs::Permissions::from_mode(0o1770))
+            .expect("make grandparent sticky");
+        super::open_private_runtime_directory(&scope, true)
+            .expect("a sticky group-writable ancestor is accepted");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nobody_owned_ancestor_is_refused_in_the_initial_user_namespace() {
+        const NOBODY: libc::uid_t = 65534;
+        const OUR_UID: libc::uid_t = 1000;
+        let initial_map = "         0          0 4294967295\n";
+        let unmapped = super::unmapped_owner_uid_from(Some(initial_map), Some("65534\n"));
+        assert_eq!(
+            unmapped, None,
+            "the initial namespace has no unmapped owner"
+        );
+        assert!(
+            !super::ancestor_owner_is_trusted(NOBODY, OUR_UID, unmapped),
+            "a directory owned by the real nobody user is refused"
+        );
+
+        let sandbox_map = "         0       1000          1\n";
+        let unmapped = super::unmapped_owner_uid_from(Some(sandbox_map), Some("65534\n"));
+        assert_eq!(unmapped, Some(NOBODY));
+        assert!(
+            super::ancestor_owner_is_trusted(NOBODY, OUR_UID, unmapped),
+            "inside a user namespace the overflow uid stands for an unmapped owner"
+        );
+        assert!(
+            !super::ancestor_owner_is_trusted(1001, OUR_UID, unmapped),
+            "another mapped user is still refused inside a namespace"
         );
     }
 
