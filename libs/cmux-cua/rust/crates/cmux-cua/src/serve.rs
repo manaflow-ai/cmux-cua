@@ -4728,6 +4728,120 @@ mod gate_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod owner_pid_tests {
+    //! `serve --owner-pid`: the daemon exits when its owning process exits
+    //! (for example the host app crashes), and it removes its socket.
+
+    use super::{run_serve_with_owner, DaemonProfile, ServeExit};
+    use cmux_cua_core::tool::ToolRegistry;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn private_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make temp root private");
+        root
+    }
+
+    fn spawn_owner() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep owner")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_exits_and_removes_its_socket_when_the_owner_exits() {
+        let root = private_root();
+        let socket = root.path().join("owned.sock");
+        let pid_file = root.path().join("owned.pid");
+        let mut owner = spawn_owner();
+        let owner_pid = owner.id() as i32;
+
+        let socket_for_server = socket.clone();
+        let pid_for_server = pid_file.clone();
+        let server = tokio::spawn(async move {
+            run_serve_with_owner(
+                Arc::new(ToolRegistry::new()),
+                socket_for_server.to_str().expect("socket path"),
+                Some(pid_for_server.to_str().expect("pid path")),
+                DaemonProfile::Native,
+                Some(owner_pid),
+            )
+            .await
+        });
+
+        let bind_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !socket.exists() {
+            assert!(!server.is_finished(), "serve stopped before the owner exited");
+            assert!(std::time::Instant::now() < bind_deadline, "serve did not bind");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        owner.kill().expect("kill owner");
+        owner.wait().expect("reap owner");
+
+        let exit = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("serve must exit within 2 s after the owner exits")
+            .expect("serve task")
+            .expect("serve result");
+        assert_eq!(exit, ServeExit::OwnerExited);
+        assert!(!socket.exists(), "serve must remove its socket");
+        assert!(!pid_file.exists(), "serve must remove its pid file");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_exits_at_once_when_the_owner_is_already_dead() {
+        let root = private_root();
+        let socket = root.path().join("orphan.sock");
+        let mut owner = spawn_owner();
+        let owner_pid = owner.id() as i32;
+        owner.kill().expect("kill owner");
+        owner.wait().expect("reap owner");
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_serve_with_owner(
+                Arc::new(ToolRegistry::new()),
+                socket.to_str().expect("socket path"),
+                None,
+                DaemonProfile::Native,
+                Some(owner_pid),
+            ),
+        )
+        .await
+        .expect("serve must exit at once when the owner is already dead")
+        .expect("serve result");
+        assert_eq!(exit, ServeExit::OwnerExited);
+        assert!(!socket.exists(), "serve must not leave a socket behind");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_without_an_owner_keeps_running() {
+        let root = private_root();
+        let socket = root.path().join("unowned.sock");
+        let socket_for_server = socket.clone();
+        let server = tokio::spawn(async move {
+            run_serve_with_owner(
+                Arc::new(ToolRegistry::new()),
+                socket_for_server.to_str().expect("socket path"),
+                None,
+                DaemonProfile::Native,
+                None,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!server.is_finished(), "serve without --owner-pid must keep running");
+        server.abort();
+        let _ = std::fs::remove_file(&socket);
+    }
+}
+
 #[cfg(test)]
 mod session_boundary_tests {
     use super::{

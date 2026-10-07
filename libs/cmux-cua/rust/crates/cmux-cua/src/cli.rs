@@ -4002,6 +4002,52 @@ mod tests {
         }
     }
 
+    // ── Surface 7b: serve --owner-pid ───────────────────────────────────────
+
+    /// A host app checks `manifest.capabilities` for `serve.owner-pid`
+    /// before it passes `--owner-pid`, so an older helper never gets a flag
+    /// it does not know. The serve entry also lists the flag.
+    #[test]
+    fn manifest_advertises_the_serve_owner_pid_capability() {
+        let m = build_manifest();
+        let capabilities: Vec<&str> = m
+            .get("capabilities")
+            .and_then(|v| v.as_array())
+            .expect("capabilities is an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            capabilities.contains(&crate::serve::OWNER_PID_CAPABILITY),
+            "capabilities must list {}: {capabilities:?}",
+            crate::serve::OWNER_PID_CAPABILITY
+        );
+        assert_eq!(crate::serve::OWNER_PID_CAPABILITY, "serve.owner-pid");
+
+        let serve = m["subcommands"]
+            .as_array()
+            .expect("subcommands")
+            .iter()
+            .find(|s| s["name"] == "serve")
+            .expect("serve subcommand");
+        assert!(
+            serve["args"]
+                .as_array()
+                .expect("serve args")
+                .iter()
+                .any(|a| a["name"] == "--owner-pid" && a["type"] == "integer"),
+            "serve args must list --owner-pid"
+        );
+    }
+
+    #[test]
+    fn owner_pid_accepts_only_a_positive_process_id() {
+        assert_eq!(parse_owner_pid("4242"), Ok(4242));
+        for bad in ["", "0", "-1", "abc", "12x", "99999999999"] {
+            assert!(parse_owner_pid(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
     // ── Surface 8: manifest shape ───────────────────────────────────────────
 
     /// The manifest must carry the four documented top-level keys so a
