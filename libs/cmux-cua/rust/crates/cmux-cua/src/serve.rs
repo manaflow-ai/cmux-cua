@@ -200,6 +200,27 @@ fn write_private_pid_file(pid_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Refuse a daemon socket peer that runs as a different user.
+///
+/// The socket directory and socket file are private, but that is a path
+/// property. The kernel peer credential is the authoritative identity of a
+/// connected process, so every accepted connection must carry our effective
+/// uid. The returned message names only uids, never request data or tokens.
+#[cfg(unix)]
+fn check_peer_uid(stream: &tokio::net::UnixStream, expected_uid: u32) -> Result<(), String> {
+    let credentials = stream
+        .peer_cred()
+        .map_err(|error| format!("could not read the peer credentials: {error}"))?;
+    let peer_uid = credentials.uid();
+    if peer_uid == expected_uid {
+        Ok(())
+    } else {
+        Err(format!(
+            "peer runs as uid {peer_uid}, expected uid {expected_uid}"
+        ))
+    }
+}
+
 const CODEX_UNVERIFIED_CLIENT_ENV: &str = "CMUX_CUA_CODEX_ALLOW_UNVERIFIED_CLIENT";
 const CODEX_PARENT_REQUIREMENT: &str =
     "anchor apple generic and certificate leaf[subject.OU] = \"2DC432GLL2\" and identifier \"codex\"";
@@ -1596,6 +1617,7 @@ pub async fn run_serve(
     );
 
     let socket = std::path::Path::new(socket_path);
+    let daemon_uid = unsafe { libc::geteuid() };
 
     // The daemon socket carries live desktop-control authority. Require every
     // socket directory to be private to the current user. The default path may
@@ -1661,6 +1683,10 @@ pub async fn run_serve(
         tokio::select! {
             result = listener.accept() => {
                 let (stream, _) = result?;
+                if let Err(refusal) = check_peer_uid(&stream, daemon_uid) {
+                    eprintln!("cmux-cua: refused daemon socket peer: {refusal}");
+                    continue;
+                }
                 #[cfg(target_os = "macos")]
                 let peer_process_id = macos_peer_process_id(&stream);
                 #[cfg(target_os = "macos")]
