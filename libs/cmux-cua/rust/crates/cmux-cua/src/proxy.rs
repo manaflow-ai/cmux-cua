@@ -3090,6 +3090,46 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn bootstrap_admission_refuses_a_guarded_target_before_the_helper_starts() {
+        // A refused target must not start the helper or wait for permission
+        // grants: admission rejects it with the typed refusal.
+        fn request(name: &str, arguments: serde_json::Value) -> Request {
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments },
+            }))
+            .expect("request envelope")
+        }
+        let tools_list =
+            with_proxy_tools(crate::build_macos_registry_with_compat(false, false).tools_list());
+        let own = std::process::id();
+        for req in [
+            request("get_window_state", serde_json::json!({ "pid": own, "window_id": 1 })),
+            request(
+                "perform_actions",
+                serde_json::json!({ "actions": [
+                    { "tool": "press_key", "arguments": { "pid": own, "key": "a" } }
+                ] }),
+            ),
+        ] {
+            match admit_bootstrap_tool_call(&req, &tools_list) {
+                BootstrapToolCallAdmission::Rejected(result) => {
+                    let text = serde_json::to_string(&result).unwrap();
+                    assert!(text.contains("target_not_allowed"), "{text}");
+                }
+                _ => panic!("a guarded target must be rejected at admission"),
+            }
+        }
+        assert!(matches!(
+            admit_bootstrap_tool_call(&request("get_screen_size", serde_json::json!({})), &tools_list),
+            BootstrapToolCallAdmission::Ready { .. }
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn bootstrap_admission_accepts_only_real_calls_and_preserves_wait_policy() {
         fn request(name: &str, arguments: serde_json::Value) -> Request {
             serde_json::from_value(serde_json::json!({
