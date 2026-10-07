@@ -513,7 +513,7 @@ done
 # the baked line hasn't been updated yet (dev / pre-release checkouts).
 #
 # ~~~ BAKED_VERSION: auto-updated by CD workflow after each release — do not edit ~~~
-CMUX_CUA_BAKED_VERSION="0.8.9"
+CMUX_CUA_BAKED_VERSION="0.8.10"
 # ~~~ END_BAKED_VERSION ~~~
 
 if [[ -n "${CMUX_CUA_VERSION:-}" ]]; then

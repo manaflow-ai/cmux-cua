@@ -4,7 +4,7 @@ This package provides a thin Python wrapper around the cmux-cua Rust binary,
 enabling pip-installable access to the MCP server for computer-use automation.
 """
 
-__version__ = "0.8.9"
+__version__ = "0.8.10"
 
 from .wrapper import run_cmux_cua, get_binary_path
 
