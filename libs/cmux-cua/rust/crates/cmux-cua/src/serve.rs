@@ -3920,6 +3920,30 @@ mod gate_tests {
         }
     }
 
+    #[tokio::test]
+    async fn daemon_peer_with_a_foreign_uid_is_refused() {
+        let root = tempfile::tempdir().expect("temp root");
+        let socket = root.path().join("peer-uid.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind test socket");
+        let _client = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connect test client");
+        let (stream, _) = listener.accept().await.expect("accept test client");
+
+        let effective_uid = unsafe { libc::geteuid() };
+        super::check_peer_uid(&stream, effective_uid)
+            .expect("a peer with our effective uid is accepted");
+
+        let foreign_uid = effective_uid.wrapping_add(1);
+        let refusal = super::check_peer_uid(&stream, foreign_uid)
+            .expect_err("a peer whose uid differs from the expected uid is refused");
+        assert!(
+            refusal.contains(&format!("uid {effective_uid}"))
+                && refusal.contains(&format!("expected uid {foreign_uid}")),
+            "refusal names both uids: {refusal}"
+        );
+    }
+
     #[test]
     fn runtime_directory_is_private_and_rejects_symlinks() {
         let root = tempfile::tempdir().expect("temp root");
