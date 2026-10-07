@@ -28,6 +28,18 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+pub use crate::owner_watch::OWNER_PID_CAPABILITY;
+
+/// Why `run_serve_with_owner` returned without an error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub enum ServeExit {
+    /// A client sent `shutdown`, or the authorized root process exited.
+    Shutdown,
+    /// The `--owner-pid` process exited (or was already dead at start).
+    OwnerExited,
+}
+
 /// Tool surface owned by a daemon instance. The proxy validates this value
 /// before exposing any tools so an explicit socket cannot accidentally bridge
 /// a native client to the narrower Codex Computer Use daemon, or vice versa.
@@ -1892,8 +1904,57 @@ pub async fn run_serve(
     pid_file_path: Option<&str>,
     profile: DaemonProfile,
 ) -> anyhow::Result<()> {
+    run_serve_with_owner(registry, socket_path, pid_file_path, profile, None)
+        .await
+        .map(|_| ())
+}
+
+/// Wait for the owner watch to report an exit. Pends forever when there is
+/// no owner, or when the watch thread ended without seeing an exit.
+#[cfg(unix)]
+async fn owner_exited(watch: &mut Option<tokio::sync::oneshot::Receiver<()>>) {
+    let result = match watch.as_mut() {
+        Some(receiver) => receiver.await,
+        None => return std::future::pending().await,
+    };
+    if result.is_ok() {
+        return;
+    }
+    *watch = None;
+    std::future::pending().await
+}
+
+/// `run_serve` plus `--owner-pid`: when `owner_pid` is set, the daemon
+/// shuts down (and removes its socket and pid file) as soon as that process
+/// exits. If the owner is already dead, it returns at once without binding.
+#[cfg(unix)]
+pub async fn run_serve_with_owner(
+    registry: std::sync::Arc<cmux_cua_core::tool::ToolRegistry>,
+    socket_path: &str,
+    pid_file_path: Option<&str>,
+    profile: DaemonProfile,
+    owner_pid: Option<i32>,
+) -> anyhow::Result<ServeExit> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
+
+    // Start the owner watch before binding, so a daemon whose owner is
+    // already gone never creates a socket.
+    let mut owner_watch = match owner_pid {
+        None => None,
+        Some(pid) => match crate::owner_watch::watch(pid) {
+            crate::owner_watch::OwnerWatch::Watching(receiver) => Some(receiver),
+            crate::owner_watch::OwnerWatch::AlreadyExited => {
+                eprintln!("cmux CUA daemon: owner process {pid} is not running; exiting.");
+                return Ok(ServeExit::OwnerExited);
+            }
+            crate::owner_watch::OwnerWatch::Unsupported(reason) => {
+                eprintln!("cmux CUA daemon: {reason}");
+                None
+            }
+        },
+    };
+    let mut exit = ServeExit::Shutdown;
 
     #[cfg(target_os = "macos")]
     let authorized_root_identity = configured_authorized_root_identity()?;
@@ -3149,6 +3210,14 @@ pub async fn run_serve(
                 eprintln!("cmux CUA daemon shutting down.");
                 break;
             }
+            _ = owner_exited(&mut owner_watch) => {
+                eprintln!(
+                    "cmux CUA daemon: owner process {} exited; removing socket and shutting down.",
+                    owner_pid.unwrap_or_default()
+                );
+                exit = ServeExit::OwnerExited;
+                break;
+            }
             _ = authorized_root_health.tick(), if authorized_root_identity.is_some() => {
                 #[cfg(target_os = "macos")]
                 if let Some(root_process_identity) = authorized_root_identity {
@@ -3175,7 +3244,7 @@ pub async fn run_serve(
     }
     registry.remove_state_file();
 
-    Ok(())
+    Ok(exit)
 }
 
 /// On Windows, optionally spawn the sibling uiAccess'd worker
@@ -3778,11 +3847,15 @@ pub async fn run_serve(
 // ── CLI helpers ───────────────────────────────────────────────────────────────
 
 /// `cmux-cua serve` implementation.
+///
+/// With `owner_pid`, the process exits 0 once the owner exits (after the
+/// daemon removed its socket), so a blocked main thread cannot keep it alive.
 pub fn run_serve_cmd(
     registry: std::sync::Arc<cmux_cua_core::tool::ToolRegistry>,
     socket_path: &str,
     pid_file_path: Option<&str>,
     profile: DaemonProfile,
+    owner_pid: Option<i32>,
 ) {
     let socket_path = socket_path.to_owned();
     let pid_file_path = pid_file_path.map(str::to_owned);
@@ -3830,15 +3903,39 @@ pub fn run_serve_cmd(
         .build()
         .expect("tokio runtime");
 
-    if let Err(e) = rt.block_on(run_serve(
+    #[cfg(unix)]
+    let result = rt.block_on(run_serve_with_owner(
         registry.clone(),
         &socket_path,
         pid_file_path.as_deref(),
         profile,
-    )) {
-        registry.remove_state_file();
-        eprintln!("cmux-cua serve error: {e}");
-        std::process::exit(1);
+        owner_pid,
+    ));
+    #[cfg(not(unix))]
+    let result = {
+        if let Some(pid) = owner_pid {
+            if let crate::owner_watch::OwnerWatch::Unsupported(reason) =
+                crate::owner_watch::watch(pid)
+            {
+                eprintln!("cmux CUA daemon: {reason}");
+            }
+        }
+        rt.block_on(run_serve(
+            registry.clone(),
+            &socket_path,
+            pid_file_path.as_deref(),
+            profile,
+        ))
+        .map(|()| ServeExit::Shutdown)
+    };
+    match result {
+        Ok(ServeExit::OwnerExited) => std::process::exit(0),
+        Ok(ServeExit::Shutdown) => {}
+        Err(e) => {
+            registry.remove_state_file();
+            eprintln!("cmux-cua serve error: {e}");
+            std::process::exit(1);
+        }
     }
 }
 

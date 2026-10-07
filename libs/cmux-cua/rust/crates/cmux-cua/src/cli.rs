@@ -79,6 +79,10 @@ pub enum Command {
         /// True when the daemon should expose the Codex Computer Use
         /// compatibility surface.
         codex_computer_use_compat: bool,
+        /// `--owner-pid <pid>`: exit (removing the socket) when this process
+        /// exits. A host app that launches serve through LaunchServices
+        /// passes its own pid so a crash does not orphan the daemon.
+        owner_pid: Option<i32>,
     },
     Stop {
         socket: Option<String>,
@@ -165,7 +169,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--cursor-icon", "--cursor-id", "--cursor-palette", "--cursor-shape",
     "--glide-ms", "--dwell-ms", "--idle-hide-ms",
     "--screenshot-out-file", "--client", "--socket", "--pid-file", "--type",
-    "--host-bundle-id",
+    "--host-bundle-id", "--owner-pid",
     // Experimental PiP preview — value flag for the optional geometry
     // override (--experimental-pip itself is a bare flag and doesn't
     // need to be listed here).
@@ -270,6 +274,12 @@ pub fn parse_command() -> Command {
         println!("  cmux-cua skills status        Report local install state + per-agent link state. Read-only.");
         println!("  cmux-cua skills path          Print where the local skill pack lives.");
         println!("  --from main                     (install only) Fetch latest from main branch instead of the tagged release.");
+        println!();
+        println!("serve options:");
+        println!("  --owner-pid <pid>       Exit 0 and remove the socket when <pid> exits (for example the");
+        println!("                          host app crashes). Exits at once if <pid> is already dead.");
+        println!("                          macOS: kqueue NOTE_EXIT. Linux: pidfd. Windows: ignored.");
+        println!("                          Hosts check `cmux-cua manifest` capabilities for serve.owner-pid.");
         println!();
         println!("mcp options (macOS):");
         println!("  --no-daemon-relaunch    Stay in-process; skip auto-launching the CmuxCua daemon.");
@@ -463,6 +473,7 @@ pub fn parse_command() -> Command {
             no_permissions_gate: args.iter().any(|a| a == "--no-permissions-gate"),
             claude_code_compat,
             codex_computer_use_compat,
+            owner_pid: serve_owner_pid_or_exit(&args),
         },
         Some("stop") => Command::Stop {
             socket,
@@ -626,6 +637,27 @@ pub fn parse_command() -> Command {
                 None => read_stdin_json(),
             };
             Command::Call { tool, json_args, screenshot_out_file, socket: socket.clone() }
+        }
+    }
+}
+
+pub(crate) use crate::owner_watch::parse_owner_pid;
+
+/// Read `serve --owner-pid <pid>`. A missing or invalid value is a usage
+/// error (exit 2), never a silent fallback to an unowned daemon.
+fn serve_owner_pid_or_exit(args: &[String]) -> Option<i32> {
+    let present = args
+        .iter()
+        .any(|a| a == "--owner-pid" || a.starts_with("--owner-pid="));
+    if !present {
+        return None;
+    }
+    let raw = flag_value(args, "--owner-pid").unwrap_or_default();
+    match parse_owner_pid(&raw) {
+        Ok(pid) => Some(pid),
+        Err(message) => {
+            eprintln!("cmux-cua serve: {message}");
+            std::process::exit(2);
         }
     }
 }
@@ -1142,6 +1174,10 @@ pub fn build_manifest() -> serde_json::Value {
         "schema_version": "1",
         "binary_version": env!("CARGO_PKG_VERSION"),
         "binary_path": binary,
+        // Feature flags a host can check before it relies on a behavior.
+        // `serve.owner-pid`: `serve --owner-pid <pid>` exits 0 and removes
+        // its socket when that pid exits (no-op with a message on Windows).
+        "capabilities": [crate::serve::OWNER_PID_CAPABILITY],
         "mcp_invocation": {
             "command": binary,
             "args": ["mcp"]
@@ -1166,6 +1202,7 @@ pub fn build_manifest() -> serde_json::Value {
               "args": [
                   { "name": "--socket", "type": "string", "description": "Override the listen socket path." },
                   { "name": "--no-permissions-gate", "type": "flag", "description": "Skip the macOS TCC first-launch gate." },
+                  { "name": "--owner-pid", "type": "integer", "description": "Exit and remove the socket when this process exits (macOS kqueue, Linux pidfd; ignored with a message on Windows)." },
                   { "name": "--claude-code-computer-use-compat", "type": "flag", "description": "Forwarded by the MCP proxy when the client asked for the compat surface." },
                   { "name": "--codex-computer-use-compat", "type": "flag", "description": "Forwarded by the MCP proxy when the client asked for the Codex compatibility surface." },
                   { "name": "--embedded", "type": "flag", "description": "Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CMUX_CUA_EMBEDDED=1." },
@@ -2801,7 +2838,8 @@ fn cli_docs_json() -> serde_json::Value {
                 "options": [
                     {"name":"socket","short_name":null,"help":"Override the daemon socket or named-pipe path.","type":"String","default_value":null,"is_optional":true},
                     {"name":"pid-file","short_name":null,"help":"Override the pid-file path on Unix targets.","type":"String","default_value":null,"is_optional":true},
-                    {"name":"host-bundle-id","short_name":null,"help":"Advisory host bundle id label echoed in check_permissions output (embedded mode).","type":"String","default_value":null,"is_optional":true}
+                    {"name":"host-bundle-id","short_name":null,"help":"Advisory host bundle id label echoed in check_permissions output (embedded mode).","type":"String","default_value":null,"is_optional":true},
+                    {"name":"owner-pid","short_name":null,"help":"Exit 0 and remove the socket when this process exits. If it is already dead, exit at once. Ignored with a message on Windows.","type":"Int","default_value":null,"is_optional":true}
                 ],
                 "flags": [
                     {"name":"no-permissions-gate","short_name":null,"help":"Skip the macOS first-launch permissions gate.","default_value":false},
