@@ -1660,6 +1660,32 @@ fn admit_bootstrap_tool_call(
         return BootstrapToolCallAdmission::Rejected(result);
     }
 
+    // Target guard before anything starts the helper or waits for grants:
+    // a refused target is side-effect free. perform_actions is checked per
+    // step; call_daemon_tool and the daemon's registry check again.
+    let allowed_targets = cmux_cua_core::target_policy::allowed_from_env();
+    let steps: Vec<(&str, &serde_json::Value)> = if call.name == PERFORM_ACTIONS_TOOL {
+        call.args
+            .get("actions")
+            .and_then(serde_json::Value::as_array)
+            .map(|actions| {
+                actions
+                    .iter()
+                    .filter_map(|action| {
+                        Some((action.get("tool")?.as_str()?, action.get("arguments")?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        vec![(call.name.as_str(), &call.args)]
+    };
+    for (tool, arguments) in steps {
+        if let Err(refusal) = proxy_target_guard(tool, arguments, &allowed_targets) {
+            return BootstrapToolCallAdmission::Rejected(refusal);
+        }
+    }
+
     let wait_for_grants = tool_call_requires_grant_wait(req);
     BootstrapToolCallAdmission::Ready {
         call,
@@ -3085,6 +3111,46 @@ mod tests {
         assert!(matches!(
             admit_bootstrap_tool_call(&invalid, &tools_list),
             BootstrapToolCallAdmission::Rejected(_)
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_admission_refuses_a_guarded_target_before_the_helper_starts() {
+        // A refused target must not start the helper or wait for permission
+        // grants: admission rejects it with the typed refusal.
+        fn request(name: &str, arguments: serde_json::Value) -> Request {
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments },
+            }))
+            .expect("request envelope")
+        }
+        let tools_list =
+            with_proxy_tools(crate::build_macos_registry_with_compat(false, false).tools_list());
+        let own = std::process::id();
+        for req in [
+            request("get_window_state", serde_json::json!({ "pid": own, "window_id": 1 })),
+            request(
+                "perform_actions",
+                serde_json::json!({ "actions": [
+                    { "tool": "press_key", "arguments": { "pid": own, "key": "a" } }
+                ] }),
+            ),
+        ] {
+            match admit_bootstrap_tool_call(&req, &tools_list) {
+                BootstrapToolCallAdmission::Rejected(result) => {
+                    let text = serde_json::to_string(&result).unwrap();
+                    assert!(text.contains("target_not_allowed"), "{text}");
+                }
+                _ => panic!("a guarded target must be rejected at admission"),
+            }
+        }
+        assert!(matches!(
+            admit_bootstrap_tool_call(&request("get_screen_size", serde_json::json!({})), &tools_list),
+            BootstrapToolCallAdmission::Ready { .. }
         ));
     }
 
