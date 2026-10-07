@@ -120,6 +120,7 @@ pub mod server;
 pub mod session_state;
 pub mod session;
 pub mod session_tools;
+pub mod target_policy;
 pub mod socket_io;
 pub mod text_sanitize;
 pub mod tool;
