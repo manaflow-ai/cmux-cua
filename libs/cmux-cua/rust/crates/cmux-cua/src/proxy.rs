@@ -1187,6 +1187,38 @@ async fn send_daemon_request_async(
     }
 }
 
+/// The target guard on the proxy side: refuse before anything reaches the
+/// daemon, whose build may predate the guard. The model-supplied private
+/// scope argument is ignored; `allowed` comes from this process's env.
+fn proxy_target_guard(
+    name: &str,
+    args: &serde_json::Value,
+    allowed: &[String],
+) -> Result<(), cmux_cua_core::protocol::ToolResult> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut args = args.clone();
+        cmux_cua_core::target_policy::take_allowed(&mut args);
+        platform_macos::target_guard::enforce_native(name, &args, allowed)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (name, args, allowed);
+        Ok(())
+    }
+}
+
+/// A guard refusal in the daemon's response shape, so the MCP client sees the
+/// same `isError` result the daemon's own guard returns.
+fn refusal_daemon_response(refusal: cmux_cua_core::protocol::ToolResult) -> DaemonResponse {
+    DaemonResponse {
+        ok: false,
+        result: serde_json::to_value(refusal).ok(),
+        error: Some("target_not_allowed".to_owned()),
+        exit_code: Some(1),
+    }
+}
+
 async fn call_daemon_tool(
     socket_path: &str,
     session_id: &str,
@@ -1194,10 +1226,11 @@ async fn call_daemon_tool(
     mut args: serde_json::Value,
 ) -> Result<DaemonResponse, String> {
     // The model never sets the target scope; this process's env does.
-    cmux_cua_core::target_policy::scope_target_args(
-        &mut args,
-        &cmux_cua_core::target_policy::allowed_from_env(),
-    );
+    let allowed_targets = cmux_cua_core::target_policy::allowed_from_env();
+    if let Err(refusal) = proxy_target_guard(name, &args, &allowed_targets) {
+        return Ok(refusal_daemon_response(refusal));
+    }
+    cmux_cua_core::target_policy::scope_target_args(&mut args, &allowed_targets);
     send_daemon_request_async(
         socket_path,
         DaemonRequest {
@@ -2014,6 +2047,17 @@ fn prepare_action_group(
             })?;
         let mut arguments =
             enforce_proxy_session_identity(arguments, session_id, managed_session);
+        if let Err(refusal) = proxy_target_guard(tool, &arguments, &allowed_targets) {
+            let text = refusal
+                .content
+                .iter()
+                .find_map(|content| match content {
+                    cmux_cua_core::protocol::Content::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "target_not_allowed".to_owned());
+            return Err(format!("perform_actions step {index}: {text}"));
+        }
         cmux_cua_core::target_policy::scope_target_args(&mut arguments, &allowed_targets);
         prepared.push(PreparedProxyAction {
             tool: tool.to_owned(),
@@ -2330,6 +2374,25 @@ fn enforce_proxy_session_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_proxy_refuses_a_guarded_target_before_forwarding() {
+        // The driver's own pid is always refused; a model-supplied scope
+        // argument does not unlock it.
+        let own = std::process::id();
+        let args = serde_json::json!({
+            "pid": own,
+            "_cua_allowed_target_bundle_ids": ["com.cmuxterm.app"],
+        });
+        let refusal = proxy_target_guard("click", &args, &[]).unwrap_err();
+        let response = refusal_daemon_response(refusal);
+        assert!(!response.ok);
+        let result = response.result.expect("typed refusal");
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["code"], "target_not_allowed");
+        assert!(proxy_target_guard("get_screen_size", &serde_json::json!({}), &[]).is_ok());
+    }
 
     fn approval_challenge_response(allow_persistent: bool) -> DaemonResponse {
         DaemonResponse::tool_error(

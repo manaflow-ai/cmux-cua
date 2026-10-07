@@ -1,6 +1,8 @@
 //! macOS lookups for the native target guard
 //! ([`cmux_cua_core::target_policy`]). The registry runs
-//! [`enforce_native`] before every tool call, in every profile.
+//! [`enforce_native`] before every tool call, in every profile, and the MCP
+//! proxy runs it again before forwarding, so the guard holds even when the
+//! helper daemon on the other end of the socket is an older build.
 
 use cmux_cua_core::protocol::ToolResult;
 use cmux_cua_core::target_policy::{self, TargetIdentity, TargetResolver};
@@ -38,7 +40,7 @@ fn pid_for_window(window_id: u64) -> Option<i64> {
 }
 
 /// The registry's target policy hook on macOS.
-pub(crate) fn enforce_native(
+pub fn enforce_native(
     tool: &str,
     args: &Value,
     allowed: &[String],
