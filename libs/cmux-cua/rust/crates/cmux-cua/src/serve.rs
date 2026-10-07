@@ -129,7 +129,10 @@ fn open_directory_component(
         let error = std::io::Error::last_os_error();
         return match error.raw_os_error() {
             Some(libc::ELOOP) | Some(libc::ENOTDIR) => {
-                anyhow::bail!("runtime path is not a real directory: {}", display.display())
+                anyhow::bail!(
+                    "runtime path is not a real directory: {}",
+                    display.display()
+                )
             }
             _ => Err(anyhow::anyhow!("open {}: {error}", display.display())),
         };
@@ -151,7 +154,10 @@ fn directory_status(
     }
     let status = unsafe { status.assume_init() };
     if status.st_mode & libc::S_IFMT != libc::S_IFDIR {
-        anyhow::bail!("runtime path is not a real directory: {}", display.display());
+        anyhow::bail!(
+            "runtime path is not a real directory: {}",
+            display.display()
+        );
     }
     Ok(status)
 }
@@ -348,7 +354,10 @@ fn bind_socket_in_directory(
             Some(std::path::Component::Normal(_))
         )
     {
-        anyhow::bail!("socket name is not a single path component: {}", display.display());
+        anyhow::bail!(
+            "socket name is not a single path component: {}",
+            display.display()
+        );
     }
     std::thread::scope(|scope| {
         scope
@@ -4238,7 +4247,10 @@ mod gate_tests {
             error.to_string().contains("writable by other users"),
             "unexpected error: {error}"
         );
-        assert!(!socket.exists(), "no socket is bound under an unsafe ancestor");
+        assert!(
+            !socket.exists(),
+            "no socket is bound under an unsafe ancestor"
+        );
     }
 
     #[test]
@@ -4249,8 +4261,7 @@ mod gate_tests {
         std::fs::set_permissions(&scope, std::fs::Permissions::from_mode(0o700))
             .expect("make scope private");
 
-        let directory =
-            super::open_private_runtime_directory(&scope, false).expect("open scope");
+        let directory = super::open_private_runtime_directory(&scope, false).expect("open scope");
 
         // Simulate the race: after the check, the path now names a different
         // directory, and our directory lives somewhere else.
