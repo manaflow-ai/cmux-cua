@@ -236,7 +236,7 @@ fn open_private_runtime_directory(
     let root_path = std::path::Path::new("/");
     let root_fd = unsafe {
         libc::open(
-            b"/\0".as_ptr().cast(),
+            c"/".as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
