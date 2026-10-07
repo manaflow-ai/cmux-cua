@@ -1660,6 +1660,32 @@ fn admit_bootstrap_tool_call(
         return BootstrapToolCallAdmission::Rejected(result);
     }
 
+    // Target guard before anything starts the helper or waits for grants:
+    // a refused target is side-effect free. perform_actions is checked per
+    // step; call_daemon_tool and the daemon's registry check again.
+    let allowed_targets = cmux_cua_core::target_policy::allowed_from_env();
+    let steps: Vec<(&str, &serde_json::Value)> = if call.name == PERFORM_ACTIONS_TOOL {
+        call.args
+            .get("actions")
+            .and_then(serde_json::Value::as_array)
+            .map(|actions| {
+                actions
+                    .iter()
+                    .filter_map(|action| {
+                        Some((action.get("tool")?.as_str()?, action.get("arguments")?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        vec![(call.name.as_str(), &call.args)]
+    };
+    for (tool, arguments) in steps {
+        if let Err(refusal) = proxy_target_guard(tool, arguments, &allowed_targets) {
+            return BootstrapToolCallAdmission::Rejected(refusal);
+        }
+    }
+
     let wait_for_grants = tool_call_requires_grant_wait(req);
     BootstrapToolCallAdmission::Ready {
         call,
