@@ -3970,6 +3970,80 @@ mod gate_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn socket_directory_refuses_an_ancestor_writable_by_other_users() {
+        let root = tempfile::tempdir().expect("temp root");
+        // A grandparent that another user can write to, without the sticky
+        // bit, lets that user rename our private scope directory between the
+        // check and the bind.
+        let grandparent = root.path().join("shared-grandparent");
+        std::fs::create_dir(&grandparent).expect("create grandparent");
+        std::fs::set_permissions(&grandparent, std::fs::Permissions::from_mode(0o777))
+            .expect("make grandparent writable by other users");
+        let scope = grandparent.join("scope");
+        std::fs::create_dir(&scope).expect("create scope");
+        std::fs::set_permissions(&scope, std::fs::Permissions::from_mode(0o700))
+            .expect("make scope private");
+        let socket = scope.join("driver.sock");
+
+        let registry = Arc::new(ToolRegistry::new());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_serve(
+                registry,
+                socket.to_str().expect("socket path"),
+                None,
+                DaemonProfile::Native,
+            ),
+        )
+        .await
+        .expect("run_serve must fail closed instead of serving");
+        let error = result.expect_err("an unsafe ancestor must fail closed");
+        assert!(
+            error.to_string().contains("writable by other users"),
+            "unexpected error: {error}"
+        );
+        assert!(!socket.exists(), "no socket is bound under an unsafe ancestor");
+    }
+
+    #[test]
+    fn socket_binds_in_the_opened_directory_after_the_path_is_swapped() {
+        let root = tempfile::tempdir().expect("temp root");
+        let scope = root.path().join("scope");
+        std::fs::create_dir(&scope).expect("create scope");
+        std::fs::set_permissions(&scope, std::fs::Permissions::from_mode(0o700))
+            .expect("make scope private");
+
+        let directory =
+            super::open_private_runtime_directory(&scope, false).expect("open scope");
+
+        // Simulate the race: after the check, the path now names a different
+        // directory, and our directory lives somewhere else.
+        let moved = root.path().join("moved-scope");
+        std::fs::rename(&scope, &moved).expect("move scope away");
+        std::fs::create_dir(&scope).expect("create replacement directory");
+
+        let name = std::ffi::OsStr::new("driver.sock");
+        let listener = super::bind_socket_in_directory(&directory, name, &scope.join(name))
+            .expect("bind through the opened directory");
+
+        assert!(
+            moved.join(name).exists(),
+            "the socket is bound inside the directory that was checked"
+        );
+        assert!(
+            !scope.join(name).exists(),
+            "the socket must not follow the swapped path"
+        );
+        let mode = std::fs::metadata(moved.join(name))
+            .expect("socket metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(listener);
+    }
+
     #[test]
     fn runtime_directory_is_private_and_rejects_symlinks() {
         let root = tempfile::tempdir().expect("temp root");
