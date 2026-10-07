@@ -104,29 +104,172 @@ fn secure_runtime_directory(
     dir: &std::path::Path,
     repair_legacy_permissions: bool,
 ) -> anyhow::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    open_private_runtime_directory(dir, repair_legacy_permissions).map(drop)
+}
+
+#[cfg(unix)]
+fn open_directory_component(
+    parent: std::os::fd::BorrowedFd<'_>,
+    name: &std::ffi::OsStr,
+    display: &std::path::Path,
+) -> anyhow::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| anyhow::anyhow!("runtime path contains a NUL byte: {}", display.display()))?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ELOOP) | Some(libc::ENOTDIR) => {
+                anyhow::bail!("runtime path is not a real directory: {}", display.display())
+            }
+            _ => Err(anyhow::anyhow!("open {}: {error}", display.display())),
+        };
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn directory_status(
+    directory: std::os::fd::BorrowedFd<'_>,
+    display: &std::path::Path,
+) -> anyhow::Result<libc::stat> {
+    use std::os::fd::AsRawFd;
+
+    let mut status = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(directory.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+        let error = std::io::Error::last_os_error();
+        anyhow::bail!("stat {}: {error}", display.display());
+    }
+    let status = unsafe { status.assume_init() };
+    if status.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        anyhow::bail!("runtime path is not a real directory: {}", display.display());
+    }
+    Ok(status)
+}
+
+/// An ancestor of the runtime directory must not let another user rename or
+/// replace the entry below it. It must be owned by root or by us, and it must
+/// not be writable by group or other users unless the sticky bit restricts
+/// renames to the entry owner (as on `/tmp`).
+#[cfg(unix)]
+fn check_runtime_ancestor(
+    directory: std::os::fd::BorrowedFd<'_>,
+    display: &std::path::Path,
+    effective_uid: libc::uid_t,
+) -> anyhow::Result<()> {
+    let status = directory_status(directory, display)?;
+    if status.st_uid != 0 && status.st_uid != effective_uid {
+        anyhow::bail!(
+            "runtime path ancestor {} is owned by uid {}, expected root or uid {}",
+            display.display(),
+            status.st_uid,
+            effective_uid
+        );
+    }
+    let mode = status.st_mode as u32;
+    if mode & 0o022 != 0 && mode & (libc::S_ISVTX as u32) == 0 {
+        anyhow::bail!(
+            "runtime path ancestor {} is writable by other users without the sticky bit mode={:o}",
+            display.display(),
+            mode & 0o7777
+        );
+    }
+    Ok(())
+}
+
+/// Open the private runtime directory without following any symlink, and
+/// return a descriptor that later socket operations use. Each component is
+/// opened relative to the descriptor of its parent, starting at `/`, with
+/// `O_NOFOLLOW`. A rename of any path component after this call cannot
+/// redirect work done through the returned descriptor.
+///
+/// The ancestors are resolved once with `canonicalize` so a root-owned system
+/// symlink such as `/tmp -> private/tmp` is allowed; every resolved ancestor
+/// is then checked by `check_runtime_ancestor`. The final directory itself
+/// must not be a symlink, must be owned by us, and must be private.
+#[cfg(unix)]
+fn open_private_runtime_directory(
+    dir: &std::path::Path,
+    repair_legacy_permissions: bool,
+) -> anyhow::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+    use std::os::unix::fs::DirBuilderExt;
+
+    let dir = if dir.as_os_str().is_empty() {
+        std::env::current_dir()?
+    } else if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
 
     if !dir.exists() {
         let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700).create(dir)?;
+        builder.recursive(true).mode(0o700).create(&dir)?;
     }
 
-    let metadata = std::fs::symlink_metadata(dir)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        anyhow::bail!("runtime path is not a real directory: {}", dir.display());
-    }
+    let name = match dir.components().next_back() {
+        Some(std::path::Component::Normal(name)) => name.to_owned(),
+        _ => anyhow::bail!("runtime path has no directory name: {}", dir.display()),
+    };
+    let parent = dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("runtime path has no parent: {}", dir.display()))?;
+    let parent = std::fs::canonicalize(parent)?;
 
     let effective_uid = unsafe { libc::geteuid() };
-    if metadata.uid() != effective_uid {
+    let root_path = std::path::Path::new("/");
+    let root_fd = unsafe {
+        libc::open(
+            b"/\0".as_ptr().cast(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        let error = std::io::Error::last_os_error();
+        anyhow::bail!("open /: {error}");
+    }
+    let mut current = unsafe { std::os::fd::OwnedFd::from_raw_fd(root_fd) };
+    check_runtime_ancestor(current.as_fd(), root_path, effective_uid)?;
+
+    let mut current_path = root_path.to_path_buf();
+    for component in parent.components() {
+        match component {
+            std::path::Component::RootDir => continue,
+            std::path::Component::Normal(part) => {
+                current_path.push(part);
+                let next = open_directory_component(current.as_fd(), part, &current_path)?;
+                check_runtime_ancestor(next.as_fd(), &current_path, effective_uid)?;
+                current = next;
+            }
+            _ => anyhow::bail!(
+                "runtime path ancestor is not canonical: {}",
+                parent.display()
+            ),
+        }
+    }
+
+    let directory = open_directory_component(current.as_fd(), &name, &dir)?;
+    let status = directory_status(directory.as_fd(), &dir)?;
+    if status.st_uid != effective_uid {
         anyhow::bail!(
             "runtime directory {} is owned by uid {}, expected {}",
             dir.display(),
-            metadata.uid(),
+            status.st_uid,
             effective_uid
         );
     }
 
-    let mode = metadata.permissions().mode() & 0o777;
+    let mode = status.st_mode as u32 & 0o777;
     if mode & 0o077 != 0 {
         if !repair_legacy_permissions {
             anyhow::bail!(
@@ -134,13 +277,101 @@ fn secure_runtime_directory(
                 dir.display()
             );
         }
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+            let error = std::io::Error::last_os_error();
+            anyhow::bail!("chmod {}: {error}", dir.display());
+        }
     }
-    Ok(())
+    Ok(directory)
+}
+
+/// Give the calling thread its own working directory, set to `directory`.
+/// The process working directory and every other thread are unchanged. The
+/// caller must be a short-lived thread that exits after its relative-path
+/// work, which discards the per-thread directory.
+#[cfg(target_os = "macos")]
+fn set_thread_working_directory(directory: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    extern "C" {
+        // Exported by libsystem_pthread since macOS 10.12.
+        fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
+    }
+    if unsafe { pthread_fchdir_np(directory.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_thread_working_directory(directory: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // Detach this thread's filesystem context first, so fchdir changes only
+    // this thread.
+    if unsafe { libc::unshare(libc::CLONE_FS) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fchdir(directory.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn set_thread_working_directory(_directory: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "binding the daemon socket through a directory descriptor is not supported on this platform",
+    ))
+}
+
+/// Bind `name` inside the already opened and checked `directory`. The stale
+/// socket check, the bind, and the chmod all run on a dedicated thread whose
+/// working directory is `directory`, and they use the bare relative `name`.
+/// The kernel therefore resolves the socket inside the checked directory even
+/// if a component of the original path was renamed after the check.
+#[cfg(unix)]
+fn bind_socket_in_directory(
+    directory: &std::os::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+    display: &std::path::Path,
+) -> anyhow::Result<std::os::unix::net::UnixListener> {
+    use std::os::fd::AsFd;
+
+    let relative = std::path::Path::new(name);
+    if relative.components().count() != 1
+        || !matches!(
+            relative.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        anyhow::bail!("socket name is not a single path component: {}", display.display());
+    }
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| -> anyhow::Result<std::os::unix::net::UnixListener> {
+                set_thread_working_directory(directory.as_fd()).map_err(|error| {
+                    anyhow::anyhow!("enter socket directory for {}: {error}", display.display())
+                })?;
+                remove_stale_socket(relative, display)?;
+                let listener = std::os::unix::net::UnixListener::bind(relative)
+                    .map_err(|error| anyhow::anyhow!("bind {}: {error}", display.display()))?;
+                set_private_socket_permissions(relative)?;
+                Ok(listener)
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("socket bind thread panicked for {}", display.display()))?
+    })
 }
 
 #[cfg(unix)]
-fn remove_stale_socket(socket_path: &std::path::Path) -> anyhow::Result<()> {
+fn remove_stale_socket(
+    socket_path: &std::path::Path,
+    display: &std::path::Path,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
     let metadata = match std::fs::symlink_metadata(socket_path) {
@@ -150,24 +381,21 @@ fn remove_stale_socket(socket_path: &std::path::Path) -> anyhow::Result<()> {
     };
 
     if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
-        anyhow::bail!(
-            "refusing to replace non-socket path: {}",
-            socket_path.display()
-        );
+        anyhow::bail!("refusing to replace non-socket path: {}", display.display());
     }
 
     let effective_uid = unsafe { libc::geteuid() };
     if metadata.uid() != effective_uid {
         anyhow::bail!(
             "socket {} is owned by uid {}, expected {}",
-            socket_path.display(),
+            display.display(),
             metadata.uid(),
             effective_uid
         );
     }
 
     if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
-        anyhow::bail!("daemon is already listening on {}", socket_path.display());
+        anyhow::bail!("daemon is already listening on {}", display.display());
     }
 
     std::fs::remove_file(socket_path)?;
@@ -1623,16 +1851,23 @@ pub async fn run_serve(
     // socket directory to be private to the current user. The default path may
     // repair permissions left by older releases; custom paths fail closed so a
     // typo cannot silently chmod a caller-managed directory.
-    if let Some(dir) = socket.parent() {
-        secure_runtime_directory(dir, is_managed_socket_path(socket_path))?;
-    }
+    //
+    // Every ancestor is checked too, and the bind goes through a descriptor
+    // of the checked directory, so a rename of any path component between the
+    // check and the bind cannot move the socket into another directory.
+    let socket_name = socket
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("socket path has no file name: {socket_path}"))?;
+    let socket_dir = socket.parent().unwrap_or_else(|| std::path::Path::new(""));
+    let socket_directory =
+        open_private_runtime_directory(socket_dir, is_managed_socket_path(socket_path))?;
 
-    // Remove stale socket file (from a crashed previous daemon).
-    remove_stale_socket(socket)?;
-
-    let listener = UnixListener::bind(socket_path)
-        .map_err(|e| anyhow::anyhow!("bind {socket_path}: {e}"))?;
-    set_private_socket_permissions(socket)?;
+    // Remove a stale socket file (from a crashed previous daemon), then bind.
+    let listener = bind_socket_in_directory(&socket_directory, socket_name, socket)?;
+    drop(socket_directory);
+    listener.set_nonblocking(true)?;
+    let listener = UnixListener::from_std(listener)
+        .map_err(|e| anyhow::anyhow!("register {socket_path} with the runtime: {e}"))?;
 
     eprintln!("cmux CUA daemon listening on {socket_path}");
 
