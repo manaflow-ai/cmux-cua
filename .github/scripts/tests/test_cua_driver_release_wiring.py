@@ -80,7 +80,7 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
     def test_python_publish_builds_linux_arm64_wheel(self) -> None:
         workflow = self.read(".github/workflows/cd-py-cua-driver.yml")
 
-        self.assertIn("os: ubuntu-24.04-arm", workflow)
+        self.assertIn("os: blacksmith-4vcpu-ubuntu-2404-arm", workflow)
         self.assertIn("arch: arm64", workflow)
 
     def test_release_on_merge_tracks_rust_driver(self) -> None:
