@@ -173,7 +173,10 @@ fn check_runtime_ancestor(
     effective_uid: libc::uid_t,
 ) -> anyhow::Result<()> {
     let status = directory_status(directory, display)?;
-    if status.st_uid != 0 && status.st_uid != effective_uid {
+    if status.st_uid != 0
+        && status.st_uid != effective_uid
+        && Some(status.st_uid) != unmapped_owner_uid()
+    {
         anyhow::bail!(
             "runtime path ancestor {} is owned by uid {}, expected root or uid {}",
             display.display(),
@@ -190,6 +193,30 @@ fn check_runtime_ancestor(
         );
     }
     Ok(())
+}
+
+/// The uid a Linux user namespace reports for a file whose real owner has no
+/// mapping in the namespace (`/proc/sys/kernel/overflowuid`, normally 65534).
+/// Build sandboxes and rootless containers show `/` and system directories
+/// with this owner. No process in the namespace can act as that uid, so such
+/// an ancestor is treated like a root-owned one; the mode check still applies.
+#[cfg(target_os = "linux")]
+fn unmapped_owner_uid() -> Option<libc::uid_t> {
+    let in_user_namespace = std::fs::read_to_string("/proc/self/uid_map")
+        .map(|map| map.split_whitespace().collect::<Vec<_>>() != ["0", "0", "4294967295"])
+        .unwrap_or(false);
+    if !in_user_namespace {
+        return None;
+    }
+    std::fs::read_to_string("/proc/sys/kernel/overflowuid")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .or(Some(65534))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn unmapped_owner_uid() -> Option<libc::uid_t> {
+    None
 }
 
 /// Open the private runtime directory without following any symlink, and
