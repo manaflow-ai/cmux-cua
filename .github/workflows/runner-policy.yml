@@ -1,0 +1,25 @@
+name: Runner policy
+
+# A GitHub billing block or hosted outage must never stop CI. This job fails
+# when a workflow selects a GitHub-hosted runner label without a recorded
+# `# runner-policy-exception: <reason>`.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  runner-policy:
+    name: runner-policy
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Refuse GitHub-hosted runner labels
+        run: python3 scripts/ci/check-runner-labels.py

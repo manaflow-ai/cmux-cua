@@ -1,0 +1,13 @@
+self-hosted-runner:
+  # Blacksmith runner labels (https://docs.blacksmith.sh). GitHub-hosted
+  # labels are refused by scripts/ci/check-runner-labels.py.
+  labels:
+    - blacksmith-2vcpu-ubuntu-2404
+    - blacksmith-4vcpu-ubuntu-2404
+    - blacksmith-8vcpu-ubuntu-2404
+    - blacksmith-4vcpu-ubuntu-2204
+    - blacksmith-4vcpu-ubuntu-2404-arm
+    - blacksmith-6vcpu-macos-15
+    - blacksmith-6vcpu-macos-26
+    - blacksmith-4vcpu-windows-2025
+    - blacksmith-2vcpu-windows-2025
