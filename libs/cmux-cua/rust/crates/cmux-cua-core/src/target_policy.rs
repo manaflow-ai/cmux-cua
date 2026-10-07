@@ -147,12 +147,55 @@ pub fn enforce(
     allowed: &[String],
     resolver: &TargetResolver<'_>,
 ) -> Result<(), ToolResult> {
-    // Not enforced yet.
-    let _ = (tool, args, allowed, resolver, is_listing_tool(tool));
+    if is_listing_tool(tool) {
+        return Ok(());
+    }
+    let own_pid = i64::from(std::process::id());
+    let mut checked_pid = None;
+    if let Some(pid) = args.get("pid").and_then(Value::as_i64) {
+        checked_pid = Some(pid);
+        check_pid(tool, pid, own_pid, allowed, resolver)?;
+    }
+    if let Some(window_id) = args.get("window_id").and_then(Value::as_u64) {
+        if let Some(owner) = (resolver.pid_for_window)(window_id) {
+            if checked_pid != Some(owner) {
+                check_pid(tool, owner, own_pid, allowed, resolver)?;
+            }
+        }
+    }
+    if tool == "launch_app" {
+        if let Some(bundle_id) = args.get("bundle_id").and_then(Value::as_str) {
+            let identity = TargetIdentity {
+                name: bundle_id.to_owned(),
+                bundle_id: Some(bundle_id.to_owned()),
+                pid: None,
+            };
+            check(tool, &identity, allowed)?;
+        }
+        if let Some(name) = args.get("name").and_then(Value::as_str) {
+            let identity = TargetIdentity {
+                name: app_name_from_reference(name),
+                bundle_id: None,
+                pid: None,
+            };
+            check(tool, &identity, allowed)?;
+        }
+        if let Some(urls) = args.get("urls").and_then(Value::as_array) {
+            for url in urls.iter().filter_map(Value::as_str) {
+                if url_opens_cmux(url) {
+                    let identity = TargetIdentity {
+                        name: url.to_owned(),
+                        bundle_id: None,
+                        pid: None,
+                    };
+                    return Err(refusal(tool, &identity, RefusalReason::UserCmux));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
-#[allow(dead_code)]
 fn check_pid(
     tool: &str,
     pid: i64,

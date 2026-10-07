@@ -211,7 +211,9 @@ Workflow per turn:
 
 Agent cursor: a per-SESSION overlay cursor visualises where a run is acting without moving the real pointer. It is shown only for a DECLARED session (pass `session`), is color-coded by the session id, and is removed by end_session or the idle-TTL. The same id over MCP, the CLI, or the raw socket drives the same cursor. set_agent_cursor_* tools hide/show/customise it. Note: a pure accessibility-action (element_index) click snaps the cursor with a brief pulse on its first action rather than a long glide, so it can be easy to miss — issue a pixel click or move_cursor first for a visibly gliding demo/recording.
 
-If a `cmux-cua` skill is loaded in your harness (Claude Code / Codex / OpenClaw / OpenCode dirs), prefer its detailed workflow — SKILL.md plus {platform_skill_pointer}. Install with `cmux-cua skills install` if not yet present."#
+If a `cmux-cua` skill is loaded in your harness (Claude Code / Codex / OpenClaw / OpenCode dirs), prefer its detailed workflow — SKILL.md plus {platform_skill_pointer}. Install with `cmux-cua skills install` if not yet present. Inside cmux the skill is `/cmux:cmux-cua`: it is hidden from your skill list because only the user starts it, so tell the user they can run /cmux:cmux-cua instead of saying the skill is missing.
+
+Calls that target the user's cmux, other terminal apps, or macOS security surfaces return target_not_allowed; do not retry them."#
     )
 }
 

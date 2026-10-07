@@ -1573,8 +1573,12 @@ pub fn run_call(
         effective
     };
     if crate::serve::is_daemon_listening(&socket_path) {
-        let args_for_daemon = json_args.clone()
+        let mut args_for_daemon = json_args.clone()
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        cmux_cua_core::target_policy::scope_target_args(
+            &mut args_for_daemon,
+            &cmux_cua_core::target_policy::allowed_from_env(),
+        );
         let req = crate::serve::DaemonRequest {
             method: "call".into(),
             name: Some(tool.to_owned()),
@@ -1685,7 +1689,11 @@ pub fn run_call(
         .build()
         .expect("tokio runtime");
 
-    let args = json_args.unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    let mut args = json_args.unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+    cmux_cua_core::target_policy::scope_target_args(
+        &mut args,
+        &cmux_cua_core::target_policy::allowed_from_env(),
+    );
     let tool_name = tool.to_string();
     let out_path = screenshot_out_file;
     let is_error = rt.block_on(async move {

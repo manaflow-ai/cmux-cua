@@ -2733,36 +2733,11 @@ fn is_protected_host_app(bundle: &str, name: &str) -> bool {
 }
 
 fn is_protected_terminal_target(bundle: &str, name: &str) -> bool {
-    matches!(
-        bundle,
-        "com.apple.terminal"
-            | "com.cmuxterm.app"
-            | "com.mitchellh.ghostty"
-            | "com.googlecode.iterm2"
-            | "net.kovidgoyal.kitty"
-            | "org.alacritty"
-            | "com.github.wez.wezterm"
-            | "co.zeit.hyper"
-            | "co.vercel.hyper"
-    ) || bundle.starts_with("com.cmuxterm.app.")
-        || bundle.starts_with("dev.warp.")
-        || matches!(
-            name,
-            "terminal"
-                | "cmux"
-                | "cmux beta"
-                | "cmux dev"
-                | "cmux nightly"
-                | "ghostty"
-                | "iterm"
-                | "iterm2"
-                | "warp"
-                | "warp preview"
-                | "kitty"
-                | "alacritty"
-                | "wezterm"
-                | "hyper"
-        )
+    // One terminal list for both profiles (cmux_cua_core::target_policy).
+    cmux_cua_core::target_policy::is_terminal(bundle, name)
+        || bundle == "com.cmuxterm.app"
+        || bundle.starts_with("com.cmuxterm.app.")
+        || matches!(name, "cmux" | "cmux beta" | "cmux dev" | "cmux nightly")
 }
 
 fn lock_guard_error(error: SessionLockError) -> CompatError {

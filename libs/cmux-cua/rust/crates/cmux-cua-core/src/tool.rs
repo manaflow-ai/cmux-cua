@@ -662,7 +662,11 @@ impl ToolRegistry {
 
         // Target guard: a refused target is side-effect free (no recording
         // turn, no fronting, no dispatch).
-        let _ = (self.target_policy_hook, &allowed_targets);
+        if let Some(hook) = self.target_policy_hook {
+            if let Err(refusal) = hook(resolved_name, &args, &allowed_targets) {
+                return refusal;
+            }
+        }
 
         // Reserve and capture the turn before dispatch so recorded evidence
         // shows the application immediately before the action changed it.

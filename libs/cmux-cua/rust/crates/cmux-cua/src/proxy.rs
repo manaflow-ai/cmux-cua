@@ -1191,8 +1191,13 @@ async fn call_daemon_tool(
     socket_path: &str,
     session_id: &str,
     name: &str,
-    args: serde_json::Value,
+    mut args: serde_json::Value,
 ) -> Result<DaemonResponse, String> {
+    // The model never sets the target scope; this process's env does.
+    cmux_cua_core::target_policy::scope_target_args(
+        &mut args,
+        &cmux_cua_core::target_policy::allowed_from_env(),
+    );
     send_daemon_request_async(
         socket_path,
         DaemonRequest {
@@ -1956,6 +1961,7 @@ fn prepare_action_group(
     session_id: &str,
     managed_session: bool,
 ) -> Result<PreparedActionGroup, String> {
+    let allowed_targets = cmux_cua_core::target_policy::allowed_from_env();
     let object = args
         .as_object()
         .ok_or_else(|| "perform_actions arguments must be an object".to_owned())?;
@@ -2006,8 +2012,9 @@ fn prepare_action_group(
             .ok_or_else(|| {
                 format!("perform_actions step {index} requires object `arguments`")
             })?;
-        let arguments =
+        let mut arguments =
             enforce_proxy_session_identity(arguments, session_id, managed_session);
+        cmux_cua_core::target_policy::scope_target_args(&mut arguments, &allowed_targets);
         prepared.push(PreparedProxyAction {
             tool: tool.to_owned(),
             request: DaemonRequest {

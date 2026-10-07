@@ -154,7 +154,13 @@ async fn handle_request_with_initialize_result(
         "tools/call" => match req.tool_call() {
             Err(e) => Response::error(id, -32602, format!("Invalid params: {e}")),
             Ok(call) => {
-                let result = registry.invoke(&call.name, call.args).await;
+                let mut args = call.args;
+                // The model never sets the target scope; this process's env does.
+                crate::target_policy::scope_target_args(
+                    &mut args,
+                    &crate::target_policy::allowed_from_env(),
+                );
+                let result = registry.invoke(&call.name, args).await;
                 match serde_json::to_value(result) {
                     Ok(v) => Response::ok(id, v),
                     Err(e) => Response::error(id, -32603, format!("Serialize error: {e}")),
