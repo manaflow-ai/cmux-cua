@@ -32,6 +32,7 @@ mod cli;
 mod doctor;
 mod journal;
 mod mcp_http;
+mod owner_watch;
 mod proxy;
 mod responsibility;
 mod serve;
@@ -40,6 +41,11 @@ mod telemetry;
 mod check_update_tool;
 mod updater;
 mod version_check;
+
+/// Process-wide lock for unit tests that mutate environment variables such
+/// as `HOME`. `std::env::set_var` is global, so modules must share one lock.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -341,6 +347,7 @@ fn main() {
             no_permissions_gate,
             claude_code_compat,
             codex_computer_use_compat,
+            owner_pid,
         } => {
             responsibility::reexec_disclaimed_if_needed();
             // Long-running daemon — kick off the background update check
@@ -436,6 +443,7 @@ fn main() {
                             serve::DaemonProfile::for_codex_compat(
                                 codex_computer_use_compat,
                             ),
+                            owner_pid,
                         );
                     });
                     platform_macos::pip::request_appkit_main_loop_stop();
@@ -766,6 +774,7 @@ fn main() -> anyhow::Result<()> {
             no_permissions_gate,
             claude_code_compat,
             codex_computer_use_compat,
+            owner_pid,
         } => {
             cli::ensure_codex_computer_use_supported(codex_computer_use_compat)?;
             responsibility::reexec_disclaimed_if_needed();
@@ -796,6 +805,7 @@ fn main() -> anyhow::Result<()> {
                     serve::DaemonProfile::for_codex_compat(
                         codex_computer_use_compat,
                     ),
+                    owner_pid,
                 );
             }).join().ok();
             return Ok(());

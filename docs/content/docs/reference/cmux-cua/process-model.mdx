@@ -47,4 +47,6 @@ In-process MCP mode is simple: one process speaks MCP and performs the driver wo
 
 Daemon-proxy mode gives the driver a longer lifetime than the MCP client. The proxy may come and go as an assistant restarts its MCP transport, but the daemon can keep running. Element-index caches can remain warm, and daemon-held configuration can continue to apply after a tool client reconnects.
 
+A host app that launches the daemon (for example through LaunchServices, so the daemon's parent is launchd) can tie the daemon to its own lifetime with `cmux-cua serve --owner-pid <host-pid>`. The daemon watches that pid (kqueue `NOTE_EXIT` on macOS, `pidfd` on Linux) and, when the host exits or crashes, removes its socket and exits with status 0. If the pid is already dead at start, the daemon exits at once. Windows ignores the flag and prints a message. Before passing the flag, a host checks that `cmux-cua manifest` lists `serve.owner-pid` in `capabilities`, so an older daemon never receives an unknown flag.
+
 In-process mode is direct and short-lived. Daemon-proxy mode adds a local IPC hop, but it puts GUI work in the operating-system context that can perform it, and gives shared state a machine-level lifetime rather than a stdio subprocess lifetime.

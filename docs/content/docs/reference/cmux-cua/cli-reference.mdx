@@ -93,6 +93,7 @@ The daemon owns per-process state such as element-index caches, recording state,
 | `--socket` | String | — | Override the daemon socket or named-pipe path. |
 | `--pid-file` | String | — | Override the pid-file path on Unix targets. |
 | `--host-bundle-id` | String | — | Advisory host bundle id label echoed in check_permissions output (embedded mode). |
+| `--owner-pid` | Int | — | Exit 0 and remove the socket when this process exits. If it is already dead, exit at once. Ignored with a message on Windows. |
 
 **Flags:**
 
