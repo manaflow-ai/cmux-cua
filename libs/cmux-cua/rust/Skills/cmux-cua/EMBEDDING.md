@@ -167,6 +167,10 @@ a dialog (the `prompt` argument is ignored) and returns:
 - `screen_recording_probe_performed` — `false` alongside that null. It is true
   only when a non-embedded, prompt-capable check actually ran the live probe;
   only then is `screen_recording_capturable` a boolean.
+- `screen_recording_capture_error` — a `capture_timeout` object (`code`,
+  `operation`, `elapsed_ms`, `budget_ms`, `hint`) when the live probe ran but
+  macOS did not answer in time; `screen_recording_capturable` is then null.
+  A pending system dialog causes this, not a missing grant: do not re-grant.
 - `source.attribution` values:
   - `host` — embedded mode; booleans reflect the host's grant. What you
     should always see when embedding.

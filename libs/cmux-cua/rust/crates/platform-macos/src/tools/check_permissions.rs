@@ -5,6 +5,8 @@ use cmux_cua_core::{
 };
 use serde_json::Value;
 
+use crate::capture_deadline::CaptureTimeout;
+
 use crate::permissions::status::{
     accessibility_granted, request_accessibility, request_screen_recording,
     screen_recording_granted,
@@ -22,7 +24,13 @@ pub struct CheckPermissionsTool;
 /// `SCShareableContent::get()` can return displays while the separate
 /// direct-capture consent alert is still waiting for a decision. Readiness
 /// therefore requires one real frame from `SCScreenshotManager`.
-pub(super) fn screen_recording_capturable() -> bool {
+/// Result of the live probe: `Ok(capturable)` when macOS answered, or the
+/// typed timeout when it did not. A timeout is not evidence that the grant is
+/// missing (a pending system dialog blocks capture too), so it is reported as
+/// `capture_timeout`, never as `capturable: false`.
+pub(super) type ScreenCaptureProbe = Result<bool, CaptureTimeout>;
+
+pub(super) fn screen_recording_capturable() -> ScreenCaptureProbe {
     use screencapturekit::{
         prelude::{SCContentFilter, SCShareableContent, SCStreamConfiguration},
         screenshot_manager::SCScreenshotManager,
@@ -30,53 +38,70 @@ pub(super) fn screen_recording_capturable() -> bool {
 
     use crate::capture_deadline::{self, CaptureOperation};
 
-    // Both calls are bounded: a pending consent alert must read as "not
-    // capturable yet", not hang check_permissions.
     verify_screen_capture_with(
         || {
-            capture_deadline::run(
-                CaptureOperation::ShareableContent,
-                capture_deadline::SHAREABLE_CONTENT_BUDGET,
-                || {
-                    Ok(SCShareableContent::get()
-                        .ok()
-                        .and_then(|content| content.displays().into_iter().next()))
-                },
+            probe_step(
+                capture_deadline::run(
+                    CaptureOperation::ShareableContent,
+                    capture_deadline::SHAREABLE_CONTENT_BUDGET,
+                    || {
+                        Ok(SCShareableContent::get()
+                            .ok()
+                            .and_then(|content| content.displays().into_iter().next()))
+                    },
+                ),
+                None,
+                "display enumeration",
             )
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "screen capture probe: display enumeration failed");
-                None
-            })
         },
         |display| {
             let display = display.clone();
-            capture_deadline::run(
-                CaptureOperation::ScreenshotCapture,
-                capture_deadline::SCREENSHOT_BUDGET,
-                move || {
-                    let filter = SCContentFilter::create()
-                        .with_display(&display)
-                        .with_excluding_windows(&[])
-                        .build();
-                    let configuration =
-                        SCStreamConfiguration::new().with_width(1).with_height(1);
-                    Ok(SCScreenshotManager::capture_image(&filter, &configuration)
-                        .is_ok_and(|image| image.width() > 0 && image.height() > 0))
-                },
+            probe_step(
+                capture_deadline::run(
+                    CaptureOperation::ScreenshotCapture,
+                    capture_deadline::SCREENSHOT_BUDGET,
+                    move || {
+                        let filter = SCContentFilter::create()
+                            .with_display(&display)
+                            .with_excluding_windows(&[])
+                            .build();
+                        let configuration =
+                            SCStreamConfiguration::new().with_width(1).with_height(1);
+                        Ok(SCScreenshotManager::capture_image(&filter, &configuration)
+                            .is_ok_and(|image| image.width() > 0 && image.height() > 0))
+                    },
+                ),
+                false,
+                "frame capture",
             )
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "screen capture probe: frame capture failed");
-                false
-            })
         },
     )
 }
 
+/// Keep a capture timeout typed; any other bounded-call failure (worker
+/// panic, thread spawn failure) reads as the step's `fallback`.
+fn probe_step<T>(
+    result: anyhow::Result<T>,
+    fallback: T,
+    step: &str,
+) -> Result<T, CaptureTimeout> {
+    result.or_else(|error| match CaptureTimeout::find(&error) {
+        Some(timeout) => Err(timeout.clone()),
+        None => {
+            tracing::warn!(%error, "screen capture probe: {step} failed");
+            Ok(fallback)
+        }
+    })
+}
+
 fn verify_screen_capture_with<Display>(
-    load_display: impl FnOnce() -> Option<Display>,
-    capture_frame: impl FnOnce(&Display) -> bool,
-) -> bool {
-    load_display().as_ref().is_some_and(capture_frame)
+    load_display: impl FnOnce() -> Result<Option<Display>, CaptureTimeout>,
+    capture_frame: impl FnOnce(&Display) -> Result<bool, CaptureTimeout>,
+) -> ScreenCaptureProbe {
+    match load_display()? {
+        Some(display) => capture_frame(&display),
+        None => Ok(false),
+    }
 }
 
 /// Run the ScreenCaptureKit probe only on an explicitly prompt-capable path.
@@ -84,8 +109,8 @@ fn verify_screen_capture_with<Display>(
 /// only truthful answer when a silent or host-owned flow skips that probe.
 fn maybe_screen_recording_capture_probe(
     should_probe: bool,
-    probe: impl FnOnce() -> bool,
-) -> Option<bool> {
+    probe: impl FnOnce() -> ScreenCaptureProbe,
+) -> Option<ScreenCaptureProbe> {
     should_probe.then(probe)
 }
 
@@ -217,7 +242,10 @@ fn def() -> &'static ToolDef {
             Returns: `accessibility` + `screen_recording` (booleans from the TCC \
             preflight APIs), `screen_recording_capturable` (true/false only when a \
             live ScreenCaptureKit probe ran; null for prompt:false, embedded, or \
-            external permission flows), `screen_recording_probe_performed`, and \
+            external permission flows or when the probe timed out), \
+            `screen_recording_probe_performed`, `screen_recording_capture_error` \
+            (a `capture_timeout` object when macOS did not answer the probe, usually \
+            because a system dialog is waiting; the grants are not the cause), and \
             `source` (which TCC identity the \
             booleans reflect: the responsible daemon app vs the launching terminal/IDE). \
             macOS attributes grants to the responsible process, so a standalone call \
@@ -294,9 +322,11 @@ impl Tool for CheckPermissionsTool {
 fn permission_result(
     accessibility: bool,
     screen_recording: bool,
-    screen_recording_capturable: Option<bool>,
+    probe: Option<ScreenCaptureProbe>,
     source: serde_json::Value,
 ) -> ToolResult {
+    let screen_recording_capturable = probe.as_ref().and_then(|probe| probe.as_ref().ok().copied());
+    let capture_timeout = probe.as_ref().and_then(|probe| probe.as_ref().err());
     let is_caller = source.get("attribution").and_then(|v| v.as_str()) == Some("caller");
     // Text format mirrors Swift 1:1:
     //   "✅ Accessibility: granted.\n✅ Screen Recording: granted."
@@ -322,6 +352,12 @@ fn permission_result(
              the grant likely belongs to a different process, not this one.",
         );
     }
+    if let Some(timeout) = capture_timeout {
+        summary.push_str(&format!(
+            "\n⏳ Live capture probe: {timeout} The permission state above is \
+             unchanged; do not re-grant it."
+        ));
+    }
     // Make the attribution explicit when answering for a host or caller
     // (not the daemon).
     if source.get("attribution").and_then(|v| v.as_str()) == Some("host") {
@@ -342,7 +378,8 @@ fn permission_result(
         "accessibility":               accessibility,
         "screen_recording":            screen_recording,
         "screen_recording_capturable": screen_recording_capturable,
-        "screen_recording_probe_performed": screen_recording_capturable.is_some(),
+        "screen_recording_probe_performed": probe.is_some(),
+        "screen_recording_capture_error": capture_timeout.map(CaptureTimeout::to_json),
         "source":                      source,
     }))
 }
@@ -350,6 +387,7 @@ fn permission_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture_deadline::{CaptureOperation, CaptureTimeout};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::permissions::test_env_lock()
@@ -487,7 +525,7 @@ mod tests {
         let probe_called = std::cell::Cell::new(false);
         let capturable = maybe_screen_recording_capture_probe(false, || {
             probe_called.set(true);
-            true
+            Ok(true)
         });
         assert_eq!(capturable, None);
         assert!(!probe_called.get(), "silent status must not call SCShareableContent");
@@ -511,39 +549,133 @@ mod tests {
     #[test]
     fn capture_readiness_requires_a_real_frame_after_display_enumeration() {
         let captures = std::cell::Cell::new(0);
-        assert!(!verify_screen_capture_with(
-            || None::<u8>,
-            |_| {
-                captures.set(captures.get() + 1);
-                true
-            }
-        ));
+        assert_eq!(
+            verify_screen_capture_with(
+                || Ok(None::<u8>),
+                |_| {
+                    captures.set(captures.get() + 1);
+                    Ok(true)
+                }
+            ),
+            Ok(false)
+        );
         assert_eq!(captures.get(), 0);
 
-        assert!(!verify_screen_capture_with(
-            || Some(7_u8),
-            |_| {
-                captures.set(captures.get() + 1);
-                false
-            }
-        ));
+        assert_eq!(
+            verify_screen_capture_with(
+                || Ok(Some(7_u8)),
+                |_| {
+                    captures.set(captures.get() + 1);
+                    Ok(false)
+                }
+            ),
+            Ok(false)
+        );
         assert_eq!(captures.get(), 1);
 
-        assert!(verify_screen_capture_with(
-            || Some(7_u8),
-            |_| {
-                captures.set(captures.get() + 1);
-                true
-            }
-        ));
+        assert_eq!(
+            verify_screen_capture_with(
+                || Ok(Some(7_u8)),
+                |_| {
+                    captures.set(captures.get() + 1);
+                    Ok(true)
+                }
+            ),
+            Ok(true)
+        );
         assert_eq!(captures.get(), 2);
+    }
+
+    fn timeout(operation: CaptureOperation) -> CaptureTimeout {
+        CaptureTimeout {
+            operation,
+            elapsed: std::time::Duration::from_secs(15),
+            budget: std::time::Duration::from_secs(15),
+            reason: crate::capture_deadline::CaptureTimeoutReason::BudgetElapsed,
+        }
+    }
+
+    #[test]
+    fn probe_timeout_propagates_from_enumeration_and_from_capture() {
+        let captured = std::cell::Cell::new(false);
+        let enumeration = timeout(CaptureOperation::ShareableContent);
+        assert_eq!(
+            verify_screen_capture_with(
+                || Err::<Option<u8>, _>(enumeration.clone()),
+                |_| {
+                    captured.set(true);
+                    Ok(true)
+                }
+            ),
+            Err(enumeration)
+        );
+        assert!(!captured.get(), "no capture after an enumeration timeout");
+
+        let frame = timeout(CaptureOperation::ScreenshotCapture);
+        assert_eq!(
+            verify_screen_capture_with(|| Ok(Some(7_u8)), |_| Err(frame.clone())),
+            Err(frame)
+        );
+    }
+
+    #[test]
+    fn bounded_probe_errors_keep_timeouts_and_map_other_failures_to_the_fallback() {
+        let hung = anyhow::Error::from(timeout(CaptureOperation::ShareableContent));
+        assert_eq!(
+            probe_step(Err::<Option<u8>, _>(hung), None, "enumeration"),
+            Err(timeout(CaptureOperation::ShareableContent))
+        );
+        assert_eq!(
+            probe_step(Err::<bool, _>(anyhow::anyhow!("worker died")), false, "frame"),
+            Ok(false)
+        );
+        assert_eq!(probe_step(Ok(true), false, "frame"), Ok(true));
+    }
+
+    #[test]
+    fn probe_timeout_is_reported_as_capture_timeout_not_as_not_capturable() {
+        let result = permission_result(
+            true,
+            true,
+            Some(Err(timeout(CaptureOperation::ScreenshotCapture))),
+            serde_json::json!({ "attribution": "helper-daemon" }),
+        );
+        let structured = result.structured_content.as_ref().expect("structured status");
+        // Unknown, never `false`: a false value tells users to re-grant a
+        // permission that is already granted.
+        assert!(structured["screen_recording_capturable"].is_null());
+        assert_eq!(structured["screen_recording_probe_performed"], true);
+        let error = &structured["screen_recording_capture_error"];
+        assert_eq!(error["code"], "capture_timeout");
+        assert_eq!(error["operation"], "screenshot_capture");
+        assert_eq!(error["elapsed_ms"], 15_000);
+        assert!(error["hint"].as_str().unwrap().contains("dialog"));
+
+        let text = result.content.iter().find_map(|content| match content {
+            cmux_cua_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        }).unwrap_or_default();
+        assert!(text.contains("capture_timeout"), "{text}");
+        assert!(!text.contains("live capture probe failed"), "{text}");
+    }
+
+    #[test]
+    fn completed_probe_has_no_capture_error() {
+        let result = permission_result(
+            true,
+            true,
+            Some(Ok(true)),
+            serde_json::json!({ "attribution": "helper-daemon" }),
+        );
+        let structured = result.structured_content.as_ref().unwrap();
+        assert!(structured["screen_recording_capture_error"].is_null());
     }
 
     #[test]
     fn live_check_reports_probe_true_or_false_and_warns_only_on_false() {
         for (live, should_warn) in [(true, false), (false, true)] {
-            let capturable = maybe_screen_recording_capture_probe(true, || live);
-            assert_eq!(capturable, Some(live));
+            let capturable = maybe_screen_recording_capture_probe(true, || Ok(live));
+            assert_eq!(capturable, Some(Ok(live)));
             let result = permission_result(
                 true,
                 true,

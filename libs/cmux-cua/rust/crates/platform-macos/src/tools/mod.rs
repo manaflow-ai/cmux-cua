@@ -42,7 +42,11 @@ mod page;
 /// This is deliberately not registered as an MCP tool. Only the daemon's
 /// host-authenticated control request can reach it, so agents cannot raise
 /// Tahoe's private-window-picker consent outside the host UI.
-pub fn verify_screen_capture_ready() -> bool {
+///
+/// `Err` means macOS did not answer the probe in time (typically a pending
+/// system dialog); that is unknown readiness, not a missing grant.
+pub fn verify_screen_capture_ready()
+-> Result<bool, crate::capture_deadline::CaptureTimeout> {
     check_permissions::screen_recording_capturable()
 }
 

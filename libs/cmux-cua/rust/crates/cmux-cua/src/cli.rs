@@ -2473,12 +2473,22 @@ fn permission_status_lines(structured: &serde_json::Value) -> Vec<String> {
         format!("Accessibility:    {}", if ax { "✅ granted" } else { "❌ not granted" }),
         format!("Screen Recording: {}", if sr { "✅ granted" } else { "❌ not granted" }),
     ];
-    match cap {
-        Some(false) if sr => lines.push(
+    let capture_error = structured
+        .get("screen_recording_capture_error")
+        .filter(|value| value.is_object());
+    match (cap, capture_error) {
+        (_, Some(error)) => lines.push(format!(
+            "Live capture probe: ⏳ {} ({}, {} ms). {} The grants above are unchanged; do not re-grant.",
+            error.get("code").and_then(|v| v.as_str()).unwrap_or("capture_timeout"),
+            error.get("operation").and_then(|v| v.as_str()).unwrap_or("capture"),
+            error.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+            error.get("hint").and_then(|v| v.as_str()).unwrap_or(""),
+        )),
+        (Some(false), None) if sr => lines.push(
             "  ⚠️  preflight reports granted, but a live capture probe failed — the grant likely belongs to another process, not this one."
                 .to_owned(),
         ),
-        None => lines.push(
+        (None, None) => lines.push(
             "Live capture probe: ❓ not performed (silent status check)".to_owned(),
         ),
         _ => {}
@@ -4038,6 +4048,30 @@ mod tests {
                 should_warn,
             );
         }
+    }
+
+    #[test]
+    fn probe_timeout_is_shown_as_capture_timeout_not_as_failure_or_not_performed() {
+        let lines = permission_status_lines(&serde_json::json!({
+            "accessibility": true,
+            "screen_recording": true,
+            "screen_recording_capturable": null,
+            "screen_recording_probe_performed": true,
+            "screen_recording_capture_error": {
+                "code": "capture_timeout",
+                "operation": "screenshot_capture",
+                "elapsed_ms": 10000,
+                "budget_ms": 10000,
+                "hint": "A system dialog may be waiting."
+            },
+            "source": { "attribution": "driver-daemon" }
+        }));
+        let output = lines.join("\n");
+        assert!(output.contains("capture_timeout"), "{output}");
+        assert!(output.contains("screenshot_capture"), "{output}");
+        assert!(output.contains("10000 ms"), "{output}");
+        assert!(!output.contains("not performed"), "{output}");
+        assert!(!output.contains("live capture probe failed"), "{output}");
     }
 
     // ── Surface 7b: serve --owner-pid ───────────────────────────────────────

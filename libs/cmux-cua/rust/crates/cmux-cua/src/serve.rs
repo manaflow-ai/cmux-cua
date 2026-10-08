@@ -1543,10 +1543,20 @@ fn validate_system_permission_request(permission: Option<&str>) -> DaemonRespons
     }
 }
 
-fn screen_capture_verification_response(capturable: bool) -> DaemonResponse {
-    DaemonResponse::ok(serde_json::json!({
-        "capturable": capturable,
-    }))
+/// `Err` carries a `capture_timeout` payload: the probe got no answer, so
+/// readiness is unknown (`capturable: null`), never "not capturable".
+fn screen_capture_verification_response(
+    probe: Result<bool, serde_json::Value>,
+) -> DaemonResponse {
+    match probe {
+        Ok(capturable) => DaemonResponse::ok(serde_json::json!({
+            "capturable": capturable,
+        })),
+        Err(capture_error) => DaemonResponse::ok(serde_json::json!({
+            "capturable": null,
+            "capture_error": capture_error,
+        })),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2496,12 +2506,13 @@ pub async fn run_serve_with_owner(
                                 }
                                 #[cfg(target_os = "macos")]
                                 let resp = {
-                                    let capturable = tokio::task::spawn_blocking(
+                                    let probe = tokio::task::spawn_blocking(
                                         platform_macos::tools::verify_screen_capture_ready,
                                     )
                                     .await
-                                    .unwrap_or(false);
-                                    screen_capture_verification_response(capturable)
+                                    .unwrap_or(Ok(false))
+                                    .map_err(|timeout| timeout.to_json());
+                                    screen_capture_verification_response(probe)
                                 };
                                 #[cfg(not(target_os = "macos"))]
                                 let resp = DaemonResponse::err(
@@ -4038,12 +4049,28 @@ mod external_permission_flow_tests {
     }
 
     #[test]
+    fn host_screen_capture_verification_reports_a_timeout_as_unknown_with_the_error() {
+        let timed_out = screen_capture_verification_response(Err(serde_json::json!({
+            "code": "capture_timeout",
+            "operation": "shareable_content",
+            "elapsed_ms": 15000,
+        })));
+        assert!(timed_out.ok);
+        let result = timed_out.result.unwrap();
+        // null, never false: the host maps false to "not capturable" and asks
+        // the user to re-grant a permission that is already granted.
+        assert!(result["capturable"].is_null());
+        assert_eq!(result["capture_error"]["code"], "capture_timeout");
+        assert_eq!(result["capture_error"]["operation"], "shareable_content");
+    }
+
+    #[test]
     fn host_screen_capture_verification_reports_live_readiness_explicitly() {
-        let ready = screen_capture_verification_response(true);
+        let ready = screen_capture_verification_response(Ok(true));
         assert!(ready.ok);
         assert_eq!(ready.result.unwrap()["capturable"], serde_json::json!(true));
 
-        let unavailable = screen_capture_verification_response(false);
+        let unavailable = screen_capture_verification_response(Ok(false));
         assert!(unavailable.ok);
         assert_eq!(
             unavailable.result.unwrap()["capturable"],
