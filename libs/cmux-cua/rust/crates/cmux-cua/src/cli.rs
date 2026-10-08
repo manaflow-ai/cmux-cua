@@ -2473,12 +2473,22 @@ fn permission_status_lines(structured: &serde_json::Value) -> Vec<String> {
         format!("Accessibility:    {}", if ax { "✅ granted" } else { "❌ not granted" }),
         format!("Screen Recording: {}", if sr { "✅ granted" } else { "❌ not granted" }),
     ];
-    match cap {
-        Some(false) if sr => lines.push(
+    let capture_error = structured
+        .get("screen_recording_capture_error")
+        .filter(|value| value.is_object());
+    match (cap, capture_error) {
+        (_, Some(error)) => lines.push(format!(
+            "Live capture probe: ⏳ {} ({}, {} ms). {} The grants above are unchanged; do not re-grant.",
+            error.get("code").and_then(|v| v.as_str()).unwrap_or("capture_timeout"),
+            error.get("operation").and_then(|v| v.as_str()).unwrap_or("capture"),
+            error.get("elapsed_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+            error.get("hint").and_then(|v| v.as_str()).unwrap_or(""),
+        )),
+        (Some(false), None) if sr => lines.push(
             "  ⚠️  preflight reports granted, but a live capture probe failed — the grant likely belongs to another process, not this one."
                 .to_owned(),
         ),
-        None => lines.push(
+        (None, None) => lines.push(
             "Live capture probe: ❓ not performed (silent status check)".to_owned(),
         ),
         _ => {}

@@ -5,6 +5,8 @@ use cmux_cua_core::{
 };
 use serde_json::Value;
 
+use crate::capture_deadline::CaptureTimeout;
+
 use crate::permissions::status::{
     accessibility_granted, request_accessibility, request_screen_recording,
     screen_recording_granted,
@@ -22,7 +24,13 @@ pub struct CheckPermissionsTool;
 /// `SCShareableContent::get()` can return displays while the separate
 /// direct-capture consent alert is still waiting for a decision. Readiness
 /// therefore requires one real frame from `SCScreenshotManager`.
-pub(super) fn screen_recording_capturable() -> bool {
+/// Result of the live probe: `Ok(capturable)` when macOS answered, or the
+/// typed timeout when it did not. A timeout is not evidence that the grant is
+/// missing (a pending system dialog blocks capture too), so it is reported as
+/// `capture_timeout`, never as `capturable: false`.
+pub(super) type ScreenCaptureProbe = Result<bool, CaptureTimeout>;
+
+pub(super) fn screen_recording_capturable() -> ScreenCaptureProbe {
     use screencapturekit::{
         prelude::{SCContentFilter, SCShareableContent, SCStreamConfiguration},
         screenshot_manager::SCScreenshotManager,
@@ -30,53 +38,70 @@ pub(super) fn screen_recording_capturable() -> bool {
 
     use crate::capture_deadline::{self, CaptureOperation};
 
-    // Both calls are bounded: a pending consent alert must read as "not
-    // capturable yet", not hang check_permissions.
     verify_screen_capture_with(
         || {
-            capture_deadline::run(
-                CaptureOperation::ShareableContent,
-                capture_deadline::SHAREABLE_CONTENT_BUDGET,
-                || {
-                    Ok(SCShareableContent::get()
-                        .ok()
-                        .and_then(|content| content.displays().into_iter().next()))
-                },
+            probe_step(
+                capture_deadline::run(
+                    CaptureOperation::ShareableContent,
+                    capture_deadline::SHAREABLE_CONTENT_BUDGET,
+                    || {
+                        Ok(SCShareableContent::get()
+                            .ok()
+                            .and_then(|content| content.displays().into_iter().next()))
+                    },
+                ),
+                None,
+                "display enumeration",
             )
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "screen capture probe: display enumeration failed");
-                None
-            })
         },
         |display| {
             let display = display.clone();
-            capture_deadline::run(
-                CaptureOperation::ScreenshotCapture,
-                capture_deadline::SCREENSHOT_BUDGET,
-                move || {
-                    let filter = SCContentFilter::create()
-                        .with_display(&display)
-                        .with_excluding_windows(&[])
-                        .build();
-                    let configuration =
-                        SCStreamConfiguration::new().with_width(1).with_height(1);
-                    Ok(SCScreenshotManager::capture_image(&filter, &configuration)
-                        .is_ok_and(|image| image.width() > 0 && image.height() > 0))
-                },
+            probe_step(
+                capture_deadline::run(
+                    CaptureOperation::ScreenshotCapture,
+                    capture_deadline::SCREENSHOT_BUDGET,
+                    move || {
+                        let filter = SCContentFilter::create()
+                            .with_display(&display)
+                            .with_excluding_windows(&[])
+                            .build();
+                        let configuration =
+                            SCStreamConfiguration::new().with_width(1).with_height(1);
+                        Ok(SCScreenshotManager::capture_image(&filter, &configuration)
+                            .is_ok_and(|image| image.width() > 0 && image.height() > 0))
+                    },
+                ),
+                false,
+                "frame capture",
             )
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "screen capture probe: frame capture failed");
-                false
-            })
         },
     )
 }
 
+/// Keep a capture timeout typed; any other bounded-call failure (worker
+/// panic, thread spawn failure) reads as the step's `fallback`.
+fn probe_step<T>(
+    result: anyhow::Result<T>,
+    fallback: T,
+    step: &str,
+) -> Result<T, CaptureTimeout> {
+    result.or_else(|error| match CaptureTimeout::find(&error) {
+        Some(timeout) => Err(timeout.clone()),
+        None => {
+            tracing::warn!(%error, "screen capture probe: {step} failed");
+            Ok(fallback)
+        }
+    })
+}
+
 fn verify_screen_capture_with<Display>(
-    load_display: impl FnOnce() -> Option<Display>,
-    capture_frame: impl FnOnce(&Display) -> bool,
-) -> bool {
-    load_display().as_ref().is_some_and(capture_frame)
+    load_display: impl FnOnce() -> Result<Option<Display>, CaptureTimeout>,
+    capture_frame: impl FnOnce(&Display) -> Result<bool, CaptureTimeout>,
+) -> ScreenCaptureProbe {
+    match load_display()? {
+        Some(display) => capture_frame(&display),
+        None => Ok(false),
+    }
 }
 
 /// Run the ScreenCaptureKit probe only on an explicitly prompt-capable path.
@@ -84,8 +109,8 @@ fn verify_screen_capture_with<Display>(
 /// only truthful answer when a silent or host-owned flow skips that probe.
 fn maybe_screen_recording_capture_probe(
     should_probe: bool,
-    probe: impl FnOnce() -> bool,
-) -> Option<bool> {
+    probe: impl FnOnce() -> ScreenCaptureProbe,
+) -> Option<ScreenCaptureProbe> {
     should_probe.then(probe)
 }
 
@@ -217,7 +242,10 @@ fn def() -> &'static ToolDef {
             Returns: `accessibility` + `screen_recording` (booleans from the TCC \
             preflight APIs), `screen_recording_capturable` (true/false only when a \
             live ScreenCaptureKit probe ran; null for prompt:false, embedded, or \
-            external permission flows), `screen_recording_probe_performed`, and \
+            external permission flows or when the probe timed out), \
+            `screen_recording_probe_performed`, `screen_recording_capture_error` \
+            (a `capture_timeout` object when macOS did not answer the probe, usually \
+            because a system dialog is waiting; the grants are not the cause), and \
             `source` (which TCC identity the \
             booleans reflect: the responsible daemon app vs the launching terminal/IDE). \
             macOS attributes grants to the responsible process, so a standalone call \
@@ -294,9 +322,11 @@ impl Tool for CheckPermissionsTool {
 fn permission_result(
     accessibility: bool,
     screen_recording: bool,
-    screen_recording_capturable: Option<bool>,
+    probe: Option<ScreenCaptureProbe>,
     source: serde_json::Value,
 ) -> ToolResult {
+    let screen_recording_capturable = probe.as_ref().and_then(|probe| probe.as_ref().ok().copied());
+    let capture_timeout = probe.as_ref().and_then(|probe| probe.as_ref().err());
     let is_caller = source.get("attribution").and_then(|v| v.as_str()) == Some("caller");
     // Text format mirrors Swift 1:1:
     //   "✅ Accessibility: granted.\n✅ Screen Recording: granted."
@@ -322,6 +352,12 @@ fn permission_result(
              the grant likely belongs to a different process, not this one.",
         );
     }
+    if let Some(timeout) = capture_timeout {
+        summary.push_str(&format!(
+            "\n⏳ Live capture probe: {timeout} The permission state above is \
+             unchanged; do not re-grant it."
+        ));
+    }
     // Make the attribution explicit when answering for a host or caller
     // (not the daemon).
     if source.get("attribution").and_then(|v| v.as_str()) == Some("host") {
@@ -342,7 +378,8 @@ fn permission_result(
         "accessibility":               accessibility,
         "screen_recording":            screen_recording,
         "screen_recording_capturable": screen_recording_capturable,
-        "screen_recording_probe_performed": screen_recording_capturable.is_some(),
+        "screen_recording_probe_performed": probe.is_some(),
+        "screen_recording_capture_error": capture_timeout.map(CaptureTimeout::to_json),
         "source":                      source,
     }))
 }
