@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "cmux-cua"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "cmux-cua-core"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "cmux-cua-testkit"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "core-foundation",
  "objc2-app-kit",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "cmux-cua-uia"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "anyhow",
  "cmux-cua-core",
@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "cursor-overlay"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "anyhow",
  "image",
@@ -1907,7 +1907,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pip-preview"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -1961,7 +1961,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "platform-linux"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -2003,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "platform-macos"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2038,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "platform-windows"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "anyhow",
  "async-trait",
