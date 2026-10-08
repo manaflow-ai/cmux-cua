@@ -4040,6 +4040,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn probe_timeout_is_shown_as_capture_timeout_not_as_failure_or_not_performed() {
+        let lines = permission_status_lines(&serde_json::json!({
+            "accessibility": true,
+            "screen_recording": true,
+            "screen_recording_capturable": null,
+            "screen_recording_probe_performed": true,
+            "screen_recording_capture_error": {
+                "code": "capture_timeout",
+                "operation": "screenshot_capture",
+                "elapsed_ms": 10000,
+                "budget_ms": 10000,
+                "hint": "A system dialog may be waiting."
+            },
+            "source": { "attribution": "driver-daemon" }
+        }));
+        let output = lines.join("\n");
+        assert!(output.contains("capture_timeout"), "{output}");
+        assert!(output.contains("screenshot_capture"), "{output}");
+        assert!(output.contains("10000 ms"), "{output}");
+        assert!(!output.contains("not performed"), "{output}");
+        assert!(!output.contains("live capture probe failed"), "{output}");
+    }
+
     // ── Surface 7b: serve --owner-pid ───────────────────────────────────────
 
     /// A host app checks `manifest.capabilities` for `serve.owner-pid`

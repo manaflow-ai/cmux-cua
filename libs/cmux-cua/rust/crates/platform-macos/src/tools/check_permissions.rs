@@ -350,6 +350,7 @@ fn permission_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture_deadline::{CaptureOperation, CaptureTimeout};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::permissions::test_env_lock()
@@ -487,7 +488,7 @@ mod tests {
         let probe_called = std::cell::Cell::new(false);
         let capturable = maybe_screen_recording_capture_probe(false, || {
             probe_called.set(true);
-            true
+            Ok(true)
         });
         assert_eq!(capturable, None);
         assert!(!probe_called.get(), "silent status must not call SCShareableContent");
@@ -511,39 +512,133 @@ mod tests {
     #[test]
     fn capture_readiness_requires_a_real_frame_after_display_enumeration() {
         let captures = std::cell::Cell::new(0);
-        assert!(!verify_screen_capture_with(
-            || None::<u8>,
-            |_| {
-                captures.set(captures.get() + 1);
-                true
-            }
-        ));
+        assert_eq!(
+            verify_screen_capture_with(
+                || Ok(None::<u8>),
+                |_| {
+                    captures.set(captures.get() + 1);
+                    Ok(true)
+                }
+            ),
+            Ok(false)
+        );
         assert_eq!(captures.get(), 0);
 
-        assert!(!verify_screen_capture_with(
-            || Some(7_u8),
-            |_| {
-                captures.set(captures.get() + 1);
-                false
-            }
-        ));
+        assert_eq!(
+            verify_screen_capture_with(
+                || Ok(Some(7_u8)),
+                |_| {
+                    captures.set(captures.get() + 1);
+                    Ok(false)
+                }
+            ),
+            Ok(false)
+        );
         assert_eq!(captures.get(), 1);
 
-        assert!(verify_screen_capture_with(
-            || Some(7_u8),
-            |_| {
-                captures.set(captures.get() + 1);
-                true
-            }
-        ));
+        assert_eq!(
+            verify_screen_capture_with(
+                || Ok(Some(7_u8)),
+                |_| {
+                    captures.set(captures.get() + 1);
+                    Ok(true)
+                }
+            ),
+            Ok(true)
+        );
         assert_eq!(captures.get(), 2);
+    }
+
+    fn timeout(operation: CaptureOperation) -> CaptureTimeout {
+        CaptureTimeout {
+            operation,
+            elapsed: std::time::Duration::from_secs(15),
+            budget: std::time::Duration::from_secs(15),
+            reason: crate::capture_deadline::CaptureTimeoutReason::BudgetElapsed,
+        }
+    }
+
+    #[test]
+    fn probe_timeout_propagates_from_enumeration_and_from_capture() {
+        let captured = std::cell::Cell::new(false);
+        let enumeration = timeout(CaptureOperation::ShareableContent);
+        assert_eq!(
+            verify_screen_capture_with(
+                || Err::<Option<u8>, _>(enumeration.clone()),
+                |_| {
+                    captured.set(true);
+                    Ok(true)
+                }
+            ),
+            Err(enumeration)
+        );
+        assert!(!captured.get(), "no capture after an enumeration timeout");
+
+        let frame = timeout(CaptureOperation::ScreenshotCapture);
+        assert_eq!(
+            verify_screen_capture_with(|| Ok(Some(7_u8)), |_| Err(frame.clone())),
+            Err(frame)
+        );
+    }
+
+    #[test]
+    fn bounded_probe_errors_keep_timeouts_and_map_other_failures_to_the_fallback() {
+        let hung = anyhow::Error::from(timeout(CaptureOperation::ShareableContent));
+        assert_eq!(
+            probe_step(Err::<Option<u8>, _>(hung), None, "enumeration"),
+            Err(timeout(CaptureOperation::ShareableContent))
+        );
+        assert_eq!(
+            probe_step(Err::<bool, _>(anyhow::anyhow!("worker died")), false, "frame"),
+            Ok(false)
+        );
+        assert_eq!(probe_step(Ok(true), false, "frame"), Ok(true));
+    }
+
+    #[test]
+    fn probe_timeout_is_reported_as_capture_timeout_not_as_not_capturable() {
+        let result = permission_result(
+            true,
+            true,
+            Some(Err(timeout(CaptureOperation::ScreenshotCapture))),
+            serde_json::json!({ "attribution": "helper-daemon" }),
+        );
+        let structured = result.structured_content.as_ref().expect("structured status");
+        // Unknown, never `false`: a false value tells users to re-grant a
+        // permission that is already granted.
+        assert!(structured["screen_recording_capturable"].is_null());
+        assert_eq!(structured["screen_recording_probe_performed"], true);
+        let error = &structured["screen_recording_capture_error"];
+        assert_eq!(error["code"], "capture_timeout");
+        assert_eq!(error["operation"], "screenshot_capture");
+        assert_eq!(error["elapsed_ms"], 15_000);
+        assert!(error["hint"].as_str().unwrap().contains("dialog"));
+
+        let text = result.content.iter().find_map(|content| match content {
+            cmux_cua_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        }).unwrap_or_default();
+        assert!(text.contains("capture_timeout"), "{text}");
+        assert!(!text.contains("live capture probe failed"), "{text}");
+    }
+
+    #[test]
+    fn completed_probe_has_no_capture_error() {
+        let result = permission_result(
+            true,
+            true,
+            Some(Ok(true)),
+            serde_json::json!({ "attribution": "helper-daemon" }),
+        );
+        let structured = result.structured_content.as_ref().unwrap();
+        assert!(structured["screen_recording_capture_error"].is_null());
     }
 
     #[test]
     fn live_check_reports_probe_true_or_false_and_warns_only_on_false() {
         for (live, should_warn) in [(true, false), (false, true)] {
-            let capturable = maybe_screen_recording_capture_probe(true, || live);
-            assert_eq!(capturable, Some(live));
+            let capturable = maybe_screen_recording_capture_probe(true, || Ok(live));
+            assert_eq!(capturable, Some(Ok(live)));
             let result = permission_result(
                 true,
                 true,

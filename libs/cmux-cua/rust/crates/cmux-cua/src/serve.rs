@@ -4038,12 +4038,28 @@ mod external_permission_flow_tests {
     }
 
     #[test]
+    fn host_screen_capture_verification_reports_a_timeout_as_unknown_with_the_error() {
+        let timed_out = screen_capture_verification_response(Err(serde_json::json!({
+            "code": "capture_timeout",
+            "operation": "shareable_content",
+            "elapsed_ms": 15000,
+        })));
+        assert!(timed_out.ok);
+        let result = timed_out.result.unwrap();
+        // null, never false: the host maps false to "not capturable" and asks
+        // the user to re-grant a permission that is already granted.
+        assert!(result["capturable"].is_null());
+        assert_eq!(result["capture_error"]["code"], "capture_timeout");
+        assert_eq!(result["capture_error"]["operation"], "shareable_content");
+    }
+
+    #[test]
     fn host_screen_capture_verification_reports_live_readiness_explicitly() {
-        let ready = screen_capture_verification_response(true);
+        let ready = screen_capture_verification_response(Ok(true));
         assert!(ready.ok);
         assert_eq!(ready.result.unwrap()["capturable"], serde_json::json!(true));
 
-        let unavailable = screen_capture_verification_response(false);
+        let unavailable = screen_capture_verification_response(Ok(false));
         assert!(unavailable.ok);
         assert_eq!(
             unavailable.result.unwrap()["capturable"],
