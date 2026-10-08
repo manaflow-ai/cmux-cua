@@ -302,9 +302,17 @@ async fn check_screen_capture_capability() -> CheckEntry {
 /// success, error string on failure.
 fn probe_shareable_displays() -> Result<u32, String> {
     use screencapturekit::prelude::SCShareableContent;
-    let content =
-        SCShareableContent::get().map_err(|e| format!("SCShareableContent::get: {e:?}"))?;
-    Ok(content.displays().len() as u32)
+    use crate::capture_deadline::{self, CaptureOperation};
+    capture_deadline::run(
+        CaptureOperation::ShareableContent,
+        capture_deadline::SHAREABLE_CONTENT_BUDGET,
+        || {
+            let content = SCShareableContent::get()
+                .map_err(|e| anyhow::anyhow!("SCShareableContent::get: {e:?}"))?;
+            Ok(content.displays().len() as u32)
+        },
+    )
+    .map_err(|e| format!("{e:#}"))
 }
 
 /// Read the running process's `CFBundleIdentifier` via CoreFoundation.

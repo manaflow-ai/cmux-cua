@@ -416,6 +416,19 @@ pub fn config_file_path() -> std::path::PathBuf {
 /// defaults for any missing or unrecognised keys.  Called at MCP startup so
 /// that `cmux-cua config set capture_mode vision` (CLI) carries over into
 /// the next MCP session without requiring a per-call `set_config`.
+/// Tool error for a screen capture that hit its deadline, carrying the
+/// structured `capture_timeout` payload. `None` for every other error.
+pub(crate) fn capture_timeout_result(
+    context: &str,
+    error: &anyhow::Error,
+) -> Option<cmux_cua_core::protocol::ToolResult> {
+    let timeout = crate::capture_deadline::CaptureTimeout::find(error)?;
+    Some(
+        cmux_cua_core::protocol::ToolResult::error(format!("{context}: {timeout}"))
+            .with_structured(timeout.to_json()),
+    )
+}
+
 pub fn load_driver_config() -> DriverConfig {
     let mut cfg = DriverConfig::default();
     let path = config_file_path();

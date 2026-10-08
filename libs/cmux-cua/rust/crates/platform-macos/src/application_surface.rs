@@ -17,6 +17,7 @@ use core_graphics::event::{CGEvent, CGEventFlags, CGEventType, CGMouseButton, Sc
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use foreign_types::ForeignType;
+use crate::capture_deadline::{self, CaptureOperation, SystemCaptureClock};
 use screencapturekit::cm::{CMSampleBufferExt, CMSampleBufferSCExt};
 use screencapturekit::prelude::{
     PixelFormat, SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration,
@@ -523,9 +524,7 @@ struct ApplicationSurfaceSession {
 
 impl Drop for ApplicationSurfaceSession {
     fn drop(&mut self) {
-        if let Err(error) = self.stream.stop_capture() {
-            tracing::warn!(%error, "application surface capture did not stop cleanly");
-        }
+        stop_stream(self.stream.clone());
     }
 }
 
@@ -586,13 +585,42 @@ fn manager() -> &'static Mutex<ApplicationSurfaceManager> {
     MANAGER.get_or_init(|| Mutex::new(ApplicationSurfaceManager::default()))
 }
 
+/// Enumerate shareable windows, bounded by
+/// [`capture_deadline::SHAREABLE_CONTENT_BUDGET`].
+fn shareable_windows() -> anyhow::Result<SCShareableContent> {
+    capture_deadline::run(
+        CaptureOperation::ShareableContent,
+        capture_deadline::SHAREABLE_CONTENT_BUDGET,
+        || {
+            SCShareableContent::create()
+                .with_on_screen_windows_only(false)
+                .with_exclude_desktop_windows(true)
+                .get()
+                .map_err(|error| anyhow!("could not enumerate application windows: {error}"))
+        },
+    )
+}
+
+/// Stop a stream outside the caller, bounded by
+/// [`capture_deadline::STREAM_STOP_BUDGET`].
+fn stop_stream(stream: SCStream) {
+    let result = capture_deadline::run(
+        CaptureOperation::StreamStop,
+        capture_deadline::STREAM_STOP_BUDGET,
+        move || {
+            stream
+                .stop_capture()
+                .map_err(|error| anyhow!("{error}"))
+        },
+    );
+    if let Err(error) = result {
+        tracing::warn!(%error, "application surface capture did not stop cleanly");
+    }
+}
+
 pub fn list_windows() -> anyhow::Result<Vec<ApplicationWindow>> {
     require_application_surface_permissions()?;
-    let content = SCShareableContent::create()
-        .with_on_screen_windows_only(false)
-        .with_exclude_desktop_windows(true)
-        .get()
-        .map_err(|error| anyhow!("could not enumerate application windows: {error}"))?;
+    let content = shareable_windows()?;
     let helper_pid = std::process::id() as i32;
     let mut windows = content
         .windows()
@@ -642,11 +670,7 @@ pub fn start(
         bail!("invalid application-surface target or frame rate");
     }
 
-    let content = SCShareableContent::create()
-        .with_on_screen_windows_only(false)
-        .with_exclude_desktop_windows(true)
-        .get()
-        .map_err(|error| anyhow!("could not enumerate application windows: {error}"))?;
+    let content = shareable_windows()?;
     let source_window = content
         .windows()
         .into_iter()
@@ -697,9 +721,20 @@ pub fn start(
             SCStreamOutputType::Screen,
         )
         .ok_or_else(|| anyhow!("could not attach application capture output"))?;
-    stream
-        .start_capture()
-        .map_err(|error| anyhow!("could not start application capture: {error}"))?;
+    // A start that answers after its deadline leaves a running stream nobody
+    // owns; the late handler stops it.
+    let stream = capture_deadline::bounded(
+        CaptureOperation::StreamStart,
+        capture_deadline::STREAM_START_BUDGET,
+        &SystemCaptureClock,
+        move || stream.start_capture().map(|()| stream),
+        |late| {
+            if let Ok(stream) = late {
+                let _ = stream.stop_capture();
+            }
+        },
+    )?
+    .map_err(|error| anyhow!("could not start application capture: {error}"))?;
 
     let session_id = Uuid::new_v4().to_string();
     let result = ApplicationSurfaceStartResult {

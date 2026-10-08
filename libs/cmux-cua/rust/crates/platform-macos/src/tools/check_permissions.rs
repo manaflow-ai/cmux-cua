@@ -28,22 +28,46 @@ pub(super) fn screen_recording_capturable() -> bool {
         screenshot_manager::SCScreenshotManager,
     };
 
+    use crate::capture_deadline::{self, CaptureOperation};
+
+    // Both calls are bounded: a pending consent alert must read as "not
+    // capturable yet", not hang check_permissions.
     verify_screen_capture_with(
         || {
-            SCShareableContent::get()
-                .ok()?
-                .displays()
-                .into_iter()
-                .next()
+            capture_deadline::run(
+                CaptureOperation::ShareableContent,
+                capture_deadline::SHAREABLE_CONTENT_BUDGET,
+                || {
+                    Ok(SCShareableContent::get()
+                        .ok()
+                        .and_then(|content| content.displays().into_iter().next()))
+                },
+            )
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "screen capture probe: display enumeration failed");
+                None
+            })
         },
         |display| {
-            let filter = SCContentFilter::create()
-                .with_display(display)
-                .with_excluding_windows(&[])
-                .build();
-            let configuration = SCStreamConfiguration::new().with_width(1).with_height(1);
-            SCScreenshotManager::capture_image(&filter, &configuration)
-                .is_ok_and(|image| image.width() > 0 && image.height() > 0)
+            let display = display.clone();
+            capture_deadline::run(
+                CaptureOperation::ScreenshotCapture,
+                capture_deadline::SCREENSHOT_BUDGET,
+                move || {
+                    let filter = SCContentFilter::create()
+                        .with_display(&display)
+                        .with_excluding_windows(&[])
+                        .build();
+                    let configuration =
+                        SCStreamConfiguration::new().with_width(1).with_height(1);
+                    Ok(SCScreenshotManager::capture_image(&filter, &configuration)
+                        .is_ok_and(|image| image.width() > 0 && image.height() > 0))
+                },
+            )
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "screen capture probe: frame capture failed");
+                false
+            })
         },
     )
 }

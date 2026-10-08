@@ -27,6 +27,8 @@ pub mod cursor;
 #[cfg(target_os = "macos")]
 pub mod capture;
 #[cfg(target_os = "macos")]
+pub mod capture_deadline;
+#[cfg(target_os = "macos")]
 pub mod browser;
 #[cfg(target_os = "macos")]
 pub mod focus_steal;

@@ -94,7 +94,8 @@ impl Tool for ZoomTool {
                     })),
                 }
             }
-            Ok(Err(e)) => ToolResult::error(format!("Zoom failed: {e}")),
+            Ok(Err(e)) => super::capture_timeout_result("Zoom failed", &e)
+                .unwrap_or_else(|| ToolResult::error(format!("Zoom failed: {e}"))),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }

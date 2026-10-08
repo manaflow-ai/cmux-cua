@@ -238,10 +238,15 @@ impl Tool for GetWindowStateTool {
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("Screenshot failed for window {window_id}: {e}");
-                    screenshot_error = Some(screenshot_unavailable(
-                        &e.to_string(),
-                        crate::permissions::status::screen_recording_granted(),
-                    ));
+                    screenshot_error = Some(
+                        match crate::capture_deadline::CaptureTimeout::find(&e) {
+                            Some(timeout) => timeout.to_json(),
+                            None => screenshot_unavailable(
+                                &e.to_string(),
+                                crate::permissions::status::screen_recording_granted(),
+                            ),
+                        },
+                    );
                     None
                 }
                 Err(e) => {
