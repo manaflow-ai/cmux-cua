@@ -8,7 +8,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// Linux refuses to exec a file that any process still holds open for
+/// writing (ETXTBSY). A child forked by a parallel test inherits the copy's
+/// write descriptor until its own exec, so every copy and every spawn in
+/// this file runs under one lock.
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+fn spawn_lock() -> MutexGuard<'static, ()> {
+    SPAWN_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn private_root() -> tempfile::TempDir {
     let root = tempfile::tempdir().expect("temp root");
@@ -18,6 +29,7 @@ fn private_root() -> tempfile::TempDir {
 }
 
 fn spawn_owner() -> Child {
+    let _guard = spawn_lock();
     Command::new("sleep")
         .arg("60")
         .spawn()
@@ -34,6 +46,7 @@ fn unbranded_binary(root: &Path) -> std::path::PathBuf {
 }
 
 fn spawn_serve(root: &Path, socket: &Path, owner_pid: u32) -> Child {
+    let _guard = spawn_lock();
     Command::new(unbranded_binary(root))
         .arg("serve")
         .arg("--socket")
@@ -122,6 +135,7 @@ fn serve_exits_zero_at_once_when_the_owner_is_already_dead() {
 fn serve_refuses_an_invalid_owner_pid() {
     let root = private_root();
     let socket = root.path().join("invalid.sock");
+    let guard = spawn_lock();
     let mut daemon = KillOnDrop(
         Command::new(unbranded_binary(root.path()))
             .arg("serve")
@@ -136,6 +150,7 @@ fn serve_refuses_an_invalid_owner_pid() {
             .spawn()
             .expect("spawn cmux-cua serve"),
     );
+    drop(guard);
     let status = wait_with_deadline(&mut daemon.0, Duration::from_secs(5))
         .expect("daemon must refuse an invalid owner pid at once");
     assert_eq!(status.code(), Some(2), "invalid --owner-pid is a usage error");
