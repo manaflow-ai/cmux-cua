@@ -42,6 +42,11 @@ mod check_update_tool;
 mod updater;
 mod version_check;
 
+/// Process-wide lock for unit tests that mutate environment variables such
+/// as `HOME`. `std::env::set_var` is global, so modules must share one lock.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
