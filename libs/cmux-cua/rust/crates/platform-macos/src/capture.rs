@@ -25,13 +25,33 @@ use core_graphics::{
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use std::process::Command;
 
+use crate::capture_deadline::{self, CaptureOperation, CaptureTimeout};
+
 /// Capture a window by its `window_id` (CGWindowID).
 /// Returns raw PNG bytes or an error.
+///
+/// Each attempt is bounded by [`capture_deadline::SCREENSHOT_BUDGET`]. A
+/// timeout returns [`capture_deadline::CaptureTimeout`] at once: the
+/// `screencapture` fallback talks to the same blocked capture service, so
+/// trying it would only double the wait.
 pub fn screenshot_window_bytes(window_id: u32) -> anyhow::Result<Vec<u8>> {
-    if let Ok(bytes) = screenshot_window_bytes_core_graphics(window_id) {
-        return Ok(bytes);
+    bounded_with_fallback(
+        CaptureOperation::WindowImage,
+        move || screenshot_window_bytes_core_graphics(window_id),
+        move || screenshot_window_bytes_screencapture(window_id),
+    )
+}
+
+fn bounded_with_fallback(
+    operation: CaptureOperation,
+    primary: impl FnOnce() -> anyhow::Result<Vec<u8>> + Send + 'static,
+    fallback: impl FnOnce() -> anyhow::Result<Vec<u8>> + Send + 'static,
+) -> anyhow::Result<Vec<u8>> {
+    match capture_deadline::run(operation, capture_deadline::SCREENSHOT_BUDGET, primary) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if CaptureTimeout::find(&error).is_some() => Err(error),
+        Err(_) => capture_deadline::run(operation, capture_deadline::SCREENSHOT_BUDGET, fallback),
     }
-    screenshot_window_bytes_screencapture(window_id)
 }
 
 fn screenshot_window_bytes_core_graphics(window_id: u32) -> anyhow::Result<Vec<u8>> {
@@ -125,11 +145,13 @@ pub fn screenshot_window(window_id: u32) -> anyhow::Result<(String, u32, u32)> {
 
 /// Capture the full main display.
 /// Returns raw PNG bytes or an error.
+/// Bounded like [`screenshot_window_bytes`].
 pub fn screenshot_display_bytes() -> anyhow::Result<Vec<u8>> {
-    if let Ok(bytes) = screenshot_display_bytes_core_graphics() {
-        return Ok(bytes);
-    }
-    screenshot_display_bytes_screencapture()
+    bounded_with_fallback(
+        CaptureOperation::DisplayImage,
+        screenshot_display_bytes_core_graphics,
+        screenshot_display_bytes_screencapture,
+    )
 }
 
 fn screenshot_display_bytes_core_graphics() -> anyhow::Result<Vec<u8>> {

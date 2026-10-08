@@ -27,6 +27,7 @@ use std::time::Instant;
 
 use cmux_cua_core::video::{VideoBackend, VideoBackendFactory, VideoMetadata};
 
+use crate::capture_deadline::{self, CaptureOperation, SystemCaptureClock};
 use screencapturekit::prelude::{
     SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration,
 };
@@ -77,8 +78,14 @@ impl SckitVideoBackend {
             }
         }
 
-        let content = SCShareableContent::get()
-            .map_err(|e| anyhow::anyhow!("SCShareableContent::get failed: {e}"))?;
+        let content = capture_deadline::run(
+            CaptureOperation::ShareableContent,
+            capture_deadline::SHAREABLE_CONTENT_BUDGET,
+            || {
+                SCShareableContent::get()
+                    .map_err(|e| anyhow::anyhow!("SCShareableContent::get failed: {e}"))
+            },
+        )?;
         let displays = content.displays();
         let display = displays
             .into_iter()
@@ -120,9 +127,20 @@ impl SckitVideoBackend {
         stream
             .add_recording_output(&recording)
             .map_err(|e| anyhow::anyhow!("SCStream::add_recording_output failed: {e}"))?;
-        stream
-            .start_capture()
-            .map_err(|e| anyhow::anyhow!("SCStream::start_capture failed: {e}"))?;
+        // A start that answers after its deadline would record with no owner;
+        // the late handler stops it (which also finalises the stray file).
+        let stream = capture_deadline::bounded(
+            CaptureOperation::StreamStart,
+            capture_deadline::STREAM_START_BUDGET,
+            &SystemCaptureClock,
+            move || stream.start_capture().map(|()| stream),
+            |late| {
+                if let Ok(stream) = late {
+                    let _ = stream.stop_capture();
+                }
+            },
+        )?
+        .map_err(|e| anyhow::anyhow!("SCStream::start_capture failed: {e}"))?;
 
         tracing::info!(
             target: "recording",
@@ -147,10 +165,19 @@ impl VideoBackend for SckitVideoBackend {
         // SCStream::stop_capture finalises the mp4 moov atom synchronously
         // on the recording output before returning. Errors here mean the
         // file may be unplayable — surface as `finalized: false`.
-        let finalized = self.stream.stop_capture().is_ok();
-        if !finalized {
+        // Bounded: a stop that never answers reports `finalized: false`
+        // instead of hanging `stop_recording`.
+        let stream = self.stream.clone();
+        let stopped = capture_deadline::run(
+            CaptureOperation::StreamStop,
+            capture_deadline::STREAM_STOP_BUDGET,
+            move || stream.stop_capture().map_err(|e| anyhow::anyhow!("{e}")),
+        );
+        let finalized = stopped.is_ok();
+        if let Err(error) = stopped {
             tracing::warn!(
                 target: "recording",
+                %error,
                 "SCStream::stop_capture failed; recording.mp4 may be incomplete"
             );
         }

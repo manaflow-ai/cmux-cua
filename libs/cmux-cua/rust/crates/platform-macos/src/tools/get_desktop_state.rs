@@ -107,7 +107,7 @@ impl Tool for GetDesktopStateTool {
 
         let (b64_opt, file_path, screenshot_width, screenshot_height) = match res {
             Ok(Ok(v)) => v,
-            Ok(Err(e)) => return ToolResult::error(format!("Desktop screenshot failed: {e}")),
+            Ok(Err(e)) => return desktop_capture_error(&e),
             Err(e) => return ToolResult::error(format!("Desktop screenshot task error: {e}")),
         };
 
@@ -138,9 +138,52 @@ impl Tool for GetDesktopStateTool {
     }
 }
 
+fn desktop_capture_error(error: &anyhow::Error) -> ToolResult {
+    super::capture_timeout_result("Desktop screenshot failed", error)
+        .unwrap_or_else(|| ToolResult::error(format!("Desktop screenshot failed: {error}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture_deadline::{bounded, CaptureOperation, SCREENSHOT_BUDGET};
+
+    #[test]
+    fn hung_display_capture_answers_with_structured_capture_timeout() {
+        let _serial = crate::capture_deadline::tests::serial();
+        let clock = crate::capture_deadline::tests::ManualClock::new();
+        let (release, gate) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (late_tx, late_rx) = std::sync::mpsc::channel::<()>();
+        let waiter_clock = std::sync::Arc::clone(&clock);
+        let waiter = std::thread::spawn(move || {
+            bounded(
+                CaptureOperation::DisplayImage,
+                SCREENSHOT_BUDGET,
+                waiter_clock.as_ref(),
+                move || gate.recv().unwrap(),
+                move |_| late_tx.send(()).unwrap(),
+            )
+        });
+        clock.wait_for_park_calls(1);
+        clock.advance(SCREENSHOT_BUDGET);
+        let error = waiter.join().unwrap().unwrap_err();
+
+        let result = desktop_capture_error(&error);
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.expect("structured payload");
+        assert_eq!(structured["code"], "capture_timeout");
+        assert_eq!(structured["operation"], "display_image");
+        assert_eq!(structured["elapsed_ms"], 10_000);
+
+        release.send(Vec::new()).unwrap();
+        late_rx.recv().unwrap();
+    }
+
+    #[test]
+    fn other_capture_errors_keep_the_plain_message() {
+        let result = desktop_capture_error(&anyhow::anyhow!("no display"));
+        assert!(result.structured_content.is_none());
+    }
 
     #[test]
     fn schema_has_no_pid_or_window_id_and_is_read_only() {
