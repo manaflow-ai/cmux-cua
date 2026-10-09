@@ -37,7 +37,7 @@ class TestCmuxCuaReleaseWiring(unittest.TestCase):
     def test_release_on_merge_tracks_rust_driver(self) -> None:
         workflow = self.read(".github/workflows/release-on-merge.yml")
 
-        self.assertIn('["libs/cmux-cua/rust/"]="cmux-cua"', workflow)
+        self.assertIn("['libs/cmux-cua/rust/', 'cmux-cua']", workflow)
 
     def test_release_reminder_tracks_rust_driver(self) -> None:
         workflow = self.read(".github/workflows/ci-release-reminder.yml")
