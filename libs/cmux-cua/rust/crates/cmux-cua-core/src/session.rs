@@ -19,8 +19,12 @@
 //! reverse coupling from core into the platform crates.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 type SessionEndHook = Box<dyn Fn(&str) + Send + Sync>;
 type SessionReviveHook = Box<dyn Fn(&str) + Send + Sync>;
@@ -89,12 +93,148 @@ struct LeaseEntry {
 
 static LEASES: OnceLock<Mutex<HashMap<String, LeaseEntry>>> = OnceLock::new();
 
+/// Persisted generation high-water mark. The active bit lets a daemon restart
+/// resume the exact live generation while still rejecting that same generation
+/// after the lease was deliberately expired.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LeaseWatermark {
+    profile: String,
+    session_id: String,
+    generation: u64,
+    active: bool,
+}
+
+static LEASE_WATERMARKS: OnceLock<Mutex<HashMap<String, LeaseWatermark>>> = OnceLock::new();
+static LEASE_WATERMARK_LOAD_ERROR: OnceLock<Option<String>> = OnceLock::new();
+static LEASE_TRANSITION: OnceLock<Mutex<()>> = OnceLock::new();
+static LEASE_PERSIST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 fn held() -> &'static Mutex<HashMap<String, usize>> {
     HELD_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn leases() -> &'static Mutex<HashMap<String, LeaseEntry>> {
     LEASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lease_transition() -> &'static Mutex<()> {
+    LEASE_TRANSITION.get_or_init(|| Mutex::new(()))
+}
+
+fn lease_watermarks() -> &'static Mutex<HashMap<String, LeaseWatermark>> {
+    LEASE_WATERMARKS.get_or_init(|| {
+        let (watermarks, error) = load_lease_watermarks();
+        let _ = LEASE_WATERMARK_LOAD_ERROR.set(error);
+        Mutex::new(watermarks)
+    })
+}
+
+fn lease_watermark_load_error() -> Option<String> {
+    let _ = lease_watermarks();
+    LEASE_WATERMARK_LOAD_ERROR
+        .get()
+        .and_then(|error| error.clone())
+}
+
+fn lease_watermark_path() -> Option<PathBuf> {
+    std::env::var_os(crate::session_state::STATE_DIR_ENV)
+        .map(PathBuf::from)
+        .map(|dir| dir.join("leases-v1.json"))
+}
+
+fn load_lease_watermarks() -> (HashMap<String, LeaseWatermark>, Option<String>) {
+    let Some(path) = lease_watermark_path() else {
+        return (HashMap::new(), None);
+    };
+    load_lease_watermarks_at(&path)
+}
+
+fn load_lease_watermarks_at(path: &Path) -> (HashMap<String, LeaseWatermark>, Option<String>) {
+    let body = match std::fs::read(&path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (HashMap::new(), None);
+        }
+        Err(error) => {
+            return (
+                HashMap::new(),
+                Some(format!("cannot read {}: {error}", path.display())),
+            );
+        }
+    };
+    let stored: HashMap<String, LeaseWatermark> = match serde_json::from_slice(&body) {
+        Ok(stored) => stored,
+        Err(error) => {
+            return (
+                HashMap::new(),
+                Some(format!("cannot decode {}: {error}", path.display())),
+            );
+        }
+    };
+    (normalize_lease_watermarks(stored), None)
+}
+
+fn normalize_lease_watermarks(
+    stored: HashMap<String, LeaseWatermark>,
+) -> HashMap<String, LeaseWatermark> {
+    let mut normalized: HashMap<String, LeaseWatermark> = HashMap::new();
+    for (key, watermark) in stored {
+        // Older lease files keyed records by profile and lease id. The lease
+        // identity is global, matching LEASES; retaining the profile in the
+        // lookup key would let another profile take ownership after restart.
+        let prefix = format!("{}\0", watermark.profile);
+        let lease_id = key.strip_prefix(&prefix).unwrap_or(&key).to_owned();
+        if let Some(previous) = normalized.get_mut(&lease_id) {
+            let conflicting_profile = previous.profile != watermark.profile;
+            if watermark.generation > previous.generation {
+                *previous = watermark;
+            }
+            // A file written before profile fencing may contain conflicting
+            // owners. Require a newer generation instead of resuming either.
+            if conflicting_profile {
+                previous.active = false;
+            }
+        } else {
+            normalized.insert(lease_id, watermark);
+        }
+    }
+    normalized
+}
+
+fn persist_lease_watermarks(
+    watermarks: &HashMap<String, LeaseWatermark>,
+) -> Result<(), String> {
+    let Some(path) = lease_watermark_path() else {
+        return Ok(());
+    };
+    persist_lease_watermarks_at(&path, watermarks)
+}
+
+fn persist_lease_watermarks_at(
+    path: &Path,
+    watermarks: &HashMap<String, LeaseWatermark>,
+) -> Result<(), String> {
+    let Some(dir) = path.parent() else {
+        return Err(format!("lease watermark path has no parent: {}", path.display()));
+    };
+    crate::session_state::ensure_private_dir(dir)
+        .map_err(|error| format!("cannot create lease watermark directory: {error}"))?;
+    let body = serde_json::to_vec(watermarks)
+        .map_err(|error| format!("cannot encode lease watermarks: {error}"))?;
+    let sequence = LEASE_PERSIST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = dir.join(format!(".leases-v1.json.tmp-{sequence}"));
+    let result = (|| {
+        use std::io::Write;
+        let mut file = crate::session_state::create_private_temp_file(&temp_path)?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, &path)
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(temp_path);
+        return Err(format!("cannot persist lease watermarks: {error}"));
+    }
+    Ok(())
 }
 
 fn validate_lease_part(value: &str, field: &str) -> Result<(), String> {
@@ -122,9 +262,16 @@ pub fn acquire_lease(
     if generation == 0 {
         return Err("lease generation must be positive".to_owned());
     }
+    if let Some(error) = lease_watermark_load_error() {
+        return Err(format!(
+            "lease watermark state is unavailable; refusing lease admission: {error}"
+        ));
+    }
 
+    let _transition = lease_transition().lock().unwrap();
     let now = Instant::now();
     let mut map = leases().lock().unwrap();
+    let mut watermarks = lease_watermarks().lock().unwrap();
     let record = LeaseRecord {
         lease_id: lease_id.to_owned(),
         profile: profile.to_owned(),
@@ -132,15 +279,59 @@ pub fn acquire_lease(
         generation,
     };
     let Some(entry) = map.get_mut(lease_id) else {
+        if let Some(previous) = watermarks.get(lease_id) {
+            if previous.profile != profile {
+                return Err(format!(
+                    "lease `{lease_id}` belongs to profile `{}`, not `{profile}`",
+                    previous.profile
+                ));
+            }
+            if generation < previous.generation {
+                return Err(format!(
+                    "stale lease generation {generation}; active generation is {}",
+                    previous.generation
+                ));
+            }
+            if generation == previous.generation {
+                if previous.active && previous.session_id == session_id {
+                    map.insert(
+                        lease_id.to_owned(),
+                        LeaseEntry {
+                            record,
+                            holders: 1,
+                            last_renewed: now,
+                            disconnected_at: None,
+                        },
+                    );
+                    return Ok(LeaseAcquire::Resumed);
+                }
+                return Err(format!(
+                    "stale lease generation {generation}; active generation is {}",
+                    previous.generation
+                ));
+            }
+        }
+        let mut next_watermarks = watermarks.clone();
+        next_watermarks.insert(
+            lease_id.to_owned(),
+            LeaseWatermark {
+                profile: profile.to_owned(),
+                session_id: session_id.to_owned(),
+                generation,
+                active: true,
+            },
+        );
+        persist_lease_watermarks(&next_watermarks)?;
         map.insert(
             lease_id.to_owned(),
             LeaseEntry {
-                record,
+                record: record.clone(),
                 holders: 1,
                 last_renewed: now,
                 disconnected_at: None,
             },
         );
+        *watermarks = next_watermarks;
         return Ok(LeaseAcquire::New);
     };
     if entry.record.profile != profile {
@@ -167,10 +358,22 @@ pub fn acquire_lease(
         return Ok(LeaseAcquire::Resumed);
     }
 
+    let mut next_watermarks = watermarks.clone();
+    next_watermarks.insert(
+        lease_id.to_owned(),
+        LeaseWatermark {
+            profile: profile.to_owned(),
+            session_id: session_id.to_owned(),
+            generation,
+            active: true,
+        },
+    );
+    persist_lease_watermarks(&next_watermarks)?;
     let previous_session_id = std::mem::replace(&mut entry.record, record).session_id;
     entry.holders = 1;
     entry.last_renewed = now;
     entry.disconnected_at = None;
+    *watermarks = next_watermarks;
     Ok(LeaseAcquire::Replaced {
         previous_session_id,
     })
@@ -185,6 +388,7 @@ pub fn renew_lease(
     session_id: &str,
     generation: u64,
 ) -> Result<(), String> {
+    let _transition = lease_transition().lock().unwrap();
     let mut map = leases().lock().unwrap();
     let Some(entry) = map.get_mut(lease_id) else {
         return Err(format!("lease `{lease_id}` is not active"));
@@ -203,6 +407,7 @@ pub fn renew_lease(
 /// Mark a control connection as gone. Cleanup is deferred until the crash
 /// grace period expires, allowing a proxy restart to resume its lease.
 pub fn release_lease(lease_id: &str, generation: u64) -> Result<(), String> {
+    let _transition = lease_transition().lock().unwrap();
     let mut map = leases().lock().unwrap();
     let Some(entry) = map.get_mut(lease_id) else {
         return Ok(());
@@ -224,6 +429,10 @@ pub fn expire_leases(grace: Duration, ttl: Duration) -> Vec<ExpiredLease> {
 }
 
 fn expire_leases_at(now: Instant, grace: Duration, ttl: Duration) -> Vec<ExpiredLease> {
+    if lease_watermark_load_error().is_some() {
+        return Vec::new();
+    }
+    let _transition = lease_transition().lock().unwrap();
     let mut map = leases().lock().unwrap();
     let expired_ids: Vec<String> = map
         .iter()
@@ -237,24 +446,83 @@ fn expire_leases_at(now: Instant, grace: Duration, ttl: Duration) -> Vec<Expired
         })
         .map(|(id, _)| id.clone())
         .collect();
-    expired_ids
-        .into_iter()
-        .filter_map(|id| {
-            map.remove(&id).map(|entry| ExpiredLease {
-                lease_id: entry.record.lease_id,
-                profile: entry.record.profile,
-                session_id: entry.record.session_id,
-                generation: entry.record.generation,
-            })
-        })
-        .collect()
+    let expired = expired_ids
+        .iter()
+        .filter_map(|id| map.get(id).map(|entry| ExpiredLease {
+            lease_id: entry.record.lease_id.clone(),
+            profile: entry.record.profile.clone(),
+            session_id: entry.record.session_id.clone(),
+            generation: entry.record.generation,
+        }))
+        .collect::<Vec<_>>();
+    if !expired.is_empty() {
+        let mut watermarks = lease_watermarks().lock().unwrap();
+        let mut next_watermarks = watermarks.clone();
+        for lease in &expired {
+            if let Some(watermark) = next_watermarks.get_mut(&lease.lease_id) {
+                watermark.active = false;
+            }
+        }
+        if lease_watermark_path().is_some()
+            && expired
+                .iter()
+                .any(|lease| !next_watermarks.contains_key(&lease.lease_id))
+        {
+            return Vec::new();
+        }
+        // Keep the lease active if its tombstone cannot be made durable. A
+        // subsequent sweep retries the write; removing it first would allow a
+        // delayed proxy to reacquire the expired generation in this process.
+        if persist_lease_watermarks(&next_watermarks).is_err() {
+            return Vec::new();
+        }
+        for id in expired_ids {
+            map.remove(&id);
+        }
+        *watermarks = next_watermarks;
+    }
+    expired
 }
 
-/// Drop activity for a superseded proxy generation without firing cleanup for
-/// the stable host lease. The replacement generation owns the same state.
+/// Run cleanup for an expired lease while excluding a replacement that may
+/// have acquired the same lease id between expiry and the sweep callback. The
+/// transition lock stays held through `cleanup`, so stable host state cannot be
+/// removed after a replacement has started writing it.
+pub fn with_expired_lease_cleanup(
+    expired: &ExpiredLease,
+    cleanup: impl FnOnce(bool),
+) {
+    let _transition = lease_transition().lock().unwrap();
+    let replacement_active = leases().lock().unwrap().contains_key(&expired.lease_id);
+    cleanup(!replacement_active);
+}
+
+/// Whether a session id belongs to a generation that has been superseded or
+/// expired. This also consults persisted host high-water marks so a daemon
+/// restart cannot let an older proxy issue calls before its session_begin is
+/// rejected.
+pub fn is_lease_session_fenced(session_id: &str, profile: &str) -> bool {
+    if lease_watermark_load_error().is_some() {
+        return true;
+    }
+    let _transition = lease_transition().lock().unwrap();
+    let lease_id = crate::session_state::durable_lease_id(session_id);
+    let generation = crate::session_state::lease_generation(session_id);
+    let watermarks = lease_watermarks().lock().unwrap();
+    watermarks.get(&lease_id).is_some_and(|watermark| {
+        watermark.profile != profile
+            || generation < watermark.generation
+            || (generation == watermark.generation
+                && (!watermark.active || watermark.session_id != session_id))
+    })
+}
+
+/// Fence and clean up a superseded proxy generation without disturbing the
+/// stable host lease. The replacement generation owns the shared host scope.
 pub fn retire_session(session_id: &str) {
     activity().lock().unwrap().remove(session_id);
     held().lock().unwrap().remove(session_id);
+    fire_session_end(session_id);
 }
 
 /// Mark `session_id` as owned by a live control connection.
@@ -704,5 +972,105 @@ mod tests {
         )
         .expect_err("one host lease cannot change tool profiles");
         assert!(error.contains("belongs to profile"));
+    }
+
+    #[test]
+    fn persisted_lease_rejects_profile_hijack_after_restart() {
+        let lease = "test-lease-profile-restart-M4N5O6";
+        let first = format!("{lease}-mcp-101-100");
+        let second = format!("{lease}-mcp-102-101");
+        assert!(acquire_lease(lease, "native", &first, 100).is_ok());
+        {
+            let _transition = lease_transition().lock().unwrap();
+            // A new daemon has only the persisted watermark for this lease.
+            leases().lock().unwrap().remove(lease);
+        }
+        let error = acquire_lease(lease, "codex-computer-use-compat", &second, 101)
+            .expect_err("a restart must preserve the lease's profile owner");
+        assert!(error.contains("belongs to profile"));
+        assert_eq!(
+            acquire_lease(lease, "native", &first, 100).unwrap(),
+            LeaseAcquire::Resumed
+        );
+    }
+
+    #[test]
+    fn lease_tool_fence_rejects_calls_through_another_profile() {
+        let lease = "test-lease-profile-tool-fence-P7Q8R9";
+        let session = format!("{lease}-mcp-103-200");
+        assert!(acquire_lease(lease, "native", &session, 200).is_ok());
+        assert!(!is_lease_session_fenced(&session, "native"));
+        assert!(
+            is_lease_session_fenced(&session, "codex-computer-use-compat"),
+            "tool calls must not bypass the profile established at lease admission"
+        );
+    }
+
+    #[test]
+    fn replacing_a_lease_ends_the_retired_generation() {
+        let lease = "test-lease-retire-generation-G4H5I6";
+        let first = "test-lease-retire-session-a";
+        let second = "test-lease-retire-session-b";
+        assert!(acquire_lease(lease, "native", first, 10).is_ok());
+        match acquire_lease(lease, "native", second, 11).unwrap() {
+            LeaseAcquire::Replaced { previous_session_id } => retire_session(&previous_session_id),
+            result => panic!("expected replacement, got {result:?}"),
+        }
+        assert!(
+            is_session_ended(first),
+            "a fenced generation must be tombstoned before its successor runs"
+        );
+    }
+
+    #[test]
+    fn an_expired_generation_cannot_reacquire_its_lease() {
+        let lease = "test-lease-expired-generation-J7K8L9";
+        let session = "test-lease-expired-session";
+        assert!(acquire_lease(lease, "native", session, 20).is_ok());
+        assert!(release_lease(lease, 20).is_ok());
+        assert!(
+            expire_leases_at(
+                Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+            )
+            .iter()
+            .any(|expired| expired.lease_id == lease)
+        );
+        assert!(
+            acquire_lease(lease, "native", session, 20).is_err(),
+            "lease expiry must retain a generation fence for delayed reconnects"
+        );
+    }
+
+    #[test]
+    fn unwritable_lease_watermark_path_fails_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "cua-lease-watermark-parent-file-{}-{}",
+            std::process::id(),
+            LEASE_PERSIST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, b"parent is a file")
+            .expect("create an unwritable watermark parent fixture");
+        let watermark_path = path.join("leases-v1.json");
+        let error = persist_lease_watermarks_at(&watermark_path, &HashMap::new())
+            .expect_err("watermark persistence must report an unwritable state directory");
+        assert!(error.contains("cannot create lease watermark directory"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn corrupt_lease_watermark_file_fails_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "cua-lease-watermark-corrupt-{}-{}",
+            std::process::id(),
+            LEASE_PERSIST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, b"not-json")
+            .expect("create a corrupt watermark fixture");
+        let (watermarks, error) = load_lease_watermarks_at(&path);
+        assert!(watermarks.is_empty());
+        assert!(error.is_some_and(|error| error.contains("cannot decode")));
+        let _ = std::fs::remove_file(path);
     }
 }

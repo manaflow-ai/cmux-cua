@@ -737,7 +737,16 @@ async fn run_unix_control_connection_once(
         tokio::select! {
             line = reader.read_line(&mut buffer) => match line {
                 Ok(0) | Err(_) => break,
-                Ok(_) => continue,
+                Ok(_) => {
+                    if serde_json::from_str::<DaemonResponse>(buffer.trim())
+                        .ok()
+                        .is_some_and(|response| !response.ok)
+                    {
+                        debug!(session_id, "daemon rejected lease renewal; reconnecting");
+                        break;
+                    }
+                    continue;
+                }
             },
             _ = renew.tick() => {
                 if writer.write_all(renew_line.as_bytes()).await.is_err()
@@ -818,7 +827,16 @@ async fn run_windows_control_connection_once(
         tokio::select! {
             line = reader.read_line(&mut buffer) => match line {
                 Ok(0) | Err(_) => break,
-                Ok(_) => continue,
+                Ok(_) => {
+                    if serde_json::from_str::<DaemonResponse>(buffer.trim())
+                        .ok()
+                        .is_some_and(|response| !response.ok)
+                    {
+                        debug!(session_id, "daemon rejected lease renewal; reconnecting");
+                        break;
+                    }
+                    continue;
+                }
             },
             _ = renew.tick() => {
                 if writer.write_all(renew_line.as_bytes()).await.is_err()
