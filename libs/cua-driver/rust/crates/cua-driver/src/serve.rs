@@ -838,20 +838,26 @@ pub async fn run_serve(
                     // must be reaped immediately on EOF. fire_session_end is
                     // idempotent, so this is safe if a proxy control teardown
                     // races a legacy explicit session_end.
-                    if let Some(sid) = control_session_id.or_else(|| {
-                        anonymous_fallback_used.then_some(connection_fallback_id)
-                    }) {
+                    let anonymous_session_id = if control_session_id.is_none()
+                        && anonymous_fallback_used
+                    {
+                        Some(connection_fallback_id)
+                    } else {
+                        None
+                    };
+                    if let Some(sid) = control_session_id.or(anonymous_session_id.clone()) {
                         // stop_owner can SYNCHRONOUSLY finalize the recording's
                         // mp4 — on macOS it hits SCStream::stop_capture(), which
                         // blocks on disk I/O (video_sckit.rs). Run it on a
                         // blocking thread so it does not stall a runtime worker.
-                        // fire_session_end stays inline: its hooks (overlay
-                        // Remove, config-override clear) are non-blocking.
-                        // Mark the session ended FIRST so an in-flight start_recording
-                        // sees ended=true and bails (mark-before-reap; the cursor/config
-                        // hooks already reap inside fire_session_end after the mark).
-                        // stop_owner ignores is_session_ended, so reaping after is safe.
-                        cua_driver_core::session::fire_session_end(&sid);
+                        // The named control-session path marks the id ended
+                        // before fan-out. Anonymous ids are unique to this
+                        // socket and use the non-tombstoning hook path.
+                        if anonymous_session_id.is_some() {
+                            cua_driver_core::session::fire_anonymous_session_end(&sid);
+                        } else {
+                            cua_driver_core::session::fire_session_end(&sid);
+                        }
                         let reg2 = reg.clone();
                         let sid_for_stop = sid.clone();
                         let _ = tokio::task::spawn_blocking(move || {
@@ -1363,17 +1369,21 @@ pub async fn run_serve(
                     // graceful proxy exit AND kill -9. Reap the session if this
                     // was the proxy's control connection (see the unix branch for
                     // the full rationale), or an anonymous one-shot connection.
-                    if let Some(sid) = control_session_id.or_else(|| {
-                        anonymous_fallback_used.then_some(connection_fallback_id)
-                    }) {
+                    let anonymous_session_id = if control_session_id.is_none()
+                        && anonymous_fallback_used
+                    {
+                        Some(connection_fallback_id)
+                    } else {
+                        None
+                    };
+                    if let Some(sid) = control_session_id.or(anonymous_session_id.clone()) {
                         // Run stop_owner off the reactor (see the unix branch):
                         // recording finalize can be a synchronous blocking call.
-                        // fire_session_end stays inline (non-blocking hooks).
-                        // Mark the session ended FIRST so an in-flight start_recording
-                        // sees ended=true and bails (mark-before-reap; the cursor/config
-                        // hooks already reap inside fire_session_end after the mark).
-                        // stop_owner ignores is_session_ended, so reaping after is safe.
-                        cua_driver_core::session::fire_session_end(&sid);
+                        if anonymous_session_id.is_some() {
+                            cua_driver_core::session::fire_anonymous_session_end(&sid);
+                        } else {
+                            cua_driver_core::session::fire_session_end(&sid);
+                        }
                         let reg2 = reg.clone();
                         let sid_for_stop = sid.clone();
                         let _ = tokio::task::spawn_blocking(move || {

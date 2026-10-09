@@ -92,6 +92,18 @@ pub fn fire_session_end(session_id: &str) {
     }
 }
 
+/// Fan an anonymous connection's cleanup hooks without retaining a tombstone.
+///
+/// Anonymous fallback ids are unique to one socket and can never be revived or
+/// reused by a caller. They therefore do not need the ended-session tombstone
+/// used to deduplicate named-session teardown, and retaining one for every
+/// short-lived connection would grow the daemon's process-global set forever.
+pub fn fire_anonymous_session_end(session_id: &str) {
+    for hook in hooks().lock().unwrap().iter() {
+        hook(session_id);
+    }
+}
+
 /// Whether `fire_session_end` has already run for this `session_id`. The
 /// daemon-side authority for "this session is permanently gone"; the macOS
 /// overlay keeps its own render-side tombstone keyed on the same id.
@@ -200,6 +212,24 @@ mod tests {
             1,
             "hook must run exactly once for a given session id"
         );
+    }
+
+    #[test]
+    fn anonymous_end_does_not_leave_a_tombstone() {
+        let sid = "connection-test-anonymous-AABBCC";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let want = sid.to_owned();
+        register_session_end_hook(move |got| {
+            if got == want {
+                calls2.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        fire_anonymous_session_end(sid);
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(!is_session_ended(sid));
     }
 
     #[test]
