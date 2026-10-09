@@ -713,6 +713,7 @@ fn spawn_lease_sweep(
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             tick.tick().await;
+            let _lease_mutation = lease_mutation_guard().await;
             for expired in cmux_cua_core::session::expire_leases(grace, ttl) {
                 let lease_id = expired.lease_id.clone();
                 let session_id = expired.session_id.clone();
