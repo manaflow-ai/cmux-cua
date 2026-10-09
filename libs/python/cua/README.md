@@ -65,5 +65,5 @@ agent = ComputerAgent(..., telemetry_enabled=False)
 ## Links
 
 - [Documentation](https://docs.trycua.com)
-- [GitHub](https://github.com/trycua/cua)
-- [Issues](https://github.com/trycua/cua/issues)
+- [GitHub](https://github.com/manaflow-ai/cmux-cua)
+- [Issues](https://github.com/manaflow-ai/cmux-cua/issues)

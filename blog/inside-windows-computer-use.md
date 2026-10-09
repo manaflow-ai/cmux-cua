@@ -2,20 +2,20 @@
 
 _Published on May 27, 2026 by Francesco Bonacci_
 
-![Cua Driver — background any computer-use agent](https://github.com/user-attachments/assets/0b0651b2-2c8c-4930-b0bb-3fd968f38800)
+![cmux CUA — background any computer-use agent](https://github.com/user-attachments/assets/0b0651b2-2c8c-4930-b0bb-3fd968f38800)
 
 **TL;DR:**
-- Cua Driver now supports Windows background computer-use for Claude Code, Codex, Hermes, and any MCP or CLI agent loop.
+- cmux CUA now supports Windows background computer-use for Claude Code, Codex, Hermes, and any MCP or CLI agent loop.
 - Windows was harder than macOS because one driver has to work across Win32, WPF, WinUI, UWP/WinRT, Electron, Chromium, legacy controls, and custom-rendered canvases.
 - The driver gives agents three things at once: window pixels, UIA/MSAA accessibility trees, and an action layer for clicks, typing, scrolling, values, and verification.
-- The visible synthetic cursor is the agent's cursor. It is painted by Cua Driver, recorded by Cua Driver, and kept separate from the user's physical pointer wherever the target allows it.
-- Source: [github.com/trycua/cua](https://github.com/trycua/cua). Docs: [cua.ai/docs/cua-driver](https://cua.ai/docs/cua-driver).
+- The visible synthetic cursor is the agent's cursor. It is painted by cmux CUA, recorded by cmux CUA, and kept separate from the user's physical pointer wherever the target allows it.
+- Source: [github.com/trycua/cua](https://github.com/manaflow-ai/cmux-cua). Docs: [cua.ai/docs/cmux-cua](https://cua.ai/docs/cmux-cua).
 
 ---
 
 Computer-use shines when you plug it into a coding agent or a general agent.
 
-The agent can edit code, launch the app, read the real window, use the controls, and verify its own work. Plug Cua Driver into Claude Code, Codex, Hermes, or your own loop, and the model gets a wider loop to think with: code, pixels, accessibility trees, app state, clicks, typing, verification.
+The agent can edit code, launch the app, read the real window, use the controls, and verify its own work. Plug cmux CUA into Claude Code, Codex, Hermes, or your own loop, and the model gets a wider loop to think with: code, pixels, accessibility trees, app state, clicks, typing, verification.
 
 Windows makes that loop matter. A lot of serious work still happens in Windows desktop apps, including software that will never get an API for agents.
 
@@ -23,7 +23,7 @@ Several of us at Cua are ex-Microsoft engineers. Windows was still harder to tac
 
 ## Windows has a lot of Windows inside it
 
-On macOS, the hard part was finding the WindowServer route that could deliver input to a target app without moving the user's cursor or pulling the user's Space forward. That became the [SkyLight post](https://github.com/trycua/cua/blob/main/blog/inside-macos-window-internals.md).
+On macOS, the hard part was finding the WindowServer route that could deliver input to a target app without moving the user's cursor or pulling the user's Space forward. That became the [SkyLight post](https://github.com/manaflow-ai/cmux-cua/blob/main/blog/inside-macos-window-internals.md).
 
 Windows has a different problem. There is no single shape called "a Windows app."
 
@@ -55,27 +55,27 @@ That works until the target is Calculator, Settings, a WinUI3 app, Chromium cont
 
 So the real driver has to choose the right backend per target and per action.
 
-For pixels, Cua Driver starts with `PrintWindow` and GDI for classic windows. When that returns the black frame you get from UWP, WinUI, or DirectComposition-backed surfaces, it falls back to Windows.Graphics.Capture. WGC reads the window's own composited frame from DWM, even when another window sits above it. If WGC is unavailable, the driver can fall back to a screen-region `BitBlt`, but it marks the result when the target was covered by something else.
+For pixels, cmux CUA starts with `PrintWindow` and GDI for classic windows. When that returns the black frame you get from UWP, WinUI, or DirectComposition-backed surfaces, it falls back to Windows.Graphics.Capture. WGC reads the window's own composited frame from DWM, even when another window sits above it. If WGC is unavailable, the driver can fall back to a screen-region `BitBlt`, but it marks the result when the target was covered by something else.
 
 That last bit matters. A screenshot that silently shows the covering window is worse than no screenshot.
 
-For trees, Cua Driver walks UI Automation with cache requests, so a big Chrome or Electron tree does not become thousands of cross-process property calls. When `ElementFromHandle` returns an empty wrapper for some CoreWindow/UWP apps, the driver walks from the desktop root and filters by process id, which is the same shape inspect.exe uses.
+For trees, cmux CUA walks UI Automation with cache requests, so a big Chrome or Electron tree does not become thousands of cross-process property calls. When `ElementFromHandle` returns an empty wrapper for some CoreWindow/UWP apps, the driver walks from the desktop root and filters by process id, which is the same shape inspect.exe uses.
 
-Then there are VCL and SAL apps. Their UIA provider can hang on subtree cache calls, and the UIA proxy loses useful role information for split dropdown buttons. For those, Cua Driver uses MSAA through `oleacc.dll`. That older path preserves roles like `ROLE_SYSTEM_BUTTONDROPDOWN`, which lets the click tool hit the dropdown half of a split button instead of pressing the main button again.
+Then there are VCL and SAL apps. Their UIA provider can hang on subtree cache calls, and the UIA proxy loses useful role information for split dropdown buttons. For those, cmux CUA uses MSAA through `oleacc.dll`. That older path preserves roles like `ROLE_SYSTEM_BUTTONDROPDOWN`, which lets the click tool hit the dropdown half of a split button instead of pressing the main button again.
 
-For actions, Cua Driver tries the highest-level route first. If an element has a UIA `InvokePattern`, `TogglePattern`, `ValuePattern`, `RangeValuePattern`, or `ExpandCollapsePattern`, the driver uses it. Element-indexed clicks are still the cleanest route because they address the control, not a coordinate.
+For actions, cmux CUA tries the highest-level route first. If an element has a UIA `InvokePattern`, `TogglePattern`, `ValuePattern`, `RangeValuePattern`, or `ExpandCollapsePattern`, the driver uses it. Element-indexed clicks are still the cleanest route because they address the control, not a coordinate.
 
 Pixel clicks use a layered path. The driver first does a UIA hit-test at the pixel. If the deepest control at that point has an invoke action, it calls that action through accessibility. If the point lands on a canvas, video, WebGL surface, or custom-rendered area, the driver falls through to Win32 input.
 
-The default dispatch mode is `background`. That means Cua Driver will use UIA and `PostMessage`, and it will refuse to steal the user's foreground silently. If the target is a known case where `PostMessage` gets dropped, the tool returns `background_unavailable`. The caller can then choose `dispatch:"foreground"` for that one action.
+The default dispatch mode is `background`. That means cmux CUA will use UIA and `PostMessage`, and it will refuse to steal the user's foreground silently. If the target is a known case where `PostMessage` gets dropped, the tool returns `background_unavailable`. The caller can then choose `dispatch:"foreground"` for that one action.
 
 That honesty is important on Windows. Some targets really do need the system input queue. Chromium coordinate clicks, GTK buttons, VCL accelerator keys, and WPF drags are examples. When the model needs one of those paths, it should know it is paying a foreground cost instead of accidentally taking over the user's desktop.
 
 ## Synthetic cursors
 
-The visible cursor in Cua Driver is not the user's mouse.
+The visible cursor in cmux CUA is not the user's mouse.
 
-On Windows, Cua Driver paints the agent cursor in a transparent, click-through layered window. The overlay spans the virtual screen across monitors, does not activate, and stays near the target window in z-order. The cursor has its own `cursor_id`, so separate agents can have separate visual cursors instead of fighting over the one physical pointer.
+On Windows, cmux CUA paints the agent cursor in a transparent, click-through layered window. The overlay spans the virtual screen across monitors, does not activate, and stays near the target window in z-order. The cursor has its own `cursor_id`, so separate agents can have separate visual cursors instead of fighting over the one physical pointer.
 
 The cursor is a UI for the agent trace. It shows where the agent is about to act, where it clicked, and what gets recorded in the demo. The action underneath can be UIA, MSAA, `PostMessage`, or `SendInput`, depending on the target.
 
@@ -87,7 +87,7 @@ One Windows issue only shows up once you run real agent harnesses.
 
 If an agent runs over SSH, from a service, or from the wrong parent process, it can land in Session 0. Session 0 has no interactive desktop. `EnumWindows`, `GetForegroundWindow`, `PrintWindow`, UIA, and screen `BitBlt` all run against the calling process's WindowStation and Desktop, so they return empty or useless results.
 
-Cua Driver solves that with a daemon in the user's interactive session. The CLI or MCP server can run wherever the agent starts, then proxy tool calls over a named pipe to the daemon that actually has the desktop attached.
+cmux CUA solves that with a daemon in the user's interactive session. The CLI or MCP server can run wherever the agent starts, then proxy tool calls over a named pipe to the daemon that actually has the desktop attached.
 
 This is plumbing, but it is the difference between "the app has no windows" and "the agent can drive the Windows session you are looking at."
 
@@ -101,7 +101,7 @@ We recorded two Windows demos for this launch.
 
 The prompt was: "build a beautiful WPF app and make sure it works."
 
-Claude Code wrote the app, launched it, inspected the real Windows UI, found rough edges, fixed them, QA'd the result, then asked Cua Driver to record the final demo.
+Claude Code wrote the app, launched it, inspected the real Windows UI, found rough edges, fixed them, QA'd the result, then asked cmux CUA to record the final demo.
 
 For desktop apps, a diff is not enough evidence. The agent needs to run the app and show what happened.
 
@@ -121,35 +121,35 @@ Windows background computer-use is background-first, not background-at-any-cost.
 
 Minimized windows have no pixels for WGC to capture, so the right fallback is `capture_mode:"ax"` when the tree is enough. Some app stacks need `SendInput` for specific actions, which means the caller must opt into `dispatch:"foreground"`. Some accessibility providers still lie, hang, or expose less tree than the app visually shows. Session 0 still has no desktop unless the interactive-session daemon is running.
 
-Cua Driver returns those cases as explicit errors instead of hiding them. That gives agents something concrete to recover from.
+cmux CUA returns those cases as explicit errors instead of hiding them. That gives agents something concrete to recover from.
 
 ## Install
 
 Install on Windows from PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/trycua/cua/main/libs/cmux-cua/scripts/install.ps1 | iex
 ```
 
 Check the session and daemon state:
 
 ```powershell
-cua-driver doctor
-cua-driver status
+cmux-cua doctor
+cmux-cua status
 ```
 
 Add it to Claude Code:
 
 ```powershell
-claude mcp add --transport stdio cua-driver -- cua-driver mcp
+claude mcp add --transport stdio cmux-cua -- cmux-cua mcp
 ```
 
 Or print the config for other clients:
 
 ```powershell
-cua-driver mcp-config
+cmux-cua mcp-config
 ```
 
-Repo: [github.com/trycua/cua](https://github.com/trycua/cua)
+Repo: [github.com/trycua/cua](https://github.com/manaflow-ai/cmux-cua)
 
-Docs: [cua.ai/docs/cua-driver](https://cua.ai/docs/cua-driver)
+Docs: [cua.ai/docs/cmux-cua](https://cua.ai/docs/cmux-cua)

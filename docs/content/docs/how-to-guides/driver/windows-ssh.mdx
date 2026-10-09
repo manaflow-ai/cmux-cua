@@ -1,6 +1,6 @@
 ---
 title: Drive a Windows app over SSH
-description: Use Cua Driver to drive GUI apps on a remote Windows machine from an SSH session.
+description: Use cmux CUA to drive GUI apps on a remote Windows machine from an SSH session.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -9,16 +9,16 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 Windows OpenSSH server runs in **Session 0**, the non-interactive services session. Sessions 1, 2, ... are interactive logons, one for each console or RDP user. A process inherits its parent's session, so shells created by `sshd` also run in Session 0.
 
-The Win32 APIs used by Cua Driver window tools, including `EnumWindows`, `GetForegroundWindow`, `PrintWindow`, UIA, and `BitBlt`, are scoped to the caller's WindowStation and Desktop. Session 0 has no attached interactive desktop, so the tools cannot see the user's windows:
+The Win32 APIs used by cmux CUA window tools, including `EnumWindows`, `GetForegroundWindow`, `PrintWindow`, UIA, and `BitBlt`, are scoped to the caller's WindowStation and Desktop. Session 0 has no attached interactive desktop, so the tools cannot see the user's windows:
 
 ```powershell
 # Over SSH (Session 0), with no daemon helper:
-cua-driver call list_windows
+cmux-cua call list_windows
 # []    ← empty, even though the user's RDP session has 12 windows open
 ```
 
 <Callout type="info">
-  Run `cua-driver doctor` to confirm this state. The Windows session probe reports it directly:
+  Run `cmux-cua doctor` to confirm this state. The Windows session probe reports it directly:
 
   ```
   [warn] interactive session: running in Session 0 (services); window-driving
@@ -30,24 +30,24 @@ cua-driver call list_windows
 
 ## The solution
 
-Run a `cua-driver serve` daemon in your **interactive session**, Session 1 or higher, through an autostart Scheduled Task. The CLI running over SSH detects that daemon and proxies tool calls through its named pipe. The SSH process only moves protocol messages; the daemon performs the actual GUI work from a session with a desktop attached.
+Run a `cmux-cua serve` daemon in your **interactive session**, Session 1 or higher, through an autostart Scheduled Task. The CLI running over SSH detects that daemon and proxies tool calls through its named pipe. The SSH process only moves protocol messages; the daemon performs the actual GUI work from a session with a desktop attached.
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
 │  Session 1+ (RDP / console, has interactive desktop)          │
 │                                                               │
-│    cua-driver-serve  (autostart Scheduled Task)               │
+│    cmux-cua-serve  (autostart Scheduled Task)               │
 │      ↑                                                        │
-│      │ named pipe: \\.\pipe\cua-driver                        │
+│      │ named pipe: \\.\pipe\cmux-cua                        │
 │      │                                                        │
 └──────┼────────────────────────────────────────────────────────┘
        │
 ┌──────┼────────────────────────────────────────────────────────┐
 │  Session 0 (services / SSH, no desktop)                       │
 │      │                                                        │
-│    cua-driver mcp                                             │
-│    cua-driver call list_windows                               │
-│    Claude Code → MCP stdio → cua-driver mcp                   │
+│    cmux-cua mcp                                             │
+│    cmux-cua call list_windows                               │
+│    Claude Code → MCP stdio → cmux-cua mcp                   │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -56,8 +56,8 @@ Run a `cua-driver serve` daemon in your **interactive session**, Session 1 or hi
 **1. From an interactive session, either RDP or the local console, run:**
 
 ```powershell
-cua-driver autostart enable
-cua-driver autostart kick
+cmux-cua autostart enable
+cmux-cua autostart kick
 ```
 
 `enable` registers a Scheduled Task with `LogonType: Interactive`. That setting is required because the alternatives would start the daemon in Session 0. `kick` starts the task immediately instead of waiting for the next logon.
@@ -77,9 +77,9 @@ cua-driver autostart kick
 **2. From your SSH session, verify that the daemon is reachable:**
 
 ```powershell
-cua-driver status
-# Cua Driver daemon is running
-#   socket: \\.\pipe\cua-driver
+cmux-cua status
+# cmux CUA daemon is running
+#   socket: \\.\pipe\cmux-cua
 #   pid: 12345
 #   session: 2    ← daemon is in your interactive session
 ```
@@ -87,7 +87,7 @@ cua-driver status
 **3. Call tools from SSH:**
 
 ```powershell
-cua-driver call list_apps    # sees real GUI apps
+cmux-cua call list_apps    # sees real GUI apps
 ```
 
 ## Connect Claude Code over SSH
@@ -96,29 +96,29 @@ After the daemon is running in the interactive session, register Claude Code the
 
 ```powershell
 # From inside your SSH session:
-claude mcp add --transport stdio cua-driver -- cua-driver.exe mcp
+claude mcp add --transport stdio cmux-cua -- cmux-cua.exe mcp
 claude
 ```
 
-Each MCP tool call starts `cua-driver mcp` on the SSH side. That process detects the daemon and proxies through it. Claude Code sees a normal stdio MCP server, while the daemon receives tool calls from the Session 1+ desktop context.
+Each MCP tool call starts `cmux-cua mcp` on the SSH side. That process detects the daemon and proxies through it. Claude Code sees a normal stdio MCP server, while the daemon receives tool calls from the Session 1+ desktop context.
 
 ## Diagnose empty results
 
 Check these items before opening an issue:
 
-1. Confirm that `cua-driver --version` on the SSH side reports the same current install you expect. Upgrade if needed with `irm https://cua.ai/driver/install.ps1 | iex`.
-2. Run `cua-driver status` from SSH and confirm it reports a running daemon. If it does not, use `cua-driver autostart status` to see whether the Scheduled Task is registered.
+1. Confirm that `cmux-cua --version` on the SSH side reports the same current install you expect. Upgrade if needed with `irm https://cua.ai/driver/install.ps1 | iex`.
+2. Run `cmux-cua status` from SSH and confirm it reports a running daemon. If it does not, use `cmux-cua autostart status` to see whether the Scheduled Task is registered.
 3. Run `query session` and confirm your user has a row in `Active` or `Disc` state.
-4. Run `cua-driver doctor` from RDP and confirm it reports `[ok] interactive session: session N has an attached interactive desktop`.
-5. Confirm that you did not pass `--no-daemon-relaunch` and that `CUA_DRIVER_RS_MCP_NO_RELAUNCH` is unset.
+4. Run `cmux-cua doctor` from RDP and confirm it reports `[ok] interactive session: session N has an attached interactive desktop`.
+5. Confirm that you did not pass `--no-daemon-relaunch` and that `CMUX_CUA_MCP_NO_RELAUNCH` is unset.
 
 ## Opt out of proxying
 
-To keep `cua-driver mcp` in the current process, such as in a CI runner that already owns an interactive session, use either opt-out:
+To keep `cmux-cua mcp` in the current process, such as in a CI runner that already owns an interactive session, use either opt-out:
 
 ```powershell
-cua-driver mcp --no-daemon-relaunch          # per-invocation flag
-$env:CUA_DRIVER_RS_MCP_NO_RELAUNCH = "1"    # per-shell env var
+cmux-cua mcp --no-daemon-relaunch          # per-invocation flag
+$env:CMUX_CUA_MCP_NO_RELAUNCH = "1"    # per-shell env var
 ```
 
 With either form, tool calls run directly against the current session.

@@ -3,7 +3,7 @@
   "icon": "BookText",
   "pages": [
     "index",
-    "cua-driver",
+    "cmux-cua",
     "lume",
     "sandbox-sdk",
     "docs-code-mcp"

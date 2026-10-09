@@ -44,7 +44,7 @@ Swift, and documentation checks remain component-owned.
 
 ## Desktop Behavior Changes
 
-cua-driver behavior must be verified through the canonical Rust harnesses. A
+cmux-cua behavior must be verified through the canonical Rust harnesses. A
 successful tool response alone is not evidence that an action reached the
 application. Delivery tests should observe fixture state and attach focus,
 z-order, cursor, leaked-input, capture, or refusal oracles as required.

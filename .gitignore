@@ -12,9 +12,9 @@ node_modules/*
 .Python
 build/
 !libs/lume/scripts/build/
-!libs/cua-driver/scripts/build/
-!libs/cua-driver/tests/fixtures/build/
-!libs/cua-driver/tests/fixtures/build/**
+!libs/cmux-cua/scripts/build/
+!libs/cmux-cua/tests/fixtures/build/
+!libs/cmux-cua/tests/fixtures/build/**
 develop-eggs/
 dist/
 downloads/

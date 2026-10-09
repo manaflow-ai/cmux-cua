@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cmux-cua"
+version = "0.7.1"
+description = "Python wrapper for cmux-cua - cross-platform MCP server for computer-use automation"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "cmux contributors", email = "hello@manaflow.ai" }
+]
+keywords = [
+    "mcp",
+    "computer-use",
+    "automation",
+    "accessibility",
+    "screen-capture",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.10"
+
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Homepage = "https://github.com/manaflow-ai/cmux-cua"
+Documentation = "https://github.com/manaflow-ai/cmux-cua/tree/main/libs/cmux-cua"
+Repository = "https://github.com/manaflow-ai/cmux-cua"
+Issues = "https://github.com/manaflow-ai/cmux-cua/issues"
+
+[project.scripts]
+cmux-cua = "cmux_cua.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cmux_cua"]
+artifacts = [
+    "src/cmux_cua/bin/*",
+]
+pure-python = false
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"

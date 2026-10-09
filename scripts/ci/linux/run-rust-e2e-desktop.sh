@@ -27,7 +27,7 @@ case "${ENVIRONMENT}" in
       }
     export CUA_E2E_COMPOSITOR=gnome-mutter
     export CUA_E2E_INPUT_BACKENDS=atspi,libei-portal
-    export CUA_DRIVER_RS_ENABLE_WAYLAND=1
+    export CMUX_CUA_ENABLE_WAYLAND=1
     ;;
   kde)
     [[ "${XDG_SESSION_TYPE:-}" == wayland ]] || {
@@ -45,7 +45,7 @@ case "${ENVIRONMENT}" in
     }
     export CUA_E2E_COMPOSITOR=kwin
     export CUA_E2E_INPUT_BACKENDS=atspi,libei-portal
-    export CUA_DRIVER_RS_ENABLE_WAYLAND=1
+    export CMUX_CUA_ENABLE_WAYLAND=1
     ;;
   xorg)
     [[ -n "${DISPLAY:-}" && "${XDG_SESSION_TYPE:-x11}" != wayland ]] || {

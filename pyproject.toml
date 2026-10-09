@@ -12,7 +12,7 @@ requires-python = "<3.14,>=3.12"
 version = "0.1.0"
 
 [project.urls]
-repository = "https://github.com/trycua/cua"
+repository = "https://github.com/manaflow-ai/cmux-cua"
 
 [dependency-groups]
 dev = [

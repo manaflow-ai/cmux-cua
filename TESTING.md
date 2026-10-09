@@ -11,7 +11,7 @@ truth.
 | -------------------- | ----------------------------------------------------- | -------------------------------------------------------------------------------- |
 | Python SDKs          | Package `tests/` directories with pytest              | Package-specific integration tests and `tests/integration`                       |
 | TypeScript SDKs      | Package Vitest/typecheck scripts                      | Package-owned integration tests                                                  |
-| cua-driver           | Rust unit, schema, protocol, and compile tests        | Canonical Rust desktop harnesses on Windows, macOS, Linux X11, and Linux Wayland |
+| cmux-cua           | Rust unit, schema, protocol, and compile tests        | Canonical Rust desktop harnesses on Windows, macOS, Linux X11, and Linux Wayland |
 | Lume                 | Swift package tests                                   | VM and unattended-setup checks documented by Lume                                |
 | Public docs          | Generator drift, hygiene, links, and production build | Rendered Fumadocs site                                                           |
 | Images and sandboxes | Component build and schema tests                      | Image-specific smoke or VM tests                                                 |
@@ -46,24 +46,24 @@ pnpm format:check
 Use a package's own `package.json` scripts when working outside that workspace,
 including CuaBot and the documentation site.
 
-## cua-driver Unit and Protocol Tests
+## cmux-cua Unit and Protocol Tests
 
-Run from `libs/cua-driver/rust`. Focused examples:
+Run from `libs/cmux-cua/rust`. Focused examples:
 
 ```bash
-cargo test -p cua-driver-core --locked
-cargo test -p cua-driver --test protocol_mcp_test --locked
+cargo test -p cmux-cua-core --locked
+cargo test -p cmux-cua --test protocol_mcp_test --locked
 ```
 
 Linux source and package checks run through Nix. Windows and Linux compile gates
 are split into OS-specific workflows. See
-[`libs/cua-driver/rust/README.md`](libs/cua-driver/rust/README.md) for workspace
+[`libs/cmux-cua/rust/README.md`](libs/cmux-cua/rust/README.md) for workspace
 commands.
 
 Unit and protocol tests do not prove that desktop input reached a real
 application.
 
-## cua-driver Harness E2E
+## cmux-cua Harness E2E
 
 The canonical desktop suites build repository-owned applications, drive them
 through the Rust driver, and verify application or desktop state independently
@@ -91,9 +91,9 @@ undeclared outcomes, and incomplete required evidence.
 
 See:
 
-- [`libs/cua-driver/docs/test-harnesses-guide.md`](libs/cua-driver/docs/test-harnesses-guide.md)
-- [`libs/cua-driver/docs/test-matrix.md`](libs/cua-driver/docs/test-matrix.md)
-- [Platform support and validation](https://cua.ai/docs/reference/cua-driver/platform-support)
+- [`libs/cmux-cua/docs/test-harnesses-guide.md`](libs/cmux-cua/docs/test-harnesses-guide.md)
+- [`libs/cmux-cua/docs/test-matrix.md`](libs/cmux-cua/docs/test-matrix.md)
+- [Platform support and validation](https://cua.ai/docs/reference/cmux-cua/platform-support)
 
 ## Lume
 

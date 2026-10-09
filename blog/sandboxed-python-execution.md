@@ -378,4 +378,4 @@ Happy coding (safely)!
 
 ---
 
-_Want to dive deeper? Check out our [virtual environment tests](https://github.com/trycua/cua/blob/main/tests/test_venv.py) on GitHub. Questions? Come chat with us on Discord!_
+_Want to dive deeper? Check out our [virtual environment tests](https://github.com/manaflow-ai/cmux-cua/blob/main/tests/test_venv.py) on GitHub. Questions? Come chat with us on Discord!_

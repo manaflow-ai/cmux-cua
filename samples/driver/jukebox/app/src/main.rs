@@ -7,7 +7,7 @@
 //!                 `PLAY` / `STOP` on stdout for the orchestrator to react to.
 //!
 //!   instrument  — one minigame + its own synth voice. When something clicks
-//!                 the widget (the orchestrator drives these via cua-driver in
+//!                 the widget (the orchestrator drives these via cmux-cua in
 //!                 the background), the window plays its note and flashes. Two
 //!                 widget kinds:
 //!                   pad  — a single drum pad; any click = a fixed hit.
@@ -367,7 +367,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
 
 /// Instrument actuation: the click's X selects what to play (pitch on a strip,
 /// or which kick/snare/hat zone on a kit), then play the voice + flash. Fires
-/// whether the click came from the human or — the point — from cua-driver.
+/// whether the click came from the human or — the point — from cmux-cua.
 unsafe fn actuate(hwnd: HWND, x: i32) {
     STATE.with(|s| {
         let mut b = s.borrow_mut(); let Some(st) = b.as_mut() else { return };

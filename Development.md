@@ -8,7 +8,7 @@ next to the code you plan to change.
 
 | Area                         | Main paths                                                  | Toolchain                           | Start here                                                                                                                   |
 | ---------------------------- | ----------------------------------------------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| cua-driver                   | `libs/cua-driver/rust`, `libs/cua-driver/python`            | Rust, platform SDKs, Nix on Linux   | [`libs/cua-driver/README.md`](libs/cua-driver/README.md), [`libs/cua-driver/rust/README.md`](libs/cua-driver/rust/README.md) |
+| cmux-cua                   | `libs/cmux-cua/rust`, `libs/cmux-cua/python`            | Rust, platform SDKs, Nix on Linux   | [`libs/cmux-cua/README.md`](libs/cmux-cua/README.md), [`libs/cmux-cua/rust/README.md`](libs/cmux-cua/rust/README.md) |
 | Python SDKs and services     | `libs/python`, `libs/cua-bench`                             | Python 3.12, uv                     | Package `pyproject.toml` and README                                                                                          |
 | TypeScript SDKs              | `libs/typescript`                                           | Node.js, pnpm                       | [`libs/typescript/README.md`](libs/typescript/README.md) and its `package.json` scripts                                      |
 | CuaBot                       | `libs/cuabot`                                               | Node.js, pnpm                       | [`libs/cuabot/README.md`](libs/cuabot/README.md)                                                                             |
@@ -27,7 +27,7 @@ and test ownership comes from CI plus the component guides.
 Clone the repository and enter it:
 
 ```bash
-git clone https://github.com/trycua/cua.git
+git clone https://github.com/manaflow-ai/cmux-cua.git
 cd cua
 ```
 
@@ -37,7 +37,7 @@ Install only the toolchains required by your component:
 | --------------------------- | --------------------------------------------------------------------------- |
 | Python packages             | Python 3.12 and [uv](https://docs.astral.sh/uv/)                            |
 | TypeScript, CuaBot, or docs | The Node.js version required by the component and its declared pnpm version |
-| cua-driver                  | Rust plus the target OS SDK; Nix for the reproducible Linux lanes           |
+| cmux-cua                  | Rust plus the target OS SDK; Nix for the reproducible Linux lanes           |
 | Lume                        | macOS, Swift, and Xcode command-line tools                                  |
 | Images                      | Docker or the image-specific builder documented by the component            |
 
@@ -83,9 +83,9 @@ pnpm prettier:check
 Component-specific Rust, TypeScript, Swift, and documentation checks remain in
 their component guides. See [`TESTING.md`](TESTING.md) for the test map.
 
-## cua-driver Development
+## cmux-cua Development
 
-cua-driver has three distinct validation layers:
+cmux-cua has three distinct validation layers:
 
 1. Rust unit and protocol tests that do not require a target GUI application.
 2. Source-built harness E2E tests that drive Electron, Tauri, and native toolkit
@@ -96,12 +96,12 @@ cua-driver has three distinct validation layers:
 The Rust harnesses are the source of truth for desktop behavior. Python tests
 do not duplicate that matrix. Start with:
 
-- [`libs/cua-driver/rust/README.md`](libs/cua-driver/rust/README.md) for the Cargo workspace.
-- [`libs/cua-driver/rust/crates/cua-driver/tests/README.md`](libs/cua-driver/rust/crates/cua-driver/tests/README.md) for test ownership.
+- [`libs/cmux-cua/rust/README.md`](libs/cmux-cua/rust/README.md) for the Cargo workspace.
+- [`libs/cmux-cua/rust/crates/cmux-cua/tests/README.md`](libs/cmux-cua/rust/crates/cmux-cua/tests/README.md) for test ownership.
 - [`scripts/ci/README.md`](scripts/ci/README.md) for canonical OS runners.
-- [Platform support](https://cua.ai/docs/reference/cua-driver/platform-support) for current capability boundaries.
-- [How Cua Driver is validated](https://cua.ai/docs/concepts/how-cua-driver-is-validated) for the public evidence model.
-- [Platform roadmap](https://cua.ai/docs/reference/cua-driver/platform-roadmap) for remaining work and platform boundaries.
+- [Platform support](https://cua.ai/docs/reference/cmux-cua/platform-support) for current capability boundaries.
+- [How cmux CUA is validated](https://cua.ai/docs/concepts/how-cmux-cua-is-validated) for the public evidence model.
+- [Platform roadmap](https://cua.ai/docs/reference/cmux-cua/platform-roadmap) for remaining work and platform boundaries.
 
 Windows and macOS desktop tests need a real user session. Windows requires an
 active console or RDP session. macOS requires a logged-in session with
@@ -125,7 +125,7 @@ instead of entering the public docs navigation.
 ## Releases
 
 Maintainers release packages through the
-[CD: Bump Version](https://github.com/trycua/cua/actions/workflows/release-bump-version.yml)
+[CD: Bump Version](https://github.com/manaflow-ai/cmux-cua/actions/workflows/release-bump-version.yml)
 workflow. Its `service` input is the current release-target registry. Each
 package's `.bumpversion.cfg`, Cargo manifest, or package manifest owns its
 version and tag format.

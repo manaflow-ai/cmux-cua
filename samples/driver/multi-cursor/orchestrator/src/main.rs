@@ -5,7 +5,7 @@
 //! "master" in the middle that overlaps all four. When the human submits a
 //! record in the master, the master emits the action on stdout; this
 //! orchestrator replays it onto all four background corners concurrently, each
-//! via its OWN cua-driver session (= its own uniquely-coloured agent cursor),
+//! via its OWN cmux-cua session (= its own uniquely-coloured agent cursor),
 //! in the background — no window raised, the user's cursor never moved.
 //!
 //! Driving is element-based where an accessibility tree exists (set_value for
@@ -38,7 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const FIELD_FRAC: (f64, f64) = (0.28, 0.145); // Account-Name field (GDI pixel fallback)
 
 // ── maze (line tool) ───────────────────────────────────────────────────────────
-// A spiral maze as straight segments in [0,1] of the drawing REGION. cua-driver
+// A spiral maze as straight segments in [0,1] of the drawing REGION. cmux-cua
 // draws each as one press-drag-release (no curves = "line tool only"). The same
 // segments rasterized are the reference the screenshot is diffed against.
 const MAZE: [(f64, f64, f64, f64); 7] = [
@@ -51,7 +51,7 @@ const MAZE: [(f64, f64, f64, f64); 7] = [
     (0.66, 0.64, 0.46, 0.64),
 ];
 // Client-fraction rect of the window that sits INSIDE every framework's drawing
-// pad (all four put the doodle top-right). cua-driver draws here and the
+// pad (all four put the doodle top-right). cmux-cua draws here and the
 // verifier crops the same rect — so the rasterized reference aligns regardless
 // of where each framework actually lays its canvas out. Tuned via screenshots.
 // Kept inside the SHORTEST drawing pad: WPF/Electron host theirs in a fixed
@@ -94,16 +94,16 @@ fn main() {
     let demo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
     let repo_root = demo_root.parent().unwrap().parent().unwrap().to_path_buf();
 
-    let cua = std::env::var("CUA_DRIVER_EXE").map(PathBuf::from)
-        .unwrap_or_else(|_| repo_root.join("libs/cua-driver/rust/target/debug/cua-driver.exe"));
+    let cua = std::env::var("CMUX_CUA_EXE").map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root.join("libs/cmux-cua/rust/target/debug/cmux-cua.exe"));
     let legacy_app = std::env::var("LEGACY_APP_EXE").map(PathBuf::from)
         .unwrap_or_else(|_| demo_root.join("target/debug/legacy-app.exe"));
-    if !cua.exists() { eprintln!("cua-driver.exe not found at {cua:?}"); std::process::exit(1); }
+    if !cua.exists() { eprintln!("cmux-cua.exe not found at {cua:?}"); std::process::exit(1); }
     if !legacy_app.exists() { eprintln!("legacy-app.exe not found at {legacy_app:?}"); std::process::exit(1); }
 
-    eprintln!("[orch] starting cua-driver daemon…");
+    eprintln!("[orch] starting cmux-cua daemon…");
     let mut daemon = Command::new(&cua).arg("serve").stdout(Stdio::null()).stderr(Stdio::null())
-        .spawn().expect("spawn cua-driver serve");
+        .spawn().expect("spawn cmux-cua serve");
     assign_to_job(&daemon);
     thread::sleep(Duration::from_millis(1500));
 
@@ -198,7 +198,7 @@ fn main() {
                 match act {
                     Action::Type { text } => {
                         let ok = match field {
-                            // a11y: plain type_text with element_index — cua-driver
+                            // a11y: plain type_text with element_index — cmux-cua
                             // auto-routes to UIA ValuePattern.SetValue on its own.
                             Some(idx) => run_call(&cua, "type_text", &format!(
                                 r#"{{"pid":{pid},"window_id":{hwnd_addr},"element_index":{idx},"text":"{}","session":"{session}"}}"#, json_escape(&text))),
@@ -244,7 +244,7 @@ fn main() {
                     Action::DrawMaze => {
                         // Pure coordinate drawing — NO element targeting, NO app
                         // cooperation. Each maze segment is one straight
-                        // press-drag-release into the common REGION; cua-driver
+                        // press-drag-release into the common REGION; cmux-cua
                         // PostMessages the drag where it can and pen-injects it
                         // where the canvas (Chromium/WPF) drops posted mouse.
                         let map = |mx: f64, my: f64| {
@@ -341,7 +341,7 @@ fn json_escape(s: &str) -> String {
     o
 }
 
-/// `cua-driver call <tool> <json>` (proxies to the daemon). True on success.
+/// `cmux-cua call <tool> <json>` (proxies to the daemon). True on success.
 fn run_call(cua: &PathBuf, tool: &str, json: &str) -> bool {
     Command::new(cua).arg("call").arg(tool).arg(json)
         .stdout(Stdio::null()).stderr(Stdio::null())
@@ -354,7 +354,7 @@ fn run_call_out(cua: &PathBuf, tool: &str, json: &str) -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default()
 }
 /// get_window_state writing the screenshot PNG to `out` (WGC; captures even a
-/// fully occluded window). Used to read back what cua-driver drew.
+/// fully occluded window). Used to read back what cmux-cua drew.
 fn run_call_shot(cua: &PathBuf, json: &str, out: &std::path::Path) -> bool {
     Command::new(cua).arg("call").arg("get_window_state").arg(json)
         .arg("--screenshot-out-file").arg(out)
@@ -374,7 +374,7 @@ fn window_frame_size(hwnd: HWND) -> Option<(i32, i32)> {
     }
 }
 
-/// Shape-only F1 (0..1) of the maze cua-driver drew vs the reference maze.
+/// Shape-only F1 (0..1) of the maze cmux-cua drew vs the reference maze.
 ///
 /// Reads the ink from the window screenshot (cropped to the drawing REGION),
 /// then normalizes BOTH the drawn ink and the reference into a unit grid by

@@ -10,13 +10,13 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
-$driverRoot = Join-Path $repoRoot "libs\cua-driver"
+$driverRoot = Join-Path $repoRoot "libs\cmux-cua"
 $rustRoot = Join-Path $driverRoot "rust"
 $suite = if ([string]::IsNullOrWhiteSpace($env:CUA_E2E_INTERNAL_LANE)) { "all" } else { $env:CUA_E2E_INTERNAL_LANE }
 if ($suite -notin @("shared", "native", "capture", "all")) {
     throw "Unsupported internal lane: $suite"
 }
-$artifactDir = Join-Path $repoRoot "artifacts\cua-driver\windows"
+$artifactDir = Join-Path $repoRoot "artifacts\cmux-cua\windows"
 New-Item -ItemType Directory -Force $artifactDir | Out-Null
 $recordingRoot = Join-Path $artifactDir "recordings"
 Remove-Item -Path $recordingRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -45,13 +45,13 @@ if ($null -eq $ffmpeg -or $null -eq $ffprobe) {
 if ($RequireGui) { $env:CUA_REQUIRE_GUI = "1" }
 
 $env:CUA_TEST_WORKSPACE_ROOT = $rustRoot
-$env:CUA_TEST_DRIVER_BIN = Join-Path $rustRoot "target\release\cua-driver.exe"
+$env:CUA_TEST_DRIVER_BIN = Join-Path $rustRoot "target\release\cmux-cua.exe"
 $env:CUA_TEST_APPS_ROOT = Join-Path $rustRoot "test-apps"
 $env:CUA_TEST_REQUIRE_FIXTURES = "1"
 $env:CUA_TEST_DRIVER_STDERR = "1"
 
 if (-not $NoBuild) {
-    & cargo build --release -p cua-driver --manifest-path (Join-Path $rustRoot "Cargo.toml")
+    & cargo build --release -p cmux-cua --manifest-path (Join-Path $rustRoot "Cargo.toml")
     if ($LASTEXITCODE -ne 0) { throw "Rust driver build failed" }
     $fixtureTargets = switch ($suite) {
         "shared" { @("electron", "tauri") }
@@ -86,7 +86,7 @@ foreach ($fixture in $requiredFixtures) {
 function Invoke-E2eReport {
     Push-Location $rustRoot
     try {
-        & cargo run -p cua-driver-testkit --bin cua-e2e-report -- `
+        & cargo run -p cmux-cua-testkit --bin cua-e2e-report -- `
             --declarations $casesPath `
             --environment $environmentPath `
             --results $resultsPath `
@@ -104,7 +104,7 @@ Write-Host "[PREFLIGHT] Windows desktop, fixture, UIA, capture, and video" -Fore
 Push-Location $rustRoot
 try {
     $preflightLog = Join-Path $artifactDir "environment-preflight.log"
-    $preflightOutput = & cargo test -p cua-driver --test e2e_environment_preflight_test -- `
+    $preflightOutput = & cargo test -p cmux-cua --test e2e_environment_preflight_test -- `
         --ignored --exact canonical_e2e_environment_is_ready --nocapture --test-threads=1 2>&1
     $preflightExit = $LASTEXITCODE
     $preflightOutput | Tee-Object -FilePath $preflightLog
@@ -181,7 +181,7 @@ $script:FailureCount = 0
 
 if ($suite -in @("shared", "all")) {
     Invoke-CargoTest "shared behavior matrix" @(
-        "test", "-p", "cua-driver", "--test", "cross_platform_behavior_test", "--",
+        "test", "-p", "cmux-cua", "--test", "cross_platform_behavior_test", "--",
         "--ignored", "--exact", "shared_web_action_matrix_is_state_verified",
         "--nocapture", "--test-threads=1"
     )
@@ -189,34 +189,34 @@ if ($suite -in @("shared", "all")) {
 
 if ($suite -in @("native", "all")) {
     Invoke-CargoTest "Windows native harnesses" @(
-        "test", "-p", "cua-driver", "--test", "harness_wpf_test", "--",
+        "test", "-p", "cmux-cua", "--test", "harness_wpf_test", "--",
         "--ignored", "--nocapture", "--test-threads=1"
     )
     Invoke-CargoTest "WinUI3 harnesses" @(
-        "test", "-p", "cua-driver", "--test", "harness_winui3_test", "--",
+        "test", "-p", "cmux-cua", "--test", "harness_winui3_test", "--",
         "--ignored", "--nocapture", "--test-threads=1"
     )
     Invoke-CargoTest "Windows web harnesses" @(
-        "test", "-p", "cua-driver", "--test", "harness_web_test", "--",
+        "test", "-p", "cmux-cua", "--test", "harness_web_test", "--",
         "--ignored", "--nocapture", "--test-threads=1"
     )
     Invoke-CargoTest "Windows minimized launch" @(
-        "test", "-p", "cua-driver", "--test", "launch_windows_test", "--",
+        "test", "-p", "cmux-cua", "--test", "launch_windows_test", "--",
         "--ignored", "--nocapture", "--test-threads=1"
     )
     Invoke-CargoTest "Windows agent cursor" @(
-        "test", "-p", "cua-driver", "--test", "agent_cursor_windows_test", "--",
+        "test", "-p", "cmux-cua", "--test", "agent_cursor_windows_test", "--",
         "--ignored", "--nocapture", "--test-threads=1"
     )
 }
 
 if ($suite -in @("capture", "all")) {
     Invoke-CargoTest "capture contract" @(
-        "test", "-p", "cua-driver", "--test", "capture_contract_test", "--",
+        "test", "-p", "cmux-cua", "--test", "capture_contract_test", "--",
         "--ignored", "--nocapture", "--test-threads=1"
     )
     Invoke-CargoTest "Windows desktop scope" @(
-        "test", "-p", "cua-driver", "--test", "desktop_scope_windows_test", "--",
+        "test", "-p", "cmux-cua", "--test", "desktop_scope_windows_test", "--",
         "--ignored", "--nocapture", "--test-threads=1"
     )
 }

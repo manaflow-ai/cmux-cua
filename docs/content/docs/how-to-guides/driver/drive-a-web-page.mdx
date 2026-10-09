@@ -5,13 +5,13 @@ description: 'Read and act on the page already loaded in a browser or Electron a
 
 # Drive a Web Page
 
-Use the `page` tool on the page already loaded in a running browser or Electron app. Open the URL first, either through `launch_app` or by having the user open it. This is the DOM/CDP path. Honest-verification `escalation.recommended: 'page'` points here when AX typing echoes but the DOM does not observe it. For the agent-side escalation behavior, see [Agent action policy](/reference/cua-driver/action-selection-policy) and [Capture and delivery modalities](/concepts/capture-and-delivery-modalities).
+Use the `page` tool on the page already loaded in a running browser or Electron app. Open the URL first, either through `launch_app` or by having the user open it. This is the DOM/CDP path. Honest-verification `escalation.recommended: 'page'` points here when AX typing echoes but the DOM does not observe it. For the agent-side escalation behavior, see [Agent action policy](/reference/cmux-cua/action-selection-policy) and [Capture and delivery modalities](/concepts/capture-and-delivery-modalities).
 
 ## When to use it
 
 Use `page` when the target is browser-tab content and the accessibility layer cannot prove the result. It is especially useful after `type_text` returns `effect: "unverifiable"` with `escalation.recommended: "page"`.
 
-Read actions (`get_text`, `query_dom`) work broadly, and `execute_javascript` works cross-platform given a CDP endpoint. `insert_text` and `type_keystrokes` are macOS-only for now; Windows and Linux return a clear "not implemented" error rather than a silent no-op. See the [`page` tool reference](/reference/cua-driver/mcp-tools#page) for the full action list, parameters, and platform notes.
+Read actions (`get_text`, `query_dom`) work broadly, and `execute_javascript` works cross-platform given a CDP endpoint. `insert_text` and `type_keystrokes` are macOS-only for now; Windows and Linux return a clear "not implemented" error rather than a silent no-op. See the [`page` tool reference](/reference/cmux-cua/mcp-tools#page) for the full action list, parameters, and platform notes.
 
 ## insert_text vs type_keystrokes
 
@@ -65,6 +65,6 @@ page({
 
 ## Related
 
-- [page tool reference](/reference/cua-driver/mcp-tools#page)
-- [Agent action policy](/reference/cua-driver/action-selection-policy)
+- [page tool reference](/reference/cmux-cua/mcp-tools#page)
+- [Agent action policy](/reference/cmux-cua/action-selection-policy)
 - [Capture and delivery modalities](/concepts/capture-and-delivery-modalities)

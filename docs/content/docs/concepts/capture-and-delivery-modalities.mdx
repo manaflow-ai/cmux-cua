@@ -1,11 +1,11 @@
 ---
 title: "Capture and Delivery Modalities"
-description: "How Cua Driver observes and acts on an app. Perception returns both the accessibility tree and a screenshot; the action call chooses the ax or px rung, delivery mode, and scope."
+description: "How cmux CUA observes and acts on an app. Perception returns both the accessibility tree and a screenshot; the action call chooses the ax or px rung, delivery mode, and scope."
 ---
 
 # Capture and Delivery Modalities
 
-Every Cua Driver action is shaped by four things: **what the agent observes**, **which rung delivers the action**, **how input is delivered**, and **what coordinate space the action targets**. Most callers use the defaults: background, per-window, accessibility-first automation. The key change from earlier versions is that perception is no longer a mode you pick. `get_window_state` returns *both* the accessibility tree and a screenshot in one call. The action call chooses `ax` or `px` by how it addresses the target.
+Every cmux CUA action is shaped by four things: **what the agent observes**, **which rung delivers the action**, **how input is delivered**, and **what coordinate space the action targets**. Most callers use the defaults: background, per-window, accessibility-first automation. The key change from earlier versions is that perception is no longer a mode you pick. `get_window_state` returns *both* the accessibility tree and a screenshot in one call. The action call chooses `ax` or `px` by how it addresses the target.
 
 ## The Axes
 
@@ -60,7 +60,7 @@ Delivery success differs from application state change. The driver can verify an
 
 `effect` is the confidence signal that separates those cases. `"confirmed"` means the driver verified the result through AX read-back. `"unverifiable"` means the delivery path ran, but the driver cannot prove the application applied it. `"suspected_noop"` means an AX action ran but almost certainly did not change the target. Treat `effect` as the action outcome.
 
-`escalation` is the machine-readable climb-the-ladder hint. When present, it tells the caller which surface to try next: `"px"` for acting off the screenshot, `"foreground"` for explicitly fronting the target, or `"page"` for the browser-tab DOM path through the `page` tool. See [Agent action policy](/reference/cua-driver/action-selection-policy) for the agent behavior and [MCP tool notes](/reference/cua-driver/mcp-tool-notes#action-response-shape) for the field table.
+`escalation` is the machine-readable climb-the-ladder hint. When present, it tells the caller which surface to try next: `"px"` for acting off the screenshot, `"foreground"` for explicitly fronting the target, or `"page"` for the browser-tab DOM path through the `page` tool. See [Agent action policy](/reference/cmux-cua/action-selection-policy) for the agent behavior and [MCP tool notes](/reference/cmux-cua/mcp-tool-notes#action-response-shape) for the field table.
 
 ### When the tree lies
 
@@ -72,4 +72,4 @@ The driver treats those as surface-aware verification cases. It probes at the el
 
 Perception is no longer an axis: every `get_window_state` returns both the tree and a screenshot by default. The enforceable constraints are the combination of **capture scope**, **action rung**, and **delivery mode**.
 
-The exact validity matrix and platform-support table live in [Interface contracts](/reference/cua-driver/contracts). Keep this page as the mental model: observe both tree and pixels, start with the accessibility rung, use the screenshot-backed pixel rung when the tree is insufficient, and escalate to foreground only when the target app requires it.
+The exact validity matrix and platform-support table live in [Interface contracts](/reference/cmux-cua/contracts). Keep this page as the mental model: observe both tree and pixels, start with the accessibility rung, use the screenshot-backed pixel rung when the tree is insufficient, and escalate to foreground only when the target app requires it.

@@ -8,7 +8,7 @@ Today the story changes - we're announcing general availability of **Cloud Windo
 
 ![Cloud Windows Sandboxes](https://github.com/user-attachments/assets/db15f4c4-70a4-425a-a264-82e629074de7)
 
-Cloud Windows Sandboxes are now generally available. You get a full Windows 11 desktop in your browser with Edge and Python pre-installed, working seamlessly with all our [Computer-Use libraries](https://github.com/trycua/cua) for RPA, UI automation, code execution, and agent development.
+Cloud Windows Sandboxes are now generally available. You get a full Windows 11 desktop in your browser with Edge and Python pre-installed, working seamlessly with all our [Computer-Use libraries](https://github.com/manaflow-ai/cmux-cua) for RPA, UI automation, code execution, and agent development.
 
 **What's new with this release:**
 

@@ -18,7 +18,7 @@ So last month, we started working on Windows support for [RPA (Robotic Process A
 
 ## Our Journey to Windows Cua Support
 
-When we started Cua, we focused on making computer-use agents work everywhere - we built [Lume for macOS](https://github.com/trycua/cua/tree/main/libs/lume), created cloud infrastructure, and worked on Linux support. But no matter what we built, Windows kept coming up in every enterprise conversation.
+When we started Cua, we focused on making computer-use agents work everywhere - we built [Lume for macOS](https://github.com/manaflow-ai/cmux-cua/tree/main/libs/lume), created cloud infrastructure, and worked on Linux support. But no matter what we built, Windows kept coming up in every enterprise conversation.
 
 The pattern became clear during customer calls: **the software that actually runs businesses lives on Windows**. Engineering teams wanted agents to automate AutoCAD workflows. Manufacturing companies needed automation for their MES systems. Finance teams were asking about Windows-only trading platforms and legacy enterprise software.
 
@@ -238,8 +238,8 @@ But for development, prototyping, and learning Windows RPA workflows, **Windows 
 ## Learn More
 
 - [Windows Sandbox Documentation](https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/)
-- [Cua GitHub Repository](https://github.com/trycua/cua)
-- [Agent UI Documentation](https://github.com/trycua/cua/tree/main/libs/python/agent)
+- [Cua GitHub Repository](https://github.com/manaflow-ai/cmux-cua)
+- [Agent UI Documentation](https://github.com/manaflow-ai/cmux-cua/tree/main/libs/python/agent)
 - [Join our Discord Community](https://discord.gg/cua-ai)
 
 ---

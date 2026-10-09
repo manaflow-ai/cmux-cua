@@ -1,11 +1,11 @@
 //! "Meridian CRM — Account Record" — a dense, realistic Windows office form for
-//! the cua-driver multi-cursor demo. Menu bar, toolbar, a packed left form
+//! the cmux-cua multi-cursor demo. Menu bar, toolbar, a packed left form
 //! (Account Name, Account Type / Region dropdowns, Priority / Credit sliders),
 //! a SAVE button, a signature doodle pad, a spreadsheet grid, and a status bar.
 //! No padding between elements beyond their 1px borders.
 //!
 //! Modes (argv[1]):
-//!   gdi    <node>  — fully GDI-drawn (NO accessibility tree → cua-driver drives
+//!   gdi    <node>  — fully GDI-drawn (NO accessibility tree → cmux-cua drives
 //!                    it via the pixel path). The Account-Name field and SAVE
 //!                    button are drawn; the doodle pad is live.
 //!   master <node>  — same chrome, but Account Name + SAVE are real Win32

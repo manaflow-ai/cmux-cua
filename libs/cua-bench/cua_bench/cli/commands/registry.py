@@ -73,7 +73,7 @@ def ensure_registry(update: bool = True, verbose: bool = True) -> Path:
             # Try HTTPS
             try:
                 result = subprocess.run(
-                    ["git", "clone", "https://github.com/trycua/cua.git", str(cua_repo_path)],
+                    ["git", "clone", "https://github.com/manaflow-ai/cmux-cua.git", str(cua_repo_path)],
                     capture_output=True,
                     text=True,
                     timeout=120,

@@ -103,4 +103,4 @@ You'll see PostHog debug output showing exact event payloads.
 
 ## Questions
 
-Questions about telemetry? Open an issue on [GitHub](https://github.com/trycua/cua).
+Questions about telemetry? Open an issue on [GitHub](https://github.com/manaflow-ai/cmux-cua).

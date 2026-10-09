@@ -64,7 +64,7 @@ def create_overlay_copy(golden_path: Path, overlay_path: Path, verbose: bool = F
     Uses native `cp -a` on Unix for speed (5x faster than Python shutil).
     Falls back to shutil.copytree on Windows.
 
-    WIP: https://github.com/trycua/cua/issues/699
+    WIP: https://github.com/manaflow-ai/cmux-cua/issues/699
 
     Args:
         golden_path: Path to golden image directory
@@ -82,7 +82,7 @@ def create_overlay_copy(golden_path: Path, overlay_path: Path, verbose: bool = F
         print(f"   Source:  {golden_path}")
         print(f"   Overlay: {overlay_path}")
         print("   (This may take a while for large images)")
-        print("   WIP: https://github.com/trycua/cua/issues/699")
+        print("   WIP: https://github.com/manaflow-ai/cmux-cua/issues/699")
 
     if platform.system() == "Windows":
         try:

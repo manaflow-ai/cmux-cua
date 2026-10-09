@@ -1143,7 +1143,7 @@ def generate_code_index_parallel(max_concurrent: int = 4) -> dict:
         REPO_URL = f"https://{github_token}@github.com/trycua/cua.git"
         print("Using authenticated GitHub URL")
     else:
-        REPO_URL = "https://github.com/trycua/cua.git"
+        REPO_URL = "https://github.com/manaflow-ai/cmux-cua.git"
         print("Warning: No GITHUB_TOKEN found")
 
     REPO_PATH = Path(CODE_REPO_PATH)
@@ -1450,7 +1450,7 @@ async def generate_code_index():
         REPO_URL = f"https://{github_token}@github.com/trycua/cua.git"
         print("Using authenticated GitHub URL")
     else:
-        REPO_URL = "https://github.com/trycua/cua.git"
+        REPO_URL = "https://github.com/manaflow-ai/cmux-cua.git"
         print("Warning: No GITHUB_TOKEN found, using unauthenticated URL")
 
     REPO_PATH = Path(CODE_REPO_PATH)
