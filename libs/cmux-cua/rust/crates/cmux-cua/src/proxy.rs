@@ -476,17 +476,38 @@ async fn run_control_connection(
         u64,
     )>,
 ) {
+    let (lease_id, lease_generation) = proxy_lease_identity(&session_id);
     let begin = DaemonRequest {
         method: "session_begin".into(),
         name: None,
-        args: (expected_profile == DaemonProfile::CodexComputerUseCompat)
-            .then(|| serde_json::json!({"approval_broker": true})),
+        args: Some(serde_json::json!({
+            "approval_broker": expected_profile == DaemonProfile::CodexComputerUseCompat,
+            "lease_id": lease_id,
+            "lease_generation": lease_generation,
+            "profile": expected_profile.as_str(),
+        })),
         session_id: Some(session_id.clone()),
     };
     let line = match serialize_request(&begin) {
         Ok(s) => s + "\n",
         Err(e) => {
             warn!("control connection: serialize session_begin failed: {e}");
+            return;
+        }
+    };
+    let renew_line = match serialize_request(&DaemonRequest {
+        method: "lease_renew".into(),
+        name: None,
+        args: Some(serde_json::json!({
+            "lease_id": proxy_lease_identity(&session_id).0,
+            "lease_generation": proxy_lease_identity(&session_id).1,
+            "profile": expected_profile.as_str(),
+        })),
+        session_id: Some(session_id.clone()),
+    }) {
+        Ok(line) => line + "\n",
+        Err(error) => {
+            warn!("control connection: serialize lease renewal failed: {error}");
             return;
         }
     };
@@ -498,6 +519,7 @@ async fn run_control_connection(
                 &socket_path,
                 &session_id,
                 &line,
+                &renew_line,
                 expected_profile,
                 &readiness,
             )
@@ -536,6 +558,7 @@ async fn run_control_connection(
                 &socket_path,
                 &session_id,
                 &line,
+                &renew_line,
                 expected_profile,
                 &readiness,
             )
@@ -653,6 +676,7 @@ async fn run_unix_control_connection_once(
     socket_path: &str,
     session_id: &str,
     begin_line: &str,
+    renew_line: &str,
     expected_profile: DaemonProfile,
     readiness: &tokio::sync::watch::Sender<ControlConnectionState>,
 ) -> Result<bool, String> {
@@ -676,7 +700,8 @@ async fn run_unix_control_connection_once(
         return Ok(true);
     }
     let _ = stream.flush().await;
-    let mut reader = BufReader::new(stream);
+    let (reader_half, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader_half);
     let mut buffer = String::new();
     match tokio::time::timeout(
         std::time::Duration::from_secs(3),
@@ -705,11 +730,22 @@ async fn run_unix_control_connection_once(
     });
     debug!(session_id, "control connection established (session_begin acknowledged)");
 
+    let mut renew = tokio::time::interval(std::time::Duration::from_secs(5));
+    renew.tick().await;
     loop {
         buffer.clear();
-        match reader.read_line(&mut buffer).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => continue,
+        tokio::select! {
+            line = reader.read_line(&mut buffer) => match line {
+                Ok(0) | Err(_) => break,
+                Ok(_) => continue,
+            },
+            _ = renew.tick() => {
+                if writer.write_all(renew_line.as_bytes()).await.is_err()
+                    || writer.flush().await.is_err()
+                {
+                    break;
+                }
+            }
         }
     }
     let _ = readiness.send(ControlConnectionState::Connecting);
@@ -721,6 +757,7 @@ async fn run_windows_control_connection_once(
     socket_path: &str,
     session_id: &str,
     begin_line: &str,
+    renew_line: &str,
     expected_profile: DaemonProfile,
     readiness: &tokio::sync::watch::Sender<ControlConnectionState>,
 ) -> Result<bool, String> {
@@ -744,7 +781,8 @@ async fn run_windows_control_connection_once(
         return Ok(true);
     }
     let _ = client.flush().await;
-    let mut reader = BufReader::new(client);
+    let (reader_half, mut writer) = tokio::io::split(client);
+    let mut reader = BufReader::new(reader_half);
     let mut buffer = String::new();
     match tokio::time::timeout(
         std::time::Duration::from_secs(3),
@@ -773,11 +811,22 @@ async fn run_windows_control_connection_once(
     });
     debug!(session_id, "control connection established (session_begin acknowledged)");
 
+    let mut renew = tokio::time::interval(std::time::Duration::from_secs(5));
+    renew.tick().await;
     loop {
         buffer.clear();
-        match reader.read_line(&mut buffer).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => continue,
+        tokio::select! {
+            line = reader.read_line(&mut buffer) => match line {
+                Ok(0) | Err(_) => break,
+                Ok(_) => continue,
+            },
+            _ = renew.tick() => {
+                if writer.write_all(renew_line.as_bytes()).await.is_err()
+                    || writer.flush().await.is_err()
+                {
+                    break;
+                }
+            }
         }
     }
     let _ = readiness.send(ControlConnectionState::Connecting);
@@ -796,6 +845,16 @@ fn mint_session_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("mcp-{pid}-{nanos}")
+}
+
+/// Derive the daemon lease from the durable host scope while fencing each
+/// short-lived MCP proxy generation. Standalone clients have no host scope, so
+/// their process session remains their lease identity.
+fn proxy_lease_identity(session_id: &str) -> (String, u64) {
+    (
+        cmux_cua_core::session_state::durable_lease_id(session_id),
+        cmux_cua_core::session_state::lease_generation(session_id),
+    )
 }
 
 fn validate_daemon_profile_and_roster(
@@ -3318,5 +3377,22 @@ mod tests {
             "a delayed EOF from the old control task must not invalidate the replacement"
         );
         assert_eq!(state.tools_list_or(&bootstrap)["source"], "daemon-v2");
+    }
+
+    #[test]
+    fn proxy_lease_identity_keeps_host_scope_and_fences_generation() {
+        let first = "cmux-surface-a-mcp-4242-100";
+        let second = "cmux-surface-a-mcp-5151-200";
+        let (first_lease, first_generation) = proxy_lease_identity(first);
+        let (second_lease, second_generation) = proxy_lease_identity(second);
+        assert_eq!(first_lease, "cmux-surface-a");
+        assert_eq!(second_lease, first_lease);
+        assert_eq!(first_generation, 100);
+        assert_eq!(second_generation, 200);
+
+        let (standalone_lease, standalone_generation) =
+            proxy_lease_identity("mcp-4242-300");
+        assert_eq!(standalone_lease, "mcp-4242-300");
+        assert_eq!(standalone_generation, 300);
     }
 }

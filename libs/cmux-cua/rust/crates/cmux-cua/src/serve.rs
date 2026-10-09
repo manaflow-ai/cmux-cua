@@ -658,6 +658,54 @@ fn spawn_session_idle_sweep() {
     });
 }
 
+/// Grace period for a proxy that vanished while its agent is still alive and
+/// reconnecting. The lease heartbeat is intentionally shorter than this value.
+const LEASE_GRACE_SECS_DEFAULT: u64 = 20;
+const LEASE_TTL_SECS_DEFAULT: u64 = 30;
+
+fn lease_grace_secs() -> u64 {
+    std::env::var("CMUX_CUA_LEASE_GRACE_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(LEASE_GRACE_SECS_DEFAULT)
+}
+
+fn lease_ttl_secs() -> u64 {
+    std::env::var("CMUX_CUA_LEASE_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(LEASE_TTL_SECS_DEFAULT)
+}
+
+/// Reap only leases that missed both the reconnect grace period and heartbeat
+/// TTL. Cleanup runs through the same lifecycle hooks as explicit session end;
+/// the durable host state file is removed separately using the stable lease id.
+fn spawn_lease_sweep(
+    registry: std::sync::Arc<cmux_cua_core::tool::ToolRegistry>,
+) {
+    let grace = std::time::Duration::from_secs(lease_grace_secs());
+    let ttl = std::time::Duration::from_secs(lease_ttl_secs());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            for expired in cmux_cua_core::session::expire_leases(grace, ttl) {
+                cmux_cua_core::session::release_session(&expired.session_id);
+                cmux_cua_core::session::fire_session_end(&expired.session_id);
+                registry.remove_session_state_file(&expired.lease_id);
+                tracing::info!(
+                    lease_id = %expired.lease_id,
+                    profile = %expired.profile,
+                    generation = expired.generation,
+                    "expired cmux-cua agent lease"
+                );
+            }
+        }
+    });
+}
+
 /// Register a `session_end` hook that stops a recording the ending session owns.
 ///
 /// The per-platform cursor-remove + config-clear hooks already run on
@@ -804,6 +852,48 @@ pub struct DaemonRequest {
     /// serde defaults a missing field to `None` on deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveLease {
+    lease_id: String,
+    generation: u64,
+    session_id: String,
+}
+
+fn requested_lease(
+    args: Option<&serde_json::Value>,
+    expected_profile: DaemonProfile,
+    session_id: &str,
+) -> Result<Option<ActiveLease>, String> {
+    let object = args.and_then(serde_json::Value::as_object);
+    let lease_id = object
+        .and_then(|value| value.get("lease_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let generation = object
+        .and_then(|value| value.get("lease_generation"))
+        .and_then(serde_json::Value::as_u64);
+    let profile = object
+        .and_then(|value| value.get("profile"))
+        .and_then(serde_json::Value::as_str);
+    match (lease_id, generation) {
+        (None, None) => Ok(None),
+        (Some(lease_id), Some(generation)) => {
+            if profile != Some(expected_profile.as_str()) {
+                return Err(format!(
+                    "lease profile must be `{}`",
+                    expected_profile.as_str()
+                ));
+            }
+            Ok(Some(ActiveLease {
+                lease_id,
+                generation,
+                session_id: session_id.to_owned(),
+            }))
+        }
+        _ => Err("lease_id and lease_generation must be supplied together".to_owned()),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1640,6 +1730,7 @@ pub async fn run_serve(
     let last_activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_unix_secs()));
     spawn_recording_idle_backstop(registry.clone(), last_activity.clone());
     spawn_session_idle_sweep();
+    spawn_lease_sweep(registry.clone());
     maybe_start_http_transport(registry.clone(), profile);
     register_recording_session_end_hook(registry.recording.clone());
     register_state_file_session_end_hook(&registry);
@@ -1708,6 +1799,7 @@ pub async fn run_serve(
                     // connection EOFs (graceful proxy exit OR kill -9, both
                     // kernel-guaranteed), the post-loop block reaps the session.
                     let mut control_session_id: Option<String> = None;
+                    let mut control_lease: Option<ActiveLease> = None;
                     let mut control_approval_token: Option<(String, String)> = None;
 
                     while let Ok(Some(line)) = lines.next_line().await {
@@ -2566,6 +2658,24 @@ pub async fn run_serve(
                                     }
                                 }
 
+                                let requested_lease = match req.session_id.as_deref() {
+                                    Some(sid) => requested_lease(
+                                        req.args.as_ref(),
+                                        profile,
+                                        sid,
+                                    ),
+                                    None => Ok(None),
+                                };
+                                let requested_lease = match requested_lease {
+                                    Ok(lease) => lease,
+                                    Err(error) => {
+                                        let resp = DaemonResponse::err(error, 78);
+                                        let _ = writer.write_all(
+                                            (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                        ).await;
+                                        continue;
+                                    }
+                                };
                                 let mut approval_broker_token = None;
                                 if let Some(sid) = req.session_id.as_deref() {
                                     // A proxy reconnect after daemon re-exec uses the same
@@ -2574,6 +2684,31 @@ pub async fn run_serve(
                                     // session first; the new control declaration revives it
                                     // before accepting more calls.
                                     cmux_cua_core::session::revive_session(sid);
+                                    if let Some(lease) = requested_lease.as_ref() {
+                                        match cmux_cua_core::session::acquire_lease(
+                                            &lease.lease_id,
+                                            profile.as_str(),
+                                            sid,
+                                            lease.generation,
+                                        ) {
+                                            Ok(cmux_cua_core::session::LeaseAcquire::Replaced {
+                                                previous_session_id,
+                                            }) => {
+                                                cmux_cua_core::session::retire_session(
+                                                    &previous_session_id,
+                                                );
+                                            }
+                                            Ok(_) => {}
+                                            Err(error) => {
+                                                let resp = DaemonResponse::err(error, 78);
+                                                let _ = writer.write_all(
+                                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                                ).await;
+                                                continue;
+                                            }
+                                        }
+                                        control_lease = Some(lease.clone());
+                                    }
                                     #[cfg(target_os = "macos")]
                                     if let Some(host_session) =
                                         cmux_cua_core::host_session_id_from_proxy(sid)
@@ -2613,6 +2748,40 @@ pub async fn run_serve(
                                         "approval_broker_token": approval_broker_token,
                                     })
                                 );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "lease_renew" => {
+                                let result = match (
+                                    control_lease.as_ref(),
+                                    req.session_id.as_deref(),
+                                    requested_lease(
+                                        req.args.as_ref(),
+                                        profile,
+                                        req.session_id.as_deref().unwrap_or(""),
+                                    ),
+                                ) {
+                                    (Some(active), Some(sid), Ok(Some(requested)))
+                                        if active.lease_id == requested.lease_id
+                                            && active.generation == requested.generation
+                                            && active.session_id == sid =>
+                                    {
+                                        cmux_cua_core::session::renew_lease(
+                                            &active.lease_id,
+                                            profile.as_str(),
+                                            sid,
+                                            active.generation,
+                                        )
+                                    }
+                                    _ => Err("stale or mismatched lease renewal".to_owned()),
+                                };
+                                let resp = match result {
+                                    Ok(()) => DaemonResponse::ok(
+                                        serde_json::json!({"lease_renewed": true}),
+                                    ),
+                                    Err(error) => DaemonResponse::err(error, 78),
+                                };
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -2674,7 +2843,15 @@ pub async fn run_serve(
                     // idempotent, so racing a legacy explicit session_end is
                     // benign.
                     if let Some(sid) = control_session_id {
-                        cmux_cua_core::session::release_session(&sid);
+                        let leased = control_lease.take();
+                        if let Some(active) = leased.as_ref() {
+                            let _ = cmux_cua_core::session::release_lease(
+                                &active.lease_id,
+                                active.generation,
+                            );
+                        } else {
+                            cmux_cua_core::session::release_session(&sid);
+                        }
                         let owns_cleanup = if profile == DaemonProfile::CodexComputerUseCompat {
                             match control_approval_token.take() {
                                 Some((owner, token))
@@ -2695,7 +2872,7 @@ pub async fn run_serve(
                         } else {
                             true
                         };
-                        if owns_cleanup {
+                        if owns_cleanup && leased.is_none() {
                             // stop_owner can SYNCHRONOUSLY finalize the recording's
                             // mp4, on macOS it hits SCStream::stop_capture(), which
                             // blocks on disk I/O (video_sckit.rs). Run it on a
@@ -2716,7 +2893,8 @@ pub async fn run_serve(
                         } else {
                             tracing::debug!(
                                 session_id = %sid,
-                                "stale Codex Computer Use control connection lost cleanup ownership"
+                                leased = leased.is_some(),
+                                "control connection lost; lease grace period owns cleanup"
                             );
                         }
                     }
@@ -2989,6 +3167,7 @@ pub async fn run_serve(
     let last_activity = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_unix_secs()));
     spawn_recording_idle_backstop(registry.clone(), last_activity.clone());
     spawn_session_idle_sweep();
+    spawn_lease_sweep(registry.clone());
     maybe_start_http_transport(registry.clone(), profile);
     register_recording_session_end_hook(registry.recording.clone());
     register_state_file_session_end_hook(&registry);
@@ -3031,6 +3210,7 @@ pub async fn run_serve(
                     // ERROR_BROKEN_PIPE on the next read, ending the while-let
                     // loop equally reliably.
                     let mut control_session_id: Option<String> = None;
+                    let mut control_lease: Option<ActiveLease> = None;
 
                     while let Ok(Some(line)) = lines.next_line().await {
                         let parsed = match parse_request(&line) {
@@ -3236,8 +3416,47 @@ pub async fn run_serve(
                                 // the unix branch). Record the session_id so this
                                 // pipe instance's EOF / broken-pipe reaps the
                                 // session in the post-loop block below. ACK ok.
+                                let requested_lease = match req.session_id.as_deref() {
+                                    Some(sid) => requested_lease(req.args.as_ref(), profile, sid),
+                                    None => Ok(None),
+                                };
+                                let requested_lease = match requested_lease {
+                                    Ok(lease) => lease,
+                                    Err(error) => {
+                                        let resp = DaemonResponse::err(error, 78);
+                                        let _ = writer.write_all(
+                                            (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                        ).await;
+                                        continue;
+                                    }
+                                };
                                 if let Some(sid) = req.session_id.as_deref() {
                                     cmux_cua_core::session::revive_session(sid);
+                                    if let Some(lease) = requested_lease.as_ref() {
+                                        match cmux_cua_core::session::acquire_lease(
+                                            &lease.lease_id,
+                                            profile.as_str(),
+                                            sid,
+                                            lease.generation,
+                                        ) {
+                                            Ok(cmux_cua_core::session::LeaseAcquire::Replaced {
+                                                previous_session_id,
+                                            }) => {
+                                                cmux_cua_core::session::retire_session(
+                                                    &previous_session_id,
+                                                );
+                                            }
+                                            Ok(_) => {}
+                                            Err(error) => {
+                                                let resp = DaemonResponse::err(error, 78);
+                                                let _ = writer.write_all(
+                                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                                ).await;
+                                                continue;
+                                            }
+                                        }
+                                        control_lease = Some(lease.clone());
+                                    }
                                     #[cfg(target_os = "macos")]
                                     if let Some(host_session) =
                                         cmux_cua_core::host_session_id_from_proxy(sid)
@@ -3261,6 +3480,40 @@ pub async fn run_serve(
                                         "profile": profile,
                                     })
                                 );
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "lease_renew" => {
+                                let result = match (
+                                    control_lease.as_ref(),
+                                    req.session_id.as_deref(),
+                                    requested_lease(
+                                        req.args.as_ref(),
+                                        profile,
+                                        req.session_id.as_deref().unwrap_or(""),
+                                    ),
+                                ) {
+                                    (Some(active), Some(sid), Ok(Some(requested)))
+                                        if active.lease_id == requested.lease_id
+                                            && active.generation == requested.generation
+                                            && active.session_id == sid =>
+                                    {
+                                        cmux_cua_core::session::renew_lease(
+                                            &active.lease_id,
+                                            profile.as_str(),
+                                            sid,
+                                            active.generation,
+                                        )
+                                    }
+                                    _ => Err("stale or mismatched lease renewal".to_owned()),
+                                };
+                                let resp = match result {
+                                    Ok(()) => DaemonResponse::ok(
+                                        serde_json::json!({"lease_renewed": true}),
+                                    ),
+                                    Err(error) => DaemonResponse::err(error, 78),
+                                };
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -3311,7 +3564,15 @@ pub async fn run_serve(
                     // the full rationale). Per-call connections leave
                     // control_session_id None.
                     if let Some(sid) = control_session_id {
-                        cmux_cua_core::session::release_session(&sid);
+                        let leased = control_lease.take();
+                        if let Some(active) = leased.as_ref() {
+                            let _ = cmux_cua_core::session::release_lease(
+                                &active.lease_id,
+                                active.generation,
+                            );
+                        } else {
+                            cmux_cua_core::session::release_session(&sid);
+                        }
                         // Run stop_owner off the reactor (see the unix branch):
                         // recording finalize can be a synchronous blocking call.
                         // fire_session_end stays inline (non-blocking hooks).
@@ -3319,13 +3580,20 @@ pub async fn run_serve(
                         // sees ended=true and bails (mark-before-reap; the cursor/config
                         // hooks already reap inside fire_session_end after the mark).
                         // stop_owner ignores is_session_ended, so reaping after is safe.
-                        cmux_cua_core::session::fire_session_end(&sid);
-                        let reg2 = reg.clone();
-                        let sid_for_stop = sid.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            reg2.recording.stop_owner(Some(&sid_for_stop))
-                        })
-                        .await;
+                        if leased.is_none() {
+                            cmux_cua_core::session::fire_session_end(&sid);
+                            let reg2 = reg.clone();
+                            let sid_for_stop = sid.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                reg2.recording.stop_owner(Some(&sid_for_stop))
+                            })
+                            .await;
+                        } else {
+                            tracing::debug!(
+                                session_id = %sid,
+                                "control connection lost; lease grace period owns cleanup"
+                            );
+                        }
                     }
                 });
             }

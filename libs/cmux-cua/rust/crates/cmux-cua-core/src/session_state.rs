@@ -227,6 +227,31 @@ fn session_for_action(
         .map(str::to_owned)
 }
 
+/// Stable lease identity shared by a hosted proxy and the daemon. Hosted MCP
+/// generations carry a `-mcp-<pid>-<start>` suffix; standalone sessions remain
+/// process-scoped and therefore use their complete id.
+pub fn durable_lease_id(session_id: &str) -> String {
+    crate::host_session_id_from_proxy(session_id)
+        .unwrap_or(session_id)
+        .to_owned()
+}
+
+/// Return the process generation embedded in a proxy session id. The daemon
+/// uses this value as a fencing token when a restarted proxy resumes a stable
+/// host lease.
+pub fn lease_generation(session_id: &str) -> u64 {
+    session_id
+        .rsplit('-')
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            let mut hasher = DefaultHasher::new();
+            session_id.hash(&mut hasher);
+            hasher.finish().max(1)
+        })
+}
+
 /// Session-scoped state files for the current driver process. Writes are always
 /// performed through a same-directory temporary file followed by `rename`.
 pub struct StateFile {
@@ -652,6 +677,20 @@ mod tests {
             writer.path_for_session(Some(host_session)).exists(),
             "the menu's last authenticated activity must outlive one MCP proxy process"
         );
+    }
+
+    #[test]
+    fn lease_identity_is_stable_across_proxy_generations() {
+        assert_eq!(
+            durable_lease_id("cmux-surface-a-mcp-4242-100"),
+            "cmux-surface-a"
+        );
+        assert_eq!(
+            durable_lease_id("cmux-surface-a-mcp-5151-200"),
+            "cmux-surface-a"
+        );
+        assert_eq!(lease_generation("mcp-4242-300"), 300);
+        assert_eq!(lease_generation("standalone-session"), lease_generation("standalone-session"));
     }
 
     #[test]

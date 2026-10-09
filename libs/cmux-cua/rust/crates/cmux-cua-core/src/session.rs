@@ -53,8 +53,208 @@ fn is_trackable(id: &str) -> bool {
 /// control-connection EOF releases the hold and reaps the session itself.
 static HELD_SESSIONS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
 
+/// A lease is the daemon-owned identity for one embedding host and tool
+/// profile. The MCP proxy process is allowed to disappear and reconnect with a
+/// newer generation without tearing down the host's cursor or recording.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseRecord {
+    pub lease_id: String,
+    pub profile: String,
+    pub session_id: String,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeaseAcquire {
+    New,
+    Resumed,
+    Replaced { previous_session_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpiredLease {
+    pub lease_id: String,
+    pub profile: String,
+    pub session_id: String,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct LeaseEntry {
+    record: LeaseRecord,
+    holders: usize,
+    last_renewed: Instant,
+    disconnected_at: Option<Instant>,
+}
+
+static LEASES: OnceLock<Mutex<HashMap<String, LeaseEntry>>> = OnceLock::new();
+
 fn held() -> &'static Mutex<HashMap<String, usize>> {
     HELD_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn leases() -> &'static Mutex<HashMap<String, LeaseEntry>> {
+    LEASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn validate_lease_part(value: &str, field: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("lease {field} must not be empty"));
+    }
+    if value.len() > 256 {
+        return Err(format!("lease {field} is too long"));
+    }
+    Ok(())
+}
+
+/// Acquire or resume a daemon-owned lease. A newer generation fences the old
+/// proxy and keeps the same host/profile lease alive. An older generation is
+/// rejected so a delayed reconnect cannot regain ownership after a restart.
+pub fn acquire_lease(
+    lease_id: &str,
+    profile: &str,
+    session_id: &str,
+    generation: u64,
+) -> Result<LeaseAcquire, String> {
+    validate_lease_part(lease_id, "id")?;
+    validate_lease_part(profile, "profile")?;
+    validate_lease_part(session_id, "session")?;
+    if generation == 0 {
+        return Err("lease generation must be positive".to_owned());
+    }
+
+    let now = Instant::now();
+    let mut map = leases().lock().unwrap();
+    let record = LeaseRecord {
+        lease_id: lease_id.to_owned(),
+        profile: profile.to_owned(),
+        session_id: session_id.to_owned(),
+        generation,
+    };
+    let Some(entry) = map.get_mut(lease_id) else {
+        map.insert(
+            lease_id.to_owned(),
+            LeaseEntry {
+                record,
+                holders: 1,
+                last_renewed: now,
+                disconnected_at: None,
+            },
+        );
+        return Ok(LeaseAcquire::New);
+    };
+    if entry.record.profile != profile {
+        return Err(format!(
+            "lease `{lease_id}` belongs to profile `{}`, not `{profile}`",
+            entry.record.profile
+        ));
+    }
+    if generation < entry.record.generation {
+        return Err(format!(
+            "stale lease generation {generation}; active generation is {}",
+            entry.record.generation
+        ));
+    }
+    if generation == entry.record.generation {
+        if entry.record.session_id != session_id {
+            return Err(format!(
+                "lease generation {generation} is already owned by another session"
+            ));
+        }
+        entry.holders = entry.holders.max(1);
+        entry.last_renewed = now;
+        entry.disconnected_at = None;
+        return Ok(LeaseAcquire::Resumed);
+    }
+
+    let previous_session_id = std::mem::replace(&mut entry.record, record).session_id;
+    entry.holders = 1;
+    entry.last_renewed = now;
+    entry.disconnected_at = None;
+    Ok(LeaseAcquire::Replaced {
+        previous_session_id,
+    })
+}
+
+/// Renew a live lease. The generation check is the fencing boundary shared by
+/// all proxy generations and prevents a delayed heartbeat from reviving an old
+/// owner.
+pub fn renew_lease(
+    lease_id: &str,
+    profile: &str,
+    session_id: &str,
+    generation: u64,
+) -> Result<(), String> {
+    let mut map = leases().lock().unwrap();
+    let Some(entry) = map.get_mut(lease_id) else {
+        return Err(format!("lease `{lease_id}` is not active"));
+    };
+    if entry.record.profile != profile
+        || entry.record.session_id != session_id
+        || entry.record.generation != generation
+    {
+        return Err("stale or mismatched lease renewal".to_owned());
+    }
+    entry.last_renewed = Instant::now();
+    entry.disconnected_at = None;
+    Ok(())
+}
+
+/// Mark a control connection as gone. Cleanup is deferred until the crash
+/// grace period expires, allowing a proxy restart to resume its lease.
+pub fn release_lease(lease_id: &str, generation: u64) -> Result<(), String> {
+    let mut map = leases().lock().unwrap();
+    let Some(entry) = map.get_mut(lease_id) else {
+        return Ok(());
+    };
+    if entry.record.generation != generation {
+        return Err("stale lease release".to_owned());
+    }
+    entry.holders = entry.holders.saturating_sub(1);
+    if entry.holders == 0 {
+        entry.disconnected_at = Some(Instant::now());
+    }
+    Ok(())
+}
+
+/// Return leases whose owner has exceeded the disconnect grace period or whose
+/// heartbeat has gone stale. The caller owns the actual session cleanup hook.
+pub fn expire_leases(grace: Duration, ttl: Duration) -> Vec<ExpiredLease> {
+    expire_leases_at(Instant::now(), grace, ttl)
+}
+
+fn expire_leases_at(now: Instant, grace: Duration, ttl: Duration) -> Vec<ExpiredLease> {
+    let mut map = leases().lock().unwrap();
+    let expired_ids: Vec<String> = map
+        .iter()
+        .filter(|(_, entry)| {
+            if entry.holders > 0 {
+                return now.duration_since(entry.last_renewed) >= ttl;
+            }
+            entry
+                .disconnected_at
+                .is_some_and(|at| now.duration_since(at) >= grace)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    expired_ids
+        .into_iter()
+        .filter_map(|id| {
+            map.remove(&id).map(|entry| ExpiredLease {
+                lease_id: entry.record.lease_id,
+                profile: entry.record.profile,
+                session_id: entry.record.session_id,
+                generation: entry.record.generation,
+            })
+        })
+        .collect()
+}
+
+/// Drop activity for a superseded proxy generation without firing cleanup for
+/// the stable host lease. The replacement generation owns the same state.
+pub fn retire_session(session_id: &str) {
+    activity().lock().unwrap().remove(session_id);
+    held().lock().unwrap().remove(session_id);
 }
 
 /// Mark `session_id` as owned by a live control connection.
@@ -62,7 +262,11 @@ pub fn hold_session(session_id: &str) {
     if !is_trackable(session_id) {
         return;
     }
-    *held().lock().unwrap().entry(session_id.to_owned()).or_insert(0) += 1;
+    *held()
+        .lock()
+        .unwrap()
+        .entry(session_id.to_owned())
+        .or_insert(0) += 1;
 }
 
 /// Release one control-connection hold on `session_id`.
@@ -250,8 +454,8 @@ pub fn active_session_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn held_session_survives_idle_sweep_until_released() {
@@ -298,9 +502,11 @@ mod tests {
         let sid = "test-ttl-session-DDEEFF";
         touch_session(sid);
         // A huge TTL leaves it alone (just touched).
-        assert!(evict_idle(Duration::from_secs(3600))
-            .iter()
-            .all(|s| s != sid));
+        assert!(
+            evict_idle(Duration::from_secs(3600))
+                .iter()
+                .all(|s| s != sid)
+        );
         // A zero TTL treats any prior activity as idle → evicts it.
         let evicted = evict_idle(Duration::ZERO);
         assert!(
@@ -452,5 +658,51 @@ mod tests {
         assert!(worker.join().unwrap().is_some());
         ender.join().unwrap();
         assert_eq!(&*events.lock().unwrap(), &["revive", "remove"]);
+    }
+
+    #[test]
+    fn lease_fences_old_proxy_generations_and_resumes_new_ones() {
+        let lease = "test-lease-fence-7A8B9C";
+        let first = "test-lease-session-a";
+        let second = "test-lease-session-b";
+        assert_eq!(
+            acquire_lease(lease, "native", first, 1).unwrap(),
+            LeaseAcquire::New
+        );
+        assert!(renew_lease(lease, "native", first, 1).is_ok());
+        assert!(renew_lease(lease, "native", first, 0).is_err());
+        assert!(acquire_lease(lease, "native", first, 0).is_err());
+        assert_eq!(
+            acquire_lease(lease, "native", second, 2).unwrap(),
+            LeaseAcquire::Replaced {
+                previous_session_id: first.to_owned()
+            }
+        );
+        assert!(renew_lease(lease, "native", first, 1).is_err());
+        assert!(renew_lease(lease, "native", second, 2).is_ok());
+        assert!(release_lease(lease, 2).is_ok());
+        assert!(
+            expire_leases_at(
+                Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+            )
+            .iter()
+            .any(|expired| expired.lease_id == lease)
+        );
+    }
+
+    #[test]
+    fn lease_rejects_profile_hijack() {
+        let lease = "test-lease-profile-D1E2F3";
+        assert!(acquire_lease(lease, "native", "test-lease-session-c", 1).is_ok());
+        let error = acquire_lease(
+            lease,
+            "codex-computer-use-compat",
+            "test-lease-session-d",
+            2,
+        )
+        .expect_err("one host lease cannot change tool profiles");
+        assert!(error.contains("belongs to profile"));
     }
 }
