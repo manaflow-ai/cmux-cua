@@ -2645,6 +2645,7 @@ pub async fn run_serve(
                                     continue;
                                 }
                                 let result = reg.invoke(&tool_name, args).await;
+                                drop(_lease_invocation_guard);
                                 let is_err = result.is_error.unwrap_or(false);
                                 let content: Vec<serde_json::Value> = result.content.iter().map(|c| {
                                     match c {
@@ -3469,6 +3470,7 @@ pub async fn run_serve(
                                     continue;
                                 }
                                 let result = reg.invoke(&tool_name, args).await;
+                                drop(_lease_invocation_guard);
                                 let is_err = result.is_error.unwrap_or(false);
                                 let content: Vec<serde_json::Value> = result.content.iter().map(|c| match c {
                                     cmux_cua_core::protocol::Content::Text { text, .. } =>
