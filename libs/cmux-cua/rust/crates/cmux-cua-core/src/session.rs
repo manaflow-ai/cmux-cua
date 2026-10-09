@@ -19,8 +19,12 @@
 //! reverse coupling from core into the platform crates.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 type SessionEndHook = Box<dyn Fn(&str) + Send + Sync>;
 type SessionReviveHook = Box<dyn Fn(&str) + Send + Sync>;
@@ -89,12 +93,83 @@ struct LeaseEntry {
 
 static LEASES: OnceLock<Mutex<HashMap<String, LeaseEntry>>> = OnceLock::new();
 
+/// Persisted generation high-water mark. The active bit lets a daemon restart
+/// resume the exact live generation while still rejecting that same generation
+/// after the lease was deliberately expired.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LeaseWatermark {
+    profile: String,
+    session_id: String,
+    generation: u64,
+    active: bool,
+}
+
+static LEASE_WATERMARKS: OnceLock<Mutex<HashMap<String, LeaseWatermark>>> = OnceLock::new();
+static LEASE_TRANSITION: OnceLock<Mutex<()>> = OnceLock::new();
+static LEASE_PERSIST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 fn held() -> &'static Mutex<HashMap<String, usize>> {
     HELD_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn leases() -> &'static Mutex<HashMap<String, LeaseEntry>> {
     LEASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lease_transition() -> &'static Mutex<()> {
+    LEASE_TRANSITION.get_or_init(|| Mutex::new(()))
+}
+
+fn lease_watermarks() -> &'static Mutex<HashMap<String, LeaseWatermark>> {
+    LEASE_WATERMARKS.get_or_init(|| Mutex::new(load_lease_watermarks()))
+}
+
+fn lease_watermark_key(profile: &str, lease_id: &str) -> String {
+    format!("{profile}\0{lease_id}")
+}
+
+fn lease_watermark_path() -> Option<PathBuf> {
+    std::env::var_os(crate::session_state::STATE_DIR_ENV)
+        .map(PathBuf::from)
+        .map(|dir| dir.join("leases-v1.json"))
+}
+
+fn load_lease_watermarks() -> HashMap<String, LeaseWatermark> {
+    let Some(path) = lease_watermark_path() else {
+        return HashMap::new();
+    };
+    std::fs::read(path)
+        .ok()
+        .and_then(|body| serde_json::from_slice(&body).ok())
+        .unwrap_or_default()
+}
+
+fn persist_lease_watermarks(watermarks: &HashMap<String, LeaseWatermark>) {
+    let Some(path) = lease_watermark_path() else {
+        return;
+    };
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if crate::session_state::ensure_private_dir(dir).is_err() {
+        return;
+    }
+    let body = match serde_json::to_vec(watermarks) {
+        Ok(body) => body,
+        Err(_) => return,
+    };
+    let sequence = LEASE_PERSIST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp_path = dir.join(format!(".leases-v1.json.tmp-{sequence}"));
+    let result = (|| {
+        use std::io::Write;
+        let mut file = crate::session_state::create_private_temp_file(&temp_path)?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, &path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp_path);
+    }
 }
 
 fn validate_lease_part(value: &str, field: &str) -> Result<(), String> {
@@ -123,8 +198,11 @@ pub fn acquire_lease(
         return Err("lease generation must be positive".to_owned());
     }
 
+    let _transition = lease_transition().lock().unwrap();
     let now = Instant::now();
     let mut map = leases().lock().unwrap();
+    let mut watermarks = lease_watermarks().lock().unwrap();
+    let watermark_key = lease_watermark_key(profile, lease_id);
     let record = LeaseRecord {
         lease_id: lease_id.to_owned(),
         profile: profile.to_owned(),
@@ -132,15 +210,57 @@ pub fn acquire_lease(
         generation,
     };
     let Some(entry) = map.get_mut(lease_id) else {
+        if let Some(previous) = watermarks.get(&watermark_key) {
+            if previous.profile != profile {
+                return Err(format!(
+                    "lease `{lease_id}` belongs to profile `{}`, not `{profile}`",
+                    previous.profile
+                ));
+            }
+            if generation < previous.generation {
+                return Err(format!(
+                    "stale lease generation {generation}; active generation is {}",
+                    previous.generation
+                ));
+            }
+            if generation == previous.generation {
+                if previous.active && previous.session_id == session_id {
+                    map.insert(
+                        lease_id.to_owned(),
+                        LeaseEntry {
+                            record,
+                            holders: 1,
+                            last_renewed: now,
+                            disconnected_at: None,
+                        },
+                    );
+                    return Ok(LeaseAcquire::Resumed);
+                }
+                return Err(format!(
+                    "stale lease generation {generation}; active generation is {}",
+                    previous.generation
+                ));
+            }
+        }
         map.insert(
             lease_id.to_owned(),
             LeaseEntry {
-                record,
+                record: record.clone(),
                 holders: 1,
                 last_renewed: now,
                 disconnected_at: None,
             },
         );
+        watermarks.insert(
+            watermark_key,
+            LeaseWatermark {
+                profile: profile.to_owned(),
+                session_id: session_id.to_owned(),
+                generation,
+                active: true,
+            },
+        );
+        persist_lease_watermarks(&watermarks);
         return Ok(LeaseAcquire::New);
     };
     if entry.record.profile != profile {
@@ -164,6 +284,7 @@ pub fn acquire_lease(
         entry.holders = entry.holders.max(1);
         entry.last_renewed = now;
         entry.disconnected_at = None;
+        persist_lease_watermarks(&watermarks);
         return Ok(LeaseAcquire::Resumed);
     }
 
@@ -171,6 +292,16 @@ pub fn acquire_lease(
     entry.holders = 1;
     entry.last_renewed = now;
     entry.disconnected_at = None;
+    watermarks.insert(
+        watermark_key,
+        LeaseWatermark {
+            profile: profile.to_owned(),
+            session_id: session_id.to_owned(),
+            generation,
+            active: true,
+        },
+    );
+    persist_lease_watermarks(&watermarks);
     Ok(LeaseAcquire::Replaced {
         previous_session_id,
     })
@@ -185,6 +316,7 @@ pub fn renew_lease(
     session_id: &str,
     generation: u64,
 ) -> Result<(), String> {
+    let _transition = lease_transition().lock().unwrap();
     let mut map = leases().lock().unwrap();
     let Some(entry) = map.get_mut(lease_id) else {
         return Err(format!("lease `{lease_id}` is not active"));
@@ -203,6 +335,7 @@ pub fn renew_lease(
 /// Mark a control connection as gone. Cleanup is deferred until the crash
 /// grace period expires, allowing a proxy restart to resume its lease.
 pub fn release_lease(lease_id: &str, generation: u64) -> Result<(), String> {
+    let _transition = lease_transition().lock().unwrap();
     let mut map = leases().lock().unwrap();
     let Some(entry) = map.get_mut(lease_id) else {
         return Ok(());
@@ -224,6 +357,7 @@ pub fn expire_leases(grace: Duration, ttl: Duration) -> Vec<ExpiredLease> {
 }
 
 fn expire_leases_at(now: Instant, grace: Duration, ttl: Duration) -> Vec<ExpiredLease> {
+    let _transition = lease_transition().lock().unwrap();
     let mut map = leases().lock().unwrap();
     let expired_ids: Vec<String> = map
         .iter()
@@ -237,7 +371,7 @@ fn expire_leases_at(now: Instant, grace: Duration, ttl: Duration) -> Vec<Expired
         })
         .map(|(id, _)| id.clone())
         .collect();
-    expired_ids
+    let expired = expired_ids
         .into_iter()
         .filter_map(|id| {
             map.remove(&id).map(|entry| ExpiredLease {
@@ -247,14 +381,56 @@ fn expire_leases_at(now: Instant, grace: Duration, ttl: Duration) -> Vec<Expired
                 generation: entry.record.generation,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if !expired.is_empty() {
+        let mut watermarks = lease_watermarks().lock().unwrap();
+        for lease in &expired {
+            let key = lease_watermark_key(&lease.profile, &lease.lease_id);
+            if let Some(watermark) = watermarks.get_mut(&key) {
+                watermark.active = false;
+            }
+        }
+        persist_lease_watermarks(&watermarks);
+    }
+    expired
 }
 
-/// Drop activity for a superseded proxy generation without firing cleanup for
-/// the stable host lease. The replacement generation owns the same state.
+/// Run cleanup for an expired lease while excluding a replacement that may
+/// have acquired the same lease id between expiry and the sweep callback. The
+/// transition lock stays held through `cleanup`, so stable host state cannot be
+/// removed after a replacement has started writing it.
+pub fn with_expired_lease_cleanup(
+    expired: &ExpiredLease,
+    cleanup: impl FnOnce(bool),
+) {
+    let _transition = lease_transition().lock().unwrap();
+    let replacement_active = leases().lock().unwrap().contains_key(&expired.lease_id);
+    cleanup(!replacement_active);
+}
+
+/// Whether a session id belongs to a generation that has been superseded or
+/// expired. This also consults persisted host high-water marks so a daemon
+/// restart cannot let an older proxy issue calls before its session_begin is
+/// rejected.
+pub fn is_lease_session_fenced(session_id: &str, profile: &str) -> bool {
+    let _transition = lease_transition().lock().unwrap();
+    let lease_id = crate::session_state::durable_lease_id(session_id);
+    let generation = crate::session_state::lease_generation(session_id);
+    let watermarks = lease_watermarks().lock().unwrap();
+    let key = lease_watermark_key(profile, &lease_id);
+    watermarks.get(&key).is_some_and(|watermark| {
+        generation < watermark.generation
+            || (generation == watermark.generation
+                && (!watermark.active || watermark.session_id != session_id))
+    })
+}
+
+/// Fence and clean up a superseded proxy generation without disturbing the
+/// stable host lease. The replacement generation owns the shared host scope.
 pub fn retire_session(session_id: &str) {
     activity().lock().unwrap().remove(session_id);
     held().lock().unwrap().remove(session_id);
+    fire_session_end(session_id);
 }
 
 /// Mark `session_id` as owned by a live control connection.
