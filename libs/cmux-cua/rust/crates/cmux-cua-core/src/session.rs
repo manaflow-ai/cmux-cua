@@ -705,4 +705,38 @@ mod tests {
         .expect_err("one host lease cannot change tool profiles");
         assert!(error.contains("belongs to profile"));
     }
+
+    #[test]
+    fn replacing_a_lease_ends_the_retired_generation() {
+        let lease = "test-lease-retire-generation-G4H5I6";
+        let first = "test-lease-retire-session-a";
+        let second = "test-lease-retire-session-b";
+        assert!(acquire_lease(lease, "native", first, 10).is_ok());
+        assert!(acquire_lease(lease, "native", second, 11).is_ok());
+        assert!(
+            is_session_ended(first),
+            "a fenced generation must be tombstoned before its successor runs"
+        );
+    }
+
+    #[test]
+    fn an_expired_generation_cannot_reacquire_its_lease() {
+        let lease = "test-lease-expired-generation-J7K8L9";
+        let session = "test-lease-expired-session";
+        assert!(acquire_lease(lease, "native", session, 20).is_ok());
+        assert!(release_lease(lease, 20).is_ok());
+        assert!(
+            expire_leases_at(
+                Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+            )
+            .iter()
+            .any(|expired| expired.lease_id == lease)
+        );
+        assert!(
+            acquire_lease(lease, "native", session, 20).is_err(),
+            "lease expiry must retain a generation fence for delayed reconnects"
+        );
+    }
 }
