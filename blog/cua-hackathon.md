@@ -34,7 +34,7 @@ Build during the weekend and submit a repo with a one-line start command. **HUD*
 
 ### Rules
 
-- Fork and star the [Cua repo](https://github.com/trycua/cua).
+- Fork and star the [Cua repo](https://github.com/manaflow-ai/cmux-cua).
 - Add your agent and instructions in `samples/community/hack-the-north/<YOUR_TEAM_NAME>`.
 - Include a README with details on the approach and any required notes.
 - Submit a PR.

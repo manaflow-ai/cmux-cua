@@ -67,23 +67,23 @@ const config = {
         permanent: true,
       },
       {
-        source: '/reference/cua-driver/modality-test-suite',
-        destination: '/reference/cua-driver/limits',
+        source: '/reference/cmux-cua/modality-test-suite',
+        destination: '/reference/cmux-cua/limits',
         permanent: true,
       },
       {
-        source: '/reference/cua-driver/modality-test-suite.mdx',
-        destination: '/reference/cua-driver/limits',
+        source: '/reference/cmux-cua/modality-test-suite.mdx',
+        destination: '/reference/cmux-cua/limits',
         permanent: true,
       },
       {
         source: '/explanation/linux-and-wayland',
-        destination: '/reference/cua-driver/limits',
+        destination: '/reference/cmux-cua/limits',
         permanent: true,
       },
       {
         source: '/explanation/linux-and-wayland.mdx',
-        destination: '/reference/cua-driver/limits',
+        destination: '/reference/cmux-cua/limits',
         permanent: true,
       },
       {
@@ -108,22 +108,22 @@ const config = {
       },
       {
         source: '/explanation/process-model',
-        destination: '/reference/cua-driver/process-model',
+        destination: '/reference/cmux-cua/process-model',
         permanent: true,
       },
       {
         source: '/explanation/process-model.mdx',
-        destination: '/reference/cua-driver/process-model',
+        destination: '/reference/cmux-cua/process-model',
         permanent: true,
       },
       {
         source: '/concepts/process-model',
-        destination: '/reference/cua-driver/process-model',
+        destination: '/reference/cmux-cua/process-model',
         permanent: true,
       },
       {
         source: '/concepts/process-model.mdx',
-        destination: '/reference/cua-driver/process-model',
+        destination: '/reference/cmux-cua/process-model',
         permanent: true,
       },
       {
@@ -158,12 +158,12 @@ const config = {
       },
       {
         source: '/how-to-guides/driver/choose-a-modality',
-        destination: '/reference/cua-driver/action-selection-policy',
+        destination: '/reference/cmux-cua/action-selection-policy',
         permanent: true,
       },
       {
         source: '/how-to-guides/driver/choose-a-modality.mdx',
-        destination: '/reference/cua-driver/action-selection-policy',
+        destination: '/reference/cmux-cua/action-selection-policy',
         permanent: true,
       },
       {

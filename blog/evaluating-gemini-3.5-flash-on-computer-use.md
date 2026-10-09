@@ -72,30 +72,30 @@ The prompts were benign here, so it did no damage in this setup. But it is the k
 
 <div align="center"><video src="https://github.com/user-attachments/assets/5e606799-6fe5-49d0-b252-51b113887ffa" width="600" controls></video></div>
 
-Gemini 3.5 Flash driving a live desktop app via the Antigravity CLI on top of Cua Driver.
+Gemini 3.5 Flash driving a live desktop app via the Antigravity CLI on top of cmux CUA.
 
 ## Try it
 
-You can run Gemini 3.5 Flash through Cua with [Cua Driver](https://cua.ai/docs/cua-driver) and the Cua Agent framework. The EAP setup depends on your Gemini API access and the Computer Use tool configuration.
+You can run Gemini 3.5 Flash through Cua with [cmux CUA](https://cua.ai/docs/cmux-cua) and the Cua Agent framework. The EAP setup depends on your Gemini API access and the Computer Use tool configuration.
 
-### 1. Install Cua Driver
+### 1. Install cmux CUA
 
 **macOS / Linux (pre-release backend)**
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cmux-cua/scripts/install.sh)"
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-irm https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/trycua/cua/main/libs/cmux-cua/scripts/install.ps1 | iex
 ```
 
 Confirm it resolved:
 
 ```bash
-cua-driver --version
+cmux-cua --version
 ```
 
 ### 2. Start the driver daemon
@@ -103,46 +103,46 @@ cua-driver --version
 **macOS**
 
 ```bash
-open -n -g -a CuaDriver --args serve
+open -n -g -a 'cmux Computer Use' --args serve
 ```
 
 **Linux (pre-release)**
 
 ```bash
-cua-driver serve &
+cmux-cua serve &
 ```
 
 **Windows**
 
 ```powershell
-cua-driver autostart enable
-cua-driver autostart kick
+cmux-cua autostart enable
+cmux-cua autostart kick
 ```
 
 Check it is up:
 
 ```bash
-cua-driver status
+cmux-cua status
 ```
 
-On first run, grant the OS permissions the driver needs (macOS: Accessibility + Screen Recording via `cua-driver check_permissions`; Windows: run from an interactive session, see `cua-driver doctor`).
+On first run, grant the OS permissions the driver needs (macOS: Accessibility + Screen Recording via `cmux-cua check_permissions`; Windows: run from an interactive session, see `cmux-cua doctor`).
 
 ### 3. Drive your desktop with Gemini 3.5 Flash
 
-Cua Driver speaks **MCP over stdio**, so any MCP client (the Antigravity CLI, Claude Code, Cursor, Codex) can call its tools to act on your real desktop in the background. The demo above uses the **Antigravity CLI** (the `agy` binary, the successor to Gemini CLI). Generate its MCP snippet:
+cmux CUA speaks **MCP over stdio**, so any MCP client (the Antigravity CLI, Claude Code, Cursor, Codex) can call its tools to act on your real desktop in the background. The demo above uses the **Antigravity CLI** (the `agy` binary, the successor to Gemini CLI). Generate its MCP snippet:
 
 ```bash
-cua-driver mcp-config --client antigravity
+cmux-cua mcp-config --client antigravity
 ```
 
 `agy` has no `agy mcp add` subcommand, so paste the printed JSON into `~/.gemini/config/mcp_config.json`, merging it under the top-level `mcpServers` object (on Windows, `%USERPROFILE%\.gemini\config\mcp_config.json`). Restart `agy` after saving - the same file is shared with the Antigravity IDE.
 
-Then point the client at `gemini-3.5-flash` with the native Computer Use API and give it a task. The driver exposes the screen and an action layer; the model observes, decides, and calls the tools until the task is done. _The clip above is Gemini 3.5 Flash driving a live desktop app through exactly this path - the Antigravity CLI on top of Cua Driver._
+Then point the client at `gemini-3.5-flash` with the native Computer Use API and give it a task. The driver exposes the screen and an action layer; the model observes, decides, and calls the tools until the task is done. _The clip above is Gemini 3.5 Flash driving a live desktop app through exactly this path - the Antigravity CLI on top of cmux CUA._
 
-You can also run Gemini 3.5 Flash with the [Cua Agent](https://github.com/trycua/cua) SDK (`pip install cua-agent`) against a Cua cloud sandbox; the SDK's Gemini Computer Use loop drives the native API directly.
+You can also run Gemini 3.5 Flash with the [Cua Agent](https://github.com/manaflow-ai/cmux-cua) SDK (`pip install cua-agent`) against a Cua cloud sandbox; the SDK's Gemini Computer Use loop drives the native API directly.
 
 If you try this against desktop apps, CAD tools, or any workflow where the model has to reason before it clicks, **send us the trajectory**. The most useful reports include the model, step budget, app, task, and where the observation stopped matching the screen.
 
-Repo: [github.com/trycua/cua](https://github.com/trycua/cua)
+Repo: [github.com/trycua/cua](https://github.com/manaflow-ai/cmux-cua)
 
-Docs: [cua.ai/docs/cua-driver](https://cua.ai/docs/cua-driver)
+Docs: [cua.ai/docs/cmux-cua](https://cua.ai/docs/cmux-cua)

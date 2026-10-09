@@ -174,7 +174,7 @@ And then there's the end-to-end loop. For tasks that span multiple applications 
 
 The future isn't CLI versus GUI. It's knowing when to use each. Code-as-action for automation at scale. Visual agents for creative work and unfamiliar interfaces. The best systems will blend both — using code when efficient, falling back to vision when necessary.
 
-This is why we built [Cua-Bench](https://github.com/trycua/cua). GUI agents need rigorous evaluation — not just on fixed screenshots, but on the messy reality of changing interfaces, novel applications, and creative workflows. If we want agents that can handle Photoshop and Figma, we need benchmarks that test for robustness, not just pattern matching.
+This is why we built [Cua-Bench](https://github.com/manaflow-ai/cmux-cua). GUI agents need rigorous evaluation — not just on fixed screenshots, but on the messy reality of changing interfaces, novel applications, and creative workflows. If we want agents that can handle Photoshop and Figma, we need benchmarks that test for robustness, not just pattern matching.
 
 <video src="https://github.com/user-attachments/assets/78347b08-e36a-43ce-a781-31c114c333fd" width="600" autoplay loop muted playsinline>
   Your browser does not support the video tag.

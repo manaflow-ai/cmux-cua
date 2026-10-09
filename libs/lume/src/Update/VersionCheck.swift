@@ -109,7 +109,7 @@ enum LumeVersionCheck {
         let updateAvailable = latest.map { isNewer($0, than: current) } ?? false
         let releaseNotesURL =
             updateAvailable
-            ? "https://github.com/trycua/cua/releases/tag/\(releaseTagPrefix)\(latest ?? "")"
+            ? "https://github.com/manaflow-ai/cmux-cua/releases/tag/\(releaseTagPrefix)\(latest ?? "")"
             : nil
 
         return State(

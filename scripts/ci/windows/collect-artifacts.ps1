@@ -1,5 +1,5 @@
 param(
-    [string]$OutputDirectory = "artifacts\cua-driver\windows"
+    [string]$OutputDirectory = "artifacts\cmux-cua\windows"
 )
 
 Set-StrictMode -Version Latest
@@ -9,7 +9,7 @@ $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
 $destination = Join-Path $repoRoot $OutputDirectory
 New-Item -ItemType Directory -Force $destination | Out-Null
 
-$rustRoot = Join-Path $repoRoot "libs\cua-driver\rust"
+$rustRoot = Join-Path $repoRoot "libs\cmux-cua\rust"
 $target = Join-Path $rustRoot "target"
 if (Test-Path $target) {
     Get-ChildItem -Path $target -Filter "*.log" -Recurse -ErrorAction SilentlyContinue |

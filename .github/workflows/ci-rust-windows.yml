@@ -3,20 +3,20 @@ name: "CI: Rust Windows unit"
 on:
   pull_request:
     paths:
-      - "libs/cua-driver/rust/Cargo.toml"
-      - "libs/cua-driver/rust/Cargo.lock"
-      - "libs/cua-driver/rust/crates/cua-driver/**"
-      - "libs/cua-driver/rust/crates/cua-driver-core/**"
-      - "libs/cua-driver/rust/crates/cua-driver-testkit/**"
-      - "libs/cua-driver/rust/crates/platform-windows/**"
-      - "libs/cua-driver/rust/crates/cua-driver-uia/**"
-      - "libs/cua-driver/tests/fixtures/**"
+      - "libs/cmux-cua/rust/Cargo.toml"
+      - "libs/cmux-cua/rust/Cargo.lock"
+      - "libs/cmux-cua/rust/crates/cmux-cua/**"
+      - "libs/cmux-cua/rust/crates/cmux-cua-core/**"
+      - "libs/cmux-cua/rust/crates/cmux-cua-testkit/**"
+      - "libs/cmux-cua/rust/crates/platform-windows/**"
+      - "libs/cmux-cua/rust/crates/cmux-cua-uia/**"
+      - "libs/cmux-cua/tests/fixtures/**"
       - ".github/workflows/ci-rust-windows.yml"
   push:
     branches: [main]
     paths:
-      - "libs/cua-driver/rust/**"
-      - "libs/cua-driver/tests/fixtures/**"
+      - "libs/cmux-cua/rust/**"
+      - "libs/cmux-cua/tests/fixtures/**"
       - ".github/workflows/ci-rust-windows.yml"
   workflow_dispatch:
 
@@ -37,9 +37,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
         with:
-          workspaces: "libs/cua-driver/rust -> target"
+          workspaces: "libs/cmux-cua/rust -> target"
       - name: Run Windows Rust tests
-        working-directory: libs/cua-driver/rust
+        working-directory: libs/cmux-cua/rust
         # Compile every Rust target without executing desktop-dependent integration
         # tests; interactive behavior belongs in e2e-rust-windows.yml.
-        run: cargo test -p cua-driver -p cua-driver-core -p cua-driver-testkit -p platform-windows -p cua-driver-uia --all-targets --no-run --locked
+        run: cargo test -p cmux-cua -p cmux-cua-core -p cmux-cua-testkit -p platform-windows -p cmux-cua-uia --all-targets --no-run --locked

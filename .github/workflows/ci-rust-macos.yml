@@ -1,0 +1,57 @@
+name: "CI: Rust macOS unit"
+
+# Hosted macOS tests for the native driver. Agents and fleet Macs do not run
+# cargo locally, so this job is the macOS test gate for every PR against the
+# cmux-cua-native line. Tests that need Accessibility or Screen Recording
+# grants cannot pass on a hosted runner; they stay behind their own guards.
+
+on:
+  pull_request:
+    paths:
+      - "libs/cmux-cua/rust/Cargo.toml"
+      - "libs/cmux-cua/rust/Cargo.lock"
+      - "libs/cmux-cua/rust/crates/cmux-cua/**"
+      - "libs/cmux-cua/rust/crates/cmux-cua-core/**"
+      - "libs/cmux-cua/rust/crates/cmux-cua-testkit/**"
+      - "libs/cmux-cua/rust/crates/cursor-overlay/**"
+      - "libs/cmux-cua/rust/crates/platform-macos/**"
+      - ".github/workflows/ci-rust-macos.yml"
+  push:
+    branches: [cmux-cua-native]
+    paths:
+      - "libs/cmux-cua/rust/**"
+      - ".github/workflows/ci-rust-macos.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-rust-macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Rust macOS unit and compile
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+        with:
+          workspaces: "libs/cmux-cua/rust -> target"
+      - name: Build the driver
+        working-directory: libs/cmux-cua/rust
+        run: cargo build -p cmux-cua --locked
+      # Unit tests only for now: 8 cmux-cua integration tests in
+      # tests/protocol_codex_compat_test.rs fail on a hosted runner (daemon
+      # spawn and a stale v829 tool description), listed in the description of
+      # https://github.com/manaflow-ai/cmux-cua/pull/30. Widen to
+      # --all-targets when they pass.
+      - name: Run core and driver unit tests
+        working-directory: libs/cmux-cua/rust
+        run: cargo test -p cmux-cua-core -p cmux-cua --lib --bins --locked
+      - name: Run macOS platform unit tests
+        working-directory: libs/cmux-cua/rust
+        run: cargo test -p platform-macos --lib --locked

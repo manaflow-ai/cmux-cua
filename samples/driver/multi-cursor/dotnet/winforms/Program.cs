@@ -5,7 +5,7 @@ using System.Windows.Forms;
 
 // "Meridian CRM — Account Record" : WinForms node (classic Win32 controls,
 // MSAA/UIA). Explicit fractional layout (dense, no gaps beyond borders).
-// cua-driver drives the Account Name field + the "Add Record" button.
+// cmux-cua drives the Account Name field + the "Add Record" button.
 static class Program
 {
     [STAThread]

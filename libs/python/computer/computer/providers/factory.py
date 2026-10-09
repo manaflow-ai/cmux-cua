@@ -62,7 +62,7 @@ class VMProviderFactory:
                 if not HAS_LUME:
                     raise ImportError(
                         "LumeProvider requires curl and the Lume CLI. "
-                        "Please install Lume from https://github.com/trycua/cua/tree/main/libs/lume"
+                        "Please install Lume from https://github.com/manaflow-ai/cmux-cua/tree/main/libs/lume"
                     )
                 return LumeProvider(
                     provider_port=provider_port,
@@ -75,7 +75,7 @@ class VMProviderFactory:
                 logger.error(f"Failed to import LumeProvider: {e}")
                 raise ImportError(
                     "LumeProvider requires curl and the Lume CLI. "
-                    "Please install Lume from https://github.com/trycua/cua/tree/main/libs/lume"
+                    "Please install Lume from https://github.com/manaflow-ai/cmux-cua/tree/main/libs/lume"
                 ) from e
         elif provider_type == VMProviderType.LUMIER:
             try:

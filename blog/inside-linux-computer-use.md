@@ -6,11 +6,11 @@ _Published on June 18 by Robert Wendt_
 
 **TL;DR:**
 
-- Cua Driver now drives real Linux desktop apps in the background for any agent (Claude Code, Codex, your own loop), over MCP or the CLI, available today on the release tag 0.5.7.
+- cmux CUA now drives real Linux desktop apps in the background for any agent (Claude Code, Codex, your own loop), over MCP or the CLI, available today on the release tag 0.5.7.
 - It uses AT-SPI 2 over D-Bus for the accessibility tree, XTEST for input synthesis, and a painted agent cursor kept separate from your physical pointer.
 - The supported backend is X11 and XWayland. Native Wayland is still in preview behind an opt-in flag, and contributions are more than welcome.
 - Tested on Debian 12, Ubuntu 22.04, Ubuntu 24.04, Rocky 9, and Fedora 41, with release binaries built for glibc 2.31 and newer.
-- Source: https://github.com/trycua/cua Docs: https://cua.ai/docs/cua-driver
+- Source: https://github.com/manaflow-ai/cmux-cua Docs: https://cua.ai/docs/cmux-cua
 
 ---
 
@@ -18,7 +18,7 @@ After shipping background computer-use on macOS and then Windows, the obvious ne
 
 Let me back up. The reason any of this matters is that a lot of real Linux work still lives in GTK, Qt, Electron, Chromium, Tk, and native desktop tools that will never expose an agent API. If you want an agent to use those apps, it eventually has to use the same interface a person uses: open the window, read the controls, click, type, drag, verify, and go back to code. That loop already works reasonably well for web apps. On the desktop it is harder, and on Linux it is harder in a way that has nothing to do with the apps themselves and everything to do with how many moving parts sit underneath them.
 
-What I came out the other side with is the Linux backend for cua-driver, a driver that lets any agent (Claude Code, Codex, your own loop) drive a real Linux desktop app while you keep working in the foreground. The cursor does not move. Focus does not need to change for most operations. The agent gets its own painted cursor, and the tools are available through both MCP and the CLI. It ships today on the same install path as macOS and Windows.
+What I came out the other side with is the Linux backend for cmux-cua, a driver that lets any agent (Claude Code, Codex, your own loop) drive a real Linux desktop app while you keep working in the foreground. The cursor does not move. Focus does not need to change for most operations. The agent gets its own painted cursor, and the tools are available through both MCP and the CLI. It ships today on the same install path as macOS and Windows.
 
 ## Linux is hard in a different way
 
@@ -36,13 +36,13 @@ That is where AT-SPI 2 comes in. It is the Linux accessibility layer over D-Bus,
 
 Chromium-based apps have one especially sharp edge, and it cost me an afternoon before I understood it. Chrome, VS Code, Slack, Discord, Obsidian, and most Electron or CEF apps do not keep their full AT-SPI tree built by default. Chromium waits until it detects an assistive technology and only then starts building the tree. That is reasonable for performance and genuinely confusing when you are writing a driver, because the app is open and the window is right there, but the tree is simply missing until the session announces that an assistive technology is present.
 
-On Linux that signal lives under the session accessibility status. When `cua-driver serve` starts, the daemon flips the session's `org.a11y.Status` accessibility flags on, which is exactly the signal a screen reader sets. The useful part is that Chromium responds retroactively: already-open Chromium and Electron apps build their AT-SPI trees without a relaunch and without any per-app flag, and GTK and Qt apps read the same signal to warm up their accessibility paths too. That one detail is most of why the backend stopped feeling brittle. Instead of telling people to relaunch Chrome with special flags or configure every Electron app on its own, the driver sets the session-level signal and lets the toolkits do what they already know how to do. You still need AT-SPI reachable on the session bus, and on GNOME you may also need:
+On Linux that signal lives under the session accessibility status. When `cmux-cua serve` starts, the daemon flips the session's `org.a11y.Status` accessibility flags on, which is exactly the signal a screen reader sets. The useful part is that Chromium responds retroactively: already-open Chromium and Electron apps build their AT-SPI trees without a relaunch and without any per-app flag, and GTK and Qt apps read the same signal to warm up their accessibility paths too. That one detail is most of why the backend stopped feeling brittle. Instead of telling people to relaunch Chrome with special flags or configure every Electron app on its own, the driver sets the session-level signal and lets the toolkits do what they already know how to do. You still need AT-SPI reachable on the session bus, and on GNOME you may also need:
 
 ```bash
 gsettings set org.gnome.desktop.interface toolkit-accessibility true
 ```
 
-`cua-driver doctor` checks this path and reports what it sees.
+`cmux-cua doctor` checks this path and reports what it sees.
 
 ## Writing without stealing focus
 
@@ -56,13 +56,13 @@ The Linux backend uses the same cursor model as macOS and Windows: the agent cur
 
 ## The daemon problem is smaller on Linux
 
-Windows needed a daemon proxy because of Session 0 isolation: a service cannot reach into the interactive desktop, and that constraint shaped a lot of the Windows driver. Linux does not have that problem in the same way. If you SSH into a machine and the session has a display server, `sshd` can inherit `DISPLAY` cleanly, and as long as the session bus and display are reachable, `cua-driver serve` connects to the desktop straight from the SSH session, with no Session 0 dance. That makes remote development simpler than it was on Windows: SSH into a Linux desktop or a runner with a desktop session, start the driver, and point your MCP client at it. For persistent sessions, use a `systemd --user` unit. For headless or CI-style machines, enable lingering so the service survives logout:
+Windows needed a daemon proxy because of Session 0 isolation: a service cannot reach into the interactive desktop, and that constraint shaped a lot of the Windows driver. Linux does not have that problem in the same way. If you SSH into a machine and the session has a display server, `sshd` can inherit `DISPLAY` cleanly, and as long as the session bus and display are reachable, `cmux-cua serve` connects to the desktop straight from the SSH session, with no Session 0 dance. That makes remote development simpler than it was on Windows: SSH into a Linux desktop or a runner with a desktop session, start the driver, and point your MCP client at it. For persistent sessions, use a `systemd --user` unit. For headless or CI-style machines, enable lingering so the service survives logout:
 
 ```bash
 loginctl enable-linger "$USER"
 ```
 
-Then run `cua-driver serve` under the user session. The `cua-driver autostart` verb family is currently Windows-only; on Linux, systemd is the supported path.
+Then run `cmux-cua serve` under the user session. The `cmux-cua autostart` verb family is currently Windows-only; on Linux, systemd is the supported path.
 
 ## What I've been using it for
 
@@ -78,27 +78,27 @@ An agent cursor drags the word "Cua" around on an XFCE desktop while I keep work
 
 <div align="center"><video src="https://github.com/user-attachments/assets/6562aa37-8077-453d-8ebf-549bd75b5021" width="600" controls></video></div>
 
-A coding agent builds a calculator desktop app, launches it, then uses Cua Driver to QA the app through its own Linux UI. This is the same loop that made the Windows WPF demo worth watching, where the agent does not stop at code generation but runs the thing and checks the thing. For desktop apps a diff is not evidence; the agent has to launch the app and show what happened.
+A coding agent builds a calculator desktop app, launches it, then uses cmux CUA to QA the app through its own Linux UI. This is the same loop that made the Windows WPF demo worth watching, where the agent does not stop at code generation but runs the thing and checks the thing. For desktop apps a diff is not evidence; the agent has to launch the app and show what happened.
 
 These are not meant to imply every Linux app is solved. They show the supported shape: real desktop apps, element-aware where possible, pointer-aware where needed, driven through the same contract as macOS and Windows.
 
 ## What's still broken
 
-Native Wayland is still in preview. The supported path today is X11 or XWayland, and on a Wayland desktop the driver talks to XWayland and treats the session as X11. That works for apps running through XWayland, but native-Wayland-only apps that bypass it, including some modern Firefox and GTK4 builds, may not be visible to the backend at all. There is a native Wayland path behind `CUA_DRIVER_RS_ENABLE_WAYLAND=1`, off by default, with screen capture and full AT-SPI parity still landing. This is the part where outside help goes furthest: if you run a Wayland-only setup, flip the flag, file what breaks, and send a PR. The issues and the backend are open, and contributions are more than welcome.
+Native Wayland is still in preview. The supported path today is X11 or XWayland, and on a Wayland desktop the driver talks to XWayland and treats the session as X11. That works for apps running through XWayland, but native-Wayland-only apps that bypass it, including some modern Firefox and GTK4 builds, may not be visible to the backend at all. There is a native Wayland path behind `CMUX_CUA_ENABLE_WAYLAND=1`, off by default, with screen capture and full AT-SPI parity still landing. This is the part where outside help goes furthest: if you run a Wayland-only setup, flip the flag, file what breaks, and send a PR. The issues and the backend are open, and contributions are more than welcome.
 
 AT-SPI also has to be enabled and reachable on the session bus. If the accessibility bus is missing or the toolkit accessibility setting is off, the driver still sees some X11-level information, but it loses the element tree that makes the backend useful in the first place.
 
-Headless is still early. The broader private-display story has not shipped. A pure-headless `Xvfb` recipe like `xvfb-run -a cua-driver serve` can be handy for CI experiments, but it is not the same thing as a fully supported background desktop product, and the community fork that explored private Xvfb and Hyprland background capture was closed rather than merged. The glibc floor has been lowered and the binary is built in a Debian 11 container, but I still expect distro, toolkit, and compositor gaps to surface. `cua-driver doctor` exists so you can report those as facts instead of guesses.
+Headless is still early. The broader private-display story has not shipped. A pure-headless `Xvfb` recipe like `xvfb-run -a cmux-cua serve` can be handy for CI experiments, but it is not the same thing as a fully supported background desktop product, and the community fork that explored private Xvfb and Hyprland background capture was closed rather than merged. The glibc floor has been lowered and the binary is built in a Debian 11 container, but I still expect distro, toolkit, and compositor gaps to surface. `cmux-cua doctor` exists so you can report those as facts instead of guesses.
 
 ## Install
 
 The same installer used by macOS now detects Linux and routes to the Rust backend:
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cmux-cua/scripts/install.sh)"
 ```
 
-On Linux, the script downloads the `x86_64 linux-gnu` binary and symlinks it into `~/.local/bin/cua-driver`. Make sure `~/.local/bin` is on your `PATH`.
+On Linux, the script downloads the `x86_64 linux-gnu` binary and symlinks it into `~/.local/bin/cmux-cua`. Make sure `~/.local/bin` is on your `PATH`.
 
 Prerequisites:
 
@@ -119,9 +119,9 @@ gsettings set org.gnome.desktop.interface toolkit-accessibility true
 Then check the session:
 
 ```bash
-cua-driver doctor
-cua-driver status
-cua-driver list_apps
+cmux-cua doctor
+cmux-cua status
+cmux-cua list_apps
 ```
 
 The release binary targets glibc 2.31 and newer. It is built in a `debian:11` container and should run on Debian 11+, Ubuntu 20.04+, and RHEL/Rocky/Alma 8+. It has been verified live on Debian 12 with glibc 2.36 and Rocky 9 with glibc 2.34, and tested across Debian 12, Ubuntu 22.04, Ubuntu 24.04, Rocky 9, and Fedora 41.
@@ -129,7 +129,7 @@ The release binary targets glibc 2.31 and newer. It is built in a `debian:11` co
 Start the driver:
 
 ```bash
-cua-driver serve
+cmux-cua serve
 ```
 
 For a persistent Linux user service, use systemd directly:
@@ -137,12 +137,12 @@ For a persistent Linux user service, use systemd directly:
 ```bash
 mkdir -p ~/.config/systemd/user
 
-cat > ~/.config/systemd/user/cua-driver.service <<'EOF'
+cat > ~/.config/systemd/user/cmux-cua.service <<'EOF'
 [Unit]
-Description=Cua Driver
+Description=cmux CUA
 
 [Service]
-ExecStart=%h/.local/bin/cua-driver serve
+ExecStart=%h/.local/bin/cmux-cua serve
 Restart=on-failure
 
 [Install]
@@ -150,7 +150,7 @@ WantedBy=default.target
 EOF
 
 systemctl --user daemon-reload
-systemctl --user enable --now cua-driver
+systemctl --user enable --now cmux-cua
 ```
 
 For headless or CI-style users that need the service to keep running after logout:
@@ -162,24 +162,24 @@ loginctl enable-linger "$USER"
 Wire it into Claude Code:
 
 ```bash
-claude mcp add --transport stdio cua-driver -- cua-driver mcp
+claude mcp add --transport stdio cmux-cua -- cmux-cua mcp
 ```
 
 For other MCP clients:
 
 ```bash
-cua-driver mcp-config
+cmux-cua mcp-config
 ```
 
 Every MCP tool is also exposed as a top-level CLI subcommand, so the same operations can be scripted directly:
 
 ```bash
-cua-driver list_apps
-cua-driver doctor
-cua-driver status
+cmux-cua list_apps
+cmux-cua doctor
+cmux-cua status
 ```
 
-Repo: https://github.com/trycua/cua  
-Docs: https://cua.ai/docs/cua-driver
+Repo: https://github.com/manaflow-ai/cmux-cua
+Docs: https://cua.ai/docs/cmux-cua
 
-If you try it against a Linux app that exposes a strange tree, rejects input, or behaves differently across toolkits, please open an issue with the output from `cua-driver doctor`, the distro, the desktop session, and the app name. Those reports are the fastest way to turn early coverage into boring, reliable platform support. ***The toolkit corners I haven't hit yet are the ones I most want to hear about.***
+If you try it against a Linux app that exposes a strange tree, rejects input, or behaves differently across toolkits, please open an issue with the output from `cmux-cua doctor`, the distro, the desktop session, and the app name. Those reports are the fastest way to turn early coverage into boring, reliable platform support. ***The toolkit corners I haven't hit yet are the ones I most want to hear about.***

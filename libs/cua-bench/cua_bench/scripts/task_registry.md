@@ -12,7 +12,7 @@ Each element corresponds to a dataset (e.g., `cua-bench-basic`) and contains an 
 ## Dataset object
 
 - **id**: string — Dataset identifier, e.g. `cua-bench-basic`.
-- **github_url**: string — Link to the dataset folder in the registry, e.g. `https://github.com/trycua/cua-bench-registry/tree/main/datasets/cua-bench-basic/`.
+- **github_url**: string — Link to the dataset folder in the registry, e.g. `https://github.com/manaflow-ai/cmux-cua-bench-registry/tree/main/datasets/cua-bench-basic/`.
 - **description**: string — Human-readable description of the dataset.
 - **num_environments**: number — Count of discovered environments in the dataset.
 - **num_tasks**: number — Sum of task counts across all environments (first-pass estimate from `@cb.tasks_config`).
@@ -23,7 +23,7 @@ Example:
 ```json
 {
   "id": "cua-bench-basic",
-  "github_url": "https://github.com/trycua/cua-bench-registry/tree/main/datasets/cua-bench-basic/",
+  "github_url": "https://github.com/manaflow-ai/cmux-cua-bench-registry/tree/main/datasets/cua-bench-basic/",
   "description": "A collection of basic, miniwob-style desktop environments for CUA agents.",
   "num_environments": 15,
   "num_tasks": 1532,
@@ -36,7 +36,7 @@ Example:
 ## Environment object
 
 - **id**: string — Environment identifier (directory name), e.g. `click-button`.
-- **github_url**: string — Link to the environment folder in the registry, e.g. `https://github.com/trycua/cua-bench-registry/tree/main/datasets/cua-bench-basic/click-button`.
+- **github_url**: string — Link to the environment folder in the registry, e.g. `https://github.com/manaflow-ai/cmux-cua-bench-registry/tree/main/datasets/cua-bench-basic/click-button`.
 - **description**: string|null — Description from `[tool.cua-bench].description` or `[project].description` in `pyproject.toml`.
 - **num_tasks**: number — Number of tasks reported by the environment's `@cb.tasks_config`.
 - **license**: string|null — From `[project].license`.
@@ -52,7 +52,7 @@ Example:
 ```json
 {
   "id": "click-button",
-  "github_url": "https://github.com/trycua/cua-bench-registry/tree/main/datasets/cua-bench-basic/click-button",
+  "github_url": "https://github.com/manaflow-ai/cmux-cua-bench-registry/tree/main/datasets/cua-bench-basic/click-button",
   "description": "Click a simple button.",
   "num_tasks": 42,
   "license": "MIT",

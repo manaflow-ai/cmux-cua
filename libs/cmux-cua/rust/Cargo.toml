@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cmux-cua",
+    "crates/cmux-cua-testkit",
+    "crates/cmux-cua-uia",
+    "crates/cmux-cua-core",
+    "crates/platform-macos",
+    "crates/platform-windows",
+    "crates/platform-linux",
+    "crates/cursor-overlay",
+    "crates/pip-preview",
+]
+
+[workspace.package]
+version = "0.7.1"
+edition = "2021"
+authors = ["cmux contributors"]
+license = "MIT"
+repository = "https://github.com/manaflow-ai/cmux-cua"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+hmac = "0.12"
+sha2 = "0.10"

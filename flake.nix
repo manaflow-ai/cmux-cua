@@ -23,14 +23,14 @@
         let
           pkgs = import nixpkgs { inherit system; };
 
-          rustSrc = ./libs/cua-driver/rust;
+          rustSrc = ./libs/cmux-cua/rust;
 
-          cuaDriverPackage = import ./nix/cua-driver/package.nix {
+          cuaDriverPackage = import ./nix/cmux-cua/package.nix {
             inherit pkgs;
             src = rustSrc;
           };
 
-          cuaCompositorPackage = pkgs.callPackage ./nix/cua-driver/compositor { };
+          cuaCompositorPackage = pkgs.callPackage ./nix/cmux-cua/compositor { };
 
           # nixpkgs builds the AT-SPI launcher for NixOS's system profile.
           # The E2E shell also runs on non-NixOS hosts such as GitHub's Ubuntu
@@ -117,26 +117,26 @@
         {
           packages = {
             cua-compositor = cuaCompositorPackage;
-            cua-driver = cuaDriverPackage;
+            cmux-cua = cuaDriverPackage;
             default = cuaDriverPackage;
           };
 
           checks = {
             cua-compositor-build = cuaCompositorPackage;
-            cua-driver-build = cuaDriverPackage;
-            cua-driver-linux-rust-unit = import ./nix/cua-driver/tests/rust-unit.nix {
+            cmux-cua-build = cuaDriverPackage;
+            cmux-cua-linux-rust-unit = import ./nix/cmux-cua/tests/rust-unit.nix {
               inherit pkgs;
               src = rustSrc;
             };
           };
 
-          devShells.cua-driver-wayland-e2e = waylandE2eShell [ ];
-          devShells.cua-driver-inject-e2e = waylandE2eShell [ cuaCompositorPackage ];
+          devShells.cmux-cua-wayland-e2e = waylandE2eShell [ ];
+          devShells.cmux-cua-inject-e2e = waylandE2eShell [ cuaCompositorPackage ];
         }
       )
     // {
-      # NixOS module — consumers must set services.cua-driver.package
+      # NixOS module — consumers must set services.cmux-cua.package
       # (or use the per-system package from self.packages)
-      nixosModules.cua-driver = ./nix/cua-driver/module.nix;
+      nixosModules.cmux-cua = ./nix/cmux-cua/module.nix;
     };
 }

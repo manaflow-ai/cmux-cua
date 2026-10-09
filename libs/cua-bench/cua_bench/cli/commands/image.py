@@ -1136,7 +1136,7 @@ def _shell_qemu(args, info, name, writable: bool) -> int:
     else:
         # Use overlay to protect golden image
         # NOTE: This is a temporary workaround that copies the entire image.
-        # Proper COW overlay support is WIP: https://github.com/trycua/cua/issues/699
+        # Proper COW overlay support is WIP: https://github.com/manaflow-ai/cmux-cua/issues/699
         overlay_path = get_data_dir() / "overlays" / f"shell-{name}"
 
         print("\n🔒 Protected mode: Copying golden image to overlay...")

@@ -78,7 +78,7 @@ class LumeRuntime(Runtime):
         if not _has_lume():
             raise RuntimeError(
                 "Lume CLI is not installed. "
-                "Install from https://github.com/trycua/cua/tree/main/libs/lume"
+                "Install from https://github.com/manaflow-ai/cmux-cua/tree/main/libs/lume"
             )
 
         lume_url = f"http://{self.lume_host}:{self.lume_port}"

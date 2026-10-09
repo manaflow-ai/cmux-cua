@@ -29,8 +29,8 @@ on:
           - npm/playground
           - npm/cuabot
           - lume
-          - cua-driver
-          - cua-driver-rs
+          - cmux-cua
+          - cmux-cua
           - docker/cuabot
           - docker/kasm
           - docker/xfce
@@ -147,13 +147,13 @@ jobs:
               echo "directory=libs/lume" >> $GITHUB_OUTPUT
               echo "type=lume" >> $GITHUB_OUTPUT
               ;;
-            "cua-driver")
-              echo "directory=libs/cua-driver" >> $GITHUB_OUTPUT
-              echo "type=cua-driver" >> $GITHUB_OUTPUT
+            "cmux-cua")
+              echo "directory=libs/cmux-cua" >> $GITHUB_OUTPUT
+              echo "type=cmux-cua" >> $GITHUB_OUTPUT
               ;;
-            "cua-driver-rs")
-              echo "directory=libs/cua-driver/rust" >> $GITHUB_OUTPUT
-              echo "type=cua-driver-rs" >> $GITHUB_OUTPUT
+            "cmux-cua")
+              echo "directory=libs/cmux-cua/rust" >> $GITHUB_OUTPUT
+              echo "type=cmux-cua" >> $GITHUB_OUTPUT
               ;;
             "docker/cuabot")
               echo "directory=libs/cuabot" >> $GITHUB_OUTPUT
@@ -210,10 +210,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Reconcile cua-driver-rs bump base with Cargo.toml (drift guard)
-        if: ${{ inputs.service == 'cua-driver-rs' }}
+      - name: Reconcile cmux-cua bump base with Cargo.toml (drift guard)
+        if: ${{ inputs.service == 'cmux-cua' }}
         run: |
-          # Cargo.toml is the single source of truth for the cua-driver-rs
+          # Cargo.toml is the single source of truth for the cmux-cua
           # version. bump2version keeps a duplicate current_version in
           # .bumpversion.cfg, and that copy has silently drifted before and cut
           # a release at the wrong version (binary reported a stale version,
@@ -225,7 +225,7 @@ jobs:
           CARGO_VERSION=$(grep -m1 '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
           CFG_VERSION=$(grep -m1 '^current_version[[:space:]]*=' .bumpversion.cfg | sed -E 's/.*=[[:space:]]*//')
           if [ -z "$CARGO_VERSION" ]; then
-            echo "::error::could not read version from libs/cua-driver/rust/Cargo.toml"
+            echo "::error::could not read version from libs/cmux-cua/rust/Cargo.toml"
             exit 1
           fi
           if [ "$CARGO_VERSION" != "$CFG_VERSION" ]; then
@@ -233,7 +233,7 @@ jobs:
             sed -i.bak -E "s/^current_version[[:space:]]*=.*/current_version = ${CARGO_VERSION}/" .bumpversion.cfg
             rm -f .bumpversion.cfg.bak
           fi
-          echo "cua-driver-rs bump base: $(grep -m1 '^current_version' .bumpversion.cfg)"
+          echo "cmux-cua bump base: $(grep -m1 '^current_version' .bumpversion.cfg)"
 
       - name: Clean existing tags if present
         run: |
@@ -266,7 +266,7 @@ jobs:
           fi
           bump2version $CONFIG_FLAG ${{ inputs.bump_type }}
 
-      - name: Sync Cargo.lock into the cua-driver-rs bump commit
+      - name: Sync Cargo.lock into the cmux-cua bump commit
         # bump2version edits only `[workspace.package] version` in Cargo.toml,
         # leaving Cargo.lock's workspace-member versions stale. The next plain
         # `cargo build` anyone runs then re-locks them and diverges from the
@@ -275,7 +275,7 @@ jobs:
         # lockfile never ships out of sync with the manifest. (cargo is
         # preinstalled on ubuntu runners; `--workspace` touches members only, not
         # registry deps, so this never silently bumps dependencies.)
-        if: ${{ inputs.service == 'cua-driver-rs' }}
+        if: ${{ inputs.service == 'cmux-cua' }}
         run: |
           cd ${{ steps.package.outputs.directory }}
           cargo update --workspace
@@ -474,20 +474,20 @@ jobs:
           echo "lume version: $VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Capture bumped cua-driver version
-        if: ${{ inputs.service == 'cua-driver' }}
-        id: cua_driver_version
+      - name: Capture bumped cmux-cua version
+        if: ${{ inputs.service == 'cmux-cua' }}
+        id: cmux_cua_version
         run: |
-          VERSION=$(grep -oP 'public static let version = "\K[^"]+' libs/cua-driver/Sources/CuaDriverCore/CuaDriverCore.swift)
-          echo "cua-driver version: $VERSION"
+          VERSION=$(grep -oP 'public static let version = "\K[^"]+' libs/cmux-cua/Sources/CmuxCuaCore/CmuxCuaCore.swift)
+          echo "cmux-cua version: $VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Capture bumped cua-driver-rs version
-        if: ${{ inputs.service == 'cua-driver-rs' }}
-        id: cua_driver_rs_version
+      - name: Capture bumped cmux-cua version
+        if: ${{ inputs.service == 'cmux-cua' }}
+        id: cmux_cua_rs_version
         run: |
-          VERSION=$(grep -m1 -oP '^version = "\K[^"]+' libs/cua-driver/rust/Cargo.toml)
-          echo "cua-driver-rs version: $VERSION"
+          VERSION=$(grep -m1 -oP '^version = "\K[^"]+' libs/cmux-cua/rust/Cargo.toml)
+          echo "cmux-cua version: $VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Capture bumped cuabot version

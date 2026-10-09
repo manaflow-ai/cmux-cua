@@ -62,7 +62,7 @@ jobs:
               ['libs/qemu-docker/linux/', 'docker/qemu-linux'],
               ['libs/qemu-docker/windows/', 'docker/qemu-windows'],
               ['libs/lume/', 'lume'],
-              ['libs/cua-driver/rust/', 'cua-driver-rs']
+              ['libs/cmux-cua/rust/', 'cmux-cua']
             ]);
 
             const changedFiles = await github.paginate(github.rest.pulls.listFiles, {
