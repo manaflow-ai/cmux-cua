@@ -124,10 +124,6 @@ fn lease_watermarks() -> &'static Mutex<HashMap<String, LeaseWatermark>> {
     LEASE_WATERMARKS.get_or_init(|| Mutex::new(load_lease_watermarks()))
 }
 
-fn lease_watermark_key(profile: &str, lease_id: &str) -> String {
-    format!("{profile}\0{lease_id}")
-}
-
 fn lease_watermark_path() -> Option<PathBuf> {
     std::env::var_os(crate::session_state::STATE_DIR_ENV)
         .map(PathBuf::from)
@@ -138,10 +134,38 @@ fn load_lease_watermarks() -> HashMap<String, LeaseWatermark> {
     let Some(path) = lease_watermark_path() else {
         return HashMap::new();
     };
-    std::fs::read(path)
+    let stored: HashMap<String, LeaseWatermark> = std::fs::read(path)
         .ok()
         .and_then(|body| serde_json::from_slice(&body).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    normalize_lease_watermarks(stored)
+}
+
+fn normalize_lease_watermarks(
+    stored: HashMap<String, LeaseWatermark>,
+) -> HashMap<String, LeaseWatermark> {
+    let mut normalized: HashMap<String, LeaseWatermark> = HashMap::new();
+    for (key, watermark) in stored {
+        // Older lease files keyed records by profile and lease id. The lease
+        // identity is global, matching LEASES; retaining the profile in the
+        // lookup key would let another profile take ownership after restart.
+        let prefix = format!("{}\0", watermark.profile);
+        let lease_id = key.strip_prefix(&prefix).unwrap_or(&key).to_owned();
+        if let Some(previous) = normalized.get_mut(&lease_id) {
+            let conflicting_profile = previous.profile != watermark.profile;
+            if watermark.generation > previous.generation {
+                *previous = watermark;
+            }
+            // A file written before profile fencing may contain conflicting
+            // owners. Require a newer generation instead of resuming either.
+            if conflicting_profile {
+                previous.active = false;
+            }
+        } else {
+            normalized.insert(lease_id, watermark);
+        }
+    }
+    normalized
 }
 
 fn persist_lease_watermarks(watermarks: &HashMap<String, LeaseWatermark>) {
@@ -202,7 +226,6 @@ pub fn acquire_lease(
     let now = Instant::now();
     let mut map = leases().lock().unwrap();
     let mut watermarks = lease_watermarks().lock().unwrap();
-    let watermark_key = lease_watermark_key(profile, lease_id);
     let record = LeaseRecord {
         lease_id: lease_id.to_owned(),
         profile: profile.to_owned(),
@@ -210,7 +233,7 @@ pub fn acquire_lease(
         generation,
     };
     let Some(entry) = map.get_mut(lease_id) else {
-        if let Some(previous) = watermarks.get(&watermark_key) {
+        if let Some(previous) = watermarks.get(lease_id) {
             if previous.profile != profile {
                 return Err(format!(
                     "lease `{lease_id}` belongs to profile `{}`, not `{profile}`",
@@ -252,7 +275,7 @@ pub fn acquire_lease(
             },
         );
         watermarks.insert(
-            watermark_key,
+            lease_id.to_owned(),
             LeaseWatermark {
                 profile: profile.to_owned(),
                 session_id: session_id.to_owned(),
@@ -293,7 +316,7 @@ pub fn acquire_lease(
     entry.last_renewed = now;
     entry.disconnected_at = None;
     watermarks.insert(
-        watermark_key,
+        lease_id.to_owned(),
         LeaseWatermark {
             profile: profile.to_owned(),
             session_id: session_id.to_owned(),
@@ -385,8 +408,7 @@ fn expire_leases_at(now: Instant, grace: Duration, ttl: Duration) -> Vec<Expired
     if !expired.is_empty() {
         let mut watermarks = lease_watermarks().lock().unwrap();
         for lease in &expired {
-            let key = lease_watermark_key(&lease.profile, &lease.lease_id);
-            if let Some(watermark) = watermarks.get_mut(&key) {
+            if let Some(watermark) = watermarks.get_mut(&lease.lease_id) {
                 watermark.active = false;
             }
         }
@@ -417,9 +439,9 @@ pub fn is_lease_session_fenced(session_id: &str, profile: &str) -> bool {
     let lease_id = crate::session_state::durable_lease_id(session_id);
     let generation = crate::session_state::lease_generation(session_id);
     let watermarks = lease_watermarks().lock().unwrap();
-    let key = lease_watermark_key(profile, &lease_id);
-    watermarks.get(&key).is_some_and(|watermark| {
-        generation < watermark.generation
+    watermarks.get(&lease_id).is_some_and(|watermark| {
+        watermark.profile != profile
+            || generation < watermark.generation
             || (generation == watermark.generation
                 && (!watermark.active || watermark.session_id != session_id))
     })
@@ -920,7 +942,10 @@ mod tests {
         let first = "test-lease-retire-session-a";
         let second = "test-lease-retire-session-b";
         assert!(acquire_lease(lease, "native", first, 10).is_ok());
-        assert!(acquire_lease(lease, "native", second, 11).is_ok());
+        match acquire_lease(lease, "native", second, 11).unwrap() {
+            LeaseAcquire::Replaced { previous_session_id } => retire_session(&previous_session_id),
+            result => panic!("expected replacement, got {result:?}"),
+        }
         assert!(
             is_session_ended(first),
             "a fenced generation must be tombstoned before its successor runs"
