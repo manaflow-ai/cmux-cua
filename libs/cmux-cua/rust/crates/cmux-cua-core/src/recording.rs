@@ -236,6 +236,19 @@ impl RecordingSession {
         }
     }
 
+    /// Transfer a live recording to a replacement proxy generation without
+    /// stopping the singleton recorder. A retired generation's end hook may
+    /// still run asynchronously, so the owner swap happens under the same
+    /// mutex as `stop_owner` and makes that stale teardown a no-op.
+    pub fn transfer_owner(&self, previous: &str, replacement: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.owner.as_deref() != Some(previous) {
+            return false;
+        }
+        inner.owner = Some(replacement.to_owned());
+        true
+    }
+
     /// Enable recording at `output_dir`, optionally with video capture.
     /// Counterpart to `stop()`. Returns the resulting state.
     ///
@@ -1020,6 +1033,30 @@ mod tests {
         assert_eq!(manifest["video"]["present"], false);
         assert_eq!(manifest["video"]["error"], "recorder did not finalize");
         let _ = std::fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
+    fn transfer_owner_keeps_recording_alive_across_proxy_replacement() {
+        let session = RecordingSession::new();
+        let old = "recording-owner-old-generation";
+        let new = "recording-owner-new-generation";
+        {
+            let mut inner = session.inner.lock().expect("recording lock");
+            inner.enabled = true;
+            inner.owner = Some(old.to_owned());
+        }
+
+        assert!(session.transfer_owner(old, new));
+        assert!(session.current_state().enabled);
+        assert_eq!(session.current_state().owner.as_deref(), Some(new));
+        session
+            .stop_owner(Some(old))
+            .expect("retired generation cleanup is a no-op");
+        assert!(session.current_state().enabled);
+        session
+            .stop_owner(Some(new))
+            .expect("replacement generation owns the live recording");
+        assert!(!session.current_state().enabled);
     }
 
     #[test]

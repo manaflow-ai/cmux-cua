@@ -2710,6 +2710,10 @@ pub async fn run_serve(
                                             Ok(cmux_cua_core::session::LeaseAcquire::Replaced {
                                                 previous_session_id,
                                             }) => {
+                                                reg.recording.transfer_owner(
+                                                    &previous_session_id,
+                                                    sid,
+                                                );
                                                 cmux_cua_core::session::retire_session(
                                                     &previous_session_id,
                                                 );
@@ -3475,6 +3479,10 @@ pub async fn run_serve(
                                             Ok(cmux_cua_core::session::LeaseAcquire::Replaced {
                                                 previous_session_id,
                                             }) => {
+                                                reg.recording.transfer_owner(
+                                                    &previous_session_id,
+                                                    sid,
+                                                );
                                                 cmux_cua_core::session::retire_session(
                                                     &previous_session_id,
                                                 );
