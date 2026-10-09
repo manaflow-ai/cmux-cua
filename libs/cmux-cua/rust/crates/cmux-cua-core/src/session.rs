@@ -105,6 +105,7 @@ struct LeaseWatermark {
 }
 
 static LEASE_WATERMARKS: OnceLock<Mutex<HashMap<String, LeaseWatermark>>> = OnceLock::new();
+static LEASE_WATERMARK_LOAD_ERROR: OnceLock<Option<String>> = OnceLock::new();
 static LEASE_TRANSITION: OnceLock<Mutex<()>> = OnceLock::new();
 static LEASE_PERSIST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -121,7 +122,18 @@ fn lease_transition() -> &'static Mutex<()> {
 }
 
 fn lease_watermarks() -> &'static Mutex<HashMap<String, LeaseWatermark>> {
-    LEASE_WATERMARKS.get_or_init(|| Mutex::new(load_lease_watermarks()))
+    LEASE_WATERMARKS.get_or_init(|| {
+        let (watermarks, error) = load_lease_watermarks();
+        let _ = LEASE_WATERMARK_LOAD_ERROR.set(error);
+        Mutex::new(watermarks)
+    })
+}
+
+fn lease_watermark_load_error() -> Option<String> {
+    let _ = lease_watermarks();
+    LEASE_WATERMARK_LOAD_ERROR
+        .get()
+        .and_then(|error| error.clone())
 }
 
 fn lease_watermark_path() -> Option<PathBuf> {
@@ -130,15 +142,36 @@ fn lease_watermark_path() -> Option<PathBuf> {
         .map(|dir| dir.join("leases-v1.json"))
 }
 
-fn load_lease_watermarks() -> HashMap<String, LeaseWatermark> {
+fn load_lease_watermarks() -> (HashMap<String, LeaseWatermark>, Option<String>) {
     let Some(path) = lease_watermark_path() else {
-        return HashMap::new();
+        return (HashMap::new(), None);
     };
-    let stored: HashMap<String, LeaseWatermark> = std::fs::read(path)
-        .ok()
-        .and_then(|body| serde_json::from_slice(&body).ok())
-        .unwrap_or_default();
-    normalize_lease_watermarks(stored)
+    load_lease_watermarks_at(&path)
+}
+
+fn load_lease_watermarks_at(path: &Path) -> (HashMap<String, LeaseWatermark>, Option<String>) {
+    let body = match std::fs::read(&path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (HashMap::new(), None);
+        }
+        Err(error) => {
+            return (
+                HashMap::new(),
+                Some(format!("cannot read {}: {error}", path.display())),
+            );
+        }
+    };
+    let stored: HashMap<String, LeaseWatermark> = match serde_json::from_slice(&body) {
+        Ok(stored) => stored,
+        Err(error) => {
+            return (
+                HashMap::new(),
+                Some(format!("cannot decode {}: {error}", path.display())),
+            );
+        }
+    };
+    (normalize_lease_watermarks(stored), None)
 }
 
 fn normalize_lease_watermarks(
@@ -228,6 +261,11 @@ pub fn acquire_lease(
     validate_lease_part(session_id, "session")?;
     if generation == 0 {
         return Err("lease generation must be positive".to_owned());
+    }
+    if let Some(error) = lease_watermark_load_error() {
+        return Err(format!(
+            "lease watermark state is unavailable; refusing lease admission: {error}"
+        ));
     }
 
     let _transition = lease_transition().lock().unwrap();
@@ -391,6 +429,9 @@ pub fn expire_leases(grace: Duration, ttl: Duration) -> Vec<ExpiredLease> {
 }
 
 fn expire_leases_at(now: Instant, grace: Duration, ttl: Duration) -> Vec<ExpiredLease> {
+    if lease_watermark_load_error().is_some() {
+        return Vec::new();
+    }
     let _transition = lease_transition().lock().unwrap();
     let mut map = leases().lock().unwrap();
     let expired_ids: Vec<String> = map
@@ -461,6 +502,9 @@ pub fn with_expired_lease_cleanup(
 /// restart cannot let an older proxy issue calls before its session_begin is
 /// rejected.
 pub fn is_lease_session_fenced(session_id: &str, profile: &str) -> bool {
+    if lease_watermark_load_error().is_some() {
+        return true;
+    }
     let _transition = lease_transition().lock().unwrap();
     let lease_id = crate::session_state::durable_lease_id(session_id);
     let generation = crate::session_state::lease_generation(session_id);
@@ -1012,6 +1056,21 @@ mod tests {
         let error = persist_lease_watermarks_at(&watermark_path, &HashMap::new())
             .expect_err("watermark persistence must report an unwritable state directory");
         assert!(error.contains("cannot create lease watermark directory"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn corrupt_lease_watermark_file_fails_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "cua-lease-watermark-corrupt-{}-{}",
+            std::process::id(),
+            LEASE_PERSIST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, b"not-json")
+            .expect("create a corrupt watermark fixture");
+        let (watermarks, error) = load_lease_watermarks_at(&path);
+        assert!(watermarks.is_empty());
+        assert!(error.is_some_and(|error| error.contains("cannot decode")));
         let _ = std::fs::remove_file(path);
     }
 }
