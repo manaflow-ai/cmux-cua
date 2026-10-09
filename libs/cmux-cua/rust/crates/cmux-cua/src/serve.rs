@@ -692,9 +692,18 @@ fn spawn_lease_sweep(
         loop {
             tick.tick().await;
             for expired in cmux_cua_core::session::expire_leases(grace, ttl) {
-                cmux_cua_core::session::release_session(&expired.session_id);
-                cmux_cua_core::session::fire_session_end(&expired.session_id);
-                registry.remove_session_state_file(&expired.lease_id);
+                let lease_id = expired.lease_id.clone();
+                let session_id = expired.session_id.clone();
+                cmux_cua_core::session::with_expired_lease_cleanup(
+                    &expired,
+                    |remove_stable_state| {
+                        cmux_cua_core::session::release_session(&session_id);
+                        cmux_cua_core::session::fire_session_end(&session_id);
+                        if remove_stable_state {
+                            registry.remove_session_state_file(&lease_id);
+                        }
+                    },
+                );
                 tracing::info!(
                     lease_id = %expired.lease_id,
                     profile = %expired.profile,
@@ -2566,15 +2575,28 @@ pub async fn run_serve(
                                 // and `end_session` stays idempotent. Live and
                                 // anonymous calls pass through unchanged.
                                 if let Some(sid) = &effective_session {
-                                    if !is_session_lifecycle_tool(&tool_name)
-                                        && cmux_cua_core::session::is_session_ended(sid)
+                                    let lease_fenced = cmux_cua_core::session::is_lease_session_fenced(
+                                        sid,
+                                        profile.as_str(),
+                                    );
+                                    let session_ended = cmux_cua_core::session::is_session_ended(sid);
+                                    if lease_fenced
+                                        || (!is_session_lifecycle_tool(&tool_name) && session_ended)
                                     {
-                                        let resp = DaemonResponse::err(
+                                        let message = if lease_fenced {
+                                            format!(
+                                                "session '{sid}' no longer owns the active lease generation; \
+                                                 reconnect the MCP proxy before issuing '{tool_name}'"
+                                            )
+                                        } else {
                                             format!(
                                                 "session '{sid}' has ended; tool call '{tool_name}' was \
                                                  rejected. Call start_session with this id to revive it \
                                                  before issuing further actions, or use a new session id."
-                                            ),
+                                            )
+                                        };
+                                        let resp = DaemonResponse::err(
+                                            message,
                                             1,
                                         );
                                         let _ = writer.write_all(
@@ -2678,12 +2700,6 @@ pub async fn run_serve(
                                 };
                                 let mut approval_broker_token = None;
                                 if let Some(sid) = req.session_id.as_deref() {
-                                    // A proxy reconnect after daemon re-exec uses the same
-                                    // session id. If the old control connection died while
-                                    // this daemon stayed alive, its EOF reaper tombstoned the
-                                    // session first; the new control declaration revives it
-                                    // before accepting more calls.
-                                    cmux_cua_core::session::revive_session(sid);
                                     if let Some(lease) = requested_lease.as_ref() {
                                         match cmux_cua_core::session::acquire_lease(
                                             &lease.lease_id,
@@ -2709,6 +2725,11 @@ pub async fn run_serve(
                                         }
                                         control_lease = Some(lease.clone());
                                     }
+                                    // A proxy reconnect after daemon re-exec uses the same
+                                    // session id. Only revive after lease admission succeeds;
+                                    // a stale generation must not clear its tombstone while
+                                    // its session_begin is being rejected.
+                                    cmux_cua_core::session::revive_session(sid);
                                     #[cfg(target_os = "macos")]
                                     if let Some(host_session) =
                                         cmux_cua_core::host_session_id_from_proxy(sid)
@@ -3368,15 +3389,28 @@ pub async fn run_serve(
                                 // but exempt the lifecycle tools so start_session
                                 // can revive and end_session stays idempotent.
                                 if let Some(sid) = &effective_session {
-                                    if !is_session_lifecycle_tool(&tool_name)
-                                        && cmux_cua_core::session::is_session_ended(sid)
+                                    let lease_fenced = cmux_cua_core::session::is_lease_session_fenced(
+                                        sid,
+                                        profile.as_str(),
+                                    );
+                                    let session_ended = cmux_cua_core::session::is_session_ended(sid);
+                                    if lease_fenced
+                                        || (!is_session_lifecycle_tool(&tool_name) && session_ended)
                                     {
-                                        let resp = DaemonResponse::err(
+                                        let message = if lease_fenced {
+                                            format!(
+                                                "session '{sid}' no longer owns the active lease generation; \
+                                                 reconnect the MCP proxy before issuing '{tool_name}'"
+                                            )
+                                        } else {
                                             format!(
                                                 "session '{sid}' has ended; tool call '{tool_name}' was \
                                                  rejected. Call start_session with this id to revive it \
                                                  before issuing further actions, or use a new session id."
-                                            ),
+                                            )
+                                        };
+                                        let resp = DaemonResponse::err(
+                                            message,
                                             1,
                                         );
                                         let _ = writer.write_all(
@@ -3431,7 +3465,6 @@ pub async fn run_serve(
                                     }
                                 };
                                 if let Some(sid) = req.session_id.as_deref() {
-                                    cmux_cua_core::session::revive_session(sid);
                                     if let Some(lease) = requested_lease.as_ref() {
                                         match cmux_cua_core::session::acquire_lease(
                                             &lease.lease_id,
@@ -3457,6 +3490,10 @@ pub async fn run_serve(
                                         }
                                         control_lease = Some(lease.clone());
                                     }
+                                    // Only revive after lease admission succeeds. A stale
+                                    // generation must not clear its tombstone while its
+                                    // session_begin is being rejected.
+                                    cmux_cua_core::session::revive_session(sid);
                                     #[cfg(target_os = "macos")]
                                     if let Some(host_session) =
                                         cmux_cua_core::host_session_id_from_proxy(sid)
