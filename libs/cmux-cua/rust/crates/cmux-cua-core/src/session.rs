@@ -883,6 +883,38 @@ mod tests {
     }
 
     #[test]
+    fn persisted_lease_rejects_profile_hijack_after_restart() {
+        let lease = "test-lease-profile-restart-M4N5O6";
+        let first = format!("{lease}-mcp-101-100");
+        let second = format!("{lease}-mcp-102-101");
+        assert!(acquire_lease(lease, "native", &first, 100).is_ok());
+        {
+            let _transition = lease_transition().lock().unwrap();
+            // A new daemon has only the persisted watermark for this lease.
+            leases().lock().unwrap().remove(lease);
+        }
+        let error = acquire_lease(lease, "codex-computer-use-compat", &second, 101)
+            .expect_err("a restart must preserve the lease's profile owner");
+        assert!(error.contains("belongs to profile"));
+        assert_eq!(
+            acquire_lease(lease, "native", &first, 100).unwrap(),
+            LeaseAcquire::Resumed
+        );
+    }
+
+    #[test]
+    fn lease_tool_fence_rejects_calls_through_another_profile() {
+        let lease = "test-lease-profile-tool-fence-P7Q8R9";
+        let session = format!("{lease}-mcp-103-200");
+        assert!(acquire_lease(lease, "native", &session, 200).is_ok());
+        assert!(!is_lease_session_fenced(&session, "native"));
+        assert!(
+            is_lease_session_fenced(&session, "codex-computer-use-compat"),
+            "tool calls must not bypass the profile established at lease admission"
+        );
+    }
+
+    #[test]
     fn replacing_a_lease_ends_the_retired_generation() {
         let lease = "test-lease-retire-generation-G4H5I6";
         let first = "test-lease-retire-session-a";
