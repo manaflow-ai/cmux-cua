@@ -501,6 +501,28 @@ pub const SOCKET_AUTHORIZED_ROOT_START_MICROSECONDS_ENV: &str =
 /// harness to exercise the backstop quickly).
 const RECORDING_IDLE_TTL_SECS_DEFAULT: u64 = 300;
 
+// Lease replacement must not overtake a tool call after that call has passed
+// its generation check. The read side is held through the async tool invoke;
+// replacement takes the write side around admission and retirement. This is a
+// daemon-local gate because the core lease map remains a synchronous API used
+// by unit tests and non-daemon callers.
+static LEASE_INVOCATION_GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::RwLock<()>>> =
+    std::sync::OnceLock::new();
+
+fn lease_invocation_gate() -> std::sync::Arc<tokio::sync::RwLock<()>> {
+    LEASE_INVOCATION_GATE
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::RwLock::new(())))
+        .clone()
+}
+
+async fn lease_mutation_guard() -> tokio::sync::OwnedRwLockWriteGuard<()> {
+    lease_invocation_gate().write_owned().await
+}
+
+async fn lease_invocation_guard() -> tokio::sync::OwnedRwLockReadGuard<()> {
+    lease_invocation_gate().read_owned().await
+}
+
 /// Wall-clock seconds since the Unix epoch. Same idiom `recording.rs` uses for
 /// `now_ms`.
 fn now_unix_secs() -> u64 {
@@ -2562,6 +2584,13 @@ pub async fn run_serve(
                                 // and the cursor's explicit-required contract.
                                 let effective_session =
                                     apply_session_identity(&mut args, &req.session_id);
+                                // Keep lease replacement from overtaking the
+                                // generation check while this call is in flight.
+                                let _lease_invocation_guard = if effective_session.is_some() {
+                                    Some(lease_invocation_guard().await)
+                                } else {
+                                    None
+                                };
                                 // Resurrection guard: a call whose effective
                                 // session has already ended (end_session / idle
                                 // TTL / control-connection EOF) must NOT run — it
@@ -2701,6 +2730,7 @@ pub async fn run_serve(
                                 let mut approval_broker_token = None;
                                 if let Some(sid) = req.session_id.as_deref() {
                                     if let Some(lease) = requested_lease.as_ref() {
+                                        let _lease_mutation = lease_mutation_guard().await;
                                         match cmux_cua_core::session::acquire_lease(
                                             &lease.lease_id,
                                             profile.as_str(),
@@ -3387,6 +3417,13 @@ pub async fn run_serve(
                                 // (see the unix branch + apply_session_identity).
                                 let effective_session =
                                     apply_session_identity(&mut args, &req.session_id);
+                                // Keep lease replacement from overtaking the
+                                // generation check while this call is in flight.
+                                let _lease_invocation_guard = if effective_session.is_some() {
+                                    Some(lease_invocation_guard().await)
+                                } else {
+                                    None
+                                };
                                 // Resurrection guard on the effective session
                                 // (see the unix branch for the full rationale):
                                 // reject a stray late action on a dead id LOUDLY,
@@ -3470,6 +3507,7 @@ pub async fn run_serve(
                                 };
                                 if let Some(sid) = req.session_id.as_deref() {
                                     if let Some(lease) = requested_lease.as_ref() {
+                                        let _lease_mutation = lease_mutation_guard().await;
                                         match cmux_cua_core::session::acquire_lease(
                                             &lease.lease_id,
                                             profile.as_str(),
@@ -4617,5 +4655,28 @@ mod session_boundary_tests {
             "proxy-session",
             "daemon-minted"
         ));
+    }
+}
+
+#[cfg(test)]
+mod lease_invocation_gate_tests {
+    use super::{lease_invocation_guard, lease_mutation_guard};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn replacement_waits_for_an_admitted_tool_call() {
+        let read_guard = lease_invocation_guard().await;
+        let mutation_finished = Arc::new(Mutex::new(false));
+        let finished = mutation_finished.clone();
+        let mutation = tokio::spawn(async move {
+            let _write_guard = lease_mutation_guard().await;
+            *finished.lock().unwrap() = true;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!*mutation_finished.lock().unwrap());
+        drop(read_guard);
+        mutation.await.expect("lease mutation task should complete");
+        assert!(*mutation_finished.lock().unwrap());
     }
 }
