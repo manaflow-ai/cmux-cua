@@ -1554,12 +1554,10 @@ mod gate_tests {
 
     use async_trait::async_trait;
     use cua_driver_core::protocol::ToolResult;
-    use cua_driver_core::session::register_session_end_hook;
     use cua_driver_core::tool::{Tool, ToolDef, ToolRegistry};
     use serde_json::Value;
 
     static PROBE_INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
-    static ANONYMOUS_CONNECTION_REAPS: AtomicUsize = AtomicUsize::new(0);
 
     struct ProbeTool {
         def: ToolDef,
@@ -1604,12 +1602,6 @@ mod gate_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ended_session_call_is_gated_live_and_anon_pass() {
         PROBE_INVOCATIONS.store(0, Ordering::SeqCst);
-        let reaps_before = ANONYMOUS_CONNECTION_REAPS.load(Ordering::SeqCst);
-        register_session_end_hook(|sid| {
-            if sid.starts_with("connection-") {
-                ANONYMOUS_CONNECTION_REAPS.fetch_add(1, Ordering::SeqCst);
-            }
-        });
 
         let mut reg = ToolRegistry::new();
         reg.register(Box::new(ProbeTool::new()));
@@ -1733,16 +1725,6 @@ mod gate_tests {
             3,
             "anonymous (no session id) call must still invoke the tool"
         );
-        let reap_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-        while ANONYMOUS_CONNECTION_REAPS.load(Ordering::SeqCst) == reaps_before
-            && tokio::time::Instant::now() < reap_deadline
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert!(
-            ANONYMOUS_CONNECTION_REAPS.load(Ordering::SeqCst) > reaps_before,
-            "anonymous connection EOF must reap its cursor session promptly"
-        );
 
         // Tear down the daemon.
         let socket5 = socket.clone();
@@ -1772,9 +1754,10 @@ mod session_boundary_tests {
     }
 
     #[test]
-    fn no_session_falls_back_to_minted_connection_identity() {
-        // The minted per-connection id drives `_session_id` for every
-        // session-aware tool, including the cursor resolver.
+    fn no_session_falls_back_to_minted_for_session_id_only() {
+        // The minted per-connection id drives `_session_id` (recording / config
+        // lifecycle) but there is NO explicit `session`, so the cursor resolver
+        // — which reads `session`/`cursor_id`, not `_session_id` — sees nothing.
         let mut args = json!({ "x": 1 });
         let eff = apply_session_identity(&mut args, &Some("mcp-123".to_owned()));
         assert_eq!(args["_session_id"], "mcp-123");

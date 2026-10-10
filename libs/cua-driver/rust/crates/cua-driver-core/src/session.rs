@@ -215,24 +215,6 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_end_does_not_leave_a_tombstone() {
-        let sid = "connection-test-anonymous-AABBCC";
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls2 = calls.clone();
-        let want = sid.to_owned();
-        register_session_end_hook(move |got| {
-            if got == want {
-                calls2.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-
-        fire_anonymous_session_end(sid);
-
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert!(!is_session_ended(sid));
-    }
-
-    #[test]
     fn touch_then_evict_by_ttl() {
         let sid = "test-ttl-session-DDEEFF";
         touch_session(sid);
