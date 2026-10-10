@@ -18,6 +18,18 @@
 //!   Windows — \\.\pipe\cua-driver  (TODO: use named pipe; stubs only for now)
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Anonymous one-shot calls still own cursor state for the lifetime of their
+/// socket connection. Give each connection a private fallback identity so EOF
+/// can reap that state without touching caller-declared sessions that may span
+/// multiple connections.
+static CONNECTION_FALLBACK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn new_connection_fallback_id() -> String {
+    let sequence = CONNECTION_FALLBACK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("connection-{}-{sequence}", std::process::id())
+}
 
 // ── Recording idle-TTL backstop (#1764) ─────────────────────────────────────────
 
@@ -42,11 +54,9 @@ fn now_unix_secs() -> u64 {
 /// property of the MCP connection. We mirror an explicit `session` into the
 /// reserved `_session_id` key that every session-aware tool already reads
 /// (cursor key, per-session config override, recording owner). When no `session`
-/// was declared we fall back to the per-connection minted id for `_session_id`
-/// ONLY — that preserves connection-EOF cleanup of recording / config as before.
-/// The cursor is deliberately NOT driven by that fallback: `resolve_cursor_key`
-/// reads the explicit `session`/`cursor_id` arg only, so a cursor appears
-/// exactly when a run declares its session (explicit-required).
+/// was declared we fall back to the per-connection minted id. That keeps
+/// anonymous one-shot cursor, recording, and config state owned by the socket
+/// that created it, so the EOF reaper can remove it promptly.
 ///
 /// Also refreshes the idle-TTL clock for an explicit session (the minted
 /// fallback is reaped by EOF, not TTL). Returns the effective `_session_id` for
@@ -553,13 +563,15 @@ pub async fn run_serve(
                     let (reader, mut writer) = stream.into_split();
                     let mut lines = BufReader::new(reader).lines();
 
-                    // Set ONLY by a `session_begin` on this connection — i.e.
-                    // the proxy's persistent control connection. Per-call
-                    // connections (call/list/describe) leave this None, so
-                    // their immediate EOF triggers NO teardown. When a control
-                    // connection EOFs (graceful proxy exit OR kill -9, both
-                    // kernel-guaranteed), the post-loop block reaps the session.
+                    // Set by a `session_begin` on the proxy's persistent control
+                    // connection. Anonymous one-shot calls use a private
+                    // connection fallback below and are reaped on this
+                    // connection's EOF; caller-declared sessions remain
+                    // connection-independent and are only reaped by their
+                    // explicit end, control EOF, or idle TTL.
                     let mut control_session_id: Option<String> = None;
+                    let connection_fallback_id = new_connection_fallback_id();
+                    let mut anonymous_fallback_used = false;
 
                     while let Ok(Some(line)) = lines.next_line().await {
                         let req: DaemonRequest = match serde_json::from_str(&line) {
@@ -667,13 +679,29 @@ pub async fn run_serve(
                                 let mut args = req.args.unwrap_or(serde_json::Value::Object(
                                     serde_json::Map::new()
                                 ));
+                                let has_caller_session_identity = args
+                                    .as_object()
+                                    .map(|o| {
+                                        ["session", "_session_id"].iter().any(|key| {
+                                            o.get(*key)
+                                                .and_then(|v| v.as_str())
+                                                .is_some_and(|s| !s.is_empty())
+                                        })
+                                    })
+                                    .unwrap_or(false);
                                 // Apply the caller-declared session identity
-                                // (explicit `session` → `_session_id`; minted id
-                                // as the recording/config fallback only). See
-                                // `apply_session_identity` for the full rationale
-                                // and the cursor's explicit-required contract.
+                                // (explicit `session` → `_session_id`; otherwise
+                                // the private connection fallback). See
+                                // `apply_session_identity` for the full rationale.
+                                let fallback_identity = req
+                                    .session_id
+                                    .clone()
+                                    .or_else(|| Some(connection_fallback_id.clone()));
                                 let effective_session =
-                                    apply_session_identity(&mut args, &req.session_id);
+                                    apply_session_identity(&mut args, &fallback_identity);
+                                if req.session_id.is_none() && !has_caller_session_identity {
+                                    anonymous_fallback_used = true;
+                                }
                                 // Resurrection guard: a call whose effective
                                 // session has already ended (end_session / idle
                                 // TTL / control-connection EOF) must NOT run — it
@@ -806,22 +834,30 @@ pub async fn run_serve(
                     // the proxy's persistent control connection, reap the
                     // session now — the reliable ungraceful-death teardown that
                     // the old graceful-only proxy-exit hook could not provide.
-                    // Per-call connections leave control_session_id None, so
-                    // their (immediate) EOF is a no-op here. fire_session_end is
-                    // idempotent, so racing a legacy explicit session_end is
-                    // benign.
-                    if let Some(sid) = control_session_id {
+                    // Anonymous one-shot calls use the connection fallback and
+                    // must be reaped immediately on EOF. fire_session_end is
+                    // idempotent, so this is safe if a proxy control teardown
+                    // races a legacy explicit session_end.
+                    let anonymous_session_id = if control_session_id.is_none()
+                        && anonymous_fallback_used
+                    {
+                        Some(connection_fallback_id)
+                    } else {
+                        None
+                    };
+                    if let Some(sid) = control_session_id.or(anonymous_session_id.clone()) {
                         // stop_owner can SYNCHRONOUSLY finalize the recording's
                         // mp4 — on macOS it hits SCStream::stop_capture(), which
                         // blocks on disk I/O (video_sckit.rs). Run it on a
                         // blocking thread so it does not stall a runtime worker.
-                        // fire_session_end stays inline: its hooks (overlay
-                        // Remove, config-override clear) are non-blocking.
-                        // Mark the session ended FIRST so an in-flight start_recording
-                        // sees ended=true and bails (mark-before-reap; the cursor/config
-                        // hooks already reap inside fire_session_end after the mark).
-                        // stop_owner ignores is_session_ended, so reaping after is safe.
-                        cua_driver_core::session::fire_session_end(&sid);
+                        // The named control-session path marks the id ended
+                        // before fan-out. Anonymous ids are unique to this
+                        // socket and use the non-tombstoning hook path.
+                        if anonymous_session_id.is_some() {
+                            cua_driver_core::session::fire_anonymous_session_end(&sid);
+                        } else {
+                            cua_driver_core::session::fire_session_end(&sid);
+                        }
                         let reg2 = reg.clone();
                         let sid_for_stop = sid.clone();
                         let _ = tokio::task::spawn_blocking(move || {
@@ -1115,12 +1151,14 @@ pub async fn run_serve(
                     let (reader, mut writer) = tokio::io::split(server);
                     let mut lines = BufReader::new(reader).lines();
 
-                    // See the unix branch: set only by `session_begin` on the
-                    // proxy's persistent control connection; drives the post-loop
-                    // EOF reaper. Named-pipe peer death surfaces as
-                    // ERROR_BROKEN_PIPE on the next read, ending the while-let
-                    // loop equally reliably.
+                    // See the unix branch: `session_begin` on the proxy's
+                    // persistent control connection drives the control EOF
+                    // reaper. Anonymous one-shot calls use a private
+                    // connection fallback and are reaped on named-pipe EOF;
+                    // caller-declared sessions remain connection-independent.
                     let mut control_session_id: Option<String> = None;
+                    let connection_fallback_id = new_connection_fallback_id();
+                    let mut anonymous_fallback_used = false;
 
                     while let Ok(Some(line)) = lines.next_line().await {
                         let req: DaemonRequest = match serde_json::from_str(&line) {
@@ -1202,10 +1240,27 @@ pub async fn run_serve(
                                     "type_text".to_owned()
                                 } else { raw_name.clone() };
                                 let mut args = req.args.unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                                let has_caller_session_identity = args
+                                    .as_object()
+                                    .map(|o| {
+                                        ["session", "_session_id"].iter().any(|key| {
+                                            o.get(*key)
+                                                .and_then(|v| v.as_str())
+                                                .is_some_and(|s| !s.is_empty())
+                                        })
+                                    })
+                                    .unwrap_or(false);
                                 // Apply the caller-declared session identity
                                 // (see the unix branch + apply_session_identity).
+                                let fallback_identity = req
+                                    .session_id
+                                    .clone()
+                                    .or_else(|| Some(connection_fallback_id.clone()));
                                 let effective_session =
-                                    apply_session_identity(&mut args, &req.session_id);
+                                    apply_session_identity(&mut args, &fallback_identity);
+                                if req.session_id.is_none() && !has_caller_session_identity {
+                                    anonymous_fallback_used = true;
+                                }
                                 // Resurrection guard on the effective session
                                 // (see the unix branch for the full rationale):
                                 // reject a stray late action on a dead id LOUDLY,
@@ -1313,17 +1368,22 @@ pub async fn run_serve(
                     // Reader EOF / ERROR_BROKEN_PIPE: named-pipe peer death on
                     // graceful proxy exit AND kill -9. Reap the session if this
                     // was the proxy's control connection (see the unix branch for
-                    // the full rationale). Per-call connections leave
-                    // control_session_id None.
-                    if let Some(sid) = control_session_id {
+                    // the full rationale), or an anonymous one-shot connection.
+                    let anonymous_session_id = if control_session_id.is_none()
+                        && anonymous_fallback_used
+                    {
+                        Some(connection_fallback_id)
+                    } else {
+                        None
+                    };
+                    if let Some(sid) = control_session_id.or(anonymous_session_id.clone()) {
                         // Run stop_owner off the reactor (see the unix branch):
                         // recording finalize can be a synchronous blocking call.
-                        // fire_session_end stays inline (non-blocking hooks).
-                        // Mark the session ended FIRST so an in-flight start_recording
-                        // sees ended=true and bails (mark-before-reap; the cursor/config
-                        // hooks already reap inside fire_session_end after the mark).
-                        // stop_owner ignores is_session_ended, so reaping after is safe.
-                        cua_driver_core::session::fire_session_end(&sid);
+                        if anonymous_session_id.is_some() {
+                            cua_driver_core::session::fire_anonymous_session_end(&sid);
+                        } else {
+                            cua_driver_core::session::fire_session_end(&sid);
+                        }
                         let reg2 = reg.clone();
                         let sid_for_stop = sid.clone();
                         let _ = tokio::task::spawn_blocking(move || {
