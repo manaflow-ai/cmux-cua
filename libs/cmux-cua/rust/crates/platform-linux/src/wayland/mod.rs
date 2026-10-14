@@ -96,7 +96,8 @@ pub fn wayland_enabled() -> bool {
 /// through invalid XIDs. Backend selection below is capability based; the mere
 /// presence of `DISPLAY` must not disable Wayland.
 pub fn is_wayland() -> bool {
-    wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some()
+    // A call that names its X11 display (crate::display) is X11.
+    !crate::display::is_targeted() && wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 /// True when input tools should attempt the Wayland input path (wlroots
@@ -106,7 +107,7 @@ pub fn is_wayland() -> bool {
 /// wlroots-vs-portal decision is made from live compositor capabilities inside
 /// the `wayland::*` input functions, not from XWayland's `DISPLAY` variable.
 pub fn wayland_input_enabled() -> bool {
-    wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some()
+    !crate::display::is_targeted() && wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 /// Reason string when X11 input injection cannot possibly work, so callers
@@ -117,7 +118,8 @@ pub fn wayland_input_enabled() -> bool {
 /// (where `DISPLAY` is set) and X11 sessions return `None` and proceed normally.
 /// See #1921.
 pub fn wayland_input_unavailable_reason() -> Option<String> {
-    if std::env::var_os("WAYLAND_DISPLAY").is_some()
+    if !crate::display::is_targeted()
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
         && std::env::var_os("DISPLAY").is_none()
         && !wayland_enabled()
     {

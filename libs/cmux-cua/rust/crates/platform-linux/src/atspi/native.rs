@@ -1179,7 +1179,7 @@ fn screen_to_window_coords(xid: u64, screen_x: i32, screen_y: i32) -> Option<(i3
     use x11rb::protocol::xproto::*;
     use x11rb::rust_connection::RustConnection;
 
-    let (conn, _) = RustConnection::connect(None).ok()?;
+    let (conn, _) = crate::display::connect().ok()?;
     let window = xid as u32;
 
     // Get window geometry to find its screen position.
@@ -1757,7 +1757,7 @@ fn x11_window_origin(xid: u64) -> Option<(i32, i32)> {
     use x11rb::protocol::xproto::*;
     use x11rb::rust_connection::RustConnection;
 
-    let (conn, _) = RustConnection::connect(None).ok()?;
+    let (conn, _) = crate::display::connect().ok()?;
     let window = xid as u32;
     let geom = conn.get_geometry(window).ok()?.reply().ok()?;
     let trans = conn
@@ -1782,7 +1782,7 @@ fn gtk_frame_extents(xid: u64) -> Option<(i32, i32)> {
     use x11rb::protocol::xproto::*;
     use x11rb::rust_connection::RustConnection;
 
-    let (conn, _) = RustConnection::connect(None).ok()?;
+    let (conn, _) = crate::display::connect().ok()?;
     // only_if_exists=true → atom is 0 when no client ever set the property.
     let atom = conn
         .intern_atom(true, b"_GTK_FRAME_EXTENTS")

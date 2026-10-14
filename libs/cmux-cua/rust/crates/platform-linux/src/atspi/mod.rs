@@ -194,7 +194,7 @@ pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> 
 fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
     use x11rb::rust_connection::RustConnection;
 
-    let (conn, _) = match RustConnection::connect(None) {
+    let (conn, _) = match crate::display::connect() {
         Ok(r) => r,
         Err(_) => {
             return AtspiTreeResult {

@@ -21,7 +21,6 @@ use evdev::{AttributeSet, EventType, InputEvent, Key, RelativeAxisType};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs;
-use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::sleep;
@@ -164,7 +163,7 @@ fn open_display() -> Result<*mut x11::xlib::Display> {
         Ok(()) => {}
         Err(err) => bail!("{err}"),
     }
-    let display = unsafe { x11::xlib::XOpenDisplay(ptr::null()) };
+    let display = crate::display::open_xlib();
     if display.is_null() {
         bail!("XOpenDisplay returned null");
     }
@@ -214,7 +213,7 @@ fn supports_parallel_pointer_injection(display: *mut x11::xlib::Display) -> Resu
         );
     }
     if is_xtigervnc_process_running() {
-        let display_name = std::env::var("DISPLAY").unwrap_or_else(|_| "<unknown>".to_owned());
+        let display_name = crate::display::effective_x11_display().unwrap_or_else(|| "<unknown>".to_owned());
         bail!(
             "parallel_mouse_drag is not supported on display {display_name} because the active X server is Xtigervnc. \
              Xtigervnc exposes only its built-in VNC/XTEST devices, so Linux uinput/libinput pointers \
@@ -225,7 +224,7 @@ fn supports_parallel_pointer_injection(display: *mut x11::xlib::Display) -> Resu
 }
 
 fn is_xtigervnc_process_running() -> bool {
-    let display = std::env::var("DISPLAY").unwrap_or_default();
+    let display = crate::display::effective_x11_display().unwrap_or_default();
     // Extract display number from DISPLAY (e.g., ":0" -> "0", "host:1.0" -> "1")
     let display_num = display
         .rsplit(':')
@@ -269,7 +268,7 @@ pub fn check_parallel_pointer_support() -> Result<()> {
 /// the server's standard `/tmp/.X{N}-lock` file. Used to recognise servers that
 /// can't expose uinput/libinput pointers as real X input slaves.
 fn x_server_exe_name() -> Option<String> {
-    let display = std::env::var("DISPLAY").unwrap_or_default();
+    let display = crate::display::effective_x11_display().unwrap_or_default();
     let display_num = display
         .rsplit(':')
         .next()
@@ -865,7 +864,7 @@ pub fn with_x11_foreground<T>(
     settle_ms: u64,
     body: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    let display = unsafe { x11::xlib::XOpenDisplay(ptr::null()) };
+    let display = crate::display::open_xlib();
     if display.is_null() {
         return body();
     }
@@ -916,11 +915,11 @@ pub fn with_x11_foreground<T>(
 /// the caller can report/inspect it. Best-effort; returns `None` prior on a
 /// headless display.
 pub fn x11_activate_window_persistent(xid: u64) -> Result<Option<u64>> {
-    let display = unsafe { x11::xlib::XOpenDisplay(ptr::null()) };
+    let display = crate::display::open_xlib();
     if display.is_null() {
         bail!(
             "cannot activate window: no X display (DISPLAY={:?})",
-            std::env::var("DISPLAY").ok()
+            crate::display::effective_x11_display()
         );
     }
     let prior = ewmh_active_window(display).map(|w| w as u64);
@@ -1514,10 +1513,10 @@ fn connect_x11_for_input() -> Result<(RustConnection, usize)> {
     if let Some(reason) = crate::wayland::wayland_input_unavailable_reason() {
         bail!("{reason}");
     }
-    RustConnection::connect(None).map_err(|e| {
+    crate::display::connect().map_err(|e| {
         anyhow!(
             "cannot inject input: X11 connection failed (DISPLAY={:?}): {e}",
-            std::env::var("DISPLAY").ok()
+            crate::display::effective_x11_display()
         )
     })
 }
@@ -2462,7 +2461,7 @@ exit 0"#,
 
     // Try to spawn wish (Tk's shell). If it's not available, this isn't a
     // Tk-based environment and we should fall back to XSendEvent.
-    let mut child = match std::process::Command::new("wish")
+    let mut child = match crate::display::command("wish")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

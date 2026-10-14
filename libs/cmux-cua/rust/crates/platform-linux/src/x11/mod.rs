@@ -32,7 +32,7 @@ pub fn list_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
 }
 
 fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
-    let (conn, screen_num) = RustConnection::connect(None)?;
+    let (conn, screen_num) = crate::display::connect()?;
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
 
@@ -161,7 +161,7 @@ fn get_window_title(conn: &RustConnection, window: Window) -> Result<String> {
 /// Returns `None` when no X connection is available, the window has no
 /// WM_CLASS atom set, or the property could not be read.
 pub fn wm_class_for_window(xid: u64) -> Option<(String, String)> {
-    let (conn, _) = RustConnection::connect(None).ok()?;
+    let (conn, _) = crate::display::connect().ok()?;
     get_window_class(&conn, xid as u32)
 }
 

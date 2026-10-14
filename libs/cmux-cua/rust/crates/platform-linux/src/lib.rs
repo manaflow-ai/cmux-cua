@@ -18,6 +18,9 @@ pub mod pip;
 pub mod health_report;
 
 #[cfg(target_os = "linux")]
+pub mod display;
+
+#[cfg(target_os = "linux")]
 pub mod x11;
 
 #[cfg(target_os = "linux")]
@@ -96,8 +99,8 @@ pub fn is_wsl() -> bool {
 /// isn't resolvable". Kept as a trailing fragment so callers can splice it
 /// onto a more specific message. See issue #2005.
 pub fn no_display_hint() -> String {
-    let neither_display_set =
-        std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none();
+    let neither_display_set = display::effective_x11_display().is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none();
     if is_wsl() {
         " — no usable display detected (WSL). WSLg provides $DISPLAY/$WAYLAND_DISPLAY \
          under a recent Windows 11 + 'wsl --update'; on older setups install an X server \

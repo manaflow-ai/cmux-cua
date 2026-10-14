@@ -3,12 +3,22 @@
 #[cfg(target_os = "linux")]
 pub fn app_state_json_for(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
     if tokio::runtime::Handle::try_current().is_ok() {
-        return std::thread::spawn(move || app_state_json_for_blocking(window_id, pid))
+        let display = crate::display::x11_display();
+        return std::thread::spawn(move || in_display(display, || app_state_json_for_blocking(window_id, pid)))
             .join()
             .ok()
             .flatten();
     }
     app_state_json_for_blocking(window_id, pid)
+}
+
+/// Runs `f` on this (new) thread with the caller's display target, if any.
+#[cfg(target_os = "linux")]
+fn in_display<R>(display: Option<String>, f: impl FnOnce() -> R) -> R {
+    match display {
+        Some(display) => crate::display::with_x11_display(&display, f),
+        None => f(),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -36,8 +46,9 @@ fn app_state_json_for_blocking(window_id: Option<u64>, pid: Option<i64>) -> Opti
 #[cfg(target_os = "linux")]
 pub fn element_window_local_xy(window_id: u64, pid: i64, element_index: u32) -> Option<(f64, f64)> {
     if tokio::runtime::Handle::try_current().is_ok() {
+        let display = crate::display::x11_display();
         return std::thread::spawn(move || {
-            element_window_local_xy_blocking(window_id, pid, element_index)
+            in_display(display, || element_window_local_xy_blocking(window_id, pid, element_index))
         })
         .join()
         .ok()
