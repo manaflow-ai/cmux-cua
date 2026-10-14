@@ -4696,6 +4696,113 @@ mod gate_tests {
         }
     }
 
+    /// Reports the X11 display its call runs on (platform-linux's display scope).
+    #[cfg(target_os = "linux")]
+    struct DisplayProbeTool {
+        def: ToolDef,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[async_trait]
+    impl Tool for DisplayProbeTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            // On a blocking thread, as the X11 tools run.
+            let display = platform_linux::display::spawn_blocking(platform_linux::display::x11_display)
+                .await
+                .expect("probe thread");
+            ToolResult::text(format!("display={}", display.as_deref().unwrap_or("process")))
+        }
+    }
+
+    /// Computer-use plan step i (cx-ncc.5): the proxy names its workspace's
+    /// display on each request and the daemon runs the call there. Only a
+    /// local display name is accepted: `host:N` would send X11 over TCP.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_runs_on_the_display_its_request_names() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(DisplayProbeTool {
+            def: ToolDef {
+                name: "display_probe".into(),
+                description: "test probe; reports the call's X11 display".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+        }));
+        let registry = Arc::new(reg);
+        let socket_root = tempfile::tempdir().expect("socket temp root");
+        std::fs::set_permissions(socket_root.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("make socket temp root private");
+        let socket = socket_root.path().join("display.sock").to_string_lossy().into_owned();
+        let socket_for_server = socket.clone();
+        let server = tokio::spawn(async move {
+            let _ = run_serve(registry, &socket_for_server, None, DaemonProfile::Native).await;
+        });
+        for _ in 0..100 {
+            if std::path::Path::new(&socket).exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let call = |display: Option<&str>| {
+            let socket = socket.clone();
+            let request = DaemonRequest {
+                method: "call".into(),
+                name: Some("display_probe".into()),
+                args: Some(serde_json::json!({})),
+                session_id: None,
+                display: display.map(str::to_owned),
+            };
+            tokio::task::spawn_blocking(move || send_request(&socket, &request))
+        };
+
+        let named = call(Some(":7")).await.unwrap().expect("named display response");
+        assert!(named.ok, "{named:?}");
+        assert!(serde_json::to_string(&named.result).unwrap().contains("display=:7"), "{named:?}");
+
+        let screen = call(Some(":12.0")).await.unwrap().expect("screen-qualified response");
+        assert!(serde_json::to_string(&screen.result).unwrap().contains("display=:12.0"), "{screen:?}");
+
+        let process = call(None).await.unwrap().expect("unnamed display response");
+        assert!(serde_json::to_string(&process.result).unwrap().contains("display=process"), "{process:?}");
+
+        for remote in ["evil.example:0", "10.0.0.1:0", "unix:0", ":0 extra", ""] {
+            let refused = call(Some(remote)).await.unwrap().expect("refused response");
+            assert!(!refused.ok, "{remote:?} must be refused: {refused:?}");
+            assert!(refused.error.as_deref().unwrap_or("").contains("display"), "{refused:?}");
+        }
+
+        server.abort();
+    }
+
+    /// The proxy stamps the session host's `CMUX_CUA_DISPLAY` on the requests it forwards.
+    #[test]
+    fn the_proxy_names_the_display_the_session_host_gave_it() {
+        let request = DaemonRequest {
+            method: "call".into(),
+            name: Some("screenshot".into()),
+            args: None,
+            session_id: None,
+            display: None,
+        };
+        // With a socket credential configured the request sits inside an envelope.
+        let body = |wire: String| {
+            let value: Value = serde_json::from_str(&wire).unwrap();
+            value.get("request").cloned().unwrap_or(value)
+        };
+        let stamped = body(serialize_request_for_display(&request, Some(":3")).unwrap());
+        assert_eq!(stamped["display"], ":3");
+        let plain = body(serialize_request_for_display(&request, None).unwrap());
+        assert!(plain.get("display").is_none(), "no display keeps the wire format: {plain}");
+    }
+
     fn call_req(sid: Option<&str>) -> DaemonRequest {
         DaemonRequest {
             method: "call".into(),
