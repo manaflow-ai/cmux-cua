@@ -92,3 +92,22 @@ fn a_scoped_call_captures_its_own_display_not_the_process_display() {
     assert_eq!(platform_linux::display::x11_display(), None);
     assert!(platform_linux::capture::screenshot_display().is_err(), "unscoped calls keep using the process DISPLAY");
 }
+
+#[test]
+fn a_tool_call_scoped_to_a_display_runs_on_that_display() {
+    let Some((small, large)) = displays() else { return };
+    std::env::set_var("DISPLAY", ":65000");
+    std::env::remove_var("WAYLAND_DISPLAY");
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    let registry = platform_linux::tools::build_registry(false);
+    // get_screen_size does its X11 work on a blocking thread, so the target
+    // has to cross from the call's task to that thread.
+    for (display, size) in [(&small, "640x480"), (&large, "800x600")] {
+        let result = runtime.block_on(platform_linux::display::scope(
+            Some(display.name.clone()),
+            registry.invoke("get_screen_size", serde_json::json!({})),
+        ));
+        let text = format!("{result:?}");
+        assert!(text.contains(size), "{}: {text}", display.name);
+    }
+}
