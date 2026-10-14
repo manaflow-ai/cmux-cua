@@ -1177,9 +1177,8 @@ async fn entry_find_window_xid(pid: u32) -> Option<u64> {
 /// Translate screen coordinates to window-local coordinates.
 fn screen_to_window_coords(xid: u64, screen_x: i32, screen_y: i32) -> Option<(i32, i32)> {
     use x11rb::protocol::xproto::*;
-    use x11rb::rust_connection::RustConnection;
 
-    let (conn, _) = RustConnection::connect(None).ok()?;
+    let (conn, _) = crate::display::connect().ok()?;
     let window = xid as u32;
 
     // Get window geometry to find its screen position.
@@ -1755,9 +1754,8 @@ pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> 
 /// if it can't be resolved. Mirrors `list_windows`' geometry path.
 fn x11_window_origin(xid: u64) -> Option<(i32, i32)> {
     use x11rb::protocol::xproto::*;
-    use x11rb::rust_connection::RustConnection;
 
-    let (conn, _) = RustConnection::connect(None).ok()?;
+    let (conn, _) = crate::display::connect().ok()?;
     let window = xid as u32;
     let geom = conn.get_geometry(window).ok()?.reply().ok()?;
     let trans = conn
@@ -1780,9 +1778,8 @@ fn x11_window_origin(xid: u64) -> Option<(i32, i32)> {
 /// how we tell GTK4-CSD apart from everyone else.
 fn gtk_frame_extents(xid: u64) -> Option<(i32, i32)> {
     use x11rb::protocol::xproto::*;
-    use x11rb::rust_connection::RustConnection;
 
-    let (conn, _) = RustConnection::connect(None).ok()?;
+    let (conn, _) = crate::display::connect().ok()?;
     // only_if_exists=true → atom is 0 when no client ever set the property.
     let atom = conn
         .intern_atom(true, b"_GTK_FRAME_EXTENTS")

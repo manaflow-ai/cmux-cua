@@ -27,7 +27,7 @@ impl PageBackend for LinuxPageBackend {
     async fn get_text(&self, pid: i32, window_id: u32) -> anyhow::Result<String> {
         let pid_u = pid as u32;
         let xid = window_id as u64;
-        let result = tokio::task::spawn_blocking(move || {
+        let result = crate::display::spawn_blocking(move || {
             crate::atspi::walk_tree(pid_u, xid, None)
         })
         .await
@@ -45,7 +45,7 @@ impl PageBackend for LinuxPageBackend {
         let pid_u = pid as u32;
         let xid = window_id as u64;
         let selector = css_selector.to_owned();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = crate::display::spawn_blocking(move || {
             crate::atspi::walk_tree(pid_u, xid, None)
         })
         .await

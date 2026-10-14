@@ -96,7 +96,8 @@ pub fn wayland_enabled() -> bool {
 /// through invalid XIDs. Backend selection below is capability based; the mere
 /// presence of `DISPLAY` must not disable Wayland.
 pub fn is_wayland() -> bool {
-    wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some()
+    // A call that names its X11 display (crate::display) is X11.
+    !crate::display::is_targeted() && wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 /// True when input tools should attempt the Wayland input path (wlroots
@@ -106,7 +107,7 @@ pub fn is_wayland() -> bool {
 /// wlroots-vs-portal decision is made from live compositor capabilities inside
 /// the `wayland::*` input functions, not from XWayland's `DISPLAY` variable.
 pub fn wayland_input_enabled() -> bool {
-    wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some()
+    !crate::display::is_targeted() && wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 /// Reason string when X11 input injection cannot possibly work, so callers
@@ -117,7 +118,8 @@ pub fn wayland_input_enabled() -> bool {
 /// (where `DISPLAY` is set) and X11 sessions return `None` and proceed normally.
 /// See #1921.
 pub fn wayland_input_unavailable_reason() -> Option<String> {
-    if std::env::var_os("WAYLAND_DISPLAY").is_some()
+    if !crate::display::is_targeted()
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
         && std::env::var_os("DISPLAY").is_none()
         && !wayland_enabled()
     {
@@ -2145,7 +2147,8 @@ pub fn inject_socket_path() -> Option<String> {
 /// True when input should be routed through the nested cua-compositor's control
 /// socket (focus-free / multi-cursor) rather than wtype / virtual-pointer.
 pub fn is_inject_mode() -> bool {
-    inject_socket_path().is_some()
+    // A call that names its X11 display (crate::display) injects there.
+    !crate::display::is_targeted() && inject_socket_path().is_some()
 }
 
 /// Reject any character the nested compositor cannot type before it reaches the
@@ -2616,7 +2619,7 @@ fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
 
 /// Window-enumeration dispatcher: native Wayland when available, else X11.
 pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
-    if wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+    if is_wayland() {
         // Prefer the richer wlroots protocol. The generic staging protocol is
         // only consulted when wlroots yields no windows (including when its
         // manager global is absent).
@@ -2693,7 +2696,7 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     // the rare app owning BOTH an XWayland window and a separate native-Wayland
     // toplevel would list only the XWayland one.
     let mut ws = crate::x11::list_windows(filter_pid);
-    if wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+    if is_wayland() {
         let seen: std::collections::HashSet<u32> = ws.iter().filter_map(|w| w.pid).collect();
         // A specific pid already resolved via X11 needs no AT-SPI walk (a full
         // D-Bus enumeration of every registered app): it can only add duplicates.

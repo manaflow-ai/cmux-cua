@@ -478,7 +478,7 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     use x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
     // Connect to X11.
-    let (conn, screen_num) = match x11rb::connect(None) {
+    let (conn, screen_num) = match crate::display::connect() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("X11 overlay: cannot connect to display: {e}");

@@ -8,7 +8,6 @@
 
 use anyhow::{bail, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use std::process::Command;
 
 /// Capture a window by X11 XID. Returns raw PNG bytes.
 pub fn screenshot_window_bytes(xid: u64) -> Result<Vec<u8>> {
@@ -36,7 +35,7 @@ pub fn screenshot_window(xid: u64) -> Result<(String, u32, u32)> {
 }
 
 fn capture_via_import(xid: u64) -> Result<Vec<u8>> {
-    let out = Command::new("import")
+    let out = crate::display::command("import")
         .args(["-window", &xid.to_string(), "png:-"])
         .output()?;
     if !out.status.success() || out.stdout.is_empty() {
@@ -47,9 +46,8 @@ fn capture_via_import(xid: u64) -> Result<Vec<u8>> {
 
 fn capture_via_xgetimage(xid: u64) -> Result<(String, u32, u32)> {
     use x11rb::protocol::xproto::*;
-    use x11rb::rust_connection::RustConnection;
 
-    let (conn, _) = RustConnection::connect(None)?;
+    let (conn, _) = crate::display::connect()?;
     let window = xid as u32;
 
     let geom = conn.get_geometry(window)?.reply()?;
@@ -129,7 +127,7 @@ pub fn screenshot_display_bytes() -> Result<Vec<u8>> {
 /// loop forever once we're on Wayland).
 pub(crate) fn screenshot_display_bytes_x11() -> Result<Vec<u8>> {
     // Try `import -window root png:-` (ImageMagick).
-    let out = Command::new("import")
+    let out = crate::display::command("import")
         .args(["-window", "root", "png:-"])
         .output();
     if let Ok(o) = out {
@@ -140,8 +138,7 @@ pub(crate) fn screenshot_display_bytes_x11() -> Result<Vec<u8>> {
     // Fallback: x11rb XGetImage on the root window.
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::*;
-    use x11rb::rust_connection::RustConnection;
-    let (conn, screen_num) = RustConnection::connect(None)
+    let (conn, screen_num) = crate::display::connect()
         .map_err(|e| anyhow::anyhow!("{e}{}", crate::no_display_hint()))?;
     let root = conn.setup().roots[screen_num].root;
     // Get root geometry.
