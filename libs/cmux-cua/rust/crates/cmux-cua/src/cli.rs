@@ -1622,6 +1622,7 @@ pub fn run_call(
             args: Some(args_for_daemon),
             // CLI one-shot is its own ephemeral, anonymous/global session.
             session_id: None,
+            display: None,
         };
         match crate::serve::send_request(&socket_path, &req) {
             Ok(resp) => {
@@ -1868,6 +1869,7 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
                 // CLI `recording start` is anonymous — the recording is owned by
                 // nobody, so only an unconditional stop (CLI / manual) reaps it.
                 session_id: None,
+                display: None,
             };
             match crate::serve::send_request(&socket_path, &req) {
                 Ok(resp) if resp.ok => {
@@ -1878,6 +1880,7 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
                         name: Some("get_recording_state".into()),
                         args: Some(serde_json::json!({})),
                         session_id: None,
+                        display: None,
                     };
                     if let Ok(sr) = crate::serve::send_request(&socket_path, &state_req) {
                         if let Some(result) = sr.result {
@@ -1903,6 +1906,7 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
                 name: Some("stop_recording".into()),
                 args: Some(serde_json::json!({})),
                 session_id: None,
+                display: None,
             };
             match crate::serve::send_request(&socket_path, &req) {
                 Ok(resp) if resp.ok => println!("Recording stopped."),
@@ -1920,6 +1924,7 @@ pub fn run_recording_cmd(subcommand: &str, args: &[String], socket: Option<&str>
                 name: Some("get_recording_state".into()),
                 args: Some(serde_json::json!({})),
                 session_id: None,
+                display: None,
             };
             match crate::serve::send_request(&socket_path, &req) {
                 Ok(resp) if resp.ok => {
@@ -2291,6 +2296,7 @@ fn query_permission_daemon(
         name: None,
         args: None,
         session_id: None,
+        display: None,
     };
     let response = match crate::serve::send_request(&endpoint.socket, &request) {
         Ok(response) => response,
@@ -2507,6 +2513,7 @@ fn send_permission_control(
         name: None,
         args: None,
         session_id: None,
+        display: None,
     };
     let response = crate::serve::send_request(&endpoint.socket, &request)?;
     if !response.ok {
@@ -3391,6 +3398,7 @@ pub fn run_config_cmd(
                     args: Some(serde_json::json!({})),
                     // CLI `config get` reads the persisted global (anonymous).
                     session_id: None,
+                    display: None,
                 };
                 if let Ok(resp) = crate::serve::send_request(&socket_path, &req) {
                     if resp.ok {
@@ -3472,6 +3480,7 @@ pub fn run_config_cmd(
                     // CLI `config set` is anonymous → writes the persisted
                     // global default (the only writer of the on-disk config).
                     session_id: None,
+                    display: None,
                 };
                 if let Ok(resp) = crate::serve::send_request(&socket_path, &req) {
                     if resp.ok {
@@ -3482,6 +3491,7 @@ pub fn run_config_cmd(
                             name: Some("get_config".into()),
                             args: Some(serde_json::json!({})),
                             session_id: None,
+                            display: None,
                         };
                         if let Ok(r2) = crate::serve::send_request(&socket_path, &req2) {
                             if let Some(result) = r2.result {

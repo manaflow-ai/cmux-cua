@@ -1126,6 +1126,59 @@ pub struct DaemonRequest {
     /// serde defaults a missing field to `None` on deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The X11 display this request's tool call runs on (Linux): the session
+    /// host gives each workspace its own display and names it to the proxy in
+    /// [`DISPLAY_ENV`]. Only a local name (":N" or ":N.S") is accepted. Absent
+    /// means the daemon's own `DISPLAY`, and the wire format is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+}
+
+/// Set by the session host on a `cmux-cua mcp` proxy: the X11 display of the
+/// workspace whose agent the proxy serves (computer-use plan step i).
+pub const DISPLAY_ENV: &str = "CMUX_CUA_DISPLAY";
+
+/// True for a local X11 display name, ":N" or ":N.S". A host part would make
+/// the daemon open X11 connections over TCP, so it is never accepted.
+pub fn is_local_display_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(':') else { return false };
+    let mut parts = rest.splitn(2, '.');
+    let number = parts.next().unwrap_or("");
+    let screen = parts.next();
+    let digits = |part: &str| !part.is_empty() && part.len() <= 5 && part.bytes().all(|b| b.is_ascii_digit());
+    digits(number) && screen.map_or(true, digits)
+}
+
+/// The display a call request names, checked; `Err` is the refusal text.
+fn call_display(req: &DaemonRequest) -> Result<Option<String>, String> {
+    match req.display.as_deref() {
+        None => Ok(None),
+        Some(name) if !cfg!(target_os = "linux") => {
+            Err(format!("display {name:?}: per-call X11 displays are Linux only"))
+        }
+        Some(name) if is_local_display_name(name) => Ok(Some(name.to_owned())),
+        Some(name) => Err(format!(
+            "display {name:?} is not a local X11 display name (\":N\" or \":N.S\")"
+        )),
+    }
+}
+
+/// Run one tool call on its display (Linux), or as before when it names none.
+async fn invoke_on_display(
+    reg: &ToolRegistry,
+    tool_name: &str,
+    args: serde_json::Value,
+    display: Option<String>,
+) -> cmux_cua_core::protocol::ToolResult {
+    #[cfg(target_os = "linux")]
+    {
+        platform_linux::display::scope(display, reg.invoke(tool_name, args)).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = display;
+        reg.invoke(tool_name, args).await
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1144,7 +1197,7 @@ struct AuthenticatedDaemonRequest<'a> {
     auth_token: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     host_auth_token: Option<&'a str>,
-    request: &'a DaemonRequest,
+    request: &'a serde_json::Value,
 }
 
 #[derive(Debug)]
@@ -1416,16 +1469,27 @@ fn attach_state_writer_identity(
 /// Serialize one daemon request, adding the authenticated envelope when the
 /// embedding host configured a socket credential.
 pub fn serialize_request(req: &DaemonRequest) -> anyhow::Result<String> {
+    let display = std::env::var(DISPLAY_ENV).ok().filter(|value| !value.is_empty());
+    serialize_request_for_display(req, display.as_deref())
+}
+
+/// [`serialize_request`] with the proxy's display: stamped on a request that
+/// names none itself.
+fn serialize_request_for_display(req: &DaemonRequest, display: Option<&str>) -> anyhow::Result<String> {
+    let mut request = serde_json::to_value(req)?;
+    if let (Some(display), None) = (display, req.display.as_deref()) {
+        request["display"] = serde_json::Value::String(display.to_owned());
+    }
     match configured_socket_auth_token() {
         Some(token) => {
             let host_token = configured_socket_host_auth_token();
             Ok(serde_json::to_string(&AuthenticatedDaemonRequest {
                 auth_token: &token,
                 host_auth_token: host_token.as_deref(),
-                request: req,
+                request: &request,
             })?)
         }
-        None => Ok(serde_json::to_string(req)?),
+        None => Ok(serde_json::to_string(&request)?),
     }
 }
 
@@ -1768,7 +1832,7 @@ pub fn is_daemon_listening(socket_path: &str) -> bool {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let req = DaemonRequest { method: "list".into(), name: None, args: None, session_id: None };
+        let req = DaemonRequest { method: "list".into(), name: None, args: None, session_id: None, display: None };
         send_request(socket_path, &req)
             .ok()
             .map(|r| r.ok)
@@ -2886,6 +2950,18 @@ pub async fn run_serve_with_owner(
                                     eprintln!("[cmux-cua] deprecated tool name 'type_text_chars' — use 'type_text' instead.");
                                     "type_text".to_owned()
                                 } else { raw_name.clone() };
+                                // The workspace display the proxy named, if any
+                                // (computer-use plan step i); a non-local name is refused.
+                                let display = match call_display(&req) {
+                                    Ok(display) => display,
+                                    Err(error) => {
+                                        let resp = DaemonResponse::err(error, 64);
+                                        let _ = writer.write_all(
+                                            (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                        ).await;
+                                        continue;
+                                    }
+                                };
                                 let mut args = req.args.unwrap_or(serde_json::Value::Object(
                                     serde_json::Map::new()
                                 ));
@@ -2990,7 +3066,7 @@ pub async fn run_serve_with_owner(
                                     None => None,
                                 };
                                 let activity_args = activity_start.as_ref().map(|_| args.clone());
-                                let result = reg.invoke(&tool_name, args).await;
+                                let result = invoke_on_display(&reg, &tool_name, args, display).await;
                                 let is_err = result.is_error.unwrap_or(false);
                                 let content: Vec<serde_json::Value> = result.content.iter().map(|c| {
                                     match c {
@@ -3673,6 +3749,18 @@ pub async fn run_serve(
                                     eprintln!("[cmux-cua] deprecated tool name 'type_text_chars' — use 'type_text' instead.");
                                     "type_text".to_owned()
                                 } else { raw_name.clone() };
+                                // The workspace display the proxy named, if any
+                                // (computer-use plan step i); a non-local name is refused.
+                                let display = match call_display(&req) {
+                                    Ok(display) => display,
+                                    Err(error) => {
+                                        let resp = DaemonResponse::err(error, 64);
+                                        let _ = writer.write_all(
+                                            (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                        ).await;
+                                        continue;
+                                    }
+                                };
                                 let mut args = req.args.unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                                 clamp_external_permission_prompt(
                                     crate::bundle::is_env_truthy(
@@ -3715,7 +3803,7 @@ pub async fn run_serve(
                                     ).await;
                                     continue;
                                 }
-                                let result = reg.invoke(&tool_name, args).await;
+                                let result = invoke_on_display(&reg, &tool_name, args, display).await;
                                 let is_err = result.is_error.unwrap_or(false);
                                 let content: Vec<serde_json::Value> = result.content.iter().map(|c| match c {
                                     cmux_cua_core::protocol::Content::Text { text, .. } =>
@@ -3957,7 +4045,7 @@ pub fn run_stop_cmd(socket_path: &str) {
         std::process::exit(1);
     }
 
-    let req = DaemonRequest { method: "shutdown".into(), name: None, args: None, session_id: None };
+    let req = DaemonRequest { method: "shutdown".into(), name: None, args: None, session_id: None, display: None };
     match send_request(socket_path, &req) {
         Ok(_) => {
             // Poll until daemon stops responding (up to 2 seconds).
@@ -4094,6 +4182,7 @@ mod socket_authentication_tests {
             name: None,
             args: None,
             session_id: None,
+            display: None,
         }
     }
 
@@ -4653,6 +4742,7 @@ mod gate_tests {
                 name: None,
                 args: None,
                 session_id: None,
+                display: None,
             };
             let socket_for_status = socket.to_string_lossy().into_owned();
             let response = tokio::task::spawn_blocking(move || {
@@ -4673,6 +4763,7 @@ mod gate_tests {
             name: None,
             args: None,
             session_id: None,
+            display: None,
         };
         let socket_for_client = socket.to_string_lossy().into_owned();
         let response = tokio::task::spawn_blocking(move || {
@@ -4809,6 +4900,7 @@ mod gate_tests {
             name: Some("probe".into()),
             args: Some(serde_json::json!({})),
             session_id: sid.map(|s| s.to_owned()),
+            display: None,
         }
     }
 
@@ -4875,6 +4967,7 @@ mod gate_tests {
             name: None,
             args: None,
             session_id: Some(sid.to_owned()),
+            display: None,
         };
         let resp = tokio::task::spawn_blocking(move || send_request(&socket2, &end))
             .await
@@ -4911,6 +5004,7 @@ mod gate_tests {
             name: Some("start_session".into()),
             args: Some(serde_json::json!({})),
             session_id: Some(s3b),
+            display: None,
         };
         let resp = tokio::task::spawn_blocking(move || send_request(&socket3b, &start))
             .await
@@ -4952,6 +5046,7 @@ mod gate_tests {
             name: None,
             args: None,
             session_id: None,
+            display: None,
         };
         let _ = tokio::task::spawn_blocking(move || send_request(&socket5, &shutdown)).await;
         let _ = server.await;

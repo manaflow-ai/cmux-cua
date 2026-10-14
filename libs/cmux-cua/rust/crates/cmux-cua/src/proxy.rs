@@ -482,6 +482,7 @@ async fn run_control_connection(
         args: (expected_profile == DaemonProfile::CodexComputerUseCompat)
             .then(|| serde_json::json!({"approval_broker": true})),
         session_id: Some(session_id.clone()),
+        display: None,
     };
     let line = match serialize_request(&begin) {
         Ok(s) => s + "\n",
@@ -865,6 +866,7 @@ fn fetch_tools_list_from_daemon(
         name: None,
         args: None,
         session_id: Some(session_id.to_owned()),
+        display: None,
     };
     let resp = send_request(socket_path, &req)?;
     if !resp.ok {
@@ -1238,6 +1240,7 @@ async fn call_daemon_tool(
             name: Some(name.to_owned()),
             args: Some(args),
             session_id: Some(session_id.to_owned()),
+            display: None,
         },
         &format!("forwarding `{name}`"),
     )
@@ -1360,6 +1363,7 @@ where
                 "persist": decision.persistence.as_deref().unwrap_or("session"),
             })),
             session_id: Some(session_id.to_owned()),
+            display: None,
         },
         "resolving app approval",
     )
@@ -1829,6 +1833,7 @@ async fn wait_for_daemon_permission_readiness(
                 name: None,
                 args: None,
                 session_id: Some(sid),
+                display: None,
             };
             send_request(&sp, &req)
         })
@@ -2092,6 +2097,7 @@ fn prepare_action_group(
                 name: Some(tool.to_owned()),
                 args: Some(arguments),
                 session_id: Some(session_id.to_owned()),
+                display: None,
             },
         });
     }
