@@ -1017,7 +1017,6 @@ fn resolve_element_local_coords(
 
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt as _;
-    use x11rb::rust_connection::RustConnection;
     let (conn, screen_num) = crate::display::connect()?;
     let root = conn.setup().roots[screen_num].root;
     let reply = conn
@@ -1036,7 +1035,6 @@ fn element_screen_center(pid: u32, idx: usize) -> anyhow::Result<(f64, f64)> {
 fn window_local_to_screen(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt as _;
-    use x11rb::rust_connection::RustConnection;
 
     let (conn, screen_num) = crate::display::connect()?;
     let root = conn.setup().roots[screen_num].root;
@@ -1384,7 +1382,6 @@ fn chromium_background_must_refuse(
 fn window_screen_center(xid: u64) -> anyhow::Result<(i32, i32)> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt as _;
-    use x11rb::rust_connection::RustConnection;
 
     let (conn, screen_num) = crate::display::connect()?;
     let root = conn.setup().roots[screen_num].root;
@@ -5410,7 +5407,6 @@ impl Tool for GetScreenSizeTool {
 /// Shared by `get_screen_size` and `get_desktop_state`.
 fn x11_screen_size() -> anyhow::Result<(u32, u32)> {
     use x11rb::connection::Connection;
-    use x11rb::rust_connection::RustConnection;
     let (conn, screen_num) = crate::display::connect()
         .map_err(|e| anyhow::anyhow!("{e}{}", crate::no_display_hint()))?;
     let setup = conn.setup();
@@ -5593,7 +5589,6 @@ impl Tool for GetCursorPositionTool {
         let result = crate::display::spawn_blocking(|| {
             use x11rb::connection::Connection;
             use x11rb::protocol::xproto::ConnectionExt as _;
-            use x11rb::rust_connection::RustConnection;
             let (conn, screen_num) = crate::display::connect()?;
             let root = conn.setup().roots[screen_num].root;
             let reply = conn.query_pointer(root)?.reply()?;
@@ -6095,7 +6090,7 @@ impl Tool for CheckPermissionsTool {
     async fn invoke(&self, _args: Value) -> ToolResult {
         // Check X11 connectivity (required for window enumeration and input injection).
         let x11_ok = crate::display::spawn_blocking(|| {
-            x11rb::rust_connection::crate::display::connect().is_ok()
+            crate::display::connect().is_ok()
         })
         .await
         .unwrap_or(false);
