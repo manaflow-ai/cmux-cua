@@ -2147,7 +2147,8 @@ pub fn inject_socket_path() -> Option<String> {
 /// True when input should be routed through the nested cua-compositor's control
 /// socket (focus-free / multi-cursor) rather than wtype / virtual-pointer.
 pub fn is_inject_mode() -> bool {
-    inject_socket_path().is_some()
+    // A call that names its X11 display (crate::display) injects there.
+    !crate::display::is_targeted() && inject_socket_path().is_some()
 }
 
 /// Reject any character the nested compositor cannot type before it reaches the
@@ -2618,7 +2619,7 @@ fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
 
 /// Window-enumeration dispatcher: native Wayland when available, else X11.
 pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
-    if wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+    if is_wayland() {
         // Prefer the richer wlroots protocol. The generic staging protocol is
         // only consulted when wlroots yields no windows (including when its
         // manager global is absent).
@@ -2695,7 +2696,7 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     // the rare app owning BOTH an XWayland window and a separate native-Wayland
     // toplevel would list only the XWayland one.
     let mut ws = crate::x11::list_windows(filter_pid);
-    if wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+    if is_wayland() {
         let seen: std::collections::HashSet<u32> = ws.iter().filter_map(|w| w.pid).collect();
         // A specific pid already resolved via X11 needs no AT-SPI walk (a full
         // D-Bus enumeration of every registered app): it can only add duplicates.

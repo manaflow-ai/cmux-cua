@@ -29,7 +29,7 @@ impl Xvfb {
         let mut stdout = child.stdout.take()?;
         let mut number = String::new();
         let mut byte = [0u8; 1];
-        while stdout.read(&mut byte).ok()? == 1 && byte[0] != b'\n' {
+        while matches!(stdout.read(&mut byte), Ok(1)) && byte[0] != b'\n' {
             number.push(byte[0] as char);
         }
         let number = number.trim().to_owned();
@@ -48,7 +48,20 @@ impl Drop for Xvfb {
     }
 }
 
+/// The tests run in parallel threads: the process env is set once, before
+/// either reads it (setenv racing a getenv in x11rb or `import` is unsafe).
+fn process_display_without_server() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // A process DISPLAY that names no server: an unscoped connect would fail.
+        // (Under 59535: x11rb adds 6000 for the TCP port in a u16.)
+        std::env::set_var("DISPLAY", ":4999");
+        std::env::remove_var("WAYLAND_DISPLAY");
+    });
+}
+
 fn displays() -> Option<(Xvfb, Xvfb)> {
+    process_display_without_server();
     let small = Xvfb::start(640, 480);
     let large = Xvfb::start(800, 600);
     match (small, large) {
@@ -64,10 +77,6 @@ fn displays() -> Option<(Xvfb, Xvfb)> {
 #[test]
 fn a_scoped_call_captures_its_own_display_not_the_process_display() {
     let Some((small, large)) = displays() else { return };
-    // A process DISPLAY that names no server: an unscoped connect would fail.
-    // (Under 59535: x11rb adds 6000 for the TCP port in a u16.)
-    std::env::set_var("DISPLAY", ":4999");
-    std::env::remove_var("WAYLAND_DISPLAY");
 
     let (_, w, h) = platform_linux::display::with_x11_display(&small.name, || {
         platform_linux::capture::screenshot_display()
@@ -97,8 +106,6 @@ fn a_scoped_call_captures_its_own_display_not_the_process_display() {
 #[test]
 fn a_tool_call_scoped_to_a_display_runs_on_that_display() {
     let Some((small, large)) = displays() else { return };
-    std::env::set_var("DISPLAY", ":4999");
-    std::env::remove_var("WAYLAND_DISPLAY");
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
     let registry = platform_linux::tools::build_registry(false);
     // get_screen_size does its X11 work on a blocking thread, so the target

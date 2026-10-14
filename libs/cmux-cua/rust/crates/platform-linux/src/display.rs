@@ -61,7 +61,9 @@ pub fn with_x11_display<R>(display: &str, f: impl FnOnce() -> R) -> R {
 }
 
 /// The display this call targets (thread scope first, then the task's), or
-/// `None` for the process `DISPLAY`.
+/// `None` for the process `DISPLAY`. A thread scope wins over a task scope
+/// entered inside it (`with_x11_display(a, || block_on(scope(b, ..)))` is
+/// `a`); nest them the other way round.
 pub fn x11_display() -> Option<String> {
     TARGET
         .with(|target| target.borrow().clone())
@@ -101,11 +103,5 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
         command.env("DISPLAY", name).env_remove("WAYLAND_DISPLAY");
     }
     command
-}
-
-/// The display number in a display name: ":1" and "host:1.0" give "1".
-pub fn display_number(name: &str) -> Option<&str> {
-    let number = name.rsplit(':').next()?.split('.').next()?.trim();
-    (!number.is_empty()).then_some(number)
 }
 

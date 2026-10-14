@@ -160,7 +160,7 @@ async fn check_ax_capability() -> CheckEntry {
             hint,
         );
     }
-    let display_set = crate::display::effective_x11_display().is_some();
+    let display_set = (crate::display::x11_display().is_some() || std::env::var_os("DISPLAY").is_some());
     let xauth_unset = std::env::var_os("XAUTHORITY").is_none();
     let hint = if display_set && xauth_unset {
         // SSH-driven Wayland+Xwayland: DISPLAY inherited but no auth cookie (#1926).
