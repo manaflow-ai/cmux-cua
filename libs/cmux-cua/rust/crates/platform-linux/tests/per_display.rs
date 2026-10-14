@@ -65,7 +65,8 @@ fn displays() -> Option<(Xvfb, Xvfb)> {
 fn a_scoped_call_captures_its_own_display_not_the_process_display() {
     let Some((small, large)) = displays() else { return };
     // A process DISPLAY that names no server: an unscoped connect would fail.
-    std::env::set_var("DISPLAY", ":65000");
+    // (Under 59535: x11rb adds 6000 for the TCP port in a u16.)
+    std::env::set_var("DISPLAY", ":4999");
     std::env::remove_var("WAYLAND_DISPLAY");
 
     let (_, w, h) = platform_linux::display::with_x11_display(&small.name, || {
@@ -96,7 +97,7 @@ fn a_scoped_call_captures_its_own_display_not_the_process_display() {
 #[test]
 fn a_tool_call_scoped_to_a_display_runs_on_that_display() {
     let Some((small, large)) = displays() else { return };
-    std::env::set_var("DISPLAY", ":65000");
+    std::env::set_var("DISPLAY", ":4999");
     std::env::remove_var("WAYLAND_DISPLAY");
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
     let registry = platform_linux::tools::build_registry(false);
