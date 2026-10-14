@@ -56,6 +56,14 @@ jobs:
         run: |
           cargo test -p cmux-cua-core --lib activity --locked
           cargo test -p cmux-cua --bin cmux-cua activity_daemon --locked
+      # Also runs before the full step: two Xvfb displays, one daemon process.
+      - name: Run per-display tests
+        working-directory: libs/cmux-cua/rust
+        env:
+          CMUX_CUA_REQUIRE_XVFB: "1"
+        run: |
+          sudo apt-get install -y --no-install-recommends xvfb imagemagick
+          cargo test -p platform-linux --test per_display --locked -- --nocapture
       - name: Run Linux Rust tests
         working-directory: libs/cmux-cua/rust
         run: cargo test -p cmux-cua -p cmux-cua-core -p cmux-cua-testkit -p platform-linux --all-targets --locked
