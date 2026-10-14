@@ -1165,7 +1165,7 @@ fn call_display(req: &DaemonRequest) -> Result<Option<String>, String> {
 
 /// Run one tool call on its display (Linux), or as before when it names none.
 async fn invoke_on_display(
-    reg: &ToolRegistry,
+    reg: &cmux_cua_core::tool::ToolRegistry,
     tool_name: &str,
     args: serde_json::Value,
     display: Option<String>,
@@ -4888,9 +4888,9 @@ mod gate_tests {
             let value: Value = serde_json::from_str(&wire).unwrap();
             value.get("request").cloned().unwrap_or(value)
         };
-        let stamped = body(serialize_request_for_display(&request, Some(":3")).unwrap());
+        let stamped = body(crate::serve::serialize_request_for_display(&request, Some(":3")).unwrap());
         assert_eq!(stamped["display"], ":3");
-        let plain = body(serialize_request_for_display(&request, None).unwrap());
+        let plain = body(crate::serve::serialize_request_for_display(&request, None).unwrap());
         assert!(plain.get("display").is_none(), "no display keeps the wire format: {plain}");
     }
 
