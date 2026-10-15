@@ -45,6 +45,19 @@ where
     })
 }
 
+/// `std::thread::spawn` that keeps the caller's display target.
+pub fn spawn_thread<F, R>(f: F) -> std::thread::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let display = x11_display();
+    std::thread::spawn(move || match display {
+        Some(display) => with_x11_display(&display, f),
+        None => f(),
+    })
+}
+
 /// Run `f` with X11 calls on this thread aimed at `display` (e.g. `":5"`).
 /// Scopes nest; the previous target comes back when `f` returns or unwinds.
 pub fn with_x11_display<R>(display: &str, f: impl FnOnce() -> R) -> R {
@@ -101,7 +114,45 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
     if let Some(name) = x11_display() {
         command.env("DISPLAY", name).env_remove("WAYLAND_DISPLAY");
+        // AT_SPI_BUS_ADDRESS wins over every other lookup, so the app joins
+        // the display's AT-SPI bus even on its process's session bus.
+        match atspi_bus_address() {
+            Ok(Some(address)) => command.env("AT_SPI_BUS_ADDRESS", address),
+            _ => command.env_remove("AT_SPI_BUS_ADDRESS"),
+        };
     }
     command
 }
 
+/// The AT-SPI bus of the display this call targets, from the root window's
+/// `AT_SPI_BUS` property, where toolkits also look. An `at-spi-bus-launcher`
+/// built with X11 writes it; Debian and Ubuntu build theirs without, so the
+/// session host writes it after starting the display's launcher (and runs the
+/// X server with `-noreset`, or the last client leaving clears it). `None` when
+/// the call targets no display. A targeted display without one is an error,
+/// never the process's bus, which would show another display's apps.
+pub fn atspi_bus_address() -> anyhow::Result<Option<String>> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+    let Some(display) = x11_display() else { return Ok(None) };
+    let missing = || {
+        anyhow::anyhow!(
+            "display {display} has no AT-SPI bus: start at-spi-bus-launcher with DISPLAY={display}"
+        )
+    };
+    let (conn, screen) = connect().map_err(|error| anyhow::anyhow!("connect to display {display}: {error}"))?;
+    let root = conn.setup().roots[screen].root;
+    let atom = conn.intern_atom(true, b"AT_SPI_BUS")?.reply()?.atom;
+    if atom == x11rb::NONE {
+        return Err(missing());
+    }
+    let reply = conn
+        .get_property(false, root, atom, AtomEnum::STRING, 0, 4096)?
+        .reply()?;
+    let address = String::from_utf8(reply.value).map_err(|_| missing())?;
+    if address.is_empty() {
+        return Err(missing());
+    }
+    Ok(Some(address))
+}

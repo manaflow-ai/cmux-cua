@@ -19,7 +19,9 @@ struct Xvfb {
 impl Xvfb {
     fn start(width: u32, height: u32) -> Option<Self> {
         let mut child = Command::new("Xvfb")
-            .args(["-displayfd", "1", "-nolisten", "tcp", "-screen", "0"])
+            // -noreset: a server reset when the last client leaves clears
+            // the root window's AT_SPI_BUS, as on a session host's displays.
+            .args(["-displayfd", "1", "-nolisten", "tcp", "-noreset", "-screen", "0"])
             .arg(format!("{width}x{height}x24"))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -118,4 +120,221 @@ fn a_tool_call_scoped_to_a_display_runs_on_that_display() {
         let text = format!("{result:?}");
         assert!(text.contains(size), "{}: {text}", display.name);
     }
+}
+
+/// A GTK app on one display with its own session bus and AT-SPI bus, as the
+/// session host gives each workspace (bus address published on the root
+/// window): one button, and a line on stdout per click. The whole process
+/// group is killed on drop.
+struct App {
+    child: Child,
+    pid: u32,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+const APP: &str = r#"
+import os, sys, gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk
+name = sys.argv[1]
+window = Gtk.Window(title="cmux-cua-" + name)
+button = Gtk.Button(label=name + "-button")
+button.connect("clicked", lambda _: print("clicked " + name, flush=True))
+window.add(button)
+window.show_all()
+print("pid", os.getpid(), flush=True)
+Gtk.main()
+"#;
+
+impl App {
+    fn start(display: &str, name: &str) -> Self {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        // The launcher writes AT_SPI_BUS on this display's root window, where
+        // both the app's toolkit and the daemon find the display's bus.
+        let script = r#"
+            for l in /usr/libexec/at-spi-bus-launcher /usr/lib/at-spi2-core/at-spi-bus-launcher; do
+                [ -x "$l" ] && launcher="$l"
+            done
+            echo "launcher: ${launcher:-none}" >&2
+            "$launcher" --launch-immediately &
+            # The display's AT-SPI bus, for the test to publish on the root
+            # window as the session host does (the distro launcher can't).
+            for i in $(seq 100); do
+                address=$(dbus-send --session --print-reply=literal --dest=org.a11y.Bus \
+                    /org/a11y/bus org.a11y.Bus.GetAddress | tr -d ' ')
+                [ -n "$address" ] && break
+                sleep 0.1
+            done
+            echo "bus $address"
+            read published
+            exec python3 -c "$CMUX_CUA_TEST_APP" "$1"
+        "#;
+        let mut child = Command::new("dbus-run-session")
+            .args(["--", "sh", "-c", script, "sh", name])
+            .env("DISPLAY", display)
+            .env("CMUX_CUA_TEST_APP", APP)
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("AT_SPI_BUS_ADDRESS")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(std::fs::File::create(Self::log_path(name)).expect("app log"))
+            .spawn()
+            .expect("start dbus-run-session");
+        let stdout = std::io::BufReader::new(child.stdout.take().expect("app stdout"));
+        let (send, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Only the session's own lines: the AT-SPI registry daemon it
+            // starts writes to the same stdout.
+            let ours = |line: &str| ["bus ", "pid ", "clicked "].iter().any(|prefix| line.starts_with(prefix));
+            for line in stdout.lines().map_while(Result::ok).filter(|line| ours(line)) {
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut stdin = child.stdin.take().expect("app stdin");
+        let mut app = Self { child, pid: 0, lines };
+        let bus = app.line().unwrap_or_else(|| panic!("{name}'s session did not start on {display}{}", app.report(display, name)));
+        let address = bus.strip_prefix("bus ").filter(|address| !address.is_empty());
+        let address = address.unwrap_or_else(|| panic!("no AT-SPI bus for {name}: {bus:?}{}", app.report(display, name)));
+        publish_atspi_bus(display, address);
+        std::io::Write::write_all(&mut stdin, b"published\n").expect("resume the app session");
+        let first = app.line().unwrap_or_else(|| panic!("{name} did not start on {display}{}", app.report(display, name)));
+        app.pid = first.strip_prefix("pid ").and_then(|pid| pid.parse().ok()).expect("app pid line");
+        app
+    }
+
+    fn log_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("cmux-cua-per-display-{name}-{}.log", std::process::id()))
+    }
+
+    /// The session's stderr and processes, and the display's root properties.
+    fn report(&self, display: &str, name: &str) -> String {
+        let run = |program: &str, args: &[&str]| {
+            Command::new(program)
+                .args(args)
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
+                .unwrap_or_else(|error| format!("{program}: {error}"))
+        };
+        let log = std::fs::read_to_string(Self::log_path(name)).unwrap_or_default();
+        let group = self.child.id().to_string();
+        format!(
+            "\n--- stderr ---\n{log}\n--- processes ---\n{}\n--- root ---\n{}",
+            run("ps", &["-o", "pid,args", "-g", &group]),
+            run("xprop", &["-display", display, "-root"])
+        )
+    }
+
+    fn line(&self) -> Option<String> {
+        self.lines.recv_timeout(std::time::Duration::from_secs(20)).ok()
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // "--" so the negative process-group id is not read as an option.
+        let group = format!("-{}", self.child.id());
+        let _ = Command::new("kill").args(["-s", "KILL", "--", &group]).status();
+        let _ = self.child.wait();
+    }
+}
+
+/// Write the display's AT-SPI bus to its root window's `AT_SPI_BUS`, as the
+/// session host does.
+fn publish_atspi_bus(display: &str, address: &str) {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+    use x11rb::wrapper::ConnectionExt as _;
+    let (conn, screen) = x11rb::rust_connection::RustConnection::connect(Some(display)).expect("connect to the display");
+    let root = conn.setup().roots[screen].root;
+    let atom = conn.intern_atom(false, b"AT_SPI_BUS").expect("intern").reply().expect("atom").atom;
+    conn.change_property8(PropMode::REPLACE, root, atom, AtomEnum::STRING, address.as_bytes())
+        .expect("set AT_SPI_BUS");
+    conn.get_input_focus().expect("sync").reply().expect("sync reply");
+}
+
+/// The app's accessibility tree as seen from `display`, once it shows
+/// `button` (any tree when `None`).
+fn tree_on(display: &str, pid: u32, button: Option<&str>) -> Option<Vec<platform_linux::atspi::AtspiNode>> {
+    tree_or_why(display, pid, button).ok()
+}
+
+/// [`tree_on`], or what the last attempt saw: the walk's result and the
+/// display's AT-SPI bus.
+fn tree_or_why(display: &str, pid: u32, button: Option<&str>) -> Result<Vec<platform_linux::atspi::AtspiNode>, String> {
+    let wait = button.is_some();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if wait { 20 } else { 0 });
+    loop {
+        let tree = platform_linux::display::with_x11_display(display, || {
+            platform_linux::atspi::native::walk_tree(pid)
+        });
+        let last = match tree {
+            Ok(Some((_, nodes))) => {
+                if button.map_or(true, |button| nodes.iter().any(|node| node.name.as_deref() == Some(button))) {
+                    return Ok(nodes);
+                }
+                format!("tree without the button: {nodes:?}")
+            }
+            Ok(None) => "no tree for the pid".to_owned(),
+            Err(error) => format!("walk failed: {error:#}"),
+        };
+        if std::time::Instant::now() >= deadline {
+            let bus = platform_linux::display::with_x11_display(display, platform_linux::display::atspi_bus_address);
+            return Err(format!("{last}; AT-SPI bus: {bus:?}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+#[test]
+fn each_display_shows_and_drives_only_its_own_apps() {
+    let Some((first, second)) = displays() else { return };
+    let gtk = Command::new("python3")
+        .args(["-c", "import gi; gi.require_version('Gtk', '3.0')"])
+        .status()
+        .is_ok_and(|status| status.success());
+    let session = Command::new("dbus-run-session").arg("--version").output().is_ok();
+    if !(gtk && session) {
+        assert!(std::env::var_os("CMUX_CUA_REQUIRE_XVFB").is_none(), "dbus-run-session and python3-gi (GTK 3) are required");
+        eprintln!("skipped: needs dbus-run-session and python3-gi (GTK 3)");
+        return;
+    }
+    let alpha = App::start(&first.name, "alpha");
+    let beta = App::start(&second.name, "beta");
+
+    let trees: Vec<_> = [(&first, &alpha, "alpha"), (&second, &beta, "beta")]
+        .into_iter()
+        .map(|(display, app, mine)| {
+            tree_or_why(&display.name, app.pid, Some(&format!("{mine}-button")))
+                .unwrap_or_else(|why| {
+                    panic!("{mine}'s tree is not reachable on {}: {why}{}", display.name, app.report(&display.name, mine))
+                })
+        })
+        .collect();
+
+    for ((display, app, mine, other), nodes) in
+        [(&first, &alpha, "alpha", &beta), (&second, &beta, "beta", &alpha)].into_iter().zip(trees)
+    {
+        let button = nodes
+            .iter()
+            .find(|node| node.name.as_deref() == Some(&format!("{mine}-button")))
+            .unwrap_or_else(|| panic!("no {mine}-button on {}: {nodes:?}", display.name));
+        assert!(
+            tree_on(&display.name, other.pid, None).is_none(),
+            "{} shows an app from another display",
+            display.name
+        );
+
+        let index = button.element_index.expect("the button is actionable");
+        platform_linux::display::with_x11_display(&display.name, || {
+            platform_linux::atspi::native::perform_action(app.pid, index)
+        })
+        .unwrap_or_else(|error| panic!("press {mine}-button: {error}"));
+        assert_eq!(app.line().as_deref(), Some(format!("clicked {mine}").as_str()));
+    }
+    assert!(alpha.lines.try_recv().is_err() && beta.lines.try_recv().is_err(), "one click each");
 }
