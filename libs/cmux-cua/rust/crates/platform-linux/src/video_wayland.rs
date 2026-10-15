@@ -15,6 +15,11 @@ pub struct WfRecorderVideoBackendFactory;
 
 impl VideoBackendFactory for WfRecorderVideoBackendFactory {
     fn start(&self, output_path: &Path) -> anyhow::Result<Box<dyn VideoBackend>> {
+        // A call that names its display targets an X11 display (Xvfb), even
+        // when the daemon itself runs in a Wayland session.
+        if crate::display::is_targeted() {
+            return cmux_cua_core::video_ffmpeg::FfmpegVideoBackendFactory.start(output_path);
+        }
         WfRecorderVideoBackend::start(output_path)
             .map(|backend| Box::new(backend) as Box<dyn VideoBackend>)
     }

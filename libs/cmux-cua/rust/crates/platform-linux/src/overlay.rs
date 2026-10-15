@@ -9,6 +9,10 @@
 //!   rendered alpha mask so bare X11 window managers do not show a black
 //!   full-screen ARGB window when no compositor is present.
 //! - Z-ordering: `XRaiseWindow` every 80ms to stay above normal windows.
+//! - One overlay thread (and window) per X11 display: the process `DISPLAY`
+//!   from `run_on_thread`, and each display a call targets
+//!   (`crate::display`) from that call's first cursor command. A cursor is
+//!   drawn by the thread of the display its commands came from.
 //! - Wayland: when WAYLAND_DISPLAY is set but DISPLAY is also available (XWayland),
 //!   the X11 path is used.  Pure Wayland support is a TODO.
 //!
@@ -20,7 +24,7 @@
 //! override-redirect visual, ShapeInput passthrough, and the XPutImage paint.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 #[cfg(target_os = "linux")]
@@ -35,10 +39,19 @@ use cursor_overlay::{
 
 // ── Global channel ────────────────────────────────────────────────────────
 
-static CMD_TX: OnceLock<std::sync::mpsc::Sender<OverlayMsg>> = OnceLock::new();
+/// An X11 display: `None` is the process `DISPLAY`, `Some` a call's target.
+type DisplayKey = Option<String>;
+
+/// Each overlay thread's command channel, by display. `None` until `init`.
+static CMD_TX: Mutex<Option<HashMap<DisplayKey, std::sync::mpsc::Sender<OverlayMsg>>>> =
+    Mutex::new(None);
 static PENDING_COMMANDS: AtomicU64 = AtomicU64::new(0);
 const MAX_PENDING_COMMANDS: u64 = 4096;
+/// The process display's channel end, held from `init` until `run_on_thread`.
 static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<OverlayMsg>>> = Mutex::new(None);
+/// Set once `run_on_thread` starts the overlay: targeted displays then get
+/// their own thread on first use.
+static RUNNING: AtomicBool = AtomicBool::new(false);
 static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
 struct ArrivalWaiter {
     generation: u64,
@@ -173,7 +186,7 @@ pub fn init(cfg: CursorConfig) {
         });
     });
     let (tx, rx) = std::sync::mpsc::channel();
-    let _ = CMD_TX.set(tx);
+    *CMD_TX.lock().unwrap() = Some(HashMap::from([(None, tx)]));
     PENDING_COMMANDS.store(0, Ordering::Release);
     *CMD_RX_CELL.lock().unwrap() = Some(rx);
     *ARRIVAL_TX.lock().unwrap() = Some(HashMap::new());
@@ -210,10 +223,7 @@ fn send_command_for_with_status(key: CursorKey, cmd: OverlayCommand) -> bool {
             (count < MAX_PENDING_COMMANDS).then_some(count + 1)
         })
         .is_ok();
-    let sent = reserved
-        && CMD_TX
-            .get()
-            .is_some_and(|tx| tx.send(msg.clone()).is_ok());
+    let sent = reserved && send_to_display(crate::display::x11_display(), msg.clone());
     if reserved && !sent {
         PENDING_COMMANDS.fetch_sub(1, Ordering::AcqRel);
     }
@@ -242,6 +252,65 @@ fn send_command_for_with_status(key: CursorKey, cmd: OverlayCommand) -> bool {
         }
     }
     sent
+}
+
+/// Send to the overlay thread of `display`, starting one for a targeted
+/// display that has none (or whose thread exited, e.g. it could not connect).
+fn send_to_display(display: DisplayKey, msg: OverlayMsg) -> bool {
+    let mut guard = CMD_TX.lock().unwrap();
+    let Some(channels) = guard.as_mut() else {
+        return false;
+    };
+    if let Some(tx) = channels.get(&display) {
+        match tx.send(msg) {
+            Ok(()) => return true,
+            Err(std::sync::mpsc::SendError(back)) if display.is_some() => {
+                channels.remove(&display);
+                return start_display_thread(channels, display, back);
+            }
+            Err(_) => return false,
+        }
+    }
+    if display.is_none() {
+        return false;
+    }
+    start_display_thread(channels, display, msg)
+}
+
+fn start_display_thread(
+    channels: &mut HashMap<DisplayKey, std::sync::mpsc::Sender<OverlayMsg>>,
+    display: DisplayKey,
+    first: OverlayMsg,
+) -> bool {
+    if !RUNNING.load(Ordering::Acquire) {
+        return false;
+    }
+    let Some(cfg) = RENDER.lock().unwrap().as_ref().map(|map| map.template.clone()) else {
+        return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if tx.send(first).is_err() {
+        return false;
+    }
+    let thread_display = display.clone();
+    let spawned = std::thread::Builder::new()
+        .name("cua-overlay-x11".into())
+        .spawn(move || run_overlay_thread(cfg, rx, thread_display))
+        .is_ok();
+    if spawned {
+        channels.insert(display, tx);
+    }
+    spawned
+}
+
+/// Session-wide messages (remove, revive) reach every display's thread; each
+/// applies them to the shared cursor map, so applying twice is harmless.
+fn broadcast(msg: OverlayMsg) {
+    if let Some(channels) = CMD_TX.lock().unwrap().as_ref() {
+        for tx in channels.values() {
+            let _ = tx.send(msg.clone());
+        }
+    }
 }
 
 fn send_registered_move(
@@ -381,18 +450,14 @@ pub fn remove_cursor(key: CursorKey) {
     if key.is_empty() {
         return;
     }
-    if let Some(tx) = CMD_TX.get() {
-        let _ = tx.send(OverlayMsg::Remove(key));
-    }
+    broadcast(OverlayMsg::Remove(key));
 }
 
 pub fn revive_cursor(key: CursorKey) {
     if key.is_empty() || key == "default" {
         return;
     }
-    if let Some(tx) = CMD_TX.get() {
-        let _ = tx.send(OverlayMsg::Revive(key));
-    }
+    broadcast(OverlayMsg::Revive(key));
 }
 
 /// Spawn the overlay on a dedicated thread.  Non-blocking.
@@ -425,10 +490,11 @@ pub fn run_on_thread() {
     // first send_command_for that triggers it spawns the thread,
     // future commands reuse it).
 
+    RUNNING.store(true, Ordering::Release);
     std::thread::Builder::new()
         .name("cua-overlay-x11".into())
         .spawn(move || {
-            run_overlay_thread(cfg, rx);
+            run_overlay_thread(cfg, rx, None);
         })
         .expect("spawn overlay thread");
 }
@@ -441,12 +507,16 @@ pub fn run_on_thread() {
 
 struct RenderState {
     core: RenderStateCore,
+    /// The display whose overlay thread draws this cursor: the display of
+    /// the call that last commanded it. `None` until its first command.
+    display: Option<DisplayKey>,
 }
 
 impl RenderState {
     fn new(cfg: CursorConfig) -> Self {
         RenderState {
             core: RenderStateCore::new(cfg),
+            display: None,
         }
     }
 
@@ -468,7 +538,19 @@ impl RenderState {
 // ── X11 thread ────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
-fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMsg>) {
+fn run_overlay_thread(
+    cfg: CursorConfig,
+    rx: std::sync::mpsc::Receiver<OverlayMsg>,
+    display: DisplayKey,
+) {
+    match display.clone() {
+        Some(name) => crate::display::with_x11_display(&name, || run_overlay_on(cfg, rx, display)),
+        None => run_overlay_on(cfg, rx, display),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_overlay_on(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMsg>, display: DisplayKey) {
     use x11rb::connection::Connection;
     use x11rb::protocol::shape::{ConnectionExt as ShapeConnectionExt, SK, SO};
     use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
@@ -491,8 +573,9 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     let scr_w = screen.width_in_pixels as u32;
     let scr_h = screen.height_in_pixels as u32;
 
-    // Update render state with screen size.
-    {
+    // Update render state with screen size (the process display's; it bounds
+    // where a new cursor starts).
+    if display.is_none() {
         let mut guard = RENDER.lock().unwrap();
         if let Some(map) = guard.as_mut() {
             map.scr_w = scr_w;
@@ -580,6 +663,8 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     let mut last_tick = Instant::now();
     let mut last_ztick = Instant::now();
     let z_enforcer = X11ZOrderEnforcer { conn: &conn, win };
+    let mine = Some(display.clone());
+    let mut last_active: Option<CursorKey> = None;
 
     loop {
         let now = Instant::now();
@@ -595,19 +680,23 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
                         PENDING_COMMANDS.fetch_sub(1, Ordering::AcqRel);
                     }
                     if let Some(key) = apply_msg(map, msg) {
-                        map.last_active = Some(key);
+                        if let Some(rs) = map.cursors.get_mut(&key) {
+                            rs.display = mine.clone();
+                        }
+                        map.last_active = Some(key.clone());
+                        last_active = Some(key);
                     }
                 }
                 let mut arrived = Vec::new();
                 for (key, rs) in map.cursors.iter_mut() {
-                    if rs.tick(dt) {
+                    if rs.display == mine && rs.tick(dt) {
                         arrived.push(key.clone());
                     }
                 }
-                let pinned_wid = map
-                    .last_active
+                let pinned_wid = last_active
                     .as_ref()
                     .and_then(|key| map.cursors.get(key))
+                    .filter(|rs| rs.display == mine)
                     .and_then(|rs| rs.core.pinned_wid);
                 (arrived, pinned_wid)
             } else {
@@ -619,9 +708,9 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
         let pixmap = {
             let guard = RENDER.lock().unwrap();
             guard.as_ref().map(|map| {
-                let mut pm = tiny_skia::Pixmap::new(map.scr_w.max(1), map.scr_h.max(1))
+                let mut pm = tiny_skia::Pixmap::new(scr_w.max(1), scr_h.max(1))
                     .unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap());
-                for rs in map.cursors.values() {
+                for rs in map.cursors.values().filter(|rs| rs.display == mine) {
                     // TODO: thread X11/Wayland scale-factor here so cursors
                     // render at native resolution on HiDPI Linux displays
                     // (`XRRGetCrtcInfo` reports per-output DPI; the GNOME
@@ -650,8 +739,19 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
             z_enforcer.reassert(pinned_wid);
         }
 
-        // Drain any X events (needed to avoid blocking).
-        while let Ok(Some(_)) = conn.poll_for_event() {}
+        // Drain any X events (needed to avoid blocking). A broken connection
+        // (the display went away, e.g. its workspace closed) ends the thread;
+        // the next command for that display starts a new one.
+        loop {
+            match conn.poll_for_event() {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!("X11 overlay: display {display:?} disconnected: {e}");
+                    return;
+                }
+            }
+        }
 
         let elapsed = Instant::now().duration_since(last_tick);
         if let Some(remaining) = frame_dur.checked_sub(elapsed) {
@@ -870,7 +970,12 @@ mod linux_shape_tests {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run_overlay_thread(_cfg: CursorConfig, _rx: std::sync::mpsc::Receiver<OverlayMsg>) {}
+fn run_overlay_thread(
+    _cfg: CursorConfig,
+    _rx: std::sync::mpsc::Receiver<OverlayMsg>,
+    _display: DisplayKey,
+) {
+}
 
 #[cfg(test)]
 mod tests {

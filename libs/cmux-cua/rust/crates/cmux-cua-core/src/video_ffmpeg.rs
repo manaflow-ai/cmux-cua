@@ -7,7 +7,8 @@
 //!
 //! Inputs per OS:
 //! - **Windows:** `gdigrab` (full virtual desktop)
-//! - **Linux:**   `x11grab` (`$DISPLAY` env var, defaults to `:0.0`)
+//! - **Linux:**   `x11grab` on the display the calling tool call targets
+//!   (see [`set_x11_display_fn`]), else `$DISPLAY`, else `:0.0`
 //!
 //! Encoder is `libx264 -preset ultrafast -pix_fmt yuv420p` everywhere.
 //! Lifecycle: spawn → caller stays alive → send `q\n` on stdin for a
@@ -16,11 +17,22 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::video::{VideoBackend, VideoBackendFactory, VideoMetadata};
 
 pub struct FfmpegVideoBackendFactory;
+
+static X11_DISPLAY_FN: OnceLock<fn() -> Option<String>> = OnceLock::new();
+
+/// Register how x11grab finds the X11 display of the calling tool call (the
+/// platform crate's per-call display target). The recorder starts on the
+/// call's thread, so the function sees that call's target. Without it, or
+/// when it returns `None`, x11grab records the process `DISPLAY`.
+pub fn set_x11_display_fn(display: fn() -> Option<String>) {
+    let _ = X11_DISPLAY_FN.set(display);
+}
 
 impl VideoBackendFactory for FfmpegVideoBackendFactory {
     fn start(&self, output_path: &Path) -> anyhow::Result<Box<dyn VideoBackend>> {
@@ -279,7 +291,11 @@ fn platform_input_args(cmd: &mut Command) {
 
     #[cfg(target_os = "linux")]
     {
-        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".into());
+        let display = X11_DISPLAY_FN
+            .get()
+            .and_then(|display| display())
+            .or_else(|| std::env::var("DISPLAY").ok())
+            .unwrap_or_else(|| ":0.0".into());
         // x11grab draws the real X pointer by default. When the synthetic agent
         // cursor is the actor (the usual case for a recorded run), the real
         // pointer is just noise — set CMUX_CUA_DRAW_SYSTEM_CURSOR=0 to

@@ -29,6 +29,7 @@ tokio::task_local! {
 /// Run the future (a tool call) with its X11 calls aimed at `display`, or at
 /// the process `DISPLAY` when `None`.
 pub async fn scope<F: std::future::Future>(display: Option<String>, future: F) -> F::Output {
+    register_core_hooks();
     TASK_TARGET.scope(display, future).await
 }
 
@@ -48,6 +49,7 @@ where
 /// Run `f` with X11 calls on this thread aimed at `display` (e.g. `":5"`).
 /// Scopes nest; the previous target comes back when `f` returns or unwinds.
 pub fn with_x11_display<R>(display: &str, f: impl FnOnce() -> R) -> R {
+    register_core_hooks();
     struct Restore(Option<String>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -58,6 +60,13 @@ pub fn with_x11_display<R>(display: &str, f: impl FnOnce() -> R) -> R {
     let previous = TARGET.with(|target| target.replace(Some(display.to_owned())));
     let _restore = Restore(previous);
     f()
+}
+
+/// Shared code that reaches X11 without this crate (x11grab recording in
+/// cmux-cua-core) asks for the call's display through a hook. Registered on
+/// the first scoped call, before any call can name a display.
+fn register_core_hooks() {
+    cmux_cua_core::video_ffmpeg::set_x11_display_fn(x11_display);
 }
 
 /// The display this call targets (thread scope first, then the task's), or
