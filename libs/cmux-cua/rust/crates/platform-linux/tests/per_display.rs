@@ -186,7 +186,10 @@ impl App {
         let stdout = std::io::BufReader::new(child.stdout.take().expect("app stdout"));
         let (send, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            for line in stdout.lines().map_while(Result::ok) {
+            // Only the session's own lines: the AT-SPI registry daemon it
+            // starts writes to the same stdout.
+            let ours = |line: &str| ["bus ", "pid ", "clicked "].iter().any(|prefix| line.starts_with(prefix));
+            for line in stdout.lines().map_while(Result::ok).filter(|line| ours(line)) {
                 if send.send(line).is_err() {
                     break;
                 }
