@@ -59,6 +59,7 @@ jobs:
       # Also runs before the full step: two Xvfb displays, one daemon process.
       - name: Run per-display tests
         working-directory: libs/cmux-cua/rust
+        timeout-minutes: 10
         env:
           CMUX_CUA_REQUIRE_XVFB: "1"
         run: |

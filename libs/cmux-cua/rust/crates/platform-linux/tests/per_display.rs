@@ -190,7 +190,9 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        let _ = Command::new("kill").arg("-KILL").arg(format!("-{}", self.child.id())).status();
+        // "--" so the negative process-group id is not read as an option.
+        let group = format!("-{}", self.child.id());
+        let _ = Command::new("kill").args(["-s", "KILL", "--", &group]).status();
         let _ = self.child.wait();
     }
 }
