@@ -153,6 +153,7 @@ impl App {
             for l in /usr/libexec/at-spi-bus-launcher /usr/lib/at-spi2-core/at-spi-bus-launcher; do
                 [ -x "$l" ] && launcher="$l"
             done
+            echo "launcher: ${launcher:-none}" >&2
             "$launcher" --launch-immediately &
             exec python3 -c "$CMUX_CUA_TEST_APP" "$1"
         "#;
@@ -165,7 +166,7 @@ impl App {
             .env_remove("DBUS_SESSION_BUS_ADDRESS")
             .process_group(0)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(Self::log_path(name)).expect("app log"))
             .spawn()
             .expect("start dbus-run-session");
         let stdout = std::io::BufReader::new(child.stdout.take().expect("app stdout"));
@@ -181,6 +182,28 @@ impl App {
         let first = app.line().unwrap_or_else(|| panic!("{name} did not start on {display}"));
         app.pid = first.strip_prefix("pid ").and_then(|pid| pid.parse().ok()).expect("app pid line");
         app
+    }
+
+    fn log_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("cmux-cua-per-display-{name}-{}.log", std::process::id()))
+    }
+
+    /// The session's stderr and processes, and the display's root properties.
+    fn report(&self, display: &str, name: &str) -> String {
+        let run = |program: &str, args: &[&str]| {
+            Command::new(program)
+                .args(args)
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
+                .unwrap_or_else(|error| format!("{program}: {error}"))
+        };
+        let log = std::fs::read_to_string(Self::log_path(name)).unwrap_or_default();
+        let group = self.child.id().to_string();
+        format!(
+            "\n--- stderr ---\n{log}\n--- processes ---\n{}\n--- root ---\n{}",
+            run("ps", &["-o", "pid,args", "-g", &group]),
+            run("xprop", &["-display", display, "-root"])
+        )
     }
 
     fn line(&self) -> Option<String> {
@@ -250,7 +273,9 @@ fn each_display_shows_and_drives_only_its_own_apps() {
         .into_iter()
         .map(|(display, app, mine)| {
             tree_or_why(&display.name, app.pid, Some(&format!("{mine}-button")))
-                .unwrap_or_else(|why| panic!("{mine}'s tree is not reachable on {}: {why}", display.name))
+                .unwrap_or_else(|why| {
+                    panic!("{mine}'s tree is not reachable on {}: {why}{}", display.name, app.report(&display.name, mine))
+                })
         })
         .collect();
 
