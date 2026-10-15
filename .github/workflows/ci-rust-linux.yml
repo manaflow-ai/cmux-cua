@@ -64,7 +64,7 @@ jobs:
           CMUX_CUA_REQUIRE_XVFB: "1"
           CUA_ATSPI_DEBUG: "1"
         run: |
-          sudo apt-get install -y --no-install-recommends xvfb imagemagick dbus at-spi2-core python3-gi gir1.2-gtk-3.0 x11-utils
+          sudo apt-get install -y --no-install-recommends xvfb imagemagick dbus at-spi2-core python3-gi gir1.2-gtk-3.0 x11-utils ffmpeg
           cargo test -p platform-linux --test per_display --locked -- --nocapture
       - name: Run Linux Rust tests
         working-directory: libs/cmux-cua/rust
