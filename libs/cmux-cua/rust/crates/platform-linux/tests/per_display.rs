@@ -119,3 +119,132 @@ fn a_tool_call_scoped_to_a_display_runs_on_that_display() {
         assert!(text.contains(size), "{}: {text}", display.name);
     }
 }
+
+/// A GTK app on one display with its own session bus and AT-SPI bus, as the
+/// session host gives each workspace: one button, and a line on stdout per
+/// click. The whole process group is killed on drop.
+struct App {
+    child: Child,
+    pid: u32,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+const APP: &str = r#"
+import os, sys, gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk
+name = sys.argv[1]
+window = Gtk.Window(title="cmux-cua-" + name)
+button = Gtk.Button(label=name + "-button")
+button.connect("clicked", lambda _: print("clicked " + name, flush=True))
+window.add(button)
+window.show_all()
+print("pid", os.getpid(), flush=True)
+Gtk.main()
+"#;
+
+impl App {
+    fn start(display: &str, name: &str) -> Self {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        // The launcher writes AT_SPI_BUS on this display's root window, where
+        // both the app's toolkit and the daemon find the display's bus.
+        let script = r#"
+            for l in /usr/libexec/at-spi-bus-launcher /usr/lib/at-spi2-core/at-spi-bus-launcher; do
+                [ -x "$l" ] && launcher="$l"
+            done
+            "$launcher" --launch-immediately &
+            exec python3 -c "$CMUX_CUA_TEST_APP" "$1"
+        "#;
+        let mut child = Command::new("dbus-run-session")
+            .args(["--", "sh", "-c", script, "sh", name])
+            .env("DISPLAY", display)
+            .env("CMUX_CUA_TEST_APP", APP)
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("AT_SPI_BUS_ADDRESS")
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start dbus-run-session");
+        let stdout = std::io::BufReader::new(child.stdout.take().expect("app stdout"));
+        let (send, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in stdout.lines().map_while(Result::ok) {
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut app = Self { child, pid: 0, lines };
+        let first = app.line().unwrap_or_else(|| panic!("{name} did not start on {display}"));
+        app.pid = first.strip_prefix("pid ").and_then(|pid| pid.parse().ok()).expect("app pid line");
+        app
+    }
+
+    fn line(&self) -> Option<String> {
+        self.lines.recv_timeout(std::time::Duration::from_secs(20)).ok()
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        let _ = Command::new("kill").arg("-KILL").arg(format!("-{}", self.child.id())).status();
+        let _ = self.child.wait();
+    }
+}
+
+/// The app's accessibility tree as seen from `display`, once it has one.
+fn tree_on(display: &str, pid: u32, wait: bool) -> Option<Vec<platform_linux::atspi::AtspiNode>> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if wait { 20 } else { 0 });
+    loop {
+        let tree = platform_linux::display::with_x11_display(display, || {
+            platform_linux::atspi::native::walk_tree(pid)
+        });
+        if let Ok(Some((_, nodes))) = tree {
+            return Some(nodes);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+#[test]
+fn each_display_shows_and_drives_only_its_own_apps() {
+    let Some((first, second)) = displays() else { return };
+    let alpha = App::start(&first.name, "alpha");
+    let beta = App::start(&second.name, "beta");
+
+    let trees: Vec<_> = [(&first, &alpha, "alpha"), (&second, &beta, "beta")]
+        .into_iter()
+        .map(|(display, app, mine)| {
+            tree_on(&display.name, app.pid, true)
+                .unwrap_or_else(|| panic!("{mine}'s tree is not reachable on {}", display.name))
+        })
+        .collect();
+
+    for ((display, app, mine, other), nodes) in
+        [(&first, &alpha, "alpha", &beta), (&second, &beta, "beta", &alpha)].into_iter().zip(trees)
+    {
+        let button = nodes
+            .iter()
+            .find(|node| node.name.as_deref() == Some(&format!("{mine}-button")))
+            .unwrap_or_else(|| panic!("no {mine}-button on {}: {nodes:?}", display.name));
+        assert!(
+            tree_on(&display.name, other.pid, false).is_none(),
+            "{} shows an app from another display",
+            display.name
+        );
+
+        let index = button.element_index.expect("the button is actionable");
+        platform_linux::display::with_x11_display(&display.name, || {
+            platform_linux::atspi::native::perform_action(app.pid, index)
+        })
+        .unwrap_or_else(|error| panic!("press {mine}-button: {error}"));
+        assert_eq!(app.line().as_deref(), Some(format!("clicked {mine}").as_str()));
+    }
+    assert!(alpha.lines.try_recv().is_err() && beta.lines.try_recv().is_err(), "one click each");
+}
