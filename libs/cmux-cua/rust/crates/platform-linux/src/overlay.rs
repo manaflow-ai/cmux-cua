@@ -747,7 +747,7 @@ fn run_overlay_on(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMsg>, 
                 Ok(Some(_)) => {}
                 Ok(None) => break,
                 Err(e) => {
-                    tracing::warn!("X11 overlay: display {display:?} disconnected: {e}");
+                    tracing::warn!("X11 overlay: display {mine:?} disconnected: {e}");
                     return;
                 }
             }
