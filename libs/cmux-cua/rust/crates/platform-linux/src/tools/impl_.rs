@@ -856,6 +856,14 @@ impl Tool for LaunchAppTool {
 
         let result = crate::display::spawn_blocking(
             move || -> anyhow::Result<(String, Option<u32>, String)> {
+                // WebKitGTK publishes its web subtree only while a registry
+                // listener exists, and a display's bus has none until a call
+                // reaches it: register before the app starts.
+                if crate::display::is_targeted() {
+                    if let Err(error) = crate::atspi::ensure_listener_active() {
+                        tracing::debug!(target: "cmux-cua", "AT-SPI listener on the call's display: {error}");
+                    }
+                }
                 // Open URLs via xdg-open.
                 if !urls.is_empty() {
                     for url in &urls {
