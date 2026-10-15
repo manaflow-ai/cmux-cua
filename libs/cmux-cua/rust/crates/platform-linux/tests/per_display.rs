@@ -229,6 +229,7 @@ fn a_recording_started_by_a_scoped_call_captures_that_display() {
         assert_eq!(video_size(&path), Some(size), "{}: {stopped:?}", display.name);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
 
 /// A GTK app on one display with its own session bus and AT-SPI bus, as the
 /// session host gives each workspace (bus address published on the root
