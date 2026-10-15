@@ -35,7 +35,7 @@ use tracing::{debug, error, warn};
 
 use crate::serve::{
     is_daemon_listening, send_request, serialize_request, DaemonProfile, DaemonRequest,
-    DaemonResponse,
+    DaemonResponse, DISPLAY_ENV,
     CODEX_COMPUTER_USE_TOOL_NAMES,
 };
 
@@ -482,6 +482,7 @@ async fn run_control_connection(
         args: (expected_profile == DaemonProfile::CodexComputerUseCompat)
             .then(|| serde_json::json!({"approval_broker": true})),
         session_id: Some(session_id.clone()),
+        display: None,
     };
     let line = match serialize_request(&begin) {
         Ok(s) => s + "\n",
@@ -609,6 +610,18 @@ fn validate_control_ack(
     line: &str,
     expected_profile: DaemonProfile,
 ) -> anyhow::Result<Option<String>> {
+    let display = std::env::var(DISPLAY_ENV).ok().filter(|value| !value.is_empty());
+    validate_control_ack_for_display(line, expected_profile, display.as_deref())
+}
+
+/// [`validate_control_ack`] for a proxy whose session host named `display`.
+/// A daemon from before per-call displays drops the request's `display` and
+/// would run the workspace's calls on its own display, so it is refused.
+fn validate_control_ack_for_display(
+    line: &str,
+    expected_profile: DaemonProfile,
+    display: Option<&str>,
+) -> anyhow::Result<Option<String>> {
     let response: DaemonResponse = serde_json::from_str(line)
         .map_err(|error| anyhow::anyhow!("decode session_begin response: {error}"))?;
     if !response.ok {
@@ -630,6 +643,20 @@ fn validate_control_ack(
             "daemon profile mismatch: MCP requested `{expected_profile}`, but the daemon \
              reports `{reported_profile}`"
         );
+    }
+    if let Some(display) = display {
+        let runs_displays = response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("displays"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if !runs_displays {
+            anyhow::bail!(
+                "{DISPLAY_ENV}={display} is set, but the daemon does not run per-call displays; \
+                 restart it with this cmux-cua version"
+            );
+        }
     }
     let approval_broker_token = response
         .result
@@ -865,6 +892,7 @@ fn fetch_tools_list_from_daemon(
         name: None,
         args: None,
         session_id: Some(session_id.to_owned()),
+        display: None,
     };
     let resp = send_request(socket_path, &req)?;
     if !resp.ok {
@@ -1238,6 +1266,7 @@ async fn call_daemon_tool(
             name: Some(name.to_owned()),
             args: Some(args),
             session_id: Some(session_id.to_owned()),
+            display: None,
         },
         &format!("forwarding `{name}`"),
     )
@@ -1360,6 +1389,7 @@ where
                 "persist": decision.persistence.as_deref().unwrap_or("session"),
             })),
             session_id: Some(session_id.to_owned()),
+            display: None,
         },
         "resolving app approval",
     )
@@ -1829,6 +1859,7 @@ async fn wait_for_daemon_permission_readiness(
                 name: None,
                 args: None,
                 session_id: Some(sid),
+                display: None,
             };
             send_request(&sp, &req)
         })
@@ -2092,6 +2123,7 @@ fn prepare_action_group(
                 name: Some(tool.to_owned()),
                 args: Some(arguments),
                 session_id: Some(session_id.to_owned()),
+                display: None,
             },
         });
     }
@@ -2977,6 +3009,32 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("approval broker token"));
+    }
+
+    #[test]
+    fn a_proxy_with_a_display_refuses_a_daemon_that_ignores_displays() {
+        let old = DaemonResponse::ok(serde_json::json!({
+            "session_begin": true,
+            "profile": DaemonProfile::Native,
+        }));
+        let old = serde_json::to_string(&old).unwrap();
+        validate_control_ack_for_display(&old, DaemonProfile::Native, None)
+            .expect("no display named: an older daemon is fine");
+        let error = validate_control_ack_for_display(&old, DaemonProfile::Native, Some(":7"))
+            .expect_err("an older daemon would run the workspace's calls on its own display");
+        assert!(error.to_string().contains("per-call displays"));
+
+        let current = DaemonResponse::ok(serde_json::json!({
+            "session_begin": true,
+            "profile": DaemonProfile::Native,
+            "displays": true,
+        }));
+        validate_control_ack_for_display(
+            &serde_json::to_string(&current).unwrap(),
+            DaemonProfile::Native,
+            Some(":7"),
+        )
+        .expect("a daemon that runs calls on their display");
     }
 
     #[cfg(unix)]
