@@ -62,7 +62,7 @@ jobs:
         env:
           CMUX_CUA_REQUIRE_XVFB: "1"
         run: |
-          sudo apt-get install -y --no-install-recommends xvfb imagemagick
+          sudo apt-get install -y --no-install-recommends xvfb imagemagick ffmpeg
           cargo test -p platform-linux --test per_display --locked -- --nocapture
       - name: Run Linux Rust tests
         working-directory: libs/cmux-cua/rust

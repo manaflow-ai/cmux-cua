@@ -119,3 +119,76 @@ fn a_tool_call_scoped_to_a_display_runs_on_that_display() {
         assert!(text.contains(size), "{}: {text}", display.name);
     }
 }
+
+/// The agent-cursor overlay's top-level windows on `display` (by title).
+fn overlay_windows_on(display: &str) -> usize {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
+    let (conn, screen) = x11rb::rust_connection::RustConnection::connect(Some(display)).expect("connect");
+    let root = conn.setup().roots[screen].root;
+    let children = conn.query_tree(root).expect("query_tree").reply().expect("tree").children;
+    children
+        .into_iter()
+        .filter(|&window| {
+            conn.get_property(false, window, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 256)
+                .ok()
+                .and_then(|cookie| cookie.reply().ok())
+                .is_some_and(|reply| reply.value.starts_with(b"Cua.AgentCursorOverlay."))
+        })
+        .count()
+}
+
+#[test]
+fn the_agent_cursor_of_a_scoped_call_shows_on_that_display() {
+    let Some((small, large)) = displays() else { return };
+    platform_linux::overlay::init(cursor_overlay::CursorConfig::default());
+    platform_linux::overlay::run_on_thread();
+
+    platform_linux::display::with_x11_display(&small.name, || {
+        platform_linux::overlay::send_command_for(
+            "per-display-cursor".to_owned(),
+            cursor_overlay::OverlayCommand::SnapTo { x: 100.0, y: 100.0, heading_radians: None },
+        );
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while overlay_windows_on(&small.name) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(overlay_windows_on(&small.name), 1, "the cursor overlay opens on {}", small.name);
+    assert_eq!(overlay_windows_on(&large.name), 0, "and only there");
+}
+
+/// Width and height of the first video stream in `path`.
+fn video_size(path: &std::path::Path) -> Option<(u32, u32)> {
+    let output = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (w, h) = text.trim().split_once(',')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
+}
+
+#[test]
+fn a_recording_started_by_a_scoped_call_captures_that_display() {
+    use cmux_cua_core::video::VideoBackendFactory;
+    let Some((small, large)) = displays() else { return };
+    if Command::new("ffmpeg").arg("-version").output().is_err() {
+        assert!(std::env::var_os("CMUX_CUA_REQUIRE_XVFB").is_none(), "ffmpeg is required but missing");
+        eprintln!("skipped: ffmpeg is not available");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("cmux-cua-per-display-video-{}", std::process::id()));
+    for (display, size) in [(&small, (640, 480)), (&large, (800, 600))] {
+        let path = dir.join(format!("{}.mp4", display.name.trim_start_matches(':')));
+        let recorder = platform_linux::display::with_x11_display(&display.name, || {
+            cmux_cua_core::video_ffmpeg::FfmpegVideoBackendFactory.start(&path)
+        })
+        .expect("start recording");
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let stopped = recorder.stop();
+        assert_eq!(video_size(&path), Some(size), "{}: {stopped:?}", display.name);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
