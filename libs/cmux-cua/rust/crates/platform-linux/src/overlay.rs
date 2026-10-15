@@ -288,6 +288,15 @@ fn start_display_thread(
     let Some(cfg) = RENDER.lock().unwrap().as_ref().map(|map| map.template.clone()) else {
         return false;
     };
+    // A display that is gone refuses the command here (the caller releases
+    // its budget) instead of starting a thread that cannot connect.
+    let reachable = match display.as_deref() {
+        Some(name) => crate::display::with_x11_display(name, crate::display::connect).is_ok(),
+        None => false,
+    };
+    if !reachable {
+        return false;
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     if tx.send(first).is_err() {
         return false;
@@ -303,13 +312,12 @@ fn start_display_thread(
     spawned
 }
 
-/// Session-wide messages (remove, revive) reach every display's thread; each
-/// applies them to the shared cursor map, so applying twice is harmless.
-fn broadcast(msg: OverlayMsg) {
-    if let Some(channels) = CMD_TX.lock().unwrap().as_ref() {
-        for tx in channels.values() {
-            let _ = tx.send(msg.clone());
-        }
+/// Session-wide messages (remove, revive) apply once to the shared cursor map,
+/// not per display thread: a thread applying them a frame late would drop the
+/// cursor of a session revived in between.
+fn apply_now(msg: OverlayMsg) {
+    if let Some(map) = RENDER.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        apply_msg(map, msg);
     }
 }
 
@@ -450,14 +458,14 @@ pub fn remove_cursor(key: CursorKey) {
     if key.is_empty() {
         return;
     }
-    broadcast(OverlayMsg::Remove(key));
+    apply_now(OverlayMsg::Remove(key));
 }
 
 pub fn revive_cursor(key: CursorKey) {
     if key.is_empty() || key == "default" {
         return;
     }
-    broadcast(OverlayMsg::Revive(key));
+    apply_now(OverlayMsg::Revive(key));
 }
 
 /// Spawn the overlay on a dedicated thread.  Non-blocking.
@@ -544,13 +552,32 @@ fn run_overlay_thread(
     display: DisplayKey,
 ) {
     match display.clone() {
-        Some(name) => crate::display::with_x11_display(&name, || run_overlay_on(cfg, rx, display)),
-        None => run_overlay_on(cfg, rx, display),
+        Some(name) => crate::display::with_x11_display(&name, || run_overlay_on(cfg, &rx, display.clone())),
+        None => run_overlay_on(cfg, &rx, display.clone()),
     }
+    retire(&display, rx);
+}
+
+/// An overlay thread is ending (its display could not be reached or went
+/// away). Under the channel lock, so no command can be queued meanwhile: drop
+/// its channel, release the budget of every command still queued and wake
+/// the waiters for those cursors, which no thread will move now.
+fn retire(display: &DisplayKey, rx: std::sync::mpsc::Receiver<OverlayMsg>) {
+    let mut guard = CMD_TX.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(channels) = guard.as_mut() {
+        channels.remove(display);
+    }
+    while let Ok(msg) = rx.try_recv() {
+        if let OverlayMsg::Cmd(KeyedOverlayCommand { key, .. }) = msg {
+            PENDING_COMMANDS.fetch_sub(1, Ordering::AcqRel);
+            arrival_fire(&key);
+        }
+    }
+    drop(rx);
 }
 
 #[cfg(target_os = "linux")]
-fn run_overlay_on(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMsg>, display: DisplayKey) {
+fn run_overlay_on(cfg: CursorConfig, rx: &std::sync::mpsc::Receiver<OverlayMsg>, display: DisplayKey) {
     use x11rb::connection::Connection;
     use x11rb::protocol::shape::{ConnectionExt as ShapeConnectionExt, SK, SO};
     use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
