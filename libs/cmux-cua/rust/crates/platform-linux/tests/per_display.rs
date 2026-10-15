@@ -19,7 +19,9 @@ struct Xvfb {
 impl Xvfb {
     fn start(width: u32, height: u32) -> Option<Self> {
         let mut child = Command::new("Xvfb")
-            .args(["-displayfd", "1", "-nolisten", "tcp", "-screen", "0"])
+            // -noreset: a server reset when the last client leaves clears
+            // the root window's AT_SPI_BUS, as on a session host's displays.
+            .args(["-displayfd", "1", "-nolisten", "tcp", "-noreset", "-screen", "0"])
             .arg(format!("{width}x{height}x24"))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

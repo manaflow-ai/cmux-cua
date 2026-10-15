@@ -127,7 +127,8 @@ pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 /// The AT-SPI bus of the display this call targets, from the root window's
 /// `AT_SPI_BUS` property, where toolkits also look. An `at-spi-bus-launcher`
 /// built with X11 writes it; Debian and Ubuntu build theirs without, so the
-/// session host writes it after starting the display's launcher. `None` when
+/// session host writes it after starting the display's launcher (and runs the
+/// X server with `-noreset`, or the last client leaving clears it). `None` when
 /// the call targets no display. A targeted display without one is an error,
 /// never the process's bus, which would show another display's apps.
 pub fn atspi_bus_address() -> anyhow::Result<Option<String>> {
