@@ -247,7 +247,7 @@ pub async fn finish(host: Arc<ActivityHost>, start: CallStart, args: &Value, res
             let window_id = args.get("window_id").and_then(Value::as_u64);
             let pid = args.get("pid").and_then(Value::as_i64);
             if window_id.is_some() || pid.is_some() {
-                let capture = tokio::task::spawn_blocking(move || cmux_cua_core::recording::screenshot_for(window_id, pid));
+                let capture = crate::serve::spawn_blocking_on_display(move || cmux_cua_core::recording::screenshot_for(window_id, pid));
                 tokio::time::timeout(std::time::Duration::from_millis(FRAME_CAPTURE_BUDGET_MS), capture)
                     .await
                     .ok()

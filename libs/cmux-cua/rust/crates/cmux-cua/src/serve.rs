@@ -1136,6 +1136,9 @@ pub struct DaemonRequest {
 
 /// Set by the session host on a `cmux-cua mcp` proxy: the X11 display of the
 /// workspace whose agent the proxy serves (computer-use plan step i).
+/// This aims calls; it is not a boundary between workspaces: any client of
+/// the daemon's socket runs as the same user and can name any display.
+/// Isolating one workspace's agent from another's needs a separate user or VM.
 pub const DISPLAY_ENV: &str = "CMUX_CUA_DISPLAY";
 
 /// True for a local X11 display name, ":N" or ":N.S". A host part would make
@@ -1163,21 +1166,33 @@ fn call_display(req: &DaemonRequest) -> Result<Option<String>, String> {
     }
 }
 
-/// Run one tool call on its display (Linux), or as before when it names none.
-async fn invoke_on_display(
-    reg: &cmux_cua_core::tool::ToolRegistry,
-    tool_name: &str,
-    args: serde_json::Value,
-    display: Option<String>,
-) -> cmux_cua_core::protocol::ToolResult {
+/// Run one call's work on its display (Linux), or as before when it names
+/// none: the tool itself and the activity log's after-frame.
+async fn on_display<F: std::future::Future>(display: Option<String>, future: F) -> F::Output {
     #[cfg(target_os = "linux")]
     {
-        platform_linux::display::scope(display, reg.invoke(tool_name, args)).await
+        platform_linux::display::scope(display, future).await
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = display;
-        reg.invoke(tool_name, args).await
+        future.await
+    }
+}
+
+/// [`tokio::task::spawn_blocking`] that keeps the calling task's display.
+pub(crate) fn spawn_blocking_on_display<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    #[cfg(target_os = "linux")]
+    {
+        platform_linux::display::spawn_blocking(f)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        tokio::task::spawn_blocking(f)
     }
 }
 
@@ -3066,7 +3081,7 @@ pub async fn run_serve_with_owner(
                                     None => None,
                                 };
                                 let activity_args = activity_start.as_ref().map(|_| args.clone());
-                                let result = invoke_on_display(&reg, &tool_name, args, display).await;
+                                let result = on_display(display.clone(), reg.invoke(&tool_name, args)).await;
                                 let is_err = result.is_error.unwrap_or(false);
                                 let content: Vec<serde_json::Value> = result.content.iter().map(|c| {
                                     match c {
@@ -3086,7 +3101,7 @@ pub async fn run_serve_with_owner(
                                 if let (Some(host), Some(start), Some(call_args)) =
                                     (activity.clone(), activity_start, activity_args)
                                 {
-                                    crate::activity_daemon::finish(host, start, &call_args, &result_obj).await;
+                                    on_display(display, crate::activity_daemon::finish(host, start, &call_args, &result_obj)).await;
                                 }
                                 // Preserve tool-level `isError` and structured
                                 // content inside a successful daemon transport.
@@ -3182,6 +3197,7 @@ pub async fn run_serve_with_owner(
                                         "session_begin": true,
                                         "profile": profile,
                                         "approval_broker_token": approval_broker_token,
+                                        "displays": cfg!(target_os = "linux"),
                                     })
                                 );
                                 let _ = writer.write_all(
@@ -3803,7 +3819,7 @@ pub async fn run_serve(
                                     ).await;
                                     continue;
                                 }
-                                let result = invoke_on_display(&reg, &tool_name, args, display).await;
+                                let result = on_display(display, reg.invoke(&tool_name, args)).await;
                                 let is_err = result.is_error.unwrap_or(false);
                                 let content: Vec<serde_json::Value> = result.content.iter().map(|c| match c {
                                     cmux_cua_core::protocol::Content::Text { text, .. } =>
