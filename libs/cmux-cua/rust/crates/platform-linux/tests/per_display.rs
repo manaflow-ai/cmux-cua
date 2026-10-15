@@ -200,19 +200,31 @@ impl Drop for App {
 /// The app's accessibility tree as seen from `display`, once it shows
 /// `button` (any tree when `None`).
 fn tree_on(display: &str, pid: u32, button: Option<&str>) -> Option<Vec<platform_linux::atspi::AtspiNode>> {
+    tree_or_why(display, pid, button).ok()
+}
+
+/// [`tree_on`], or what the last attempt saw: the walk's result and the
+/// display's AT-SPI bus.
+fn tree_or_why(display: &str, pid: u32, button: Option<&str>) -> Result<Vec<platform_linux::atspi::AtspiNode>, String> {
     let wait = button.is_some();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if wait { 20 } else { 0 });
     loop {
         let tree = platform_linux::display::with_x11_display(display, || {
             platform_linux::atspi::native::walk_tree(pid)
         });
-        if let Ok(Some((_, nodes))) = tree {
-            if button.map_or(true, |button| nodes.iter().any(|node| node.name.as_deref() == Some(button))) {
-                return Some(nodes);
+        let last = match tree {
+            Ok(Some((_, nodes))) => {
+                if button.map_or(true, |button| nodes.iter().any(|node| node.name.as_deref() == Some(button))) {
+                    return Ok(nodes);
+                }
+                format!("tree without the button: {nodes:?}")
             }
-        }
+            Ok(None) => "no tree for the pid".to_owned(),
+            Err(error) => format!("walk failed: {error:#}"),
+        };
         if std::time::Instant::now() >= deadline {
-            return None;
+            let bus = platform_linux::display::with_x11_display(display, platform_linux::display::atspi_bus_address);
+            return Err(format!("{last}; AT-SPI bus: {bus:?}"));
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
@@ -237,8 +249,8 @@ fn each_display_shows_and_drives_only_its_own_apps() {
     let trees: Vec<_> = [(&first, &alpha, "alpha"), (&second, &beta, "beta")]
         .into_iter()
         .map(|(display, app, mine)| {
-            tree_on(&display.name, app.pid, Some(&format!("{mine}-button")))
-                .unwrap_or_else(|| panic!("{mine}'s tree is not reachable on {}", display.name))
+            tree_or_why(&display.name, app.pid, Some(&format!("{mine}-button")))
+                .unwrap_or_else(|why| panic!("{mine}'s tree is not reachable on {}: {why}", display.name))
         })
         .collect();
 
