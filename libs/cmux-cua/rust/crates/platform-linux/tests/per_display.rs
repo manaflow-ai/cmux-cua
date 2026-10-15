@@ -156,15 +156,16 @@ impl App {
             done
             echo "launcher: ${launcher:-none}" >&2
             "$launcher" --launch-immediately &
-            # Publish the display's AT-SPI bus on its root window, as the
-            # session host does (the distro launcher has no X11 support).
-            for _ in $(seq 100); do
+            # The display's AT-SPI bus, for the test to publish on the root
+            # window as the session host does (the distro launcher can't).
+            for i in $(seq 100); do
                 address=$(dbus-send --session --print-reply=literal --dest=org.a11y.Bus \
-                    /org/a11y/bus org.a11y.Bus.GetAddress 2>/dev/null | tr -d ' ')
+                    /org/a11y/bus org.a11y.Bus.GetAddress | tr -d ' ')
                 [ -n "$address" ] && break
                 sleep 0.1
             done
-            xprop -root -f AT_SPI_BUS 8s -set AT_SPI_BUS "$address"
+            echo "bus $address"
+            read published
             exec python3 -c "$CMUX_CUA_TEST_APP" "$1"
         "#;
         let mut child = Command::new("dbus-run-session")
@@ -175,6 +176,7 @@ impl App {
             .env_remove("AT_SPI_BUS_ADDRESS")
             .env_remove("DBUS_SESSION_BUS_ADDRESS")
             .process_group(0)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(std::fs::File::create(Self::log_path(name)).expect("app log"))
             .spawn()
@@ -188,8 +190,14 @@ impl App {
                 }
             }
         });
+        let mut stdin = child.stdin.take().expect("app stdin");
         let mut app = Self { child, pid: 0, lines };
-        let first = app.line().unwrap_or_else(|| panic!("{name} did not start on {display}"));
+        let bus = app.line().unwrap_or_else(|| panic!("{name}'s session did not start on {display}{}", app.report(display, name)));
+        let address = bus.strip_prefix("bus ").filter(|address| !address.is_empty());
+        let address = address.unwrap_or_else(|| panic!("no AT-SPI bus for {name}: {bus:?}{}", app.report(display, name)));
+        publish_atspi_bus(display, address);
+        std::io::Write::write_all(&mut stdin, b"published\n").expect("resume the app session");
+        let first = app.line().unwrap_or_else(|| panic!("{name} did not start on {display}{}", app.report(display, name)));
         app.pid = first.strip_prefix("pid ").and_then(|pid| pid.parse().ok()).expect("app pid line");
         app
     }
@@ -228,6 +236,20 @@ impl Drop for App {
         let _ = Command::new("kill").args(["-s", "KILL", "--", &group]).status();
         let _ = self.child.wait();
     }
+}
+
+/// Write the display's AT-SPI bus to its root window's `AT_SPI_BUS`, as the
+/// session host does.
+fn publish_atspi_bus(display: &str, address: &str) {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, PropMode};
+    use x11rb::wrapper::ConnectionExt as _;
+    let (conn, screen) = x11rb::rust_connection::RustConnection::connect(Some(display)).expect("connect to the display");
+    let root = conn.setup().roots[screen].root;
+    let atom = conn.intern_atom(false, b"AT_SPI_BUS").expect("intern").reply().expect("atom").atom;
+    conn.change_property8(PropMode::REPLACE, root, atom, AtomEnum::STRING, address.as_bytes())
+        .expect("set AT_SPI_BUS");
+    conn.get_input_focus().expect("sync").reply().expect("sync reply");
 }
 
 /// The app's accessibility tree as seen from `display`, once it shows
