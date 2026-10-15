@@ -2985,6 +2985,32 @@ mod tests {
         .contains("approval broker token"));
     }
 
+    #[test]
+    fn a_proxy_with_a_display_refuses_a_daemon_that_ignores_displays() {
+        let old = DaemonResponse::ok(serde_json::json!({
+            "session_begin": true,
+            "profile": DaemonProfile::Native,
+        }));
+        let old = serde_json::to_string(&old).unwrap();
+        validate_control_ack_for_display(&old, DaemonProfile::Native, None)
+            .expect("no display named: an older daemon is fine");
+        let error = validate_control_ack_for_display(&old, DaemonProfile::Native, Some(":7"))
+            .expect_err("an older daemon would run the workspace's calls on its own display");
+        assert!(error.to_string().contains("per-call displays"));
+
+        let current = DaemonResponse::ok(serde_json::json!({
+            "session_begin": true,
+            "profile": DaemonProfile::Native,
+            "displays": true,
+        }));
+        validate_control_ack_for_display(
+            &serde_json::to_string(&current).unwrap(),
+            DaemonProfile::Native,
+            Some(":7"),
+        )
+        .expect("a daemon that runs calls on their display");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn control_connection_reconnects_after_daemon_rebind() {
