@@ -197,15 +197,19 @@ impl Drop for App {
     }
 }
 
-/// The app's accessibility tree as seen from `display`, once it has one.
-fn tree_on(display: &str, pid: u32, wait: bool) -> Option<Vec<platform_linux::atspi::AtspiNode>> {
+/// The app's accessibility tree as seen from `display`, once it shows
+/// `button` (any tree when `None`).
+fn tree_on(display: &str, pid: u32, button: Option<&str>) -> Option<Vec<platform_linux::atspi::AtspiNode>> {
+    let wait = button.is_some();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if wait { 20 } else { 0 });
     loop {
         let tree = platform_linux::display::with_x11_display(display, || {
             platform_linux::atspi::native::walk_tree(pid)
         });
         if let Ok(Some((_, nodes))) = tree {
-            return Some(nodes);
+            if button.map_or(true, |button| nodes.iter().any(|node| node.name.as_deref() == Some(button))) {
+                return Some(nodes);
+            }
         }
         if std::time::Instant::now() >= deadline {
             return None;
@@ -217,13 +221,23 @@ fn tree_on(display: &str, pid: u32, wait: bool) -> Option<Vec<platform_linux::at
 #[test]
 fn each_display_shows_and_drives_only_its_own_apps() {
     let Some((first, second)) = displays() else { return };
+    let gtk = Command::new("python3")
+        .args(["-c", "import gi; gi.require_version('Gtk', '3.0')"])
+        .status()
+        .is_ok_and(|status| status.success());
+    let session = Command::new("dbus-run-session").arg("--version").output().is_ok();
+    if !(gtk && session) {
+        assert!(std::env::var_os("CMUX_CUA_REQUIRE_XVFB").is_none(), "dbus-run-session and python3-gi (GTK 3) are required");
+        eprintln!("skipped: needs dbus-run-session and python3-gi (GTK 3)");
+        return;
+    }
     let alpha = App::start(&first.name, "alpha");
     let beta = App::start(&second.name, "beta");
 
     let trees: Vec<_> = [(&first, &alpha, "alpha"), (&second, &beta, "beta")]
         .into_iter()
         .map(|(display, app, mine)| {
-            tree_on(&display.name, app.pid, true)
+            tree_on(&display.name, app.pid, Some(&format!("{mine}-button")))
                 .unwrap_or_else(|| panic!("{mine}'s tree is not reachable on {}", display.name))
         })
         .collect();
@@ -236,7 +250,7 @@ fn each_display_shows_and_drives_only_its_own_apps() {
             .find(|node| node.name.as_deref() == Some(&format!("{mine}-button")))
             .unwrap_or_else(|| panic!("no {mine}-button on {}: {nodes:?}", display.name));
         assert!(
-            tree_on(&display.name, other.pid, false).is_none(),
+            tree_on(&display.name, other.pid, None).is_none(),
             "{} shows an app from another display",
             display.name
         );

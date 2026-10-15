@@ -86,10 +86,11 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 static SHARED_CONNECTION: tokio::sync::OnceCell<Arc<AccessibilityConnection>> =
     tokio::sync::OnceCell::const_new();
 
-/// Connections to targeted displays' AT-SPI buses, by bus address: a display
-/// that restarts with a new bus gets a new connection.
-static DISPLAY_CONNECTIONS: OnceLock<Mutex<HashMap<String, Arc<AccessibilityConnection>>>> =
-    OnceLock::new();
+/// Each targeted display's AT-SPI connection and the bus address it is for:
+/// a display that restarts with a new bus replaces its entry, so the map
+/// holds one connection per display name.
+type DisplayConnections = HashMap<String, (String, Arc<AccessibilityConnection>)>;
+static DISPLAY_CONNECTIONS: OnceLock<Mutex<DisplayConnections>> = OnceLock::new();
 
 /// Keep one AT-SPI connection and registry registration alive for the daemon
 /// lifetime. WebKitGTK only publishes its WebProcess accessibility subtree
@@ -98,7 +99,10 @@ static DISPLAY_CONNECTIONS: OnceLock<Mutex<HashMap<String, Arc<AccessibilityConn
 async fn shared_connection() -> Result<Arc<AccessibilityConnection>> {
     // Read before the first await: the display target is per thread.
     match crate::display::atspi_bus_address()? {
-        Some(address) => display_connection(address).await,
+        Some(address) => {
+            let display = crate::display::x11_display().unwrap_or_default();
+            display_connection(display, address).await
+        }
         None => SHARED_CONNECTION
             .get_or_try_init(|| async {
                 let conn = AccessibilityConnection::new()
@@ -111,10 +115,12 @@ async fn shared_connection() -> Result<Arc<AccessibilityConnection>> {
     }
 }
 
-async fn display_connection(address: String) -> Result<Arc<AccessibilityConnection>> {
+async fn display_connection(display: String, address: String) -> Result<Arc<AccessibilityConnection>> {
     let connections = DISPLAY_CONNECTIONS.get_or_init(Default::default);
-    if let Some(conn) = connections.lock().unwrap_or_else(|e| e.into_inner()).get(&address) {
-        return Ok(conn.clone());
+    if let Some((current, conn)) = connections.lock().unwrap_or_else(|e| e.into_inner()).get(&display) {
+        if *current == address {
+            return Ok(conn.clone());
+        }
     }
     let bus = address
         .parse()
@@ -123,12 +129,15 @@ async fn display_connection(address: String) -> Result<Arc<AccessibilityConnecti
         .await
         .map_err(|error| anyhow!("AT-SPI connect to {address} failed: {error}"))?;
     let conn = Arc::new(listening(conn).await);
-    Ok(connections
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(address)
-        .or_insert(conn)
-        .clone())
+    let mut connections = connections.lock().unwrap_or_else(|e| e.into_inner());
+    match connections.get(&display) {
+        // Another call connected to the same bus first: keep its connection.
+        Some((current, existing)) if *current == address => Ok(existing.clone()),
+        _ => {
+            connections.insert(display, (address, conn.clone()));
+            Ok(conn)
+        }
+    }
 }
 
 async fn listening(conn: AccessibilityConnection) -> AccessibilityConnection {
@@ -729,11 +738,16 @@ pub fn walk_tree_bounded(
     max_depth: Option<usize>,
 ) -> Result<Option<(String, Vec<AtspiNode>, Vec<(usize, i32, i32, u32, u32)>)>> {
     runtime().block_on(async {
-        let walk = async {
-            let shared = shared_connection().await?;
-            let conn = &*shared;
-            collect_visited_bounded(conn, pid, max_elements, max_depth).await
+        // The walk's nodes borrow the connection, so it outlives the walk.
+        let shared = match tokio::time::timeout(OP_TIMEOUT, shared_connection()).await {
+            Ok(shared) => shared?,
+            Err(_) => {
+                dlog!("AT-SPI connect timed out for pid {pid}");
+                return Ok(None);
+            }
         };
+        let conn = &*shared;
+        let walk = collect_visited_bounded(conn, pid, max_elements, max_depth);
         let visited = match tokio::time::timeout(OP_TIMEOUT, walk).await {
             Ok(result) => result?,
             Err(_) => {
