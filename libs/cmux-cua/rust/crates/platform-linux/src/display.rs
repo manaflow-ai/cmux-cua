@@ -113,21 +113,23 @@ pub fn open_xlib() -> *mut x11::xlib::Display {
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
     if let Some(name) = x11_display() {
-        // An inherited AT_SPI_BUS_ADDRESS would win over the display's own
-        // bus, so the app finds the one on the display's root window.
-        command
-            .env("DISPLAY", name)
-            .env_remove("WAYLAND_DISPLAY")
-            .env_remove("AT_SPI_BUS_ADDRESS");
+        command.env("DISPLAY", name).env_remove("WAYLAND_DISPLAY");
+        // AT_SPI_BUS_ADDRESS wins over every other lookup, so the app joins
+        // the display's AT-SPI bus even on its process's session bus.
+        match atspi_bus_address() {
+            Ok(Some(address)) => command.env("AT_SPI_BUS_ADDRESS", address),
+            _ => command.env_remove("AT_SPI_BUS_ADDRESS"),
+        };
     }
     command
 }
 
-/// The AT-SPI bus of the display this call targets: the address its
-/// `at-spi-bus-launcher` wrote to the root window's `AT_SPI_BUS` property, the
-/// same place toolkits look. `None` when the call targets no display. A
-/// targeted display without one is an error, never the process's bus, which
-/// would show another display's apps.
+/// The AT-SPI bus of the display this call targets, from the root window's
+/// `AT_SPI_BUS` property, where toolkits also look. An `at-spi-bus-launcher`
+/// built with X11 writes it; Debian and Ubuntu build theirs without, so the
+/// session host writes it after starting the display's launcher. `None` when
+/// the call targets no display. A targeted display without one is an error,
+/// never the process's bus, which would show another display's apps.
 pub fn atspi_bus_address() -> anyhow::Result<Option<String>> {
     use x11rb::connection::Connection as _;
     use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};

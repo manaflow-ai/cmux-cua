@@ -121,8 +121,9 @@ fn a_tool_call_scoped_to_a_display_runs_on_that_display() {
 }
 
 /// A GTK app on one display with its own session bus and AT-SPI bus, as the
-/// session host gives each workspace: one button, and a line on stdout per
-/// click. The whole process group is killed on drop.
+/// session host gives each workspace (bus address published on the root
+/// window): one button, and a line on stdout per click. The whole process
+/// group is killed on drop.
 struct App {
     child: Child,
     pid: u32,
@@ -155,6 +156,15 @@ impl App {
             done
             echo "launcher: ${launcher:-none}" >&2
             "$launcher" --launch-immediately &
+            # Publish the display's AT-SPI bus on its root window, as the
+            # session host does (the distro launcher has no X11 support).
+            for _ in $(seq 100); do
+                address=$(dbus-send --session --print-reply=literal --dest=org.a11y.Bus \
+                    /org/a11y/bus org.a11y.Bus.GetAddress 2>/dev/null | tr -d ' ')
+                [ -n "$address" ] && break
+                sleep 0.1
+            done
+            xprop -root -f AT_SPI_BUS 8s -set AT_SPI_BUS "$address"
             exec python3 -c "$CMUX_CUA_TEST_APP" "$1"
         "#;
         let mut child = Command::new("dbus-run-session")
