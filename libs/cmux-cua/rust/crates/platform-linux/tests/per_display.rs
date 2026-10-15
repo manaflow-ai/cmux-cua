@@ -140,11 +140,28 @@ fn overlay_windows_on(display: &str) -> usize {
         .count()
 }
 
+/// The overlay is process-global: start it once for every test here.
+fn overlay_started() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        platform_linux::overlay::init(cursor_overlay::CursorConfig::default());
+        platform_linux::overlay::run_on_thread();
+    });
+}
+
+/// Waits up to 10 s for the overlay window count on `display` to reach `want`.
+fn wait_for_overlay_windows(display: &str, want: usize) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while overlay_windows_on(display) != want && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    overlay_windows_on(display)
+}
+
 #[test]
 fn the_agent_cursor_of_a_scoped_call_shows_on_that_display() {
     let Some((small, large)) = displays() else { return };
-    platform_linux::overlay::init(cursor_overlay::CursorConfig::default());
-    platform_linux::overlay::run_on_thread();
+    overlay_started();
 
     platform_linux::display::with_x11_display(&small.name, || {
         platform_linux::overlay::send_command_for(
@@ -152,12 +169,31 @@ fn the_agent_cursor_of_a_scoped_call_shows_on_that_display() {
             cursor_overlay::OverlayCommand::SnapTo { x: 100.0, y: 100.0, heading_radians: None },
         );
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while overlay_windows_on(&small.name) == 0 && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert_eq!(overlay_windows_on(&small.name), 1, "the cursor overlay opens on {}", small.name);
+    assert_eq!(wait_for_overlay_windows(&small.name, 1), 1, "the cursor overlay opens on {}", small.name);
     assert_eq!(overlay_windows_on(&large.name), 0, "and only there");
+}
+
+#[test]
+fn a_display_that_is_gone_never_starves_the_others() {
+    let Some((small, _large)) = displays() else { return };
+    overlay_started();
+    // A workspace whose display is gone (no server on :4998) keeps moving its
+    // cursor, e.g. a long drag: more commands than the overlay's whole queue.
+    platform_linux::display::with_x11_display(":4998", || {
+        for step in 0..5000 {
+            platform_linux::overlay::send_command_for(
+                "cursor-on-a-closed-display".to_owned(),
+                cursor_overlay::OverlayCommand::SnapTo { x: step as f64, y: 10.0, heading_radians: None },
+            );
+        }
+    });
+    platform_linux::display::with_x11_display(&small.name, || {
+        platform_linux::overlay::send_command_for(
+            "cursor-on-a-live-display".to_owned(),
+            cursor_overlay::OverlayCommand::SnapTo { x: 100.0, y: 100.0, heading_radians: None },
+        );
+    });
+    assert_eq!(wait_for_overlay_windows(&small.name, 1), 1, "a live display still gets its cursor overlay");
 }
 
 /// Width and height of the first video stream in `path`.
