@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   prepare:
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-15
     outputs:
       version: ${{ steps.get-version.outputs.version }}
       agent_version: ${{ steps.update-deps.outputs.agent_version }}
@@ -151,7 +151,7 @@ jobs:
 
   set-env-variables:
     needs: [prepare, publish]
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-15
     steps:
       - name: Set environment variables for use in other jobs
         run: |

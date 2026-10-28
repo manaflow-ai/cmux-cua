@@ -31,7 +31,7 @@ on:
 jobs:
   check-docs-sync:
     name: Check Documentation Sync
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

@@ -47,10 +47,10 @@ jobs:
         include:
           - arch: x86_64
             target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: blacksmith-4vcpu-ubuntu-2404
           - arch: arm64
             target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
     # Build INSIDE a Debian 11 (bullseye) container instead of directly on
     # the host. ubuntu-latest is now Ubuntu 24.04, whose glibc is 2.39 — a
     # binary linked there imports GLIBC_2.39 symbols (e.g. posix_spawn's
@@ -136,7 +136,7 @@ jobs:
   # the matching zip at install time based on the host's OS architecture.
   build-windows:
     name: windows-${{ matrix.arch }}
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     strategy:
       fail-fast: false
       matrix:
@@ -224,7 +224,7 @@ jobs:
   # expose those symbols, so the transitive Swift bridge fails to compile.
   build-macos-universal:
     name: darwin-universal
-    runs-on: macos-26
+    runs-on: blacksmith-6vcpu-macos-26
     # Notarize on tag push (real release); on workflow_dispatch honor the
     # `notarize` input so we can iterate on the build pipeline without
     # touching the Apple notary service.
@@ -417,7 +417,7 @@ jobs:
   release:
     needs: [build-linux, build-windows, build-macos-universal]
     if: startsWith(github.ref, 'refs/tags/cua-driver-rs-v')
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
         with:
