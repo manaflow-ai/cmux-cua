@@ -53,6 +53,13 @@ jobs:
       - name: Run core and driver unit tests
         working-directory: libs/cmux-cua/rust
         run: cargo test -p cmux-cua-core -p cmux-cua --lib --bins --locked
+      # The build that ships inside cmux.app: machine consent from the
+      # verified cmux host (cmux-host-consent).
+      - name: Build and test the cmux.app build
+        working-directory: libs/cmux-cua/rust
+        run: |
+          cargo build -p cmux-cua --locked --features cmux-host-consent
+          cargo test -p cmux-cua-core --lib --locked --features cmux-host-consent consent
       - name: Run cursor-overlay tests (glide vectors shared with Swift)
         working-directory: libs/cmux-cua/rust
         run: cargo test -p cursor-overlay --locked
