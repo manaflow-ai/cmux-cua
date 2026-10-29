@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 
 use crate::machine_consent::{ConsentSource, ConsentStatus, Surface};
 
