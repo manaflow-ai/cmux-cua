@@ -203,11 +203,16 @@ pub trait ConsentSource: Send + Sync {
 ///
 /// The build that ships inside cmux.app (feature `cmux-host-consent`) holds
 /// the person's macOS grants, so it trusts no file a caller could redirect:
-/// until the verified-host source exists, it answers [`Unavailable`].
+/// it asks the verified cmux host (`host_consent`), and with no host
+/// connected the answer is "joined, nothing granted".
 /// Standalone and released builds keep acpmux's state files, which are
 /// advisory: `$ACPMUX_HOME` is chosen by whoever starts the process.
 pub fn default_source() -> Arc<dyn ConsentSource> {
-    #[cfg(feature = "cmux-host-consent")]
+    #[cfg(all(feature = "cmux-host-consent", unix))]
+    {
+        crate::host_consent::shared()
+    }
+    #[cfg(all(feature = "cmux-host-consent", not(unix)))]
     {
         Arc::new(Unavailable)
     }

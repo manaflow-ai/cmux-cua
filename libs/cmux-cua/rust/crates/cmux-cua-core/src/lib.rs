@@ -108,6 +108,8 @@ pub mod health_report;
 pub mod image_utils;
 pub mod lease;
 pub mod machine_consent;
+#[cfg(all(feature = "cmux-host-consent", unix))]
+pub mod host_consent;
 pub mod page;
 pub mod pip_hook;
 pub mod protocol;
