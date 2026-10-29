@@ -486,6 +486,7 @@ dependencies = [
  "async-trait",
  "hmac",
  "image",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

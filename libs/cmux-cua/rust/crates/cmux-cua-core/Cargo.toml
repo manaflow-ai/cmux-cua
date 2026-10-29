@@ -19,11 +19,30 @@ async-trait = "0.1"
 # all three platforms call the same code path.
 image = { workspace = true }
 
+[features]
+# The build that ships inside cmux.app: machine consent comes only from the
+# verified cmux host, never from files a caller could redirect. cmux's
+# build-cmux-cua.sh turns it on; released and standalone builds leave it off.
+cmux-host-consent = []
+
 [dev-dependencies]
 tempfile = "3"
+
+# `machine_consent` opens acpmux's consent record without following a link
+# and checks its owner against this process's uid.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Used by `cursor_sampler::sample_cursor` to poll the OS mouse position
 # during video recording. Same version as platform-windows uses to avoid
 # a duplicate crate version.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+# Win32_Security*/Win32_System_Threading: `machine_consent` checks the owner
+# and DACL of acpmux's consent and join records on the opened handle.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }

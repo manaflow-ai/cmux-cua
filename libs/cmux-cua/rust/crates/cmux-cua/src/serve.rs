@@ -11,6 +11,8 @@
 //!   {"method":"permissions_present"}      (private macOS operator control)
 //!   {"method":"permissions_refresh"}      (private macOS operator control)
 //!   {"method":"application_windows"}      (private authenticated cmux host control)
+//!   {"method":"machine_consent_host"}     (the cmux app serves machine consent on this
+//!                                          connection; cmux-host-consent builds only)
 //!   {"method":"application_surface_start","args":{...}}
 //!   {"method":"application_surface_stop","args":{"session":"..."}}
 //!   {"method":"application_surface_event","args":{...}}
@@ -539,6 +541,16 @@ type SecurityFlags = u32;
 #[link(name = "Security", kind = "framework")]
 extern "C" {
     static kSecGuestAttributePid: core_foundation::string::CFStringRef;
+    #[cfg(feature = "cmux-host-consent")]
+    static kSecGuestAttributeAudit: core_foundation::string::CFStringRef;
+    #[cfg(feature = "cmux-host-consent")]
+    static kSecCodeInfoIdentifier: core_foundation::string::CFStringRef;
+    #[cfg(feature = "cmux-host-consent")]
+    fn SecCodeCopySigningInformation(
+        code: SecurityCodeRef,
+        flags: SecurityFlags,
+        information: *mut core_foundation::dictionary::CFDictionaryRef,
+    ) -> SecurityStatus;
     fn SecCodeCopySelf(flags: SecurityFlags, code: *mut SecurityCodeRef) -> SecurityStatus;
     fn SecCodeCopyDesignatedRequirement(
         code: SecurityCodeRef,
@@ -772,6 +784,144 @@ fn approval_broker_peer_is_trusted(peer_pid: libc::pid_t) -> Result<(), String> 
         return Ok(());
     }
     validate_codex_dynamic_code(process_parent_pid(peer_pid)?)
+}
+
+/// A cmux app that may serve machine consent: valid code with an
+/// Apple-anchored signature of cmux's team (this requirement), whose
+/// signing identifier is a cmux app's ([`is_cmux_app_identifier`]; a
+/// requirement's `identifier` clause only matches exactly).
+#[cfg(all(target_os = "macos", feature = "cmux-host-consent"))]
+const CMUX_TEAM_REQUIREMENT: &str = "anchor apple generic and certificate leaf[subject.OU] = \"7WLXT3NR37\"";
+
+/// The cmux main apps a consent answer may come from; never a helper.
+/// The same list as cmux's Computer Use helper v2 (`CmuxAppIdentity` in
+/// CmuxCuaHelperCore/HostVerifier.swift): stable, NIGHTLY, cmux NEXT
+/// nightly, RC, untagged DEV and staging, and tagged DEV and staging builds
+/// whose tag is `[a-z0-9]+` segments joined by single dots (`sanitize_bundle`).
+#[cfg(any(test, all(target_os = "macos", feature = "cmux-host-consent")))]
+const CMUX_APP_IDENTIFIERS: &[&str] = &[
+    "com.cmuxterm.app",
+    "com.cmuxterm.app.nightly",
+    "com.cmuxterm.app.nightly.cmux-next",
+    "com.cmuxterm.app.rc",
+    "com.cmuxterm.app.debug",
+    "com.cmuxterm.app.staging",
+];
+
+#[cfg(any(test, all(target_os = "macos", feature = "cmux-host-consent")))]
+const CMUX_APP_TAGGED_PREFIXES: &[&str] = &["com.cmuxterm.app.debug.", "com.cmuxterm.app.staging."];
+
+/// Whether `identifier` is a cmux main app's. Any id naming a helper
+/// (`cua`, `computer-use`, `helper`: com.cmuxterm.cua, the Computer Use
+/// helper apps, server helpers) is refused, whatever else matches.
+#[cfg(any(test, all(target_os = "macos", feature = "cmux-host-consent")))]
+fn is_cmux_app_identifier(identifier: &str) -> bool {
+    if ["cua", "computer-use", "helper"].iter().any(|marker| identifier.contains(marker)) {
+        return false;
+    }
+    if CMUX_APP_IDENTIFIERS.contains(&identifier) {
+        return true;
+    }
+    CMUX_APP_TAGGED_PREFIXES.iter().any(|prefix| {
+        identifier.strip_prefix(prefix).is_some_and(|tag| {
+            tag.split('.').all(|segment| {
+                !segment.is_empty()
+                    && segment.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            })
+        })
+    })
+}
+
+/// The connected peer's audit token (LOCAL_PEERTOKEN), so the code check
+/// names this exact process instance, not a pid that could be reused.
+#[cfg(all(target_os = "macos", feature = "cmux-host-consent"))]
+fn macos_peer_audit_token(stream: &tokio::net::UnixStream) -> Option<[u32; 8]> {
+    use std::os::fd::AsRawFd;
+    const LOCAL_PEERTOKEN: libc::c_int = 6;
+    let mut token = [0u32; 8];
+    let mut length = std::mem::size_of_val(&token) as libc::socklen_t;
+    let status = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            LOCAL_PEERTOKEN,
+            token.as_mut_ptr().cast(),
+            &mut length,
+        )
+    };
+    (status == 0 && length as usize == std::mem::size_of_val(&token)).then_some(token)
+}
+
+/// Whether the peer with `token` runs valid code of cmux's team whose
+/// signing identifier is a cmux app's. `Err` says why not, for the log and
+/// the refused host (no secret is involved): checked in steps so an ad hoc
+/// build, another team and another app are told apart. Any error refuses.
+#[cfg(all(target_os = "macos", feature = "cmux-host-consent"))]
+fn macos_peer_cmux_app_check(token: &[u32; 8]) -> Result<(), String> {
+    use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
+    use core_foundation::data::CFData;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+    use core_foundation::string::CFString;
+
+    /// Owns a Security object and releases it once.
+    struct Owned(*const libc::c_void);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0 as CFTypeRef) };
+            }
+        }
+    }
+    let satisfies = |code: SecurityCodeRef, text: &str| -> bool {
+        let text = CFString::new(text);
+        let mut requirement: SecurityRequirementRef = std::ptr::null();
+        let created =
+            unsafe { SecRequirementCreateWithString(text.as_concrete_TypeRef(), 0, &mut requirement) } == 0;
+        let requirement = Owned(requirement);
+        created
+            && !requirement.0.is_null()
+            && unsafe { SecCodeCheckValidity(code, 0, requirement.0) } == 0
+    };
+
+    let bytes: Vec<u8> = token.iter().flat_map(|word| word.to_ne_bytes()).collect();
+    let audit_key = unsafe { CFString::wrap_under_get_rule(kSecGuestAttributeAudit) };
+    let attributes = CFDictionary::from_CFType_pairs(&[(audit_key, CFData::from_buffer(&bytes))]);
+    let mut code: SecurityCodeRef = std::ptr::null();
+    let found = unsafe {
+        SecCodeCopyGuestWithAttributes(std::ptr::null(), attributes.as_concrete_TypeRef(), 0, &mut code)
+    } == 0;
+    let code = Owned(code);
+    if !found || code.0.is_null() {
+        return Err("no code for the peer".into());
+    }
+    if unsafe { SecCodeCheckValidity(code.0, 0, std::ptr::null()) } != 0 {
+        return Err("invalid signature".into());
+    }
+    if !satisfies(code.0, "anchor apple generic") {
+        return Err("not Apple-signed (ad hoc or unsigned)".into());
+    }
+    if !satisfies(code.0, CMUX_TEAM_REQUIREMENT) {
+        return Err("not signed by cmux's team".into());
+    }
+    // The identifier of the code just validated (kSecCSSigningInformation).
+    let mut information: CFDictionaryRef = std::ptr::null();
+    let status = unsafe { SecCodeCopySigningInformation(code.0, 1 << 1, &mut information) };
+    if status != 0 || information.is_null() {
+        return Err("no signing information".into());
+    }
+    let information: CFDictionary<CFString, core_foundation::base::CFType> =
+        unsafe { CFDictionary::wrap_under_create_rule(information) };
+    let key = unsafe { CFString::wrap_under_get_rule(kSecCodeInfoIdentifier) };
+    let identifier = information
+        .find(&key)
+        .and_then(|value| value.downcast::<CFString>())
+        .map(|identifier| identifier.to_string())
+        .unwrap_or_default();
+    if is_cmux_app_identifier(&identifier) {
+        Ok(())
+    } else {
+        Err(format!("signing identifier {identifier:?} is not a cmux app"))
+    }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -2135,6 +2285,8 @@ pub async fn run_serve_with_owner(
                 }
                 #[cfg(target_os = "macos")]
                 let peer_process_id = macos_peer_process_id(&stream);
+                #[cfg(all(target_os = "macos", feature = "cmux-host-consent"))]
+                let peer_audit_token = macos_peer_audit_token(&stream);
                 #[cfg(target_os = "macos")]
                 let peer_process_identity =
                     peer_process_id.and_then(macos_process_identity);
@@ -2238,6 +2390,74 @@ pub async fn run_serve_with_owner(
                                     let _ = tx.send(());
                                 }
                                 return;
+                            }
+                            "machine_consent_host" => {
+                                // The cmux app answers machine-consent questions on this
+                                // connection from its own acpmux daemon. Only the
+                                // authenticated host, running code signed as a cmux app,
+                                // may hold it; the connection serves nothing else after.
+                                #[cfg(all(target_os = "macos", feature = "cmux-host-consent"))]
+                                {
+                                    // The host token itself, never the authorized-root
+                                    // fallback a daemon without host authority uses.
+                                    let authenticated =
+                                        host_authority_configured && parsed.host_authenticated;
+                                    // Only an authenticated host learns why its code
+                                    // was refused; the log says it either way.
+                                    let check = authenticated.then(|| match peer_audit_token.as_ref() {
+                                        Some(token) => macos_peer_cmux_app_check(token),
+                                        None => Err("no audit token for the peer".to_owned()),
+                                    });
+                                    let verified = matches!(check, Some(Ok(())));
+                                    let resp = match check {
+                                        Some(Ok(())) => {
+                                            DaemonResponse::ok(serde_json::json!({"attached": true}))
+                                        }
+                                        Some(Err(why)) => {
+                                            eprintln!(
+                                                "cmux-cua: refused the machine consent host: \
+                                                 {}: {why}",
+                                                cmux_cua_core::machine_consent::HOST_UNVERIFIED
+                                            );
+                                            DaemonResponse::err(
+                                                format!(
+                                                    "Unauthorized host-only consent request: {} ({why})",
+                                                    cmux_cua_core::machine_consent::HOST_UNVERIFIED
+                                                ),
+                                                77,
+                                            )
+                                        }
+                                        None => {
+                                            eprintln!(
+                                                "cmux-cua: refused the machine consent host: \
+                                                 no host token"
+                                            );
+                                            DaemonResponse::err(
+                                                "Unauthorized host-only consent request",
+                                                77,
+                                            )
+                                        }
+                                    };
+                                    let sent = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await.is_ok();
+                                    if verified && sent {
+                                        cmux_cua_core::host_consent::shared_host()
+                                            .serve_host(&mut lines, &mut writer)
+                                            .await;
+                                        return;
+                                    }
+                                }
+                                #[cfg(not(all(target_os = "macos", feature = "cmux-host-consent")))]
+                                {
+                                    let resp = DaemonResponse::err(
+                                        "machine_consent_host is not in this build",
+                                        64,
+                                    );
+                                    let _ = writer.write_all(
+                                        (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                    ).await;
+                                }
                             }
                             "permissions_status" => {
                                 #[cfg(target_os = "macos")]
@@ -2778,12 +2998,22 @@ pub async fn run_serve_with_owner(
                                 // capability_version + schema_version so MCP
                                 // proxy callers can pass them through verbatim
                                 // (one daemon round-trip, complete response).
-                                let resp = DaemonResponse::ok(serde_json::json!({
+                                #[allow(unused_mut)]
+                                let mut listed = serde_json::json!({
                                     "tools": tools,
                                     "capability_version": cmux_cua_core::tool::CAPABILITY_VERSION,
                                     "schema_version": "1",
                                     "profile": profile,
-                                }));
+                                });
+                                // The cmux.app build gates every call on the verified
+                                // host's machine consent; say so to whoever lists.
+                                #[cfg(feature = "cmux-host-consent")]
+                                {
+                                    listed["capabilities"] = serde_json::json!([
+                                        cmux_cua_core::machine_consent::GATE_CAPABILITY
+                                    ]);
+                                }
+                                let resp = DaemonResponse::ok(listed);
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -5339,5 +5569,81 @@ mod session_boundary_tests {
             "proxy-session",
             "daemon-minted"
         ));
+    }
+}
+
+#[cfg(test)]
+mod machine_consent_host_tests {
+    use super::*;
+
+    #[test]
+    fn only_cmux_app_identifiers_may_serve_consent() {
+        for identifier in [
+            "com.cmuxterm.app",
+            "com.cmuxterm.app.nightly",
+            "com.cmuxterm.app.nightly.cmux-next",
+            "com.cmuxterm.app.rc",
+            "com.cmuxterm.app.debug",
+            "com.cmuxterm.app.staging",
+            "com.cmuxterm.app.debug.mytag",
+            "com.cmuxterm.app.debug.next",
+            "com.cmuxterm.app.debug.split.spring2",
+            "com.cmuxterm.app.staging.mytag",
+        ] {
+            assert!(is_cmux_app_identifier(identifier), "{identifier}");
+        }
+        for identifier in [
+            // Helpers, whatever else matches.
+            "com.cmuxterm.cua",
+            "com.cmuxterm.cua.dev",
+            "com.cmuxterm.app.computer-use",
+            "com.cmuxterm.app.debug.cua",
+            "com.cmuxterm.app.nightly.server-helper",
+            "com.cmuxterm.app.debug.mytag.server-helper",
+            // Near misses.
+            "com.cmuxterm.apple",
+            "com.cmuxterm.app.",
+            "com.cmuxterm.app.next",
+            "com.cmuxterm.app.nightly.leo",
+            "com.cmuxterm.app.debug.",
+            "com.cmuxterm.app.debug.my-tag",
+            "com.cmuxterm.app.debug.MyTag",
+            "com.cmuxterm.app.debug.a..b",
+            "com.cmuxterm.app.debug.a.",
+            "com.cmuxterm.app.debugger",
+            "acpmux",
+            "cmux-cua",
+            "",
+        ] {
+            assert!(!is_cmux_app_identifier(identifier), "{identifier}");
+        }
+    }
+
+    /// The cmux.app build says it gates every call; others do not.
+    #[test]
+    fn only_the_cmux_app_build_advertises_the_consent_gate() {
+        let manifest = crate::cli::build_manifest();
+        let advertised = manifest["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == cmux_cua_core::machine_consent::GATE_CAPABILITY);
+        assert_eq!(advertised, cfg!(feature = "cmux-host-consent"));
+        assert_eq!(cmux_cua_core::machine_consent::GATE_CAPABILITY, "machine-consent-gate-v1");
+    }
+
+    /// This test binary is not a signed cmux app, so as a peer it may
+    /// never serve consent.
+    #[cfg(all(target_os = "macos", feature = "cmux-host-consent"))]
+    #[tokio::test]
+    async fn a_peer_that_is_not_a_signed_cmux_app_is_refused() {
+        let (daemon_end, _host_end) = tokio::net::UnixStream::pair().unwrap();
+        let token = macos_peer_audit_token(&daemon_end).expect("the peer's audit token");
+        let why = macos_peer_cmux_app_check(&token).unwrap_err();
+        // An unsigned or ad hoc test binary is told apart from another team.
+        assert!(
+            ["not Apple-signed (ad hoc or unsigned)", "invalid signature", "no code for the peer"].contains(&why.as_str()),
+            "{why}"
+        );
     }
 }

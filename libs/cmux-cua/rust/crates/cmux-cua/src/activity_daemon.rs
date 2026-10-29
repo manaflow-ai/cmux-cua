@@ -241,7 +241,14 @@ pub async fn finish(host: Arc<ActivityHost>, start: CallStart, args: &Value, res
             use base64::Engine as _;
             base64::engine::general_purpose::STANDARD.decode(data).ok()
         });
+    // On a machine joined to a cmux team, the activity log keeps no pixels
+    // unless the person allows `screen` now: an action allowed by `control`
+    // alone neither takes an after frame nor keeps one from its result.
+    let screen_allowed = cmux_cua_core::machine_consent::default_source()
+        .status()
+        .granted(cmux_cua_core::machine_consent::Surface::Screen);
     frames.after_png = match (image_in_result, start.kind) {
+        _ if !screen_allowed => None,
         (Some(bytes), _) => Some(bytes),
         (None, CallKind::Act) => {
             let window_id = args.get("window_id").and_then(Value::as_u64);
