@@ -793,16 +793,43 @@ fn approval_broker_peer_is_trusted(peer_pid: libc::pid_t) -> Result<(), String> 
 #[cfg(all(target_os = "macos", feature = "cmux-host-consent"))]
 const CMUX_TEAM_REQUIREMENT: &str = "anchor apple generic and certificate leaf[subject.OU] = \"7WLXT3NR37\"";
 
-/// `com.cmuxterm.app` and its channels and tags (`com.cmuxterm.app.nightly`,
-/// `com.cmuxterm.app.debug.<tag>`), never another identifier that merely
-/// starts with those letters.
+/// The cmux main apps a consent answer may come from; never a helper.
+/// The same list as cmux's Computer Use helper v2 (`CmuxAppIdentity` in
+/// CmuxCuaHelperCore/HostVerifier.swift): stable, NIGHTLY, cmux NEXT
+/// nightly, RC, untagged DEV and staging, and tagged DEV and staging builds
+/// whose tag is `[a-z0-9]+` segments joined by single dots (`sanitize_bundle`).
+#[cfg(any(test, all(target_os = "macos", feature = "cmux-host-consent")))]
+const CMUX_APP_IDENTIFIERS: &[&str] = &[
+    "com.cmuxterm.app",
+    "com.cmuxterm.app.nightly",
+    "com.cmuxterm.app.nightly.cmux-next",
+    "com.cmuxterm.app.rc",
+    "com.cmuxterm.app.debug",
+    "com.cmuxterm.app.staging",
+];
+
+#[cfg(any(test, all(target_os = "macos", feature = "cmux-host-consent")))]
+const CMUX_APP_TAGGED_PREFIXES: &[&str] = &["com.cmuxterm.app.debug.", "com.cmuxterm.app.staging."];
+
+/// Whether `identifier` is a cmux main app's. Any id naming a helper
+/// (`cua`, `computer-use`, `helper`: com.cmuxterm.cua, the Computer Use
+/// helper apps, server helpers) is refused, whatever else matches.
 #[cfg(any(test, all(target_os = "macos", feature = "cmux-host-consent")))]
 fn is_cmux_app_identifier(identifier: &str) -> bool {
-    match identifier.strip_prefix("com.cmuxterm.app") {
-        Some("") => true,
-        Some(rest) => rest.starts_with('.') && rest.len() > 1,
-        None => false,
+    if ["cua", "computer-use", "helper"].iter().any(|marker| identifier.contains(marker)) {
+        return false;
     }
+    if CMUX_APP_IDENTIFIERS.contains(&identifier) {
+        return true;
+    }
+    CMUX_APP_TAGGED_PREFIXES.iter().any(|prefix| {
+        identifier.strip_prefix(prefix).is_some_and(|tag| {
+            tag.split('.').all(|segment| {
+                !segment.is_empty()
+                    && segment.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            })
+        })
+    })
 }
 
 /// The connected peer's audit token (LOCAL_PEERTOKEN), so the code check
@@ -5554,15 +5581,36 @@ mod machine_consent_host_tests {
         for identifier in [
             "com.cmuxterm.app",
             "com.cmuxterm.app.nightly",
-            "com.cmuxterm.app.debug.my-tag",
-            "com.cmuxterm.app.next",
+            "com.cmuxterm.app.nightly.cmux-next",
+            "com.cmuxterm.app.rc",
+            "com.cmuxterm.app.debug",
+            "com.cmuxterm.app.staging",
+            "com.cmuxterm.app.debug.mytag",
+            "com.cmuxterm.app.debug.next",
+            "com.cmuxterm.app.debug.split.spring2",
+            "com.cmuxterm.app.staging.mytag",
         ] {
             assert!(is_cmux_app_identifier(identifier), "{identifier}");
         }
         for identifier in [
+            // Helpers, whatever else matches.
+            "com.cmuxterm.cua",
+            "com.cmuxterm.cua.dev",
+            "com.cmuxterm.app.computer-use",
+            "com.cmuxterm.app.debug.cua",
+            "com.cmuxterm.app.nightly.server-helper",
+            "com.cmuxterm.app.debug.mytag.server-helper",
+            // Near misses.
             "com.cmuxterm.apple",
             "com.cmuxterm.app.",
-            "com.cmuxterm.cua",
+            "com.cmuxterm.app.next",
+            "com.cmuxterm.app.nightly.leo",
+            "com.cmuxterm.app.debug.",
+            "com.cmuxterm.app.debug.my-tag",
+            "com.cmuxterm.app.debug.MyTag",
+            "com.cmuxterm.app.debug.a..b",
+            "com.cmuxterm.app.debug.a.",
+            "com.cmuxterm.app.debugger",
             "acpmux",
             "cmux-cua",
             "",
