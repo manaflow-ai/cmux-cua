@@ -952,8 +952,10 @@ impl ToolRegistry {
     }
 
     /// Start (once per registry) the thread that stops a running recording,
-    /// video included, within half a second of a `screen` revoke, without
-    /// waiting for the next tool call. It holds only a weak reference to the
+    /// video included, after a `screen` revoke without waiting for the next
+    /// tool call: it checks every half second, and each check takes at most
+    /// the source's own deadline (1.5 s for the cmux host), so a revoke
+    /// ends the recording within about two seconds. It holds only a weak reference to the
     /// recording. Stop condition: the registry is dropped (its `Drop` drops
     /// the sender and joins the thread) or the recording is gone. Returns
     /// false when no watcher runs and none could be started.

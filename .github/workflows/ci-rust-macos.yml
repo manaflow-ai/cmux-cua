@@ -60,6 +60,7 @@ jobs:
         run: |
           cargo build -p cmux-cua --locked --features cmux-host-consent
           cargo test -p cmux-cua-core --lib --locked --features cmux-host-consent consent
+          cargo test -p cmux-cua --bins --locked --features cmux-host-consent machine_consent_host
       - name: Run cursor-overlay tests (glide vectors shared with Swift)
         working-directory: libs/cmux-cua/rust
         run: cargo test -p cursor-overlay --locked
