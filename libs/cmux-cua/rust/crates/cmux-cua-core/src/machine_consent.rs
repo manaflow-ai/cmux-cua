@@ -1057,7 +1057,10 @@ mod tests {
         assert!(!unjoined.status().consent_required);
         let default = default_source().status();
         if cfg!(feature = "cmux-host-consent") {
-            assert_eq!(default, ConsentStatus::UNKNOWN);
+            // No host attached: joined, nothing granted (and, with the host
+            // source, refusals say the host is unverified).
+            assert!(default.consent_required && !default.screen && !default.control);
+            assert_eq!(default.host_unverified, cfg!(unix));
         }
     }
 
