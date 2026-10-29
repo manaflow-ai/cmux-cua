@@ -486,6 +486,9 @@ pub struct ToolRegistry {
     consent_home: Option<std::path::PathBuf>,
     /// Set while a thread watches the screen grant during a recording.
     consent_watch: Arc<std::sync::atomic::AtomicBool>,
+    /// Test hook: the watcher fails to start.
+    #[cfg(test)]
+    fail_consent_watch_spawn: bool,
 }
 
 /// Signature of the platform target guard.
@@ -503,6 +506,8 @@ impl ToolRegistry {
             target_policy_hook: None,
             consent_home: None,
             consent_watch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_consent_watch_spawn: false,
         }
     }
 
@@ -699,13 +704,13 @@ impl ToolRegistry {
             screen_granted = status.granted(crate::machine_consent::Surface::Screen);
             if recording_on && !screen_granted {
                 // A screen revoke ends a running recording (and its video) now.
-                let _ = self.recording.stop_owner(None);
                 if let Some(home) = consent_home.as_deref() {
                     crate::machine_consent::record_refusal(
                         home,
                         crate::machine_consent::Surface::Screen,
                     );
                 }
+                let _ = self.recording.stop_owner(None);
             }
             if let Some(surface) =
                 crate::machine_consent::missing_surface(&status, resolved_name, false)
@@ -758,8 +763,17 @@ impl ToolRegistry {
 
         let result = tool.invoke(args.clone()).await;
 
-        if resolved_name == "start_recording" && result.is_error != Some(true) {
-            self.watch_screen_consent_while_recording(consent_home.clone());
+        if resolved_name == "start_recording"
+            && result.is_error != Some(true)
+            && !self.watch_screen_consent_while_recording(consent_home.clone())
+        {
+            // Without a watcher a revoke could not stop the video between
+            // calls: do not record at all.
+            let _ = self.recording.stop_owner(None);
+            return ToolResult::error(
+                "start_recording: could not start the consent watcher; recording stopped.",
+            )
+            .with_structured(serde_json::json!({"code": "consent_watch_unavailable"}));
         }
 
         // Embedded-host process state is action-scoped: update it only after a
@@ -879,10 +893,16 @@ impl ToolRegistry {
     /// the recording (video included) as soon as it is revoked, without
     /// waiting for the next tool call. One watcher per registry. Stop
     /// condition: the recording is no longer running; the thread then exits.
-    fn watch_screen_consent_while_recording(&self, home: Option<std::path::PathBuf>) {
+    /// Returns false when no watcher runs and none could be started.
+    fn watch_screen_consent_while_recording(&self, home: Option<std::path::PathBuf>) -> bool {
         use std::sync::atomic::Ordering;
         if self.consent_watch.swap(true, Ordering::SeqCst) {
-            return;
+            return true;
+        }
+        #[cfg(test)]
+        if self.fail_consent_watch_spawn {
+            self.consent_watch.store(false, Ordering::SeqCst);
+            return false;
         }
         let recording = self.recording.clone();
         let watching = self.consent_watch.clone();
@@ -901,18 +921,20 @@ impl ToolRegistry {
                 }
                 let status = crate::machine_consent::read_status(home.as_deref());
                 if !status.granted(crate::machine_consent::Surface::Screen) {
-                    let _ = recording.stop_owner(None);
                     if let Some(home) = home.as_deref() {
                         crate::machine_consent::record_refusal(
                             home,
                             crate::machine_consent::Surface::Screen,
                         );
                     }
+                    let _ = recording.stop_owner(None);
                 }
             });
         if spawned.is_err() {
             self.consent_watch.store(false, Ordering::SeqCst);
+            return false;
         }
+        true
     }
 }
 
@@ -2041,5 +2063,27 @@ mod machine_consent_registry_tests {
         )
         .unwrap();
         assert_eq!(refusal["surface"], "screen");
+    }
+
+    #[tokio::test]
+    async fn a_recording_without_a_watcher_does_not_start() {
+        let home = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.set_machine_consent_home(home.path().to_owned());
+        registry.register_recording_tools();
+        registry.fail_consent_watch_spawn = true;
+        let started = registry
+            .invoke(
+                "start_recording",
+                json!({"output_dir": out.path().to_str().unwrap()}),
+            )
+            .await;
+        assert_eq!(started.is_error, Some(true));
+        assert_eq!(
+            started.structured_content.unwrap()["code"],
+            "consent_watch_unavailable"
+        );
+        assert!(!registry.recording.is_enabled());
     }
 }

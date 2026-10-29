@@ -112,9 +112,15 @@ fn sample_cursor() -> Option<(f64, f64)> {
     // CGEventGetLocation(event) → CGPoint. The point is in points
     // (top-left origin) so it matches the cursor-space convention the
     // renderer uses.
+    // Link the frameworks here: the driver binary gets them from
+    // platform-macos, but this crate's own test binary links nothing else.
+    #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGEventCreate(source: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
         fn CGEventGetLocation(event: *mut std::ffi::c_void) -> CGPoint;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
         fn CFRelease(cf: *mut std::ffi::c_void);
     }
     #[repr(C)]

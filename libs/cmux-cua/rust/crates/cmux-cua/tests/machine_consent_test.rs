@@ -20,6 +20,9 @@ use serde_json::{json, Value};
 
 struct Server {
     child: Child,
+    /// Dropping the sender wakes the watchdog early; it is joined before
+    /// the child is reaped, so it never signals a reused pid.
+    watchdog: Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
@@ -43,15 +46,21 @@ impl Server {
         // A hung server fails the test instead of hanging it: the watchdog
         // kills the child after two minutes, so the next read sees EOF.
         let pid = child.id() as libc::pid_t;
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(120));
-            // SAFETY: signals only this test's own child pid.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+        let (cancel, cancelled) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                cancelled.recv_timeout(std::time::Duration::from_secs(120))
+            {
+                // SAFETY: the child is not reaped until this thread is joined,
+                // so the pid still names it.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
         });
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut server = Server {
             child,
+            watchdog: Some((cancel, watchdog)),
             stdin,
             stdout,
             next_id: 1,
@@ -102,6 +111,10 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        if let Some((cancel, watchdog)) = self.watchdog.take() {
+            drop(cancel);
+            let _ = watchdog.join();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

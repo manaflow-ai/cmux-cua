@@ -6,8 +6,9 @@
 //! `~/.acpmux`):
 //!
 //! - `machine-credential.json`: present once the machine has joined. This
-//!   module only checks that the path exists; it never opens the file, so the
-//!   credential inside never enters this process.
+//!   module checks that it is a private file with acpmux's record shape; the
+//!   credential value inside is type-checked and dropped, never kept, logged
+//!   or returned.
 //! - `consent.json`: `{"screen": "granted"|"none", "control": ...}`, written
 //!   only by acpmux's person-proven local consent RPC.
 //! - `consent-refusal.json`: the last refusal, which the app's consent sheet
@@ -192,7 +193,12 @@ pub fn acpmux_home() -> Option<PathBuf> {
 
 #[cfg(unix)]
 fn user_home() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+    user_home_from(std::env::var_os("HOME"))
+}
+
+#[cfg(unix)]
+fn user_home_from(env_home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if let Some(home) = env_home.filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(home));
     }
     // No $HOME: the account's home from the password database, as acpmux's
@@ -236,7 +242,10 @@ pub fn read_status(home: Option<&Path>) -> ConsentStatus {
     };
     let credential_path = home.join(CREDENTIAL_FILE);
     match std::fs::symlink_metadata(&credential_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        // Absent, and not because a link on the way to it dangles.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && cleanly_absent(&credential_path) =>
+        {
             return ConsentStatus {
                 consent_required: false,
                 screen: false,
@@ -264,6 +273,25 @@ pub fn read_status(home: Option<&Path>) -> ConsentStatus {
         screen,
         control,
     }
+}
+
+/// Whether `path` is missing because its nearest existing ancestor is a real
+/// directory (directly or through a link that resolves) that lacks the rest.
+/// A dangling link on the way (`$ACPMUX_HOME` or `~/.acpmux` pointing at
+/// nothing) is not "never joined": it may be a home that is unmounted or
+/// moved, so the answer is unknown.
+fn cleanly_absent(path: &Path) -> bool {
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            return false;
+        }
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => return std::fs::metadata(ancestor).is_ok_and(|m| m.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 #[derive(Deserialize, PartialEq, Eq)]
@@ -751,25 +779,42 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_home_falls_back_to_the_password_database_without_home() {
-        // Only the fallback helper is exercised: the process environment is
-        // shared with other tests and is not modified here.
-        let saved = std::env::var_os("HOME");
-        assert!(saved.is_some(), "test runner has a HOME");
-        let mut buffer = vec![0 as libc::c_char; 16 * 1024];
-        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
-        let mut found: *mut libc::passwd = std::ptr::null_mut();
-        let status = unsafe {
-            libc::getpwuid_r(
-                libc::getuid(),
-                &mut entry,
-                buffer.as_mut_ptr(),
-                buffer.len(),
-                &mut found,
-            )
-        };
-        if status == 0 && !found.is_null() {
-            assert!(user_home().is_some());
+        assert_eq!(
+            user_home_from(Some("/explicit/home".into())),
+            Some(PathBuf::from("/explicit/home"))
+        );
+        // Unset and empty $HOME both read the password database, which on
+        // any test runner names this account's home directory.
+        for env_home in [None, Some(std::ffi::OsString::new())] {
+            let home = user_home_from(env_home).expect("password database home");
+            assert!(home.is_absolute(), "{}", home.display());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_state_directory_link_is_not_unjoined() {
+        let root = tempfile::tempdir().unwrap();
+        // $ACPMUX_HOME itself is a dangling link.
+        let home = root.path().join("acpmux");
+        std::os::unix::fs::symlink(root.path().join("gone"), &home).unwrap();
+        assert_eq!(read_status(Some(&home)), ConsentStatus::UNKNOWN);
+        assert!(check(Some(&home), "click").is_err());
+        // ~/.acpmux under a home whose link dangles.
+        let user = root.path().join("user");
+        std::os::unix::fs::symlink(root.path().join("unmounted"), &user).unwrap();
+        assert_eq!(
+            read_status(Some(&user.join(".acpmux"))),
+            ConsentStatus::UNKNOWN
+        );
+        // A missing ~/.acpmux in a real home, or a link that resolves, is
+        // simply not joined.
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        assert!(!read_status(Some(&real.join(".acpmux"))).consent_required);
+        let linked = root.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        assert!(!read_status(Some(&linked)).consent_required);
     }
 
     #[test]
