@@ -481,6 +481,9 @@ pub struct ToolRegistry {
     /// tool name, its args, and the trusted allow list before every call; an
     /// `Err` is returned to the caller and the tool does not run.
     target_policy_hook: Option<TargetPolicyHook>,
+    /// acpmux state directory holding the machine-join consent record. `None`
+    /// resolves it on every call (`machine_consent::acpmux_home`); tests pin it.
+    consent_home: Option<std::path::PathBuf>,
 }
 
 /// Signature of the platform target guard.
@@ -496,7 +499,14 @@ impl ToolRegistry {
             target_app_resolver: Some(crate::session_state::resolve_process_name),
             target_front_hook: None,
             target_policy_hook: None,
+            consent_home: None,
         }
+    }
+
+    /// Pin the acpmux state directory the consent check reads (tests only;
+    /// production resolves it per call so a moved `ACPMUX_HOME` is honored).
+    pub fn set_machine_consent_home(&mut self, home: std::path::PathBuf) {
+        self.consent_home = Some(home);
     }
 
     /// Install the platform target guard. See [`crate::target_policy`].
@@ -659,6 +669,19 @@ impl ToolRegistry {
         let Some(tool) = self.tools.get(resolved_name) else {
             return ToolResult::error(format!("Unknown tool: {name}"));
         };
+
+        // Machine-join consent: on a machine joined to a cmux team, a tool
+        // that reads the screen needs the person's `screen` grant and a tool
+        // that acts needs `control`. Read on every call, so a revoke stops the
+        // next call of this already-running process. A refusal is side-effect
+        // free: no target guard, recording turn, fronting or dispatch.
+        let consent_home = self
+            .consent_home
+            .clone()
+            .unwrap_or_else(crate::machine_consent::acpmux_home);
+        if let Err(refusal) = crate::machine_consent::check(&consent_home, resolved_name) {
+            return refusal;
+        }
 
         // Target guard: a refused target is side-effect free (no recording
         // turn, no fronting, no dispatch).
@@ -1713,5 +1736,157 @@ mod capability_tests {
         assert_eq!(v["schema_version"], "1");
         assert!(v["tools"].is_array(), "tools array must still be present");
         assert_eq!(v["tools"].as_array().unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod machine_consent_registry_tests {
+    //! The registry checks machine-join consent on every call, before the
+    //! target guard and before the tool runs.
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingTool {
+        def: ToolDef,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CountingTool {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ToolResult::text("ran")
+        }
+    }
+
+    fn counting_registry(home: &std::path::Path) -> (ToolRegistry, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let mut registry = ToolRegistry::new();
+        registry.set_machine_consent_home(home.to_owned());
+        let screen_calls = Arc::new(AtomicUsize::new(0));
+        let control_calls = Arc::new(AtomicUsize::new(0));
+        for (name, read_only, calls) in [
+            ("get_window_state", true, screen_calls.clone()),
+            ("click", false, control_calls.clone()),
+        ] {
+            registry.register(Box::new(CountingTool {
+                def: ToolDef {
+                    name: name.to_owned(),
+                    description: "test".to_owned(),
+                    input_schema: json!({"type": "object"}),
+                    read_only,
+                    destructive: !read_only,
+                    idempotent: read_only,
+                    open_world: false,
+                },
+                calls,
+            }));
+        }
+        (registry, screen_calls, control_calls)
+    }
+
+    fn write_private(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn join(home: &std::path::Path) {
+        write_private(&home.join("machine-credential.json"), r#"{"credential":"cmm_test"}"#);
+    }
+
+    fn consent(home: &std::path::Path, screen: &str, control: &str) {
+        write_private(
+            &home.join("consent.json"),
+            &format!(r#"{{"screen":"{screen}","control":"{control}"}}"#),
+        );
+    }
+
+    fn refused(result: &ToolResult, surface: &str) -> bool {
+        result.is_error == Some(true)
+            && result.structured_content.as_ref().is_some_and(|structured| {
+                structured["code"] == "consent_required" && structured["surface"] == surface
+            })
+    }
+
+    #[tokio::test]
+    async fn a_machine_that_is_not_joined_runs_every_tool_as_before() {
+        let home = tempfile::tempdir().unwrap();
+        let (registry, screen, control) = counting_registry(home.path());
+        assert_eq!(registry.invoke("get_window_state", json!({})).await.is_error, None);
+        assert_eq!(registry.invoke("click", json!({})).await.is_error, None);
+        assert_eq!((screen.load(Ordering::SeqCst), control.load(Ordering::SeqCst)), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_joined_machine_with_no_consent_runs_neither_screen_nor_control_tools() {
+        let home = tempfile::tempdir().unwrap();
+        join(home.path());
+        let (registry, screen, control) = counting_registry(home.path());
+        assert!(refused(&registry.invoke("get_window_state", json!({})).await, "screen"));
+        assert!(refused(&registry.invoke("click", json!({})).await, "control"));
+        assert_eq!((screen.load(Ordering::SeqCst), control.load(Ordering::SeqCst)), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn screen_only_runs_screenshots_and_refuses_clicks() {
+        let home = tempfile::tempdir().unwrap();
+        join(home.path());
+        consent(home.path(), "granted", "none");
+        let (registry, screen, control) = counting_registry(home.path());
+        assert_eq!(registry.invoke("get_window_state", json!({})).await.is_error, None);
+        assert!(refused(&registry.invoke("click", json!({})).await, "control"));
+        assert_eq!((screen.load(Ordering::SeqCst), control.load(Ordering::SeqCst)), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn revoking_between_two_calls_refuses_the_second() {
+        let home = tempfile::tempdir().unwrap();
+        join(home.path());
+        consent(home.path(), "granted", "granted");
+        // One registry stands for one already-running server process.
+        let (registry, _screen, control) = counting_registry(home.path());
+        assert_eq!(registry.invoke("click", json!({})).await.is_error, None);
+        consent(home.path(), "granted", "none");
+        assert!(refused(&registry.invoke("click", json!({})).await, "control"));
+        assert_eq!(control.load(Ordering::SeqCst), 1);
+
+        // Joining while the process is running gates it from the next call.
+        let fresh = tempfile::tempdir().unwrap();
+        let (registry, screen, _control) = counting_registry(fresh.path());
+        assert_eq!(registry.invoke("get_window_state", json!({})).await.is_error, None);
+        join(fresh.path());
+        assert!(refused(&registry.invoke("get_window_state", json!({})).await, "screen"));
+        assert_eq!(screen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_deprecated_alias_is_gated_as_the_tool_it_names() {
+        let home = tempfile::tempdir().unwrap();
+        join(home.path());
+        consent(home.path(), "granted", "none");
+        let mut registry = ToolRegistry::new();
+        registry.set_machine_consent_home(home.path().to_owned());
+        let calls = Arc::new(AtomicUsize::new(0));
+        registry.register(Box::new(CountingTool {
+            def: ToolDef {
+                name: "type_text".to_owned(),
+                description: "test".to_owned(),
+                input_schema: json!({"type": "object"}),
+                read_only: false,
+                destructive: true,
+                idempotent: false,
+                open_world: false,
+            },
+            calls: calls.clone(),
+        }));
+        assert!(refused(&registry.invoke("type_text_chars", json!({})).await, "control"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
