@@ -760,10 +760,17 @@ impl ToolRegistry {
 
         // Reserve and capture the turn before dispatch so recorded evidence
         // shows the application immediately before the action changed it.
-        // Every capture site re-reads consent right before it touches pixels.
-        let pending_turn = (should_record && self.screen_allowed_now())
-            .then(|| self.recording.begin_turn(resolved_name, &args, start_ms))
-            .flatten();
+        // Consent is required again right before the capture: any surface
+        // the call needs (and screen, for the capture) missing now refuses
+        // the whole call, not just the recording.
+        let pending_turn = if should_record && self.recording.is_enabled() {
+            if let Err(refusal) = self.require(resolved_name, true) {
+                return refusal;
+            }
+            self.recording.begin_turn(resolved_name, &args, start_ms)
+        } else {
+            None
+        };
 
         // A rejected action must be side-effect free. In particular, explicit
         // watchable mode must not front a target until schema + tool-specific
@@ -772,7 +779,7 @@ impl ToolRegistry {
         // Consent is required again, as of now, right before fronting and
         // right before dispatch: a revoke, or a host that went away, after
         // the first check stops the call there.
-        let fronted = self.require(resolved_name).and_then(|()| {
+        let fronted = self.require(resolved_name, false).and_then(|()| {
             preflight_and_front_target(
                 tool.as_ref(),
                 resolved_name,
@@ -781,7 +788,7 @@ impl ToolRegistry {
                 self.target_front_hook,
             )
         });
-        if let Err(error) = fronted.and_then(|()| self.require(resolved_name)) {
+        if let Err(error) = fronted.and_then(|()| self.require(resolved_name, false)) {
             if let Some(pending_turn) = pending_turn {
                 let result_text = error.content.iter().find_map(|content| match content {
                     Content::Text { text, .. } => Some(text.as_str()),
@@ -934,11 +941,24 @@ impl ToolRegistry {
         pip_hook::pip_enabled()
     }
 
-    /// Every surface `tool` needs, as of now: the check right before each
-    /// side effect. `Err` is the refusal (already recorded); nothing past it
-    /// may run. Tools that need nothing pass without asking.
-    fn require(&self, tool: &str) -> Result<(), ToolResult> {
-        crate::machine_consent::check(self.consent.as_ref(), tool)
+    /// Every surface `tool` needs (plus screen when `capture`), as of now:
+    /// the check right before each side effect on the call path. `Err` is
+    /// the refusal (already recorded) and refuses the whole call; nothing
+    /// past it may run. Only post-dispatch captures may merely skip.
+    fn require(&self, tool: &str, capture: bool) -> Result<(), ToolResult> {
+        use crate::machine_consent::{missing_surface, refuse, requirement_for, Requirement, Surface};
+        if !capture && requirement_for(tool) == Requirement::Nothing {
+            return Ok(());
+        }
+        let status = self.consent.status();
+        let Some(surface) = missing_surface(&status, tool, capture) else {
+            return Ok(());
+        };
+        if !status.granted(Surface::Screen) && self.recording.is_enabled() {
+            // A screen revoke ends a running recording (and its video) now.
+            let _ = self.recording.stop_owner(None);
+        }
+        Err(refuse(self.consent.as_ref(), &status, tool, surface))
     }
 
     fn watchable_front(&self) -> bool {
@@ -2124,22 +2144,20 @@ mod machine_consent_registry_tests {
         }
     }
 
-    /// Grants for its first `grants` asks, then answers `after`.
-    struct RevokingSource {
-        grants: usize,
-        after: crate::machine_consent::ConsentStatus,
-        asked: AtomicUsize,
+    /// Answers each ask from a script, in order; past its end, grants.
+    struct ScriptedAnswers {
+        answers: std::sync::Mutex<std::collections::VecDeque<crate::machine_consent::ConsentStatus>>,
         refusals: std::sync::Mutex<Vec<&'static str>>,
     }
 
-    impl crate::machine_consent::ConsentSource for RevokingSource {
+    impl crate::machine_consent::ConsentSource for ScriptedAnswers {
         fn status(&self) -> crate::machine_consent::ConsentStatus {
             use crate::machine_consent::ConsentStatus;
-            if self.asked.fetch_add(1, Ordering::SeqCst) < self.grants {
-                ConsentStatus { screen: true, control: true, ..ConsentStatus::UNKNOWN }
-            } else {
-                self.after
-            }
+            self.answers.lock().unwrap().pop_front().unwrap_or(ConsentStatus {
+                screen: true,
+                control: true,
+                ..ConsentStatus::UNKNOWN
+            })
         }
         fn record_refusal(&self, surface: crate::machine_consent::Surface) {
             self.refusals.lock().unwrap().push(surface.as_str());
@@ -2152,65 +2170,63 @@ mod machine_consent_registry_tests {
         FRONTED.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// The first check grants, then screen or control is revoked, or the
-    /// host goes away, before the capture, the fronting or the dispatch:
-    /// the action never runs, nothing is fronted after the denial was
-    /// seen, and the refusal is recorded.
+    /// One denied, unknown or lost answer anywhere on the call path refuses
+    /// the whole call, even when every later answer grants: nothing after
+    /// it is fronted or dispatched, and the refusal is recorded. A click
+    /// with a recording on asks at four points: the first check (0), the
+    /// capture before dispatch (1), before fronting (2) and before
+    /// dispatch (3); fronting happens only between 2 and 3.
     #[tokio::test]
-    async fn a_denial_after_the_first_check_stops_the_action_before_any_side_effect() {
+    async fn one_denial_anywhere_on_the_call_path_refuses_the_whole_call() {
         use crate::machine_consent::ConsentStatus;
+        let granted = ConsentStatus { screen: true, control: true, ..ConsentStatus::UNKNOWN };
         let denials = [
-            ("screen revoked", ConsentStatus { control: true, ..ConsentStatus::UNKNOWN }),
-            ("control revoked", ConsentStatus { screen: true, ..ConsentStatus::UNKNOWN }),
-            ("no answer", ConsentStatus::UNKNOWN),
+            ("screen denied", ConsentStatus { control: true, ..ConsentStatus::UNKNOWN }),
+            ("control denied", ConsentStatus { screen: true, ..ConsentStatus::UNKNOWN }),
+            ("unknown", ConsentStatus::UNKNOWN),
             ("host gone", ConsentStatus::HOST_UNVERIFIED),
         ];
-        // Asks in order: the first check, the capture, before fronting,
-        // before dispatch.
-        for (label, after) in denials {
-            for grants in 1..=3 {
-                let home = tempfile::tempdir().unwrap();
-                let (mut registry, _screen, control) = counting_registry(home.path());
-                let source = Arc::new(RevokingSource {
-                    grants,
-                    after,
-                    asked: AtomicUsize::new(0),
-                    refusals: std::sync::Mutex::new(Vec::new()),
-                });
-                registry.set_consent_source(source.clone());
-                registry.set_target_front_hook(count_front);
-                registry.force_watchable_front = true;
-                let fronted = FRONTED.load(Ordering::SeqCst);
-                let result = registry.invoke("click", json!({"pid": 4242})).await;
-                assert_eq!(result.is_error, Some(true), "{label} after {grants}");
+        let invoke = |answers: Vec<ConsentStatus>| async move {
+            let home = tempfile::tempdir().unwrap();
+            let out = tempfile::tempdir().unwrap();
+            let (mut registry, _screen, control) = counting_registry(home.path());
+            let source = Arc::new(ScriptedAnswers {
+                answers: std::sync::Mutex::new(answers.into()),
+                refusals: std::sync::Mutex::new(Vec::new()),
+            });
+            registry.set_consent_source(source.clone());
+            registry.set_target_front_hook(count_front);
+            registry.force_watchable_front = true;
+            registry.recording.start(out.path().to_str().unwrap(), false, None).unwrap();
+            let fronted = FRONTED.load(Ordering::SeqCst);
+            let result = registry.invoke("click", json!({"pid": 4242})).await;
+            let fronts = FRONTED.load(Ordering::SeqCst) - fronted;
+            let refusals = source.refusals.lock().unwrap().len();
+            (result, fronts, control.load(Ordering::SeqCst), refusals)
+        };
+        for (label, denial) in denials {
+            for position in 0..4 {
+                // Granted before the denial, and granted after it.
+                let mut answers = vec![granted; position];
+                answers.push(denial);
+                answers.extend([granted; 4]);
+                let (result, fronts, ran, refusals) = invoke(answers).await;
+                let case = format!("{label} at {position}");
+                assert_eq!(result.is_error, Some(true), "{case}");
                 assert_eq!(
                     result.structured_content.unwrap()["code"],
                     crate::machine_consent::CONSENT_REQUIRED,
-                    "{label} after {grants}"
+                    "{case}"
                 );
-                assert_eq!(control.load(Ordering::SeqCst), 0, "{label} after {grants}: ran");
-                assert_eq!(
-                    FRONTED.load(Ordering::SeqCst) - fronted,
-                    usize::from(grants == 3),
-                    "{label} after {grants}: fronted only while consent held"
-                );
-                assert!(!source.refusals.lock().unwrap().is_empty(), "{label} after {grants}");
+                assert_eq!(ran, 0, "{case}: dispatched");
+                // Only a denial before dispatch comes after the fronting.
+                assert_eq!(fronts, usize::from(position == 3), "{case}: fronted");
+                assert!(refusals > 0, "{case}: refusal recorded");
             }
         }
         // Consent held throughout: fronted once, ran once.
-        let home = tempfile::tempdir().unwrap();
-        let (mut registry, _screen, control) = counting_registry(home.path());
-        registry.set_consent_source(Arc::new(RevokingSource {
-            grants: usize::MAX,
-            after: ConsentStatus::UNKNOWN,
-            asked: AtomicUsize::new(0),
-            refusals: std::sync::Mutex::new(Vec::new()),
-        }));
-        registry.set_target_front_hook(count_front);
-        registry.force_watchable_front = true;
-        let fronted = FRONTED.load(Ordering::SeqCst);
-        assert_eq!(registry.invoke("click", json!({"pid": 4242})).await.is_error, None);
-        assert_eq!((control.load(Ordering::SeqCst), FRONTED.load(Ordering::SeqCst) - fronted), (1, 1));
+        let (result, fronts, ran, _) = invoke(Vec::new()).await;
+        assert_eq!((result.is_error, fronts, ran), (None, 1, 1));
     }
 
     #[tokio::test]
