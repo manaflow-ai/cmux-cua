@@ -31,4 +31,12 @@ libc = "0.2"
 # during video recording. Same version as platform-windows uses to avoid
 # a duplicate crate version.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+# Win32_Security*/Win32_System_Threading: `machine_consent` checks the owner
+# and DACL of acpmux's consent and join records on the opened handle.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }

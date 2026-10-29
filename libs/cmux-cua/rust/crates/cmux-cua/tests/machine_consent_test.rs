@@ -40,6 +40,14 @@ impl Server {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn cmux-cua mcp");
+        // A hung server fails the test instead of hanging it: the watchdog
+        // kills the child after two minutes, so the next read sees EOF.
+        let pid = child.id() as libc::pid_t;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(120));
+            // SAFETY: signals only this test's own child pid.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        });
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let mut server = Server {
@@ -59,7 +67,11 @@ impl Server {
         writeln!(self.stdin, "{frame}").unwrap();
         self.stdin.flush().unwrap();
         let mut line = String::new();
-        self.stdout.read_line(&mut line).expect("read response");
+        let read = self.stdout.read_line(&mut line).expect("read response");
+        assert!(
+            read > 0,
+            "cmux-cua mcp exited or was killed by the watchdog"
+        );
         let response: Value = serde_json::from_str(line.trim()).expect("parse response");
         assert_eq!(response["id"], id, "{response}");
         response
@@ -126,7 +138,7 @@ fn a_running_server_follows_join_grant_and_revoke_on_every_call() {
     // both surfaces are refused from the next call on.
     write_private(
         &acpmux_home.join("machine-credential.json"),
-        r#"{"credential":"cmm_test"}"#,
+        cmux_cua_core::machine_consent::TEST_CREDENTIAL_RECORD,
     );
     assert_eq!(server.screen().as_deref(), Some("screen"));
     assert_eq!(server.control().as_deref(), Some("control"));
@@ -157,4 +169,25 @@ fn a_running_server_follows_join_grant_and_revoke_on_every_call() {
         response["result"]["structuredContent"]["code"],
         "consent_required"
     );
+}
+
+#[test]
+fn every_tool_the_server_lists_is_classified() {
+    use cmux_cua_core::machine_consent::{requirement_for, Requirement};
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let acpmux_home = root.path().join("acpmux");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&acpmux_home).unwrap();
+    let mut server = Server::spawn(&home, &acpmux_home);
+    let listed = server.request("tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().expect("tools/list");
+    assert!(!tools.is_empty());
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap();
+        assert!(
+            name == "page" || requirement_for(name) != Requirement::Both,
+            "{name} has no consent classification in machine_consent::requirement_for"
+        );
+    }
 }

@@ -484,6 +484,8 @@ pub struct ToolRegistry {
     /// acpmux state directory holding the machine-join consent record. `None`
     /// resolves it on every call (`machine_consent::acpmux_home`); tests pin it.
     consent_home: Option<std::path::PathBuf>,
+    /// Set while a thread watches the screen grant during a recording.
+    consent_watch: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Signature of the platform target guard.
@@ -500,6 +502,7 @@ impl ToolRegistry {
             target_front_hook: None,
             target_policy_hook: None,
             consent_home: None,
+            consent_watch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -675,13 +678,48 @@ impl ToolRegistry {
         // that acts needs `control`. Read on every call, so a revoke stops the
         // next call of this already-running process. A refusal is side-effect
         // free: no target guard, recording turn, fronting or dispatch.
+        let should_record = !tool.def().read_only
+            && !matches!(
+                resolved_name,
+                "start_recording" | "stop_recording" | "get_recording_state" | "replay_trajectory"
+            );
         let consent_home = self
             .consent_home
             .clone()
-            .unwrap_or_else(crate::machine_consent::acpmux_home);
-        if let Err(refusal) = crate::machine_consent::check(&consent_home, resolved_name) {
-            return refusal;
+            .or_else(crate::machine_consent::acpmux_home);
+        let recording_on = self.recording.is_enabled();
+        let side_capture = should_record && (recording_on || pip_hook::pip_enabled());
+        let mut screen_granted = true;
+        if recording_on
+            || side_capture
+            || crate::machine_consent::requirement_for(resolved_name)
+                != crate::machine_consent::Requirement::Nothing
+        {
+            let status = crate::machine_consent::read_status(consent_home.as_deref());
+            screen_granted = status.granted(crate::machine_consent::Surface::Screen);
+            if recording_on && !screen_granted {
+                // A screen revoke ends a running recording (and its video) now.
+                let _ = self.recording.stop_owner(None);
+                if let Some(home) = consent_home.as_deref() {
+                    crate::machine_consent::record_refusal(
+                        home,
+                        crate::machine_consent::Surface::Screen,
+                    );
+                }
+            }
+            if let Some(surface) =
+                crate::machine_consent::missing_surface(&status, resolved_name, false)
+            {
+                return crate::machine_consent::refuse(
+                    consent_home.as_deref(),
+                    resolved_name,
+                    surface,
+                );
+            }
         }
+        // An action allowed by `control` alone still runs, but captures no
+        // recording turn and no preview frame without `screen`.
+        let should_record = should_record && screen_granted;
 
         // Target guard: a refused target is side-effect free (no recording
         // turn, no fronting, no dispatch).
@@ -693,11 +731,6 @@ impl ToolRegistry {
 
         // Reserve and capture the turn before dispatch so recorded evidence
         // shows the application immediately before the action changed it.
-        let should_record = !tool.def().read_only
-            && !matches!(
-                resolved_name,
-                "start_recording" | "stop_recording" | "get_recording_state" | "replay_trajectory"
-            );
         let pending_turn = should_record
             .then(|| self.recording.begin_turn(resolved_name, &args, start_ms))
             .flatten();
@@ -724,6 +757,10 @@ impl ToolRegistry {
         }
 
         let result = tool.invoke(args.clone()).await;
+
+        if resolved_name == "start_recording" && result.is_error != Some(true) {
+            self.watch_screen_consent_while_recording(consent_home.clone());
+        }
 
         // Embedded-host process state is action-scoped: update it only after a
         // successful call to one of the target-driving tools, and only when the
@@ -834,6 +871,48 @@ impl ToolRegistry {
         }
 
         result
+    }
+}
+
+impl ToolRegistry {
+    /// While a recording runs, check the screen grant twice a second and stop
+    /// the recording (video included) as soon as it is revoked, without
+    /// waiting for the next tool call. One watcher per registry. Stop
+    /// condition: the recording is no longer running; the thread then exits.
+    fn watch_screen_consent_while_recording(&self, home: Option<std::path::PathBuf>) {
+        use std::sync::atomic::Ordering;
+        if self.consent_watch.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let recording = self.recording.clone();
+        let watching = self.consent_watch.clone();
+        let spawned = std::thread::Builder::new()
+            .name("cua-consent-watch".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if !recording.is_enabled() {
+                    watching.store(false, Ordering::SeqCst);
+                    // A recording that started after the check above keeps a
+                    // watcher: take the flag back if nobody else has.
+                    if recording.is_enabled() && !watching.swap(true, Ordering::SeqCst) {
+                        continue;
+                    }
+                    return;
+                }
+                let status = crate::machine_consent::read_status(home.as_deref());
+                if !status.granted(crate::machine_consent::Surface::Screen) {
+                    let _ = recording.stop_owner(None);
+                    if let Some(home) = home.as_deref() {
+                        crate::machine_consent::record_refusal(
+                            home,
+                            crate::machine_consent::Surface::Screen,
+                        );
+                    }
+                }
+            });
+        if spawned.is_err() {
+            self.consent_watch.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -1798,7 +1877,10 @@ mod machine_consent_registry_tests {
     }
 
     fn join(home: &std::path::Path) {
-        write_private(&home.join("machine-credential.json"), r#"{"credential":"cmm_test"}"#);
+        write_private(
+            &home.join("machine-credential.json"),
+            crate::machine_consent::TEST_CREDENTIAL_RECORD,
+        );
     }
 
     fn consent(home: &std::path::Path, screen: &str, control: &str) {
@@ -1888,5 +1970,76 @@ mod machine_consent_registry_tests {
         }));
         assert!(refused(&registry.invoke("type_text_chars", json!({})).await, "control"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn turn_dirs(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("turn-"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn revoking_screen_during_a_recording_stops_capture_but_control_still_acts() {
+        let home = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        join(home.path());
+        consent(home.path(), "granted", "granted");
+        let (registry, _screen, control) = counting_registry(home.path());
+        registry
+            .recording
+            .start(out.path().to_str().unwrap(), false, None)
+            .unwrap();
+
+        assert_eq!(registry.invoke("click", json!({})).await.is_error, None);
+        assert_eq!(turn_dirs(out.path()), 1, "a granted action is recorded");
+
+        consent(home.path(), "none", "granted");
+        assert_eq!(registry.invoke("click", json!({})).await.is_error, None);
+        assert_eq!(control.load(Ordering::SeqCst), 2, "control alone still acts");
+        assert_eq!(turn_dirs(out.path()), 1, "no turn is captured after the revoke");
+        assert!(!registry.recording.is_enabled(), "the revoke ended the recording");
+
+        // Granting screen again does not resume a recording on its own.
+        consent(home.path(), "granted", "granted");
+        assert_eq!(registry.invoke("click", json!({})).await.is_error, None);
+        assert_eq!(turn_dirs(out.path()), 1);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn the_watcher_stops_a_recording_when_screen_is_revoked_between_calls() {
+        let home = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        join(home.path());
+        consent(home.path(), "granted", "granted");
+        let mut registry = ToolRegistry::new();
+        registry.set_machine_consent_home(home.path().to_owned());
+        registry.register_recording_tools();
+        let started = registry
+            .invoke(
+                "start_recording",
+                json!({"output_dir": out.path().to_str().unwrap()}),
+            )
+            .await;
+        assert_ne!(started.is_error, Some(true), "{started:?}");
+        assert!(registry.recording.is_enabled());
+
+        consent(home.path(), "none", "granted");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while registry.recording.is_enabled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!registry.recording.is_enabled(), "no call needed to stop it");
+        let refusal: Value = serde_json::from_slice(
+            &std::fs::read(home.path().join("consent-refusal.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refusal["surface"], "screen");
     }
 }

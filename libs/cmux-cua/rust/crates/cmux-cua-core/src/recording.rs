@@ -454,6 +454,11 @@ impl RecordingSession {
         self.start(dir, true, None)
     }
 
+    /// Whether a recording is running. Cheaper than `current_state()`.
+    pub fn is_enabled(&self) -> bool {
+        self.inner.lock().unwrap().enabled
+    }
+
     /// Return a snapshot of the current state (non-blocking).
     pub fn current_state(&self) -> RecordingState {
         let inner = self.inner.lock().unwrap();
