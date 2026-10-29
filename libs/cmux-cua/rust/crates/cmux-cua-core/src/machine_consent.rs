@@ -21,12 +21,14 @@
 //! treated as having granted nothing, and a join status that cannot be read
 //! counts as joined. A machine with no join record behaves exactly as before.
 //!
-//! The same answer is served by acpmux's `_acpmux/machine_consent_get`
-//! (`{consentRequired, consent, lastRefusal}`); [`ConsentStatus`] mirrors that
-//! shape. It is read from the files here so the check needs no running daemon
-//! and an unjoined machine never depends on one.
+//! Every gate and every capture site asks one [`ConsentSource`], right before
+//! it acts. Today's source, [`StateFiles`], reads the files above. The same
+//! answer is served by acpmux's `_acpmux/machine_consent_get`
+//! (`{consentRequired, consent, lastRefusal}`), which [`ConsentStatus`]
+//! mirrors; moving to that daemon query changes only [`default_source`].
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::json;
@@ -153,7 +155,7 @@ pub fn requirement_for(tool: &str) -> Requirement {
 
 /// The consent state for one call, shaped like acpmux's
 /// `_acpmux/machine_consent_get` answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsentStatus {
     /// True when the machine is joined, or its join status cannot be read.
     pub consent_required: bool,
@@ -180,11 +182,61 @@ impl ConsentStatus {
     }
 }
 
+/// Where cmux-cua learns the consent state. Callers ask [`status`] right
+/// before each gate and each capture, and never reuse an answer read before
+/// an await.
+///
+/// [`status`]: ConsentSource::status
+pub trait ConsentSource: Send + Sync {
+    /// The state as of now. Fails closed: any error is
+    /// [`ConsentStatus::UNKNOWN`], never "not joined".
+    fn status(&self) -> ConsentStatus;
+    /// Record a refused call for the app's consent sheet. Best effort.
+    fn record_refusal(&self, surface: Surface);
+}
+
+/// The consent source this process uses. The one place to change when the
+/// answer moves from acpmux's state files to the acpmux daemon.
+pub fn default_source() -> Arc<dyn ConsentSource> {
+    Arc::new(StateFiles::FromEnv)
+}
+
+/// Consent read from acpmux's state files.
+#[derive(Debug, Clone)]
+pub enum StateFiles {
+    /// The state directory resolved on every read: `$ACPMUX_HOME`, else
+    /// `~/.acpmux`.
+    FromEnv,
+    /// A fixed state directory; `None` means none could be found.
+    At(Option<PathBuf>),
+}
+
+impl StateFiles {
+    fn home(&self) -> Option<PathBuf> {
+        match self {
+            Self::FromEnv => acpmux_home(),
+            Self::At(home) => home.clone(),
+        }
+    }
+}
+
+impl ConsentSource for StateFiles {
+    fn status(&self) -> ConsentStatus {
+        read_status(self.home().as_deref())
+    }
+
+    fn record_refusal(&self, surface: Surface) {
+        if let Some(home) = self.home() {
+            record_refusal(&home, surface);
+        }
+    }
+}
+
 /// acpmux's state directory for this process: `$ACPMUX_HOME`, else
 /// `<home>/.acpmux`, the same rule acpmux uses without a tagged-build
 /// override. `None` when no home directory can be found; callers treat that
 /// as an unreadable join status and refuse.
-pub fn acpmux_home() -> Option<PathBuf> {
+fn acpmux_home() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("ACPMUX_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(home));
     }
@@ -236,7 +288,7 @@ fn user_home() -> Option<PathBuf> {
 
 /// Read the consent state under `home` (`None`: no home could be found).
 /// Never fails: every error is the answer that refuses.
-pub fn read_status(home: Option<&Path>) -> ConsentStatus {
+fn read_status(home: Option<&Path>) -> ConsentStatus {
     let Some(home) = home else {
         return ConsentStatus::UNKNOWN;
     };
@@ -615,24 +667,21 @@ pub fn missing_surface(status: &ConsentStatus, tool: &str, also_screen: bool) ->
         .find(|surface| !status.granted(*surface))
 }
 
-/// Check `tool` against the consent state under `home`. `Err` carries the
-/// MCP tool error to return in place of running the tool.
-pub fn check(home: Option<&Path>, tool: &str) -> Result<(), ToolResult> {
+/// Check `tool` against `source`. `Err` carries the MCP tool error to
+/// return in place of running the tool.
+pub fn check(source: &dyn ConsentSource, tool: &str) -> Result<(), ToolResult> {
     if requirement_for(tool) == Requirement::Nothing {
         return Ok(());
     }
-    match missing_surface(&read_status(home), tool, false) {
+    match missing_surface(&source.status(), tool, false) {
         None => Ok(()),
-        Some(surface) => Err(refuse(home, tool, surface)),
+        Some(surface) => Err(refuse(source, tool, surface)),
     }
 }
 
-/// Record a refusal (when there is a home to record it in) and return the
-/// MCP tool error for it.
-pub fn refuse(home: Option<&Path>, tool: &str, surface: Surface) -> ToolResult {
-    if let Some(home) = home {
-        record_refusal(home, surface);
-    }
+/// Record a refusal with `source` and return the MCP tool error for it.
+pub fn refuse(source: &dyn ConsentSource, tool: &str, surface: Surface) -> ToolResult {
+    source.record_refusal(surface);
     refusal(tool, surface)
 }
 
@@ -655,7 +704,7 @@ pub fn refusal(tool: &str, surface: Surface) -> ToolResult {
 /// Record the refusal for the app's consent sheet, in acpmux's format.
 /// Best effort: a failure here never changes the refusal. Writes only into
 /// an existing state directory and never follows a link at the final path.
-pub fn record_refusal(home: &Path, surface: Surface) {
+fn record_refusal(home: &Path, surface: Surface) {
     let Ok(metadata) = std::fs::symlink_metadata(home) else {
         return;
     };
@@ -747,8 +796,10 @@ mod tests {
     }
 
     fn check_in(home: &Path, tool: &str) -> Result<(), ToolResult> {
-        check(Some(home), tool)
+        check(&StateFiles::At(Some(home.to_owned())), tool)
     }
+
+    const NO_HOME: StateFiles = StateFiles::At(None);
 
     #[test]
     fn a_machine_that_is_not_joined_needs_no_consent_and_gets_no_files() {
@@ -766,14 +817,14 @@ mod tests {
     fn no_home_at_all_refuses_but_metadata_still_runs() {
         assert_eq!(read_status(None), ConsentStatus::UNKNOWN);
         assert_eq!(
-            refused_surface(check(None, "click")).as_deref(),
+            refused_surface(check(&NO_HOME, "click")).as_deref(),
             Some("control")
         );
         assert_eq!(
-            refused_surface(check(None, "zoom")).as_deref(),
+            refused_surface(check(&NO_HOME, "zoom")).as_deref(),
             Some("screen")
         );
-        assert!(check(None, "get_config").is_ok());
+        assert!(check(&NO_HOME, "get_config").is_ok());
     }
 
     #[cfg(unix)]
@@ -799,7 +850,7 @@ mod tests {
         let home = root.path().join("acpmux");
         std::os::unix::fs::symlink(root.path().join("gone"), &home).unwrap();
         assert_eq!(read_status(Some(&home)), ConsentStatus::UNKNOWN);
-        assert!(check(Some(&home), "click").is_err());
+        assert!(check_in(&home, "click").is_err());
         // ~/.acpmux under a home whose link dangles.
         let user = root.path().join("user");
         std::os::unix::fs::symlink(root.path().join("unmounted"), &user).unwrap();

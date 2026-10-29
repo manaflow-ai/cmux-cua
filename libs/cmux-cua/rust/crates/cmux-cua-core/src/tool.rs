@@ -481,9 +481,9 @@ pub struct ToolRegistry {
     /// tool name, its args, and the trusted allow list before every call; an
     /// `Err` is returned to the caller and the tool does not run.
     target_policy_hook: Option<TargetPolicyHook>,
-    /// acpmux state directory holding the machine-join consent record. `None`
-    /// resolves it on every call (`machine_consent::acpmux_home`); tests pin it.
-    consent_home: Option<std::path::PathBuf>,
+    /// Where machine-join consent comes from. Asked on every call and right
+    /// before every capture (see [`crate::machine_consent::ConsentSource`]).
+    consent: Arc<dyn crate::machine_consent::ConsentSource>,
     /// The thread that stops a recording when `screen` is revoked between
     /// calls, and the sender whose drop tells it to exit (see `Drop`).
     consent_watcher: std::sync::Mutex<Option<ConsentWatcher>>,
@@ -518,7 +518,7 @@ impl ToolRegistry {
             target_app_resolver: Some(crate::session_state::resolve_process_name),
             target_front_hook: None,
             target_policy_hook: None,
-            consent_home: None,
+            consent: crate::machine_consent::default_source(),
             consent_watcher: std::sync::Mutex::new(None),
             #[cfg(test)]
             fail_consent_watch_spawn: false,
@@ -531,10 +531,14 @@ impl ToolRegistry {
         }
     }
 
-    /// Pin the acpmux state directory the consent check reads (tests only;
-    /// production resolves it per call so a moved `ACPMUX_HOME` is honored).
+    /// Pin the acpmux state directory the consent check reads (tests).
     pub fn set_machine_consent_home(&mut self, home: std::path::PathBuf) {
-        self.consent_home = Some(home);
+        self.consent = Arc::new(crate::machine_consent::StateFiles::At(Some(home)));
+    }
+
+    /// Replace where consent comes from.
+    pub fn set_consent_source(&mut self, source: Arc<dyn crate::machine_consent::ConsentSource>) {
+        self.consent = source;
     }
 
     /// Install the platform target guard. See [`crate::target_policy`].
@@ -708,10 +712,6 @@ impl ToolRegistry {
                 resolved_name,
                 "start_recording" | "stop_recording" | "get_recording_state" | "replay_trajectory"
             );
-        let consent_home = self
-            .consent_home
-            .clone()
-            .or_else(crate::machine_consent::acpmux_home);
         let recording_on = self.recording.is_enabled();
         let side_capture = should_record && (recording_on || self.pip_on());
         let mut screen_granted = true;
@@ -720,23 +720,19 @@ impl ToolRegistry {
             || crate::machine_consent::requirement_for(resolved_name)
                 != crate::machine_consent::Requirement::Nothing
         {
-            let status = crate::machine_consent::read_status(consent_home.as_deref());
+            let status = self.consent.status();
             screen_granted = status.granted(crate::machine_consent::Surface::Screen);
             if recording_on && !screen_granted {
                 // A screen revoke ends a running recording (and its video) now.
-                if let Some(home) = consent_home.as_deref() {
-                    crate::machine_consent::record_refusal(
-                        home,
-                        crate::machine_consent::Surface::Screen,
-                    );
-                }
+                self.consent
+                    .record_refusal(crate::machine_consent::Surface::Screen);
                 let _ = self.recording.stop_owner(None);
             }
             if let Some(surface) =
                 crate::machine_consent::missing_surface(&status, resolved_name, false)
             {
                 return crate::machine_consent::refuse(
-                    consent_home.as_deref(),
+                    self.consent.as_ref(),
                     resolved_name,
                     surface,
                 );
@@ -757,7 +753,7 @@ impl ToolRegistry {
         // Reserve and capture the turn before dispatch so recorded evidence
         // shows the application immediately before the action changed it.
         // Every capture site re-reads consent right before it touches pixels.
-        let pending_turn = (should_record && self.screen_allowed_now(consent_home.as_deref()))
+        let pending_turn = (should_record && self.screen_allowed_now())
             .then(|| self.recording.begin_turn(resolved_name, &args, start_ms))
             .flatten();
 
@@ -777,7 +773,7 @@ impl ToolRegistry {
                     Content::Text { text, .. } => Some(text.as_str()),
                     _ => None,
                 }).unwrap_or("");
-                self.finish_turn_if_screen_allowed(consent_home.as_deref(), pending_turn, result_text);
+                self.finish_turn_if_screen_allowed(pending_turn, result_text);
             }
             return error;
         }
@@ -786,7 +782,7 @@ impl ToolRegistry {
 
         if resolved_name == "start_recording"
             && result.is_error != Some(true)
-            && !self.watch_screen_consent_while_recording(consent_home.clone())
+            && !self.watch_screen_consent_while_recording()
         {
             // Without a watcher a revoke could not stop the video between
             // calls: do not record at all.
@@ -885,7 +881,7 @@ impl ToolRegistry {
                 .unwrap_or("");
             // The action may have run for a while: re-read consent before
             // the after capture.
-            self.finish_turn_if_screen_allowed(consent_home.as_deref(), pending_turn, result_text);
+            self.finish_turn_if_screen_allowed(pending_turn, result_text);
         }
 
         // Experimental PiP push — only when --experimental-pip is on argv
@@ -896,7 +892,7 @@ impl ToolRegistry {
         // what the recorder would have captured for the turn.
         // Re-read consent after the await: a revoke during the action stops
         // this capture.
-        if self.pip_on() && should_record && self.screen_allowed_now(consent_home.as_deref()) {
+        if self.pip_on() && should_record && self.screen_allowed_now() {
             #[cfg(test)]
             self.pip_captures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let window_id = args.opt_u64("window_id");
@@ -926,8 +922,10 @@ impl ToolRegistry {
 
     /// The `screen` grant as of now. Called right before each capture, never
     /// reused across an await.
-    fn screen_allowed_now(&self, home: Option<&std::path::Path>) -> bool {
-        crate::machine_consent::read_status(home).granted(crate::machine_consent::Surface::Screen)
+    fn screen_allowed_now(&self) -> bool {
+        self.consent
+            .status()
+            .granted(crate::machine_consent::Surface::Screen)
     }
 
     /// Finish a recorded turn (which captures the after frame) only if
@@ -935,19 +933,17 @@ impl ToolRegistry {
     /// the recording.
     fn finish_turn_if_screen_allowed(
         &self,
-        home: Option<&std::path::Path>,
         pending: crate::recording::PendingTurn,
         result_text: &str,
     ) {
-        if self.screen_allowed_now(home) {
+        if self.screen_allowed_now() {
             self.recording.finish_turn(pending, result_text);
             return;
         }
         drop(pending);
         if self.recording.is_enabled() {
-            if let Some(home) = home {
-                crate::machine_consent::record_refusal(home, crate::machine_consent::Surface::Screen);
-            }
+            self.consent
+                .record_refusal(crate::machine_consent::Surface::Screen);
             let _ = self.recording.stop_owner(None);
         }
     }
@@ -958,7 +954,7 @@ impl ToolRegistry {
     /// recording. Stop condition: the registry is dropped (its `Drop` drops
     /// the sender and joins the thread) or the recording is gone. Returns
     /// false when no watcher runs and none could be started.
-    fn watch_screen_consent_while_recording(&self, home: Option<std::path::PathBuf>) -> bool {
+    fn watch_screen_consent_while_recording(&self) -> bool {
         let mut slot = self.consent_watcher.lock().unwrap();
         if let Some(watcher) = slot.as_ref() {
             if !watcher.thread.is_finished() {
@@ -974,6 +970,7 @@ impl ToolRegistry {
         }
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
         let recording = Arc::downgrade(&self.recording);
+        let consent = self.consent.clone();
         #[cfg(test)]
         let exited = self.watcher_exited.clone();
         let spawned = std::thread::Builder::new()
@@ -981,7 +978,7 @@ impl ToolRegistry {
             .spawn(move || {
                 #[cfg(test)]
                 let _exited = SetOnDrop(exited);
-                watch_loop(stopped, recording, home)
+                watch_loop(stopped, recording, consent)
             });
         match spawned {
             Ok(thread) => {
@@ -999,7 +996,7 @@ impl ToolRegistry {
 fn watch_loop(
     stopped: std::sync::mpsc::Receiver<()>,
     recording: std::sync::Weak<RecordingSession>,
-    home: Option<std::path::PathBuf>,
+    consent: Arc<dyn crate::machine_consent::ConsentSource>,
 ) {
     loop {
         match stopped.recv_timeout(std::time::Duration::from_millis(500)) {
@@ -1012,11 +1009,11 @@ fn watch_loop(
         if !recording.is_enabled() {
             continue;
         }
-        let status = crate::machine_consent::read_status(home.as_deref());
-        if !status.granted(crate::machine_consent::Surface::Screen) {
-            if let Some(home) = home.as_deref() {
-                crate::machine_consent::record_refusal(home, crate::machine_consent::Surface::Screen);
-            }
+        if !consent
+            .status()
+            .granted(crate::machine_consent::Surface::Screen)
+        {
+            consent.record_refusal(crate::machine_consent::Surface::Screen);
             let _ = recording.stop_owner(None);
         }
     }
@@ -2076,6 +2073,53 @@ mod machine_consent_registry_tests {
         join(fresh.path());
         assert!(refused(&registry.invoke("get_window_state", json!({})).await, "screen"));
         assert_eq!(screen.load(Ordering::SeqCst), 1);
+    }
+
+    /// A consent source with no files behind it, standing in for the
+    /// acpmux daemon query: the registry asks it and nothing else.
+    struct ScriptedSource {
+        status: std::sync::Mutex<crate::machine_consent::ConsentStatus>,
+        asked: AtomicUsize,
+        refusals: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl crate::machine_consent::ConsentSource for ScriptedSource {
+        fn status(&self) -> crate::machine_consent::ConsentStatus {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            *self.status.lock().unwrap()
+        }
+        fn record_refusal(&self, surface: crate::machine_consent::Surface) {
+            self.refusals.lock().unwrap().push(surface.as_str());
+        }
+    }
+
+    #[tokio::test]
+    async fn every_check_asks_the_consent_source_and_nothing_else() {
+        use crate::machine_consent::ConsentStatus;
+        // A state directory that says "not joined"; the source must win.
+        let home = tempfile::tempdir().unwrap();
+        let (mut registry, screen, control) = counting_registry(home.path());
+        let source = Arc::new(ScriptedSource {
+            // The source cannot answer: refuse everything that needs consent.
+            status: std::sync::Mutex::new(ConsentStatus::UNKNOWN),
+            asked: AtomicUsize::new(0),
+            refusals: std::sync::Mutex::new(Vec::new()),
+        });
+        registry.set_consent_source(source.clone());
+        assert!(refused(&registry.invoke("get_window_state", json!({})).await, "screen"));
+        assert!(refused(&registry.invoke("click", json!({})).await, "control"));
+        assert_eq!(*source.refusals.lock().unwrap(), ["screen", "control"]);
+        assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
+
+        *source.status.lock().unwrap() = ConsentStatus {
+            consent_required: true,
+            screen: true,
+            control: false,
+        };
+        assert_eq!(registry.invoke("get_window_state", json!({})).await.is_error, None);
+        assert!(refused(&registry.invoke("click", json!({})).await, "control"));
+        assert_eq!((screen.load(Ordering::SeqCst), control.load(Ordering::SeqCst)), (1, 0));
+        assert!(source.asked.load(Ordering::SeqCst) >= 4);
     }
 
     #[tokio::test]
