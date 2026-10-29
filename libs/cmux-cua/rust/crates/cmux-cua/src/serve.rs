@@ -543,6 +543,14 @@ extern "C" {
     static kSecGuestAttributePid: core_foundation::string::CFStringRef;
     #[cfg(feature = "cmux-host-consent")]
     static kSecGuestAttributeAudit: core_foundation::string::CFStringRef;
+    #[cfg(feature = "cmux-host-consent")]
+    static kSecCodeInfoIdentifier: core_foundation::string::CFStringRef;
+    #[cfg(feature = "cmux-host-consent")]
+    fn SecCodeCopySigningInformation(
+        code: SecurityCodeRef,
+        flags: SecurityFlags,
+        information: *mut core_foundation::dictionary::CFDictionaryRef,
+    ) -> SecurityStatus;
     fn SecCodeCopySelf(flags: SecurityFlags, code: *mut SecurityCodeRef) -> SecurityStatus;
     fn SecCodeCopyDesignatedRequirement(
         code: SecurityCodeRef,
@@ -778,10 +786,24 @@ fn approval_broker_peer_is_trusted(peer_pid: libc::pid_t) -> Result<(), String> 
     validate_codex_dynamic_code(process_parent_pid(peer_pid)?)
 }
 
-/// The code requirement of a cmux app that may serve machine consent: an
-/// Apple-anchored signature of cmux's team with a cmux app identifier.
+/// A cmux app that may serve machine consent: valid code with an
+/// Apple-anchored signature of cmux's team (this requirement), whose
+/// signing identifier is a cmux app's ([`is_cmux_app_identifier`]; a
+/// requirement's `identifier` clause only matches exactly).
 #[cfg(all(target_os = "macos", feature = "cmux-host-consent"))]
-const CMUX_APP_REQUIREMENT: &str = "anchor apple generic and certificate leaf[subject.OU] = \"7WLXT3NR37\" and identifier \"com.cmuxterm.app*\"";
+const CMUX_TEAM_REQUIREMENT: &str = "anchor apple generic and certificate leaf[subject.OU] = \"7WLXT3NR37\"";
+
+/// `com.cmuxterm.app` and its channels and tags (`com.cmuxterm.app.nightly`,
+/// `com.cmuxterm.app.debug.<tag>`), never another identifier that merely
+/// starts with those letters.
+#[cfg(any(test, all(target_os = "macos", feature = "cmux-host-consent")))]
+fn is_cmux_app_identifier(identifier: &str) -> bool {
+    match identifier.strip_prefix("com.cmuxterm.app") {
+        Some("") => true,
+        Some(rest) => rest.starts_with('.') && rest.len() > 1,
+        None => false,
+    }
+}
 
 /// The connected peer's audit token (LOCAL_PEERTOKEN), so the code check
 /// names this exact process instance, not a pid that could be reused.
@@ -803,16 +825,16 @@ fn macos_peer_audit_token(stream: &tokio::net::UnixStream) -> Option<[u32; 8]> {
     (status == 0 && length as usize == std::mem::size_of_val(&token)).then_some(token)
 }
 
-/// Whether the peer with `token` runs valid code satisfying
-/// [`CMUX_APP_REQUIREMENT`]. Any error is false.
+/// Whether the peer with `token` runs valid code of cmux's team whose
+/// signing identifier is a cmux app's. Any error is false.
 #[cfg(all(target_os = "macos", feature = "cmux-host-consent"))]
 fn macos_peer_is_cmux_app(token: &[u32; 8]) -> bool {
     use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
     use core_foundation::data::CFData;
-    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
     use core_foundation::string::CFString;
 
-    let requirement_text = CFString::new(CMUX_APP_REQUIREMENT);
+    let requirement_text = CFString::new(CMUX_TEAM_REQUIREMENT);
     let mut requirement: SecurityRequirementRef = std::ptr::null();
     if unsafe {
         SecRequirementCreateWithString(requirement_text.as_concrete_TypeRef(), 0, &mut requirement)
@@ -830,13 +852,29 @@ fn macos_peer_is_cmux_app(token: &[u32; 8]) -> bool {
     } == 0
         && !code.is_null();
     let valid = found && unsafe { SecCodeCheckValidity(code, 0, requirement) } == 0;
+    // The identifier of the code just validated (kSecCSSigningInformation).
+    let identified = valid && {
+        let mut information: CFDictionaryRef = std::ptr::null();
+        let status = unsafe { SecCodeCopySigningInformation(code, 1 << 1, &mut information) };
+        if status != 0 || information.is_null() {
+            false
+        } else {
+            let information: CFDictionary<CFString, core_foundation::base::CFType> =
+                unsafe { CFDictionary::wrap_under_create_rule(information) };
+            let key = unsafe { CFString::wrap_under_get_rule(kSecCodeInfoIdentifier) };
+            information
+                .find(&key)
+                .and_then(|value| value.downcast::<CFString>())
+                .is_some_and(|identifier| is_cmux_app_identifier(&identifier.to_string()))
+        }
+    };
     unsafe {
         if !code.is_null() {
             CFRelease(code as CFTypeRef);
         }
         CFRelease(requirement as CFTypeRef);
     }
-    valid
+    identified
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -5449,5 +5487,42 @@ mod session_boundary_tests {
             "proxy-session",
             "daemon-minted"
         ));
+    }
+}
+
+#[cfg(test)]
+mod machine_consent_host_tests {
+    use super::*;
+
+    #[test]
+    fn only_cmux_app_identifiers_may_serve_consent() {
+        for identifier in [
+            "com.cmuxterm.app",
+            "com.cmuxterm.app.nightly",
+            "com.cmuxterm.app.debug.my-tag",
+            "com.cmuxterm.app.next",
+        ] {
+            assert!(is_cmux_app_identifier(identifier), "{identifier}");
+        }
+        for identifier in [
+            "com.cmuxterm.apple",
+            "com.cmuxterm.app.",
+            "com.cmuxterm.cua",
+            "acpmux",
+            "cmux-cua",
+            "",
+        ] {
+            assert!(!is_cmux_app_identifier(identifier), "{identifier}");
+        }
+    }
+
+    /// This test binary is not a signed cmux app, so as a peer it may
+    /// never serve consent.
+    #[cfg(all(target_os = "macos", feature = "cmux-host-consent"))]
+    #[tokio::test]
+    async fn a_peer_that_is_not_a_signed_cmux_app_is_refused() {
+        let (daemon_end, _host_end) = tokio::net::UnixStream::pair().unwrap();
+        let token = macos_peer_audit_token(&daemon_end).expect("the peer's audit token");
+        assert!(!macos_peer_is_cmux_app(&token));
     }
 }

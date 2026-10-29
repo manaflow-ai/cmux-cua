@@ -531,12 +531,15 @@ impl ToolRegistry {
         }
     }
 
-    /// Pin the acpmux state directory the consent check reads (tests).
+    /// Pin the acpmux state directory the consent check reads (tests). Not
+    /// in the cmux.app build, where only the verified host decides.
+    #[cfg(any(test, not(feature = "cmux-host-consent")))]
     pub fn set_machine_consent_home(&mut self, home: std::path::PathBuf) {
         self.consent = Arc::new(crate::machine_consent::StateFiles::At(Some(home)));
     }
 
-    /// Replace where consent comes from.
+    /// Replace where consent comes from (tests). Not in the cmux.app build.
+    #[cfg(any(test, not(feature = "cmux-host-consent")))]
     pub fn set_consent_source(&mut self, source: Arc<dyn crate::machine_consent::ConsentSource>) {
         self.consent = source;
     }

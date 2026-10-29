@@ -28,12 +28,15 @@ use crate::machine_consent::{ConsentSource, ConsentStatus, Surface};
 /// bounded below this.
 pub const DEADLINE: Duration = Duration::from_millis(1500);
 
+/// Lines waiting for the host's connection; more fail closed.
+const QUEUE: usize = 64;
+
 type Reply = std::sync::mpsc::Sender<Option<Value>>;
 
 #[derive(Default)]
 struct State {
     /// The connected host: its generation and the queue its writer drains.
-    host: Option<(u64, tokio::sync::mpsc::UnboundedSender<String>)>,
+    host: Option<(u64, tokio::sync::mpsc::Sender<String>)>,
     next_id: u64,
     next_generation: u64,
     /// Open questions by id, with the generation of the host they went to:
@@ -94,7 +97,9 @@ impl HostConsent {
         R: AsyncBufRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // Bounded: a host that stops reading fails new questions at once
+        // instead of queueing them.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(QUEUE);
         let generation = {
             let mut state = self.lock();
             state.next_generation += 1;
@@ -108,9 +113,12 @@ impl HostConsent {
             tokio::select! {
                 question = rx.recv() => {
                     let Some(question) = question else { break };
-                    if writer.write_all(question.as_bytes()).await.is_err()
-                        || writer.flush().await.is_err()
-                    {
+                    let write = async {
+                        writer.write_all(question.as_bytes()).await?;
+                        writer.flush().await
+                    };
+                    // A host that does not read within the deadline is gone.
+                    if !matches!(tokio::time::timeout(DEADLINE, write).await, Ok(Ok(()))) {
                         break;
                     }
                 }
@@ -156,7 +164,7 @@ impl HostConsent {
             let id = state.next_id;
             state.pending.insert(id, (generation, reply));
             let question = json!({"type": "machine_consent", "id": id}).to_string() + "\n";
-            if host.send(question).is_err() {
+            if host.try_send(question).is_err() {
                 state.pending.remove(&id);
                 return None;
             }
@@ -209,7 +217,7 @@ impl ConsentSource for HostConsent {
         let state = self.lock();
         if let Some((_, host)) = state.host.as_ref() {
             let line = json!({"type": "consent_refused", "surface": surface.as_str()}).to_string();
-            let _ = host.send(line + "\n");
+            let _ = host.try_send(line + "\n");
         }
     }
 }
@@ -412,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn a_current_thread_runtime_never_blocks_on_the_host() {
         let consent = HostConsent::with_deadline(Duration::from_secs(30));
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
         consent.lock().host = Some((1, tx));
         assert_eq!(consent.status(), ConsentStatus::UNKNOWN);
     }
