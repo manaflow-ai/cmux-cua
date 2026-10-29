@@ -36,7 +36,22 @@ struct State {
     host: Option<(u64, tokio::sync::mpsc::UnboundedSender<String>)>,
     next_id: u64,
     next_generation: u64,
-    pending: HashMap<u64, Reply>,
+    /// Open questions by id, with the generation of the host they went to:
+    /// only that host's connection may answer one.
+    pending: HashMap<u64, (u64, Reply)>,
+}
+
+impl State {
+    /// Fails every open question not asked of `generation`'s host.
+    fn fail_pending_except(&mut self, generation: Option<u64>) {
+        self.pending.retain(|_, (asked, waiter)| {
+            let keep = Some(*asked) == generation;
+            if !keep {
+                let _ = waiter.send(None);
+            }
+            keep
+        });
+    }
 }
 
 /// The consent the verified host serves. One per process ([`shared`]);
@@ -85,6 +100,8 @@ impl HostConsent {
             state.next_generation += 1;
             let generation = state.next_generation;
             state.host = Some((generation, tx));
+            // Questions the replaced host was asked fail now.
+            state.fail_pending_except(Some(generation));
             generation
         };
         loop {
@@ -99,7 +116,7 @@ impl HostConsent {
                 }
                 line = lines.next_line() => {
                     let Ok(Some(line)) = line else { break };
-                    self.answer(&line);
+                    self.answer(generation, &line);
                 }
             }
         }
@@ -107,13 +124,11 @@ impl HostConsent {
         if state.host.as_ref().is_some_and(|(current, _)| *current == generation) {
             state.host = None;
             // Questions this host will never answer fail now.
-            for (_, waiter) in state.pending.drain() {
-                let _ = waiter.send(None);
-            }
+            state.fail_pending_except(None);
         }
     }
 
-    fn answer(&self, line: &str) {
+    fn answer(&self, generation: u64, line: &str) {
         let Ok(message) = serde_json::from_str::<Value>(line) else { return };
         if message["type"] != "machine_consent" {
             return;
@@ -122,8 +137,12 @@ impl HostConsent {
         let result = (message["ok"] == Value::Bool(true))
             .then(|| message.get("result").cloned())
             .flatten();
-        if let Some(waiter) = self.lock().pending.remove(&id) {
-            let _ = waiter.send(result);
+        let mut state = self.lock();
+        // An answer counts only from the host the question went to.
+        if state.pending.get(&id).is_some_and(|(asked, _)| *asked == generation) {
+            if let Some((_, waiter)) = state.pending.remove(&id) {
+                let _ = waiter.send(result);
+            }
         }
     }
 
@@ -131,11 +150,11 @@ impl HostConsent {
         let (reply, answer) = std::sync::mpsc::channel();
         let id = {
             let mut state = self.lock();
-            let (_, host) = state.host.as_ref()?;
-            let host = host.clone();
+            let (generation, host) = state.host.as_ref()?;
+            let (generation, host) = (*generation, host.clone());
             state.next_id += 1;
             let id = state.next_id;
-            state.pending.insert(id, reply);
+            state.pending.insert(id, (generation, reply));
             let question = json!({"type": "machine_consent", "id": id}).to_string() + "\n";
             if host.send(question).is_err() {
                 state.pending.remove(&id);
@@ -331,6 +350,47 @@ mod tests {
         let started = std::time::Instant::now();
         assert_eq!(consent.status(), ConsentStatus::UNKNOWN);
         assert!(started.elapsed() < Duration::from_secs(5), "no wait for a host that is gone");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_the_host_a_question_went_to_may_answer_it() {
+        let consent = Arc::new(HostConsent::with_deadline(Duration::from_secs(30)));
+        let (old_daemon, old_host) = tokio::net::UnixStream::pair().unwrap();
+        let old_serving = {
+            let consent = consent.clone();
+            tokio::spawn(async move {
+                let (reader, mut writer) = old_daemon.into_split();
+                consent.serve_host(&mut BufReader::new(reader).lines(), &mut writer).await;
+            })
+        };
+        attached(&consent).await;
+        // A question to the old host, which never answers in time.
+        let asking = {
+            let consent = consent.clone();
+            tokio::task::spawn_blocking(move || consent.status())
+        };
+        let (old_reader, mut old_writer) = old_host.into_split();
+        let mut old_lines = BufReader::new(old_reader).lines();
+        let question: Value = serde_json::from_str(&old_lines.next_line().await.unwrap().unwrap()).unwrap();
+        // A new host replaces it: the open question fails at once.
+        let (new_daemon, _new_host) = tokio::net::UnixStream::pair().unwrap();
+        let new_serving = {
+            let consent = consent.clone();
+            tokio::spawn(async move {
+                let (reader, mut writer) = new_daemon.into_split();
+                consent.serve_host(&mut BufReader::new(reader).lines(), &mut writer).await;
+            })
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(asking.await.unwrap(), ConsentStatus::UNKNOWN);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // A late grant from the replaced host is ignored.
+        let late = json!({"type": "machine_consent", "id": question["id"], "ok": true,
+            "result": serde_json::from_str::<Value>(GRANTED).unwrap()});
+        let _ = old_writer.write_all((late.to_string() + "\n").as_bytes()).await;
+        assert!(consent.lock().pending.is_empty());
+        old_serving.abort();
+        new_serving.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

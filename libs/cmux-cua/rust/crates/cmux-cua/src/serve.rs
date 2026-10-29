@@ -2313,7 +2313,10 @@ pub async fn run_serve_with_owner(
                                 // may hold it; the connection serves nothing else after.
                                 #[cfg(all(target_os = "macos", feature = "cmux-host-consent"))]
                                 {
-                                    let verified = host_request_authorized
+                                    // The host token itself, never the authorized-root
+                                    // fallback a daemon without host authority uses.
+                                    let verified = host_authority_configured
+                                        && parsed.host_authenticated
                                         && peer_audit_token
                                             .as_ref()
                                             .is_some_and(macos_peer_is_cmux_app);
