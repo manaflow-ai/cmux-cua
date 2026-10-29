@@ -1159,6 +1159,16 @@ pub fn run_manifest(pretty: bool) {
 /// from `run_manifest` so tests can introspect the shape without going
 /// through stdout.
 pub fn build_manifest() -> serde_json::Value {
+    /// `machine-consent-gate-v1` only in the cmux.app build, which gates
+    /// every call on the verified cmux host's machine consent.
+    fn manifest_capabilities() -> Vec<&'static str> {
+        #[allow(unused_mut)]
+        let mut capabilities = vec![crate::serve::OWNER_PID_CAPABILITY];
+        #[cfg(feature = "cmux-host-consent")]
+        capabilities.push(cmux_cua_core::machine_consent::GATE_CAPABILITY);
+        capabilities
+    }
+
     // Resolve the binary path the way `run_mcp_config` already does so the
     // emitted `mcp_invocation.command` is the actually-runnable path, not
     // a bare "cmux-cua" the caller has to resolve.
@@ -1177,7 +1187,7 @@ pub fn build_manifest() -> serde_json::Value {
         // Feature flags a host can check before it relies on a behavior.
         // `serve.owner-pid`: `serve --owner-pid <pid>` exits 0 and removes
         // its socket when that pid exits (no-op with a message on Windows).
-        "capabilities": [crate::serve::OWNER_PID_CAPABILITY],
+        "capabilities": manifest_capabilities(),
         "mcp_invocation": {
             "command": binary,
             "args": ["mcp"]

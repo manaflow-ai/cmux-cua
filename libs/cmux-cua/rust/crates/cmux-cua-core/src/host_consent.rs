@@ -12,8 +12,9 @@
 //!
 //! and the host answers from its own acpmux daemon
 //! (`_acpmux/machine_consent_get`). Every [`ConsentSource::status`] asks
-//! fresh. No host, no reply within [`DEADLINE`], an error or a malformed
-//! result is [`ConsentStatus::UNKNOWN`]: joined, nothing granted.
+//! fresh. No verified host attached is [`ConsentStatus::HOST_UNVERIFIED`]
+//! (refusals then say so); no reply within [`DEADLINE`], an error or a
+//! malformed result is [`ConsentStatus::UNKNOWN`]. Both grant nothing.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -202,11 +203,15 @@ pub fn parse_status(result: &Value) -> Option<ConsentStatus> {
         consent_required: result.get("consentRequired")?.as_bool()?,
         screen: grant(result.get("consent")?.get("screen")?)?,
         control: grant(result.get("consent")?.get("control")?)?,
+        host_unverified: false,
     })
 }
 
 impl ConsentSource for HostConsent {
     fn status(&self) -> ConsentStatus {
+        if self.lock().host.is_none() {
+            return ConsentStatus::HOST_UNVERIFIED;
+        }
         self.ask()
             .as_ref()
             .and_then(parse_status)
@@ -234,7 +239,7 @@ mod tests {
         let parsed = |text: &str| parse_status(&serde_json::from_str(text).unwrap());
         assert_eq!(
             parsed(r#"{"consentRequired":true,"consent":{"screen":"granted","control":"none"},"lastRefusal":null}"#),
-            Some(ConsentStatus { consent_required: true, screen: true, control: false })
+            Some(ConsentStatus { screen: true, ..ConsentStatus::UNKNOWN })
         );
         for bad in [
             r#"{"consent":{"screen":"granted","control":"granted"}}"#,
@@ -252,7 +257,7 @@ mod tests {
     #[test]
     fn with_no_host_nothing_is_granted() {
         let consent = HostConsent::default();
-        assert_eq!(consent.status(), ConsentStatus::UNKNOWN);
+        assert_eq!(consent.status(), ConsentStatus::HOST_UNVERIFIED);
         consent.record_refusal(Surface::Screen);
     }
 
@@ -332,7 +337,7 @@ mod tests {
         let alternate = tempfile::tempdir().unwrap();
         let files = crate::machine_consent::StateFiles::At(Some(alternate.path().to_owned()));
         assert!(!files.status().consent_required);
-        let status = |screen, control| ConsentStatus { consent_required: true, screen, control };
+        let status = |screen, control| ConsentStatus { screen, control, ..ConsentStatus::UNKNOWN };
         assert_eq!(consent.status(), status(false, false), "deny");
         consent.record_refusal(Surface::Screen);
         assert_eq!(consent.status(), status(true, true), "grant");
@@ -341,9 +346,32 @@ mod tests {
         assert_eq!(consent.status(), ConsentStatus::UNKNOWN, "malformed");
         assert!(!consent.status().consent_required, "unjoined, from the host");
         let seen = script.await.unwrap();
-        assert_eq!(consent.status(), ConsentStatus::UNKNOWN, "the host went away");
+        serving.await.unwrap();
+        assert_eq!(consent.status(), ConsentStatus::HOST_UNVERIFIED, "the host went away");
         assert!(seen.iter().any(|m| m["type"] == "consent_refused" && m["surface"] == "screen"));
-        drop(serving);
+    }
+
+    /// With no verified host a refusal says `host_unverified`; a verified
+    /// host that denies gives the plain `consent_required` a person's
+    /// refusal gives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refusals_tell_an_unverified_host_from_a_denial() {
+        use crate::machine_consent::{check, CONSENT_REQUIRED, HOST_UNVERIFIED};
+        let consent = Arc::new(HostConsent::with_deadline(Duration::from_secs(10)));
+        let refused = check(consent.as_ref(), "click").unwrap_err();
+        let structured = refused.structured_content.unwrap();
+        assert_eq!(structured["code"], CONSENT_REQUIRED);
+        assert_eq!(structured["reason"], HOST_UNVERIFIED);
+
+        let denied = r#"{"consentRequired":true,"consent":{"screen":"granted","control":"none"}}"#;
+        let (serving, _script) = host(consent.clone(), vec![Some(denied), Some(denied)]).await;
+        attached(&consent).await;
+        let refused = check(consent.as_ref(), "click").unwrap_err();
+        let structured = refused.structured_content.unwrap();
+        assert_eq!(structured["code"], CONSENT_REQUIRED);
+        assert_eq!(structured["surface"], "control");
+        assert!(structured.get("reason").is_none(), "{structured}");
+        serving.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -356,7 +384,7 @@ mod tests {
         let _ = script.await;
         serving.await.unwrap();
         let started = std::time::Instant::now();
-        assert_eq!(consent.status(), ConsentStatus::UNKNOWN);
+        assert_eq!(consent.status(), ConsentStatus::HOST_UNVERIFIED);
         assert!(started.elapsed() < Duration::from_secs(5), "no wait for a host that is gone");
     }
 

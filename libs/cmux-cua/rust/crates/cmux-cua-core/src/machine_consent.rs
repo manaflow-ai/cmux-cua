@@ -37,6 +37,14 @@ use crate::protocol::ToolResult;
 
 /// The error code acpmux uses for the same refusal.
 pub const CONSENT_REQUIRED: &str = "consent_required";
+/// What a helper built with `cmux-host-consent` advertises (the daemon's
+/// `list` result and `cmux-cua manifest` `capabilities`): every call is
+/// gated on the verified cmux host's machine consent.
+pub const GATE_CAPABILITY: &str = "machine-consent-gate-v1";
+/// The `reason` a refusal carries when the cmux.app build has no verified
+/// cmux host to ask (see [`ConsentStatus::HOST_UNVERIFIED`]), so the app and
+/// doctor can tell it from a person's refusal, which carries no reason.
+pub const HOST_UNVERIFIED: &str = "host_unverified";
 
 const CREDENTIAL_FILE: &str = "machine-credential.json";
 const CONSENT_FILE: &str = "consent.json";
@@ -166,6 +174,9 @@ pub struct ConsentStatus {
     /// record it belongs to, cannot be trusted.
     pub screen: bool,
     pub control: bool,
+    /// No verified cmux host is attached to answer (cmux.app build only):
+    /// nothing is granted, and the refusal says why.
+    pub host_unverified: bool,
 }
 
 impl ConsentStatus {
@@ -174,6 +185,14 @@ impl ConsentStatus {
         consent_required: true,
         screen: false,
         control: false,
+        host_unverified: false,
+    };
+
+    /// The cmux.app build with no verified cmux host attached: nothing is
+    /// granted, and refusals carry `reason: host_unverified`.
+    pub const HOST_UNVERIFIED: ConsentStatus = ConsentStatus {
+        host_unverified: true,
+        ..ConsentStatus::UNKNOWN
     };
 
     pub fn granted(&self, surface: Surface) -> bool {
@@ -334,8 +353,7 @@ fn read_status(home: Option<&Path>) -> ConsentStatus {
         {
             return ConsentStatus {
                 consent_required: false,
-                screen: false,
-                control: false,
+                ..ConsentStatus::UNKNOWN
             };
         }
         // Present in some form, or unreadable: joined.
@@ -355,9 +373,9 @@ fn read_status(home: Option<&Path>) -> ConsentStatus {
         })
         .unwrap_or((false, false));
     ConsentStatus {
-        consent_required: true,
         screen,
         control,
+        ..ConsentStatus::UNKNOWN
     }
 }
 
@@ -707,16 +725,43 @@ pub fn check(source: &dyn ConsentSource, tool: &str) -> Result<(), ToolResult> {
     if requirement_for(tool) == Requirement::Nothing {
         return Ok(());
     }
-    match missing_surface(&source.status(), tool, false) {
+    let status = source.status();
+    match missing_surface(&status, tool, false) {
         None => Ok(()),
-        Some(surface) => Err(refuse(source, tool, surface)),
+        Some(surface) => Err(refuse(source, &status, tool, surface)),
     }
 }
 
 /// Record a refusal with `source` and return the MCP tool error for it.
-pub fn refuse(source: &dyn ConsentSource, tool: &str, surface: Surface) -> ToolResult {
+pub fn refuse(
+    source: &dyn ConsentSource,
+    status: &ConsentStatus,
+    tool: &str,
+    surface: Surface,
+) -> ToolResult {
     source.record_refusal(surface);
-    refusal(tool, surface)
+    if status.host_unverified {
+        host_unverified_refusal(tool, surface)
+    } else {
+        refusal(tool, surface)
+    }
+}
+
+/// The refusal when no verified cmux host can answer: the stable code, a
+/// distinct `reason`, and what the person can do about it.
+pub fn host_unverified_refusal(tool: &str, surface: Surface) -> ToolResult {
+    ToolResult::error(format!(
+        "{CONSENT_REQUIRED} ({HOST_UNVERIFIED}): Computer Use is off: legacy Computer Use \
+         could not verify the cmux app that started it (a cmux build that isn't team-signed \
+         can't be verified). `{tool}` did not run. Use the built-in Computer Use \
+         (Settings › Computer Use › driver: upstream) or a signed cmux build."
+    ))
+    .with_structured(json!({
+        "code": CONSENT_REQUIRED,
+        "reason": HOST_UNVERIFIED,
+        "surface": surface.as_str(),
+        "tool": tool,
+    }))
 }
 
 /// The MCP tool error for a refused call. It names the tool and the surface
@@ -1201,6 +1246,35 @@ mod tests {
             .unwrap();
         assert!(status.success());
         assert!(check_in(home.path(), "click").is_err());
+    }
+
+    /// A person's refusal is plain `consent_required`; with no verified
+    /// cmux host it carries `reason: host_unverified` and says what to do.
+    #[test]
+    fn an_unverified_host_is_told_apart_from_a_person_refusing() {
+        struct Fixed(ConsentStatus);
+        impl ConsentSource for Fixed {
+            fn status(&self) -> ConsentStatus {
+                self.0
+            }
+            fn record_refusal(&self, _surface: Surface) {}
+        }
+        let denied = ConsentStatus { screen: true, ..ConsentStatus::UNKNOWN };
+        let error = check(&Fixed(denied), "click").unwrap_err();
+        let structured = error.structured_content.unwrap();
+        assert_eq!(structured["code"], CONSENT_REQUIRED);
+        assert_eq!(structured["surface"], "control");
+        assert!(structured.get("reason").is_none(), "{structured}");
+
+        let error = check(&Fixed(ConsentStatus::HOST_UNVERIFIED), "get_window_state").unwrap_err();
+        let structured = error.structured_content.as_ref().unwrap();
+        assert_eq!(structured["code"], CONSENT_REQUIRED);
+        assert_eq!(structured["reason"], HOST_UNVERIFIED);
+        let text = serde_json::to_string(&error).unwrap();
+        assert!(text.contains("driver: upstream"), "{text}");
+        assert!(text.contains("signed cmux build"), "{text}");
+        // Tools that need no consent still run without a host.
+        assert!(check(&Fixed(ConsentStatus::HOST_UNVERIFIED), "get_config").is_ok());
     }
 
     #[test]

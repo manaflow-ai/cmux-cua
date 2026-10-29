@@ -826,55 +826,75 @@ fn macos_peer_audit_token(stream: &tokio::net::UnixStream) -> Option<[u32; 8]> {
 }
 
 /// Whether the peer with `token` runs valid code of cmux's team whose
-/// signing identifier is a cmux app's. Any error is false.
+/// signing identifier is a cmux app's. `Err` says why not, for the log and
+/// the refused host (no secret is involved): checked in steps so an ad hoc
+/// build, another team and another app are told apart. Any error refuses.
 #[cfg(all(target_os = "macos", feature = "cmux-host-consent"))]
-fn macos_peer_is_cmux_app(token: &[u32; 8]) -> bool {
+fn macos_peer_cmux_app_check(token: &[u32; 8]) -> Result<(), String> {
     use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
     use core_foundation::data::CFData;
     use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
     use core_foundation::string::CFString;
 
-    let requirement_text = CFString::new(CMUX_TEAM_REQUIREMENT);
-    let mut requirement: SecurityRequirementRef = std::ptr::null();
-    if unsafe {
-        SecRequirementCreateWithString(requirement_text.as_concrete_TypeRef(), 0, &mut requirement)
-    } != 0
-        || requirement.is_null()
-    {
-        return false;
+    /// Owns a Security object and releases it once.
+    struct Owned(*const libc::c_void);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0 as CFTypeRef) };
+            }
+        }
     }
+    let satisfies = |code: SecurityCodeRef, text: &str| -> bool {
+        let text = CFString::new(text);
+        let mut requirement: SecurityRequirementRef = std::ptr::null();
+        let created =
+            unsafe { SecRequirementCreateWithString(text.as_concrete_TypeRef(), 0, &mut requirement) } == 0;
+        let requirement = Owned(requirement);
+        created
+            && !requirement.0.is_null()
+            && unsafe { SecCodeCheckValidity(code, 0, requirement.0) } == 0
+    };
+
     let bytes: Vec<u8> = token.iter().flat_map(|word| word.to_ne_bytes()).collect();
     let audit_key = unsafe { CFString::wrap_under_get_rule(kSecGuestAttributeAudit) };
     let attributes = CFDictionary::from_CFType_pairs(&[(audit_key, CFData::from_buffer(&bytes))]);
     let mut code: SecurityCodeRef = std::ptr::null();
     let found = unsafe {
         SecCodeCopyGuestWithAttributes(std::ptr::null(), attributes.as_concrete_TypeRef(), 0, &mut code)
-    } == 0
-        && !code.is_null();
-    let valid = found && unsafe { SecCodeCheckValidity(code, 0, requirement) } == 0;
-    // The identifier of the code just validated (kSecCSSigningInformation).
-    let identified = valid && {
-        let mut information: CFDictionaryRef = std::ptr::null();
-        let status = unsafe { SecCodeCopySigningInformation(code, 1 << 1, &mut information) };
-        if status != 0 || information.is_null() {
-            false
-        } else {
-            let information: CFDictionary<CFString, core_foundation::base::CFType> =
-                unsafe { CFDictionary::wrap_under_create_rule(information) };
-            let key = unsafe { CFString::wrap_under_get_rule(kSecCodeInfoIdentifier) };
-            information
-                .find(&key)
-                .and_then(|value| value.downcast::<CFString>())
-                .is_some_and(|identifier| is_cmux_app_identifier(&identifier.to_string()))
-        }
-    };
-    unsafe {
-        if !code.is_null() {
-            CFRelease(code as CFTypeRef);
-        }
-        CFRelease(requirement as CFTypeRef);
+    } == 0;
+    let code = Owned(code);
+    if !found || code.0.is_null() {
+        return Err("no code for the peer".into());
     }
-    identified
+    if unsafe { SecCodeCheckValidity(code.0, 0, std::ptr::null()) } != 0 {
+        return Err("invalid signature".into());
+    }
+    if !satisfies(code.0, "anchor apple generic") {
+        return Err("not Apple-signed (ad hoc or unsigned)".into());
+    }
+    if !satisfies(code.0, CMUX_TEAM_REQUIREMENT) {
+        return Err("not signed by cmux's team".into());
+    }
+    // The identifier of the code just validated (kSecCSSigningInformation).
+    let mut information: CFDictionaryRef = std::ptr::null();
+    let status = unsafe { SecCodeCopySigningInformation(code.0, 1 << 1, &mut information) };
+    if status != 0 || information.is_null() {
+        return Err("no signing information".into());
+    }
+    let information: CFDictionary<CFString, core_foundation::base::CFType> =
+        unsafe { CFDictionary::wrap_under_create_rule(information) };
+    let key = unsafe { CFString::wrap_under_get_rule(kSecCodeInfoIdentifier) };
+    let identifier = information
+        .find(&key)
+        .and_then(|value| value.downcast::<CFString>())
+        .map(|identifier| identifier.to_string())
+        .unwrap_or_default();
+    if is_cmux_app_identifier(&identifier) {
+        Ok(())
+    } else {
+        Err(format!("signing identifier {identifier:?} is not a cmux app"))
+    }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -2353,18 +2373,43 @@ pub async fn run_serve_with_owner(
                                 {
                                     // The host token itself, never the authorized-root
                                     // fallback a daemon without host authority uses.
-                                    let verified = host_authority_configured
-                                        && parsed.host_authenticated
-                                        && peer_audit_token
-                                            .as_ref()
-                                            .is_some_and(macos_peer_is_cmux_app);
-                                    let resp = if verified {
-                                        DaemonResponse::ok(serde_json::json!({"attached": true}))
-                                    } else {
-                                        DaemonResponse::err(
-                                            "Unauthorized host-only consent request",
-                                            77,
-                                        )
+                                    let authenticated =
+                                        host_authority_configured && parsed.host_authenticated;
+                                    // Only an authenticated host learns why its code
+                                    // was refused; the log says it either way.
+                                    let check = authenticated.then(|| match peer_audit_token.as_ref() {
+                                        Some(token) => macos_peer_cmux_app_check(token),
+                                        None => Err("no audit token for the peer".to_owned()),
+                                    });
+                                    let verified = matches!(check, Some(Ok(())));
+                                    let resp = match check {
+                                        Some(Ok(())) => {
+                                            DaemonResponse::ok(serde_json::json!({"attached": true}))
+                                        }
+                                        Some(Err(why)) => {
+                                            eprintln!(
+                                                "cmux-cua: refused the machine consent host: \
+                                                 {}: {why}",
+                                                cmux_cua_core::machine_consent::HOST_UNVERIFIED
+                                            );
+                                            DaemonResponse::err(
+                                                format!(
+                                                    "Unauthorized host-only consent request: {} ({why})",
+                                                    cmux_cua_core::machine_consent::HOST_UNVERIFIED
+                                                ),
+                                                77,
+                                            )
+                                        }
+                                        None => {
+                                            eprintln!(
+                                                "cmux-cua: refused the machine consent host: \
+                                                 no host token"
+                                            );
+                                            DaemonResponse::err(
+                                                "Unauthorized host-only consent request",
+                                                77,
+                                            )
+                                        }
                                     };
                                     let sent = writer.write_all(
                                         (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
@@ -2926,12 +2971,22 @@ pub async fn run_serve_with_owner(
                                 // capability_version + schema_version so MCP
                                 // proxy callers can pass them through verbatim
                                 // (one daemon round-trip, complete response).
-                                let resp = DaemonResponse::ok(serde_json::json!({
+                                #[allow(unused_mut)]
+                                let mut listed = serde_json::json!({
                                     "tools": tools,
                                     "capability_version": cmux_cua_core::tool::CAPABILITY_VERSION,
                                     "schema_version": "1",
                                     "profile": profile,
-                                }));
+                                });
+                                // The cmux.app build gates every call on the verified
+                                // host's machine consent; say so to whoever lists.
+                                #[cfg(feature = "cmux-host-consent")]
+                                {
+                                    listed["capabilities"] = serde_json::json!([
+                                        cmux_cua_core::machine_consent::GATE_CAPABILITY
+                                    ]);
+                                }
+                                let resp = DaemonResponse::ok(listed);
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -5516,6 +5571,19 @@ mod machine_consent_host_tests {
         }
     }
 
+    /// The cmux.app build says it gates every call; others do not.
+    #[test]
+    fn only_the_cmux_app_build_advertises_the_consent_gate() {
+        let manifest = crate::cli::build_manifest();
+        let advertised = manifest["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == cmux_cua_core::machine_consent::GATE_CAPABILITY);
+        assert_eq!(advertised, cfg!(feature = "cmux-host-consent"));
+        assert_eq!(cmux_cua_core::machine_consent::GATE_CAPABILITY, "machine-consent-gate-v1");
+    }
+
     /// This test binary is not a signed cmux app, so as a peer it may
     /// never serve consent.
     #[cfg(all(target_os = "macos", feature = "cmux-host-consent"))]
@@ -5523,6 +5591,11 @@ mod machine_consent_host_tests {
     async fn a_peer_that_is_not_a_signed_cmux_app_is_refused() {
         let (daemon_end, _host_end) = tokio::net::UnixStream::pair().unwrap();
         let token = macos_peer_audit_token(&daemon_end).expect("the peer's audit token");
-        assert!(!macos_peer_is_cmux_app(&token));
+        let why = macos_peer_cmux_app_check(&token).unwrap_err();
+        // An unsigned or ad hoc test binary is told apart from another team.
+        assert!(
+            ["not Apple-signed (ad hoc or unsigned)", "invalid signature", "no code for the peer"].contains(&why.as_str()),
+            "{why}"
+        );
     }
 }
