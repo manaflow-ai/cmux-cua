@@ -19,6 +19,12 @@ async-trait = "0.1"
 # all three platforms call the same code path.
 image = { workspace = true }
 
+[features]
+# The build that ships inside cmux.app: machine consent comes only from the
+# verified cmux host, never from files a caller could redirect. cmux's
+# build-cmux-cua.sh turns it on; released and standalone builds leave it off.
+cmux-host-consent = []
+
 [dev-dependencies]
 tempfile = "3"
 

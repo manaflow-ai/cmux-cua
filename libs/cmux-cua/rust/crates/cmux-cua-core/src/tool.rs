@@ -2039,7 +2039,7 @@ mod machine_consent_registry_tests {
         join(home.path());
         let (registry, screen, control) = counting_registry(home.path());
         assert!(refused(&registry.invoke("get_window_state", json!({})).await, "screen"));
-        assert!(refused(&registry.invoke("click", json!({})).await, "control"));
+        assert!(refused(&registry.invoke("click", json!({})).await, "screen"));
         assert_eq!((screen.load(Ordering::SeqCst), control.load(Ordering::SeqCst)), (0, 0));
     }
 
@@ -2107,8 +2107,8 @@ mod machine_consent_registry_tests {
         });
         registry.set_consent_source(source.clone());
         assert!(refused(&registry.invoke("get_window_state", json!({})).await, "screen"));
-        assert!(refused(&registry.invoke("click", json!({})).await, "control"));
-        assert_eq!(*source.refusals.lock().unwrap(), ["screen", "control"]);
+        assert!(refused(&registry.invoke("click", json!({})).await, "screen"));
+        assert_eq!(*source.refusals.lock().unwrap(), ["screen", "screen"]);
         assert!(std::fs::read_dir(home.path()).unwrap().next().is_none());
 
         *source.status.lock().unwrap() = ConsentStatus {
@@ -2288,7 +2288,7 @@ mod machine_consent_registry_tests {
 
     #[cfg(any(unix, windows))]
     #[tokio::test]
-    async fn revoking_screen_during_a_recording_stops_capture_but_control_still_acts() {
+    async fn revoking_screen_during_a_recording_refuses_the_action_and_ends_the_recording() {
         let home = tempfile::tempdir().unwrap();
         let out = tempfile::tempdir().unwrap();
         join(home.path());
@@ -2303,8 +2303,8 @@ mod machine_consent_registry_tests {
         assert_eq!(turn_dirs(out.path()), 1, "a granted action is recorded");
 
         consent(home.path(), "none", "granted");
-        assert_eq!(registry.invoke("click", json!({})).await.is_error, None);
-        assert_eq!(control.load(Ordering::SeqCst), 2, "control alone still acts");
+        assert!(refused(&registry.invoke("click", json!({})).await, "screen"));
+        assert_eq!(control.load(Ordering::SeqCst), 1, "acting needs screen too");
         assert_eq!(turn_dirs(out.path()), 1, "no turn is captured after the revoke");
         assert!(!registry.recording.is_enabled(), "the revoke ended the recording");
 

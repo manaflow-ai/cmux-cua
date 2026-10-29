@@ -67,8 +67,11 @@ impl Surface {
 pub enum Requirement {
     /// Reads no screen content and changes nothing the person sees.
     Nothing,
+    /// Observation only.
     Screen,
-    Control,
+    /// Acts on the machine: needs `screen` and `control`, the rule acpmux's
+    /// Computer Use bridge enforces, since acting means seeing what is acted on.
+    Act,
     /// Both surfaces: tools that read and act (`page`), and any tool this
     /// table does not know, so a new tool is gated until it is classified.
     Both,
@@ -79,7 +82,7 @@ impl Requirement {
         match self {
             Requirement::Nothing => &[],
             Requirement::Screen => &[Surface::Screen],
-            Requirement::Control => &[Surface::Control],
+            Requirement::Act => &[Surface::Screen, Surface::Control],
             Requirement::Both => &[Surface::Screen, Surface::Control],
         }
     }
@@ -144,7 +147,7 @@ pub fn requirement_for(tool: &str) -> Requirement {
         | "set_agent_cursor_style"
         | "set_config"
         | "install_ffmpeg"
-        | "replay_trajectory" => Requirement::Control,
+        | "replay_trajectory" => Requirement::Act,
 
         // `page` both reads page content and acts on it.
         "page" => Requirement::Both,
@@ -195,10 +198,36 @@ pub trait ConsentSource: Send + Sync {
     fn record_refusal(&self, surface: Surface);
 }
 
-/// The consent source this process uses. The one place to change when the
-/// answer moves from acpmux's state files to the acpmux daemon.
+/// The consent source this process uses: the one place to change when the
+/// answer moves to the cmux app's authenticated connection.
+///
+/// The build that ships inside cmux.app (feature `cmux-host-consent`) holds
+/// the person's macOS grants, so it trusts no file a caller could redirect:
+/// until the verified-host source exists, it answers [`Unavailable`].
+/// Standalone and released builds keep acpmux's state files, which are
+/// advisory: `$ACPMUX_HOME` is chosen by whoever starts the process.
 pub fn default_source() -> Arc<dyn ConsentSource> {
-    Arc::new(StateFiles::FromEnv)
+    #[cfg(feature = "cmux-host-consent")]
+    {
+        Arc::new(Unavailable)
+    }
+    #[cfg(not(feature = "cmux-host-consent"))]
+    {
+        Arc::new(StateFiles::FromEnv)
+    }
+}
+
+/// No trusted answer: joined, nothing granted, so everything that needs
+/// consent refuses.
+#[derive(Debug, Clone, Copy)]
+pub struct Unavailable;
+
+impl ConsentSource for Unavailable {
+    fn status(&self) -> ConsentStatus {
+        ConsentStatus::UNKNOWN
+    }
+
+    fn record_refusal(&self, _surface: Surface) {}
 }
 
 /// Consent read from acpmux's state files.
@@ -818,7 +847,7 @@ mod tests {
         assert_eq!(read_status(None), ConsentStatus::UNKNOWN);
         assert_eq!(
             refused_surface(check(&NO_HOME, "click")).as_deref(),
-            Some("control")
+            Some("screen")
         );
         assert_eq!(
             refused_surface(check(&NO_HOME, "zoom")).as_deref(),
@@ -877,7 +906,7 @@ mod tests {
         );
         assert_eq!(
             refused_surface(check_in(home.path(), "click")).as_deref(),
-            Some("control")
+            Some("screen")
         );
         assert_eq!(
             refused_surface(check_in(home.path(), "page")).as_deref(),
@@ -940,15 +969,46 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn a_capturing_call_also_needs_screen() {
+    fn control_alone_allows_no_action() {
+        // Acting needs screen and control, as acpmux's bridge enforces.
         let home = joined_home();
         grant(home.path(), "none", "granted");
-        let status = read_status(Some(home.path()));
-        assert_eq!(missing_surface(&status, "click", false), None);
+        for tool in ["click", "type_text", "launch_app", "page", "get_window_state"] {
+            assert_eq!(
+                refused_surface(check_in(home.path(), tool)).as_deref(),
+                Some("screen"),
+                "{tool}"
+            );
+        }
+        assert!(check_in(home.path(), "get_config").is_ok());
+    }
+
+    #[test]
+    fn the_unavailable_source_refuses_everything_that_needs_consent() {
+        assert_eq!(Unavailable.status(), ConsentStatus::UNKNOWN);
         assert_eq!(
-            missing_surface(&status, "click", true),
-            Some(Surface::Screen)
+            refused_surface(check(&Unavailable, "get_window_state")).as_deref(),
+            Some("screen")
         );
+        assert_eq!(
+            refused_surface(check(&Unavailable, "click")).as_deref(),
+            Some("screen")
+        );
+        assert!(check(&Unavailable, "get_config").is_ok());
+    }
+
+    /// The build inside cmux.app never falls back to a file a caller could
+    /// redirect; other builds keep the advisory file reader.
+    #[test]
+    fn the_default_source_follows_the_build() {
+        let home = tempfile::tempdir().unwrap();
+        // An "unjoined" state directory the caller chose.
+        let unjoined = StateFiles::At(Some(home.path().to_owned()));
+        assert!(!unjoined.status().consent_required);
+        let default = default_source().status();
+        if cfg!(feature = "cmux-host-consent") {
+            assert_eq!(default, ConsentStatus::UNKNOWN);
+        }
     }
 
     #[test]

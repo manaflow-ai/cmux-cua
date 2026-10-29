@@ -153,13 +153,18 @@ fn a_running_server_follows_join_grant_and_revoke_on_every_call() {
         &acpmux_home.join("machine-credential.json"),
         cmux_cua_core::machine_consent::TEST_CREDENTIAL_RECORD,
     );
+    // Acting needs screen and control, so an action is refused for screen.
     assert_eq!(server.screen().as_deref(), Some("screen"));
-    assert_eq!(server.control().as_deref(), Some("control"));
+    assert_eq!(server.control().as_deref(), Some("screen"));
     let refusal: Value =
         serde_json::from_slice(&std::fs::read(acpmux_home.join("consent-refusal.json")).unwrap())
             .unwrap();
     assert_eq!(refusal["code"], "consent_required");
-    assert_eq!(refusal["surface"], "control");
+    assert_eq!(refusal["surface"], "screen");
+
+    // Control alone allows no action.
+    consent(&acpmux_home, "none", "granted");
+    assert_eq!(server.control().as_deref(), Some("screen"));
 
     // Screen only: reads run, actions are refused.
     consent(&acpmux_home, "granted", "none");
