@@ -301,6 +301,9 @@ pub fn pixel_obstruction(
     )
 }
 
+/// `kCGDockWindowLevel`.
+const DOCK_WINDOW_LEVEL: i32 = 20;
+
 /// Drop the Dock's full-display backdrop: on macOS 26 the Dock keeps an
 /// opaque, above-normal-level window exactly the size of each display (behind
 /// Mission Control and the desktop), which takes no clicks there, yet its frame
@@ -308,9 +311,6 @@ pub fn pixel_obstruction(
 /// bar and its menus are smaller windows and still count. Blind spot: a
 /// display-sized Dock overlay at the same level (Mission Control or Launchpad
 /// while open) is dropped too, so a background event sent then is not refused.
-/// `kCGDockWindowLevel`.
-const DOCK_WINDOW_LEVEL: i32 = 20;
-
 fn without_dock_backdrops(windows: Vec<WindowInfo>, displays: &[WindowBounds]) -> Vec<WindowInfo> {
     windows
         .into_iter()
