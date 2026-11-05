@@ -66,6 +66,7 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends xvfb imagemagick dbus at-spi2-core python3-gi gir1.2-gtk-3.0 x11-utils ffmpeg
           cargo test -p platform-linux --test per_display --locked -- --nocapture
+          cargo test -p platform-linux --test person_wait --locked -- --nocapture
       - name: Run Linux Rust tests
         working-directory: libs/cmux-cua/rust
         run: cargo test -p cmux-cua -p cmux-cua-core -p cmux-cua-testkit -p platform-linux --all-targets --locked

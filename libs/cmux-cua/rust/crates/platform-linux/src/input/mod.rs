@@ -2015,6 +2015,10 @@ pub fn send_click_xtest_desktop(x: i32, y: i32, button: u8, count: usize) -> Res
     use x11rb::protocol::xtest::ConnectionExt as _;
     let (conn, screen_num) = connect_x11_for_input()?;
     let root = conn.setup().roots[screen_num].root;
+    // A person acting in that window through cmux remote desktop goes first.
+    if let Err(busy) = crate::person::wait_for_press(&conn, root, x, y) {
+        bail!(busy.press_message());
+    }
     // Absolute pointer warp (MotionNotify, detail=0 => absolute) so the button
     // events that follow are delivered at (x, y).
     conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x as i16, y as i16, 0)?;
@@ -2054,6 +2058,9 @@ pub fn send_drag_xtest_desktop(
     use x11rb::protocol::xtest::ConnectionExt as _;
     let (conn, screen_num) = connect_x11_for_input()?;
     let root = conn.setup().roots[screen_num].root;
+    if let Err(busy) = crate::person::wait_for_press(&conn, root, from_x, from_y) {
+        bail!(busy.press_message());
+    }
     let steps = steps.max(1);
     let delay = duration_ms / steps as u64;
 

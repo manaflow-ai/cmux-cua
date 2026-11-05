@@ -1355,6 +1355,28 @@ fn unavailable_wayland_focused_input_background(
     })
 }
 
+/// Before XTest keys reach a Chromium window: waits while a person acts on this display
+/// through cmux remote desktop, since Chromium takes keys from their keyboard instead and
+/// would drop these (`crate::person`). None when the keys may go.
+async fn person_keys_gate(pid: u32) -> Option<ToolResult> {
+    // Only X11 XTest keys go through the core keyboard the person's master shadows; the
+    // Wayland and cua-compositor routes never do.
+    if crate::wayland::is_wayland()
+        || crate::wayland::wayland_input_enabled()
+        || crate::wayland::is_inject_mode()
+        || !is_chromium_embedder(pid)
+    {
+        return None;
+    }
+    match crate::display::spawn_blocking(crate::person::wait_for_keys).await {
+        Ok(Err(busy)) => Some(
+            ToolResult::error(busy.keys_message())
+                .with_structured(json!({"code": "person_acting", "retryable": true})),
+        ),
+        _ => None,
+    }
+}
+
 /// Chromium's X11 renderer drops synthetic input sent to an occluded,
 /// unfocused toplevel. Returning success here would be a silent loss, so all
 /// input tools expose the same typed refusal and leave foreground activation
@@ -2276,6 +2298,9 @@ impl Tool for TypeTextTool {
         if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
             return refusal;
         }
+        if let Some(busy) = person_keys_gate(pid).await {
+            return busy;
+        }
         if resolved_elem_idx.is_none() {
             if let Some(refusal) = unavailable_wayland_focused_input_background(delivery, true) {
                 return refusal;
@@ -2831,6 +2856,9 @@ impl Tool for PressKeyTool {
         if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
             return refusal;
         }
+        if let Some(busy) = person_keys_gate(pid).await {
+            return busy;
+        }
 
         if let Some(refusal) = unavailable_webkit_keyboard_background(pid, delivery) {
             return refusal;
@@ -3110,6 +3138,9 @@ impl Tool for HotkeyTool {
 
         if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
             return refusal;
+        }
+        if let Some(busy) = person_keys_gate(pid).await {
+            return busy;
         }
         if let Some(refusal) = unavailable_webkit_keyboard_background(pid, delivery) {
             return refusal;
