@@ -1359,7 +1359,13 @@ fn unavailable_wayland_focused_input_background(
 /// through cmux remote desktop, since Chromium takes keys from their keyboard instead and
 /// would drop these (`crate::person`). None when the keys may go.
 async fn person_keys_gate(pid: u32) -> Option<ToolResult> {
-    if !is_chromium_embedder(pid) {
+    // Only X11 XTest keys go through the core keyboard the person's master shadows; the
+    // Wayland and cua-compositor routes never do.
+    if crate::wayland::is_wayland()
+        || crate::wayland::wayland_input_enabled()
+        || crate::wayland::is_inject_mode()
+        || !is_chromium_embedder(pid)
+    {
         return None;
     }
     match crate::display::spawn_blocking(crate::person::wait_for_keys).await {

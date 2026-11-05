@@ -121,14 +121,19 @@ impl Host {
 
     /// A mapped toplevel at (100,100)-(300,300).
     fn window(&self) -> Window {
+        self.window_at(100, 100)
+    }
+
+    /// A mapped 200x200 toplevel at (`x`, `y`), which may be negative.
+    fn window_at(&self, x: i16, y: i16) -> Window {
         let win = self.conn.generate_id().unwrap();
         self.conn
             .create_window(
                 0,
                 win,
                 self.root,
-                100,
-                100,
+                x,
+                y,
                 200,
                 200,
                 0,
@@ -222,4 +227,19 @@ fn a_press_waits_only_for_the_window_the_person_uses() {
         "waited {waited:?}"
     );
     assert!(waited < person::PRESS_WAIT, "waited {waited:?}");
+}
+
+#[test]
+fn a_press_at_negative_coordinates_finds_its_window() {
+    let Some(x) = Xvfb::start() else { return };
+    let host = Host::new(&x.name);
+    // A toplevel reaching left of and above the root origin (a monitor there).
+    let win = host.window_at(-150, -150);
+    host.write(std::process::id(), win, true, now_ms());
+    let start = Instant::now();
+    assert!(matches!(
+        press(&x.name, -100, -100),
+        Err(Busy::StillActing(_))
+    ));
+    assert!(start.elapsed() >= person::PRESS_WAIT);
 }

@@ -235,13 +235,14 @@ pub fn wait_for_press(conn: &RustConnection, root: Window, x: i32, y: i32) -> Re
     if !matches!(watch.read(), Ok(Some(_))) {
         return Ok(());
     }
+    // Same signed root coordinates XTest gets (a monitor left of or above the
+    // primary has negative ones).
+    let (x, y) = (
+        x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+        y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+    );
     let window = conn
-        .translate_coordinates(
-            root,
-            root,
-            x.clamp(0, i16::MAX as i32) as i16,
-            y.clamp(0, i16::MAX as i32) as i16,
-        )
+        .translate_coordinates(root, root, x, y)
         .ok()
         .and_then(|c| c.reply().ok())
         .map_or(0, |r| r.child);
