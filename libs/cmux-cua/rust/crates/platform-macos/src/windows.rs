@@ -305,13 +305,18 @@ pub fn pixel_obstruction(
 /// opaque, above-normal-level window exactly the size of each display (behind
 /// Mission Control and the desktop), which takes no clicks there, yet its frame
 /// contains every point and would block every background pixel event. The Dock
-/// bar itself is a smaller window and still counts.
+/// bar and its menus are smaller windows and still count. Blind spot: a
+/// display-sized Dock overlay at the same level (Mission Control or Launchpad
+/// while open) is dropped too, so a background event sent then is not refused.
+/// `kCGDockWindowLevel`.
+const DOCK_WINDOW_LEVEL: i32 = 20;
+
 fn without_dock_backdrops(windows: Vec<WindowInfo>, displays: &[WindowBounds]) -> Vec<WindowInfo> {
     windows
         .into_iter()
         .filter(|w| {
             let backdrop = w.app_name.trim() == "Dock"
-                && w.layer != 0
+                && w.layer == DOCK_WINDOW_LEVEL
                 && displays.iter().any(|d| {
                     (w.bounds.x - d.x).abs() < 1.0
                         && (w.bounds.y - d.y).abs() < 1.0
@@ -513,6 +518,22 @@ mod tests {
         // The Dock bar itself still blocks a point it covers.
         let windows = without_dock_backdrops(vec![bar, backdrop, target], &[display]);
         assert_eq!(pixel_obstruction_in_stack(&windows, 300, 9, 50.0, 50.0, 100).unwrap().window_id, 5);
+    }
+
+    #[test]
+    fn display_sized_windows_that_are_not_the_dock_backdrop_still_obstruct() {
+        let display = WindowBounds { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 };
+        let target = window(9, 300, "Calculator", 0, 1.0);
+        for (app, layer) in [("Screen Saver", 20), ("Dock", 0), ("Dock", 25)] {
+            let mut cover = window(6, 400, app, layer, 1.0);
+            cover.bounds = display.clone();
+            let windows = without_dock_backdrops(vec![cover, target.clone()], &[display.clone()]);
+            assert_eq!(
+                pixel_obstruction_in_stack(&windows, 300, 9, 50.0, 50.0, 100).map(|w| w.window_id),
+                Some(6),
+                "{app} at layer {layer} must still block",
+            );
+        }
     }
 
     #[test]
