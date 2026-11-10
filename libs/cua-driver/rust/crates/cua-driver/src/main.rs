@@ -19,8 +19,9 @@
 //!  1. Initialises the cursor overlay channel synchronously (so
 //!     `run_on_main_thread` always finds it ready).
 //!  2. Spawns a background tokio thread for the MCP server.
-//!  3. Calls `platform_macos::cursor::overlay::run_on_main_thread()` which
-//!     starts `NSApplication.run()` and the 60 fps render loop.
+//!  3. Runs AppKit on the main thread. With the cursor enabled this uses the
+//!     overlay loop; otherwise it uses the plain event loop so browser Apple
+//!     Events and other main-queue work remain serviceable.
 //!
 //! On all other platforms `#[tokio::main]` is used directly.
 
@@ -48,6 +49,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// they take `compat: bool` directly, but the binary crate decides what
 /// to pass without making every Command variant carry the flag.
 static CLAUDE_CODE_COMPAT: AtomicBool = AtomicBool::new(false);
+static CODEX_COMPUTER_USE_COMPAT: AtomicBool = AtomicBool::new(false);
 
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
@@ -156,22 +158,92 @@ fn build_macos_registry() -> cua_driver_core::tool::ToolRegistry {
 }
 
 #[cfg(target_os = "macos")]
-fn build_macos_registry_with_compat(compat: bool) -> cua_driver_core::tool::ToolRegistry {
-    let mut r = platform_macos::register_tools_with_compat(compat);
-    check_update_tool::register_into(&mut r);
-    r
+fn build_macos_registry_with_compat(
+    claude_compat: bool,
+    codex_compat: bool,
+) -> cua_driver_core::tool::ToolRegistry {
+    if codex_compat {
+        platform_macos::register_codex_computer_use_compat_tools()
+    } else {
+        let mut r = platform_macos::register_tools_with_compat(claude_compat);
+        check_update_tool::register_into(&mut r);
+        r
+    }
 }
 
 // ── macOS entry-point ─────────────────────────────────────────────────────
 
 #[cfg(target_os = "macos")]
+fn run_guarded_appkit_worker(name: &str, work: impl FnOnce()) -> i32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(()) => 0,
+        Err(_) => {
+            eprintln!("[cua-driver] {name} worker panicked");
+            101
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn finish_appkit_worker(handle: std::thread::JoinHandle<i32>) {
+    let exit_code = handle.join().unwrap_or(101);
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod appkit_worker_tests {
+    use super::run_guarded_appkit_worker;
+
+    #[test]
+    fn worker_panic_becomes_failure_status_instead_of_stranding_main_loop() {
+        assert_eq!(run_guarded_appkit_worker("test", || {}), 0);
+        platform_macos::pip::prepare_appkit_main_loop();
+        platform_macos::pip::mark_appkit_main_loop_available();
+        let worker = std::thread::spawn(|| {
+            let status = run_guarded_appkit_worker("test", || panic!("worker failed"));
+            platform_macos::pip::request_appkit_main_loop_stop();
+            status
+        });
+        assert_eq!(worker.join().unwrap(), 101);
+        assert!(platform_macos::pip::appkit_main_loop_stop_requested());
+        assert!(!platform_macos::pip::appkit_main_loop_available());
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn main() {
     init_logging();
+
+    // Standalone-helper identity: when cmux spawns the bundled helper (both the
+    // long-running `mcp` server and one-shot `call check_permissions` status
+    // probes) it sets CUA_DRIVER_DISCLAIM, asking this process to disclaim
+    // responsibility so it becomes its own responsible process. Because the
+    // executable lives inside the helper's own .app bundle, macOS then
+    // attributes — and reports — its Accessibility / Screen Recording grants
+    // under that bundle's identity ("cmux Computer Use") instead of cmux's.
+    // Runs before command dispatch so it applies uniformly to every subcommand;
+    // reexec_disclaimed_if_needed is still a no-op for embedded mode, an
+    // already-disclaimed re-exec, or a binary inside CuaDriver.app.
+    if crate::bundle::is_env_truthy("CUA_DRIVER_DISCLAIM") {
+        responsibility::reexec_disclaimed_if_needed();
+    }
 
     // ── CLI subcommand dispatch ──────────────────────────────────────────────
     // Handled before AppKit init so `list-tools` / `describe` / `call` exit
     // cleanly without starting the overlay or NSApplication.
     let command = cli::parse_command();
+    if cmux_command_requires_branded_helper(&command)
+        && crate::bundle::is_cmux_branded_executable()
+        && !crate::bundle::is_executable_inside_cmux_helper_app()
+    {
+        eprintln!(
+            "cmux-cua-driver: TCC-protected commands belong to cmux Computer Use. {}",
+            crate::bundle::CMUX_RUNTIME_RECOVERY_GUIDANCE
+        );
+        std::process::exit(78);
+    }
     emit_entry_telemetry(&command);
     match command {
         cli::Command::TelemetryInstallEvent => {
@@ -229,10 +301,37 @@ fn main() {
             );
             let reg = Arc::new(build_macos_registry());
             reg.init_self_weak();
-            cli::run_call(reg, &tool, json_args, screenshot_out_file, socket);
+            if platform_macos::session::has_graphic_access() {
+                // Browser automation dispatches NSAppleScript to the AppKit
+                // main queue. Run the one-shot tool on a worker while main
+                // pumps that queue, then terminate with the tool's exit code.
+                platform_macos::pip::prepare_appkit_main_loop();
+                platform_macos::pip::mark_appkit_main_loop_available();
+                let call_handle = std::thread::Builder::new()
+                    .name("cua-call".into())
+                    .spawn(move || {
+                        let exit_code = run_guarded_appkit_worker("call", || {
+                            cli::run_call(reg, &tool, json_args, screenshot_out_file, socket);
+                        });
+                        platform_macos::pip::request_appkit_main_loop_stop();
+                        exit_code
+                    })
+                    .expect("spawn call thread");
+                platform_macos::pip::run_appkit_main_loop();
+                finish_appkit_worker(call_handle);
+            } else {
+                // Headless calls cannot target GUI browsers and must avoid
+                // registering NSApplication with a missing Window Server.
+                cli::run_call(reg, &tool, json_args, screenshot_out_file, socket);
+            }
             return;
         }
-        cli::Command::Serve { socket, no_permissions_gate, claude_code_compat } => {
+        cli::Command::Serve {
+            socket,
+            no_permissions_gate,
+            claude_code_compat,
+            codex_computer_use_compat,
+        } => {
             responsibility::reexec_disclaimed_if_needed();
             // Long-running daemon — kick off the background update check
             // before any blocking work so the banner can land on stderr
@@ -263,10 +362,6 @@ fn main() {
             cua_driver_core::video::set_video_backend_factory(
                 Box::new(platform_macos::video_sckit::SckitVideoBackendFactory),
             );
-            let pip_cfg = match pip_preview::default_config_path() {
-                Some(p) => pip_preview::PipConfig::from_args_and_file(&p),
-                None => pip_preview::PipConfig::from_args(),
-            };
             maybe_init_pip();
 
             // Agent-cursor overlay. The DAEMON is the process that actually
@@ -278,7 +373,7 @@ fn main() {
             // the agent cursor never appeared. Init the channel before spawning
             // the serve thread so `run_on_main_thread()` always finds it ready
             // (mirrors the Mcp arm).
-            let cursor_cfg = cursor_overlay::CursorConfig::from_args();
+            let cursor_cfg = cli::cursor_config(codex_computer_use_compat);
             if cursor_cfg.enabled {
                 platform_macos::cursor::overlay::init(cursor_cfg.clone());
             }
@@ -288,10 +383,16 @@ fn main() {
             // --claude-code-computer-use-compat`). The Serve arm is the daemon
             // the proxy talks to, so without this the proxy path always served
             // the full screenshot tool regardless of the client's request.
-            let reg = Arc::new(build_macos_registry_with_compat(claude_code_compat));
+            let reg = Arc::new(build_macos_registry_with_compat(
+                claude_code_compat,
+                codex_computer_use_compat,
+            ));
             reg.init_self_weak();
-            let sp = socket.unwrap_or_else(serve::default_socket_path);
-            let pid_path = serve::default_pid_file_path();
+            let pid_path =
+                cli::daemon_pid_file_path(socket.as_deref(), codex_computer_use_compat);
+            let sp = cli::daemon_socket_path(socket, codex_computer_use_compat);
+            let has_graphic_access = platform_macos::session::has_graphic_access();
+            platform_macos::pip::prepare_appkit_main_loop();
 
             // Bind the Unix socket FIRST, on a background thread, BEFORE
             // running the (blocking) permissions gate (#1761).
@@ -317,8 +418,18 @@ fn main() {
             let serve_handle = std::thread::Builder::new()
                 .name("cua-serve".into())
                 .spawn(move || {
-                    serve::run_serve_cmd(reg, &sp, Some(&pid_path));
-                    std::process::exit(0);
+                    let exit_code = run_guarded_appkit_worker("serve", || {
+                        serve::run_serve_cmd(
+                            reg,
+                            &sp,
+                            Some(&pid_path),
+                            serve::DaemonProfile::for_codex_compat(
+                                codex_computer_use_compat,
+                            ),
+                        );
+                    });
+                    platform_macos::pip::request_appkit_main_loop_stop();
+                    exit_code
                 })
                 .expect("spawn serve thread");
 
@@ -342,14 +453,14 @@ fn main() {
 
             // Keep the main thread alive for the daemon.
             //
-            // PiP needs the AppKit main run loop to process the
-            // dispatch_async_f calls that push frames into NSImageView;
-            // park main in NSApplication.run() when --experimental-pip is
-            // on. Otherwise just join the serve thread so the process
-            // stays up as long as the daemon does.
-            if pip_cfg.enabled {
-                platform_macos::pip::run_appkit_main_loop();
-            } else if cursor_cfg.enabled {
+            // The cursor loop also services PiP and browser automation main-
+            // queue dispatch. Without a cursor, keep a plain AppKit loop alive
+            // whenever a Window Server is available. Headless daemons retain
+            // the old join behavior and never touch NSApplication.
+            if has_graphic_access {
+                platform_macos::pip::mark_appkit_main_loop_available();
+            }
+            if cursor_cfg.enabled && has_graphic_access {
                 // Render the agent-cursor overlay: park the main thread in the
                 // AppKit run loop so the overlay NSWindow draws. `run_on_main_thread`
                 // self-guards on `has_graphic_access()` and returns immediately
@@ -357,20 +468,27 @@ fn main() {
                 // join so the daemon still serves headless. The serve thread runs
                 // on its background thread regardless.
                 platform_macos::cursor::overlay::run_on_main_thread();
-                let _ = serve_handle.join();
-            } else {
-                let _ = serve_handle.join();
+            } else if has_graphic_access {
+                platform_macos::pip::run_appkit_main_loop();
             }
+            finish_appkit_worker(serve_handle);
             return;
         }
-        cli::Command::Stop { socket } => {
-            let sp = socket.unwrap_or_else(serve::default_socket_path);
+        cli::Command::Stop {
+            socket,
+            codex_computer_use_compat,
+        } => {
+            let sp = cli::daemon_socket_path(socket, codex_computer_use_compat);
             serve::run_stop_cmd(&sp);
             return;
         }
-        cli::Command::Status { socket } => {
-            let sp = socket.unwrap_or_else(serve::default_socket_path);
-            let pid_path = serve::default_pid_file_path();
+        cli::Command::Status {
+            socket,
+            codex_computer_use_compat,
+        } => {
+            let pid_path =
+                cli::daemon_pid_file_path(socket.as_deref(), codex_computer_use_compat);
+            let sp = cli::daemon_socket_path(socket, codex_computer_use_compat);
             serve::run_status_cmd(&sp, &pid_path);
             return;
         }
@@ -412,6 +530,10 @@ fn main() {
             cli::run_permissions_cmd(reg, &subcommand, json);
             return;
         }
+        cli::Command::Approvals { subcommand, json } => {
+            cli::run_approvals_cmd(&subcommand, json);
+            return;
+        }
         cli::Command::Autostart { subcommand } => {
             autostart::run_autostart_cmd(&subcommand);
             return;
@@ -426,8 +548,14 @@ fn main() {
             cli::run_config_cmd(reg, subcommand.as_deref(), key.as_deref(), value.as_deref(), socket.as_deref());
             return;
         }
-        cli::Command::Mcp { no_daemon_relaunch, socket, claude_code_compat } => {
+        cli::Command::Mcp {
+            no_daemon_relaunch,
+            socket,
+            claude_code_compat,
+            codex_computer_use_compat,
+        } => {
             CLAUDE_CODE_COMPAT.store(claude_code_compat, Ordering::SeqCst);
+            CODEX_COMPUTER_USE_COMPAT.store(codex_computer_use_compat, Ordering::SeqCst);
             // Long-running MCP server — kick off the background update
             // check before any TCC / daemon-proxy decisions so the
             // banner can land on stderr in either dispatch path.
@@ -439,7 +567,11 @@ fn main() {
             // attribution and forwards stdio MCP through its socket.
             // Issue #1525 / mirror of Swift PR #1479.
             if cli::should_use_daemon_proxy(no_daemon_relaunch) {
-                if let Err(e) = cli::run_mcp_via_daemon_proxy(socket, claude_code_compat) {
+                if let Err(e) = cli::run_mcp_via_daemon_proxy(
+                    socket,
+                    claude_code_compat,
+                    codex_computer_use_compat,
+                ) {
                     eprintln!("cua-driver-rs: {e}");
                     std::process::exit(1);
                 }
@@ -452,7 +584,8 @@ fn main() {
         }
     }
 
-    let cursor_cfg = cursor_overlay::CursorConfig::from_args();
+    let codex_compat = CODEX_COMPUTER_USE_COMPAT.load(Ordering::SeqCst);
+    let cursor_cfg = cli::cursor_config(codex_compat);
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -500,37 +633,63 @@ fn main() {
     );
     maybe_init_pip();
 
-    std::thread::Builder::new()
+    let has_graphic_access = platform_macos::session::has_graphic_access();
+    platform_macos::pip::prepare_appkit_main_loop();
+    if has_graphic_access {
+        platform_macos::pip::mark_appkit_main_loop_available();
+    }
+    let mcp_handle = std::thread::Builder::new()
         .name("cua-mcp".into())
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
-            let compat = CLAUDE_CODE_COMPAT.load(Ordering::SeqCst);
-            rt.block_on(async move {
-                // Register tools; overlay init has already happened above.
-                let registry = Arc::new(build_macos_registry_with_compat(compat));
-                // Wire up replay tool's back-reference to the registry.
-                registry.init_self_weak();
-                if let Err(e) = cua_driver_core::server::run(registry).await {
-                    tracing::error!("MCP server error: {e}");
-                }
+            let exit_code = run_guarded_appkit_worker("mcp", || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime");
+                let compat = CLAUDE_CODE_COMPAT.load(Ordering::SeqCst);
+                let codex_compat = CODEX_COMPUTER_USE_COMPAT.load(Ordering::SeqCst);
+                rt.block_on(async move {
+                    // Register tools; overlay init has already happened above.
+                    let registry = Arc::new(build_macos_registry_with_compat(compat, codex_compat));
+                    // Wire up replay tool's back-reference to the registry.
+                    registry.init_self_weak();
+                    let result = if codex_compat {
+                        cua_driver_core::server::run_codex_computer_use_compat(registry.clone())
+                            .await
+                    } else {
+                        cua_driver_core::server::run(registry.clone()).await
+                    };
+                    if let Err(e) = result {
+                        tracing::error!("MCP server error: {e}");
+                    }
+                    registry.remove_state_file();
+                });
             });
-            // MCP server exited (stdin closed / client disconnected).
-            // The main thread is blocked in NSApplication.run() and won't
-            // exit on its own — force-exit the process cleanly.
-            std::process::exit(0);
+            platform_macos::pip::request_appkit_main_loop_stop();
+            exit_code
         })
         .expect("spawn mcp thread");
 
-    // Main thread: AppKit overlay (blocks until the process exits).
-    if enabled {
+    // Main thread: AppKit overlay or plain event loop. Browser automation
+    // requires main-queue dispatch even when `--no-overlay` is set.
+    if enabled && has_graphic_access {
         platform_macos::cursor::overlay::run_on_main_thread();
+    } else if has_graphic_access {
+        platform_macos::pip::run_appkit_main_loop();
     }
-    // Overlay disabled: park the main thread while the MCP background thread
-    // keeps running.
-    loop { std::thread::park(); }
+    finish_appkit_worker(mcp_handle);
+}
+
+#[cfg(target_os = "macos")]
+fn cmux_command_requires_branded_helper(command: &cli::Command) -> bool {
+    matches!(
+        command,
+        cli::Command::Call { .. }
+            | cli::Command::Serve { .. }
+            | cli::Command::Doctor { .. }
+            | cli::Command::Diagnose
+            | cli::Command::Permissions { .. }
+    )
 }
 
 // ── Non-macOS entry-point ─────────────────────────────────────────────────
@@ -584,7 +743,13 @@ fn main() -> anyhow::Result<()> {
             }).join().ok();
             return Ok(());
         }
-        cli::Command::Serve { socket, no_permissions_gate, claude_code_compat } => {
+        cli::Command::Serve {
+            socket,
+            no_permissions_gate,
+            claude_code_compat,
+            codex_computer_use_compat,
+        } => {
+            cli::ensure_codex_computer_use_supported(codex_computer_use_compat)?;
             responsibility::reexec_disclaimed_if_needed();
             // Long-running daemon — kick off the background update check
             // before any blocking work so the banner can land on stderr.
@@ -601,22 +766,37 @@ fn main() -> anyhow::Result<()> {
             let reg = Arc::new(build_registry(cursor_cfg));
             reg.init_self_weak();
             maybe_init_pip();
-            let sp = socket.unwrap_or_else(serve::default_socket_path);
-            let pid_path = serve::default_pid_file_path();
+            let pid_path =
+                cli::daemon_pid_file_path(socket.as_deref(), codex_computer_use_compat);
+            let sp = cli::daemon_socket_path(socket, codex_computer_use_compat);
             // run_serve_cmd builds its own runtime; must run on a fresh thread.
             std::thread::spawn(move || {
-                serve::run_serve_cmd(reg, &sp, Some(&pid_path));
+                serve::run_serve_cmd(
+                    reg,
+                    &sp,
+                    Some(&pid_path),
+                    serve::DaemonProfile::for_codex_compat(
+                        codex_computer_use_compat,
+                    ),
+                );
             }).join().ok();
             return Ok(());
         }
-        cli::Command::Stop { socket } => {
-            let sp = socket.unwrap_or_else(serve::default_socket_path);
+        cli::Command::Stop {
+            socket,
+            codex_computer_use_compat,
+        } => {
+            let sp = cli::daemon_socket_path(socket, codex_computer_use_compat);
             serve::run_stop_cmd(&sp);
             return Ok(());
         }
-        cli::Command::Status { socket } => {
-            let sp = socket.unwrap_or_else(serve::default_socket_path);
-            let pid_path = serve::default_pid_file_path();
+        cli::Command::Status {
+            socket,
+            codex_computer_use_compat,
+        } => {
+            let pid_path =
+                cli::daemon_pid_file_path(socket.as_deref(), codex_computer_use_compat);
+            let sp = cli::daemon_socket_path(socket, codex_computer_use_compat);
             serve::run_status_cmd(&sp, &pid_path);
             return Ok(());
         }
@@ -657,6 +837,10 @@ fn main() -> anyhow::Result<()> {
             cli::run_permissions_cmd(reg, &subcommand, json);
             return Ok(());
         }
+        cli::Command::Approvals { subcommand, json } => {
+            cli::run_approvals_cmd(&subcommand, json);
+            return Ok(());
+        }
         cli::Command::Autostart { subcommand } => {
             autostart::run_autostart_cmd(&subcommand);
             return Ok(());
@@ -673,8 +857,15 @@ fn main() -> anyhow::Result<()> {
             }).join().ok();
             return Ok(());
         }
-        cli::Command::Mcp { no_daemon_relaunch, socket, claude_code_compat } => {
+        cli::Command::Mcp {
+            no_daemon_relaunch,
+            socket,
+            claude_code_compat,
+            codex_computer_use_compat,
+        } => {
+            cli::ensure_codex_computer_use_supported(codex_computer_use_compat)?;
             CLAUDE_CODE_COMPAT.store(claude_code_compat, Ordering::SeqCst);
+            CODEX_COMPUTER_USE_COMPAT.store(codex_computer_use_compat, Ordering::SeqCst);
             // Long-running MCP server — kick off the background update
             // check before any daemon-proxy decisions.
             version_check::maybe_announce_update();
@@ -689,7 +880,11 @@ fn main() -> anyhow::Result<()> {
             // Code over SSH lands in Session 0 and every desktop
             // tool returns empty. See `cli::should_use_daemon_proxy`.
             if cli::should_use_daemon_proxy(no_daemon_relaunch) {
-                if let Err(e) = cli::run_mcp_via_daemon_proxy(socket, claude_code_compat) {
+                if let Err(e) = cli::run_mcp_via_daemon_proxy(
+                    socket,
+                    claude_code_compat,
+                    codex_computer_use_compat,
+                ) {
                     eprintln!("cua-driver-rs: {e}");
                     std::process::exit(1);
                 }
@@ -729,10 +924,11 @@ async fn async_main() -> anyhow::Result<()> {
     let registry = Arc::new(build_registry(cursor_cfg));
     registry.init_self_weak();
     maybe_init_pip();
-    let result = cua_driver_core::server::run(registry).await;
+    let result = cua_driver_core::server::run(registry.clone()).await;
     if let Err(e) = &result {
         tracing::error!("MCP server error: {e}");
     }
+    registry.remove_state_file();
 
     // The stdio MCP server loop has ended — the client disconnected (stdin
     // EOF) or a fatal I/O error occurred. The cursor overlay runs on its own

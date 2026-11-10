@@ -95,6 +95,9 @@ pub fn forward(msg: &OverlayMsg) -> bool {
             let _ = tx.try_send(WlOverlayCmd::Remove);
             true
         }
+        // The layer-shell backend owns one visual cursor and keeps no
+        // per-session tombstones. Revival only affects the keyed X11 render map.
+        OverlayMsg::Revive(_) => false,
         OverlayMsg::Cmd(kc) => {
             if matches!(&kc.cmd, OverlayCommand::ShowFocusRect(_)) {
                 return false;
@@ -280,11 +283,11 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
                         _ => None,
                     };
                     if let Some((tx, ty)) = seed_target {
-                        if state.core.pos.0 < -50.0 {
+                        if state.core.is_unplaced() {
                             const SEED_OFFSET: f64 = 16.0;
                             let sx = (tx - SEED_OFFSET).max(2.0);
                             let sy = (ty - SEED_OFFSET).max(2.0);
-                            state.core.pos = (sx, sy);
+                            state.core.place_at(sx, sy);
                         }
                     }
                     // apply_command_base consumes every variant the X11

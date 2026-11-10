@@ -30,77 +30,53 @@ pub struct AppInfo {
     pub last_used: Option<String>,
 }
 
-/// Enumerate running apps with NSApplicationActivationPolicyRegular.
-/// Uses `osascript` to query System Events — no Accessibility permission needed.
+/// Enumerate running apps with `NSApplicationActivationPolicyRegular`.
+///
+/// This stays in-process through `NSWorkspace`. Querying System Events through
+/// AppleScript adds an unrelated Automation permission, can block on a prompt,
+/// and turns a denied prompt into an empty app list.
 pub fn list_running_apps() -> Vec<AppInfo> {
-    // Use `ps` + NSWorkspace via a brief Swift one-liner via swift-sh is heavy;
-    // instead use the Obj-C bridge via `osascript`.
-    // Fallback: parse `ps -axo pid,command` and cross-reference with bundle IDs.
-    // Better: use a native call via core-foundation bindings.
-    list_running_apps_native()
-}
+    use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
 
-fn list_running_apps_native() -> Vec<AppInfo> {
-    // Use `lsappinfo list` which is a macOS system tool available on all versions.
-    // Alternatively we can use NSWorkspace via objc2 — but for simplicity and
-    // to match the Swift reference, we use a subprocess call to `osascript`.
-    let script = r#"
-set output to ""
-tell application "System Events"
-    set appList to every application process whose background only is false
-    repeat with proc in appList
-        set procName to name of proc
-        set procPid to unix id of proc
-        set bundleId to bundle identifier of proc
-        if bundleId is missing value then set bundleId to ""
-        set isFront to "0"
-        if frontmost of proc then set isFront to "1"
-        set output to output & procName & "|" & procPid & "|" & bundleId & "|" & isFront & linefeed
-    end repeat
-end tell
-return output
-"#;
+    unsafe {
+        let workspace = NSWorkspace::sharedWorkspace();
+        let applications = workspace.runningApplications();
+        (0..applications.len())
+            .filter_map(|index| applications.get(index))
+            .filter(|app| {
+                !app.isTerminated()
+                    && app.activationPolicy() == NSApplicationActivationPolicy::Regular
+            })
+            .filter_map(|app| {
+                let pid = app.processIdentifier();
+                if pid <= 0 {
+                    return None;
+                }
 
-    let out = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output();
+                let bundle_id = app.bundleIdentifier().map(|value| value.to_string());
+                let name = app
+                    .localizedName()
+                    .map(|value| value.to_string())
+                    .or_else(|| bundle_id.clone())
+                    .unwrap_or_else(|| format!("pid {pid}"));
+                let launch_path = app
+                    .bundleURL()
+                    .and_then(|url| url.path())
+                    .map(|path| path.to_string());
 
-    match out {
-        Err(_) => vec![],
-        Ok(o) => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            parse_osascript_app_list(&text)
-        }
+                Some(AppInfo {
+                    name,
+                    pid,
+                    bundle_id,
+                    running: true,
+                    active: app.isActive(),
+                    launch_path,
+                    kind: Some("desktop".to_owned()),
+                    last_used: None,
+                })
+            })
+            .collect()
     }
-}
-
-fn parse_osascript_app_list(text: &str) -> Vec<AppInfo> {
-    let mut apps = Vec::new();
-    for line in text.lines() {
-        let parts: Vec<&str> = line.splitn(4, '|').collect();
-        if parts.len() < 2 { continue; }
-        let name = parts[0].trim().to_owned();
-        let pid: i32 = parts[1].trim().parse().unwrap_or(0);
-        let bundle_id = if parts.len() > 2 && !parts[2].trim().is_empty() {
-            Some(parts[2].trim().to_owned())
-        } else {
-            None
-        };
-        let active = parts.get(3).map(|s| s.trim() == "1").unwrap_or(false);
-        if name.is_empty() || pid == 0 { continue; }
-        apps.push(AppInfo {
-            name,
-            pid,
-            bundle_id,
-            running: true,
-            active,
-            launch_path: None,
-            kind: Some("desktop".to_owned()),
-            last_used: None,
-        });
-    }
-    apps
 }
 
 /// Launch an app by bundle ID via NSWorkspace, background only (no focus
@@ -330,23 +306,11 @@ pub(crate) fn locate_by_name(name: &str) -> Option<AppLocator> {
 }
 
 /// Read `CFBundleIdentifier` from an `.app` bundle's `Info.plist`.
-/// Falls back to shelling out to `plutil` (already used elsewhere in
-/// this file) to avoid pulling in a plist crate just for this.
+/// NSBundle reads both XML and binary property lists in-process.
 fn bundle_id_for_app_path(app_path: &str) -> Option<String> {
-    let plist = format!("{app_path}/Contents/Info.plist");
-    let out = Command::new("plutil")
-        .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-", &plist])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let bid = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if bid.is_empty() {
-        None
-    } else {
-        Some(bid)
-    }
+    let bundle = app_bundle(std::path::Path::new(app_path))?;
+    let bundle_id = unsafe { bundle.bundleIdentifier()? }.to_string();
+    nonempty_string(bundle_id)
 }
 
 /// Return all apps: running apps merged with installed-but-not-running apps.
@@ -463,42 +427,15 @@ pub(crate) fn unix_secs_to_rfc3339(secs: i64) -> String {
 }
 
 fn read_app_plist(plist_path: &std::path::Path) -> Option<AppInfo> {
-    let bundle_id_out = Command::new("plutil")
-        .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-",
-               plist_path.to_str()?])
-        .output().ok()?;
-    if !bundle_id_out.status.success() { return None; }
-    let bundle_id = String::from_utf8_lossy(&bundle_id_out.stdout).trim().to_string();
-    if bundle_id.is_empty() { return None; }
+    use objc2_foundation::ns_string;
 
-    let name_out = Command::new("plutil")
-        .args(["-extract", "CFBundleDisplayName", "raw", "-o", "-",
-               plist_path.to_str()?])
-        .output().ok();
-    let name = name_out
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            // Fallback: CFBundleName.
-            Command::new("plutil")
-                .args(["-extract", "CFBundleName", "raw", "-o", "-",
-                       plist_path.to_str().unwrap_or("")])
-                .output().ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| {
-                    plist_path.parent()
-                        .and_then(|p| p.parent())
-                        .and_then(|p| p.file_stem())
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string()
-                })
-        });
-
-    if name.is_empty() { return None; }
+    let app_path = app_path_for_info_plist(plist_path)?;
+    let bundle = app_bundle(app_path)?;
+    let bundle_id = nonempty_string(unsafe { bundle.bundleIdentifier()? }.to_string())?;
+    let name = bundle_info_string(&bundle, ns_string!("CFBundleDisplayName"))
+        .or_else(|| bundle_info_string(&bundle, ns_string!("CFBundleName")))
+        .or_else(|| app_path.file_stem()?.to_str().map(str::to_owned))
+        .and_then(nonempty_string)?;
 
     Some(AppInfo {
         name,
@@ -510,6 +447,49 @@ fn read_app_plist(plist_path: &std::path::Path) -> Option<AppInfo> {
         kind: None,
         last_used: None,
     })
+}
+
+/// Return the `.app` directory containing `Contents/Info.plist`.
+fn app_path_for_info_plist(plist_path: &std::path::Path) -> Option<&std::path::Path> {
+    let contents = plist_path.parent()?;
+    if contents.file_name()?.to_str()? != "Contents"
+        || plist_path.file_name()?.to_str()? != "Info.plist"
+    {
+        return None;
+    }
+    contents.parent()
+}
+
+/// Load bundle metadata without spawning one or more `plutil` processes per app.
+fn app_bundle(app_path: &std::path::Path) -> Option<objc2::rc::Retained<objc2_foundation::NSBundle>> {
+    use objc2_foundation::{NSBundle, NSString};
+
+    let path = NSString::from_str(app_path.to_str()?);
+    unsafe { NSBundle::bundleWithPath(&path) }
+}
+
+fn bundle_info_string(
+    bundle: &objc2_foundation::NSBundle,
+    key: &objc2_foundation::NSString,
+) -> Option<String> {
+    use objc2::{msg_send, rc::Retained, ClassType};
+    use objc2_foundation::NSString;
+
+    let value = unsafe { bundle.infoDictionary()?.objectForKey(key)? };
+    let is_string: bool = unsafe { msg_send![&*value, isKindOfClass: NSString::class()] };
+    if !is_string {
+        return None;
+    }
+
+    // SAFETY: `isKindOfClass:` confirmed NSString or one of its immutable-compatible
+    // subclasses. The property-list dictionary retains the value for this call.
+    let value = unsafe { Retained::cast::<NSString>(value) };
+    nonempty_string(value.to_string())
+}
+
+fn nonempty_string(value: String) -> Option<String> {
+    let value = value.trim().to_owned();
+    (!value.is_empty()).then_some(value)
 }
 
 /// Return the pid of the current frontmost application via
@@ -535,6 +515,25 @@ pub fn activate_pid(pid: i32) -> bool {
     unsafe {
         match NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
             Some(app) => app.activateWithOptions(NSApplicationActivationOptions(0)),
+            None => false,
+        }
+    }
+}
+
+/// Bring the app owning `pid` fully to the foreground via
+/// `NSRunningApplication.activateWithOptions(NSApplicationActivateAllWindows)`
+/// — the same call `bring_to_front` uses, so a multi-window target lands
+/// entirely frontmost (not just its key window). Returns `true` when Cocoa
+/// accepted the swap. Used by the explicit "watchable" fronting path so the
+/// user watching the agent cursor sees the driven app. Best-effort: callers
+/// treat a `false`/missing app as a warning, never a hard failure.
+pub fn activate_pid_all_windows(pid: i32) -> bool {
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+    unsafe {
+        match NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
+            Some(app) => app.activateWithOptions(
+                NSApplicationActivationOptions::NSApplicationActivateAllWindows,
+            ),
             None => false,
         }
     }
@@ -602,7 +601,7 @@ pub fn format_app_list(apps: &[AppInfo]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::unix_secs_to_rfc3339;
+    use super::{app_path_for_info_plist, read_app_plist, unix_secs_to_rfc3339};
 
     #[test]
     fn rfc3339_epoch() {
@@ -640,6 +639,50 @@ mod tests {
         // 2023-12-31T23:59:59Z = 1704067199; +1 second wraps to 2024-01-01.
         assert_eq!(unix_secs_to_rfc3339(1_704_067_199), "2023-12-31T23:59:59Z");
         assert_eq!(unix_secs_to_rfc3339(1_704_067_200), "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn info_plist_path_resolves_its_app_bundle() {
+        let path = std::path::Path::new("/Applications/Example.app/Contents/Info.plist");
+        assert_eq!(
+            app_path_for_info_plist(path),
+            Some(std::path::Path::new("/Applications/Example.app"))
+        );
+        assert_eq!(app_path_for_info_plist(std::path::Path::new("/tmp/Info.plist")), None);
+    }
+
+    #[test]
+    fn reads_bundle_id_and_display_name_in_process() {
+        let root = std::env::temp_dir().join(format!(
+            "cua-driver-app-plist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let app = root.join("Fixture.app");
+        let contents = app.join("Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        let plist = contents.join("Info.plist");
+        std::fs::write(
+            &plist,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>dev.trycua.fixture</string>
+<key>CFBundleDisplayName</key><string>Fixture Display Name</string>
+<key>CFBundleName</key><string>Ignored Name</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+
+        let info = read_app_plist(&plist).expect("fixture bundle metadata");
+        assert_eq!(info.bundle_id.as_deref(), Some("dev.trycua.fixture"));
+        assert_eq!(info.name, "Fixture Display Name");
+        assert!(!info.running);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

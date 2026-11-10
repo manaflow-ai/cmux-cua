@@ -32,10 +32,11 @@ block2 = "0.5"
 # objc2 and its AppKit/CoreFoundation bindings
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = [
-    "NSArray", "NSString", "NSDictionary", "NSRunLoop",
+    "NSArray", "NSBundle", "NSString", "NSDictionary", "NSRunLoop",
     "NSThread", "NSObject", "NSValue",
     "NSAppleEventDescriptor", "NSNotification", "NSOperation",
-    "NSURL", "NSDate", "NSError",
+    "NSAppleScript",
+    "NSURL", "NSDate", "NSError", "NSDistributedNotificationCenter",
     "block2", "libc",
 ] }
 objc2-app-kit = { version = "0.2", features = [
@@ -65,3 +66,9 @@ tiny-skia = { version = "0.11", default-features = false, features = ["std"] }
 # WebSocket CDP client (used by browser/cdp_client.rs for the page tool)
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tempfile = "3"

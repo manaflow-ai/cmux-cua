@@ -4,23 +4,28 @@
 //!
 //! * **AXPopUpButton**: Find the child option whose AXTitle or AXValue matches
 //!   `value` (case-insensitive) and AXPress it directly.  The native macOS popup
-//!   menu is never opened, so focus is never stolen.  Falls back to Safari
-//!   `osascript do JavaScript` for WebKit `<select>` elements that expose no AX
-//!   children when the popup is closed.
+//!   menu is never opened, so focus is never stolen. Falls back to Safari's
+//!   in-process Apple Event JavaScript suite for WebKit `<select>` elements
+//!   that expose no AX children when the popup is closed.
 //!
 //! * **Everything else**: Write `AXValue` directly (sliders, steppers, native
 //!   text fields that expose a settable AXValue).
 
+use anyhow::Context;
 use async_trait::async_trait;
-use cua_driver_core::{protocol::ToolResult, tool::{Tool, ToolDef}};
+use cua_driver_core::{
+    protocol::ToolResult,
+    tool::{Tool, ToolDef},
+};
 use serde_json::Value;
 use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_children, copy_number_attr, copy_string_attr, perform_action, set_number_attr,
-    set_string_attr, kAXErrorSuccess, AXUIElementRef,
+    copy_children, copy_number_attr, copy_string_attr, kAXErrorSuccess, perform_action,
+    set_number_attr, set_string_attr, AXUIElementRef,
 };
+use crate::browser::BrowserJs;
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
 use core_foundation::base::CFRelease;
@@ -32,7 +37,9 @@ pub struct SetValueTool {
 }
 
 impl SetValueTool {
-    pub fn new(state: Arc<ToolState>) -> Self { Self { state } }
+    pub fn new(state: Arc<ToolState>) -> Self {
+        Self { state }
+    }
 }
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
@@ -59,7 +66,7 @@ fn def() -> &'static ToolDef {
             "type": "object",
             "required": ["pid", "value"],
             "properties": {
-                "session": { "type": "string", "description": "Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less." },
+                "session": { "type": "string", "description": "Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-<pid>); anonymous non-embedded calls remain cursor-less." },
                 "pid": { "type": "integer" },
                 "window_id": {
                     "type": "integer",
@@ -83,18 +90,43 @@ fn def() -> &'static ToolDef {
 
 #[async_trait]
 impl Tool for SetValueTool {
-    fn def(&self) -> &ToolDef { def() }
+    fn def(&self) -> &ToolDef {
+        def()
+    }
+
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        cua_driver_core::tool::validate_dispatch_args(self.def(), args)?;
+        let address = super::preflight_action_address(args, "set_value")?;
+        if !address.element {
+            return Err(ToolResult::error(
+                "set_value requires element_index (+ window_id) or element_token to address the target element.",
+            ));
+        }
+        if address.window_id.is_none() {
+            return Err(ToolResult::error(
+                "set_value requires window_id when element_index is used (omit only when supplying element_token, which carries it).",
+            ));
+        }
+        Ok(())
+    }
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
-        let pid = match args.require_i32("pid") { Ok(v) => v, Err(e) => return e };
-        let value = match args.require_str("value") { Ok(v) => v, Err(e) => return e };
+        let dispatch_gate = crate::dispatch_gate::NativeDispatchGate::for_args(&args);
+        let pid = match args.require_i32("pid") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let value = match args.require_str("value") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
 
         // Surface 6: element_token / element_index precedence. Neither
         // is now schema-required so the resolver can centralize the
         // "missing addressing" error message.
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg     = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid,
@@ -107,49 +139,91 @@ impl Tool for SetValueTool {
             Err(e) => return e,
         };
         let (element_index, window_id) = match resolved {
-            cua_driver_core::element_token::ResolvedElement::None =>
+            cua_driver_core::element_token::ResolvedElement::None => {
                 return ToolResult::error(
                     "set_value requires element_index (+ window_id) or element_token to \
-                     address the target element."
-                ),
+                     address the target element.",
+                )
+            }
             cua_driver_core::element_token::ResolvedElement::Element {
-                window_id: Some(wid), element_index: idx, via_token: _,
+                window_id: Some(wid),
+                element_index: idx,
+                via_token: _,
             } => (idx, wid),
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: None, ..
-            } => return ToolResult::error(
-                "set_value requires window_id when element_index is used \
-                 (omit only when supplying element_token, which carries it)."
-            ),
+            } => {
+                return ToolResult::error(
+                    "set_value requires window_id when element_index is used \
+                 (omit only when supplying element_token, which carries it).",
+                )
+            }
         };
 
         // Retain out of the cache so a concurrent get_window_state can't free
-        // the element mid-action (use-after-free → daemon crash). Guard lives
-        // to the end of this method, past the AX write below.
-        let element_guard = match self.state.element_cache.get_element_retained(pid, window_id, element_index) {
-            Some(e) => e,
-            None => return ToolResult::error(format!(
-                "Element index {element_index} not found. Call get_window_state first."
-            )),
-        };
+        // the element mid-action (use-after-free → daemon crash). Ownership is
+        // moved into spawn_blocking below, so cancellation of this async invoke
+        // cannot release the AX object while the detached worker still uses it.
+        let element_guard =
+            match self
+                .state
+                .element_cache
+                .get_element_retained(pid, window_id, element_index)
+            {
+                Some(e) => e,
+                None => {
+                    return ToolResult::error(format!(
+                        "Element index {element_index} not found. Call get_window_state first."
+                    ))
+                }
+            };
         let element_ptr = element_guard.as_ptr();
 
+        // AXValue writes have a concrete on-screen target even though they do
+        // not synthesize pointer input. Show/glide the owning cursor there
+        // before changing the control so embedded actions remain observable.
+        if let Some(point) = super::cursor_tools::retained_element_center(element_ptr).await {
+            super::cursor_tools::animate_to_action_point(
+                &self.state,
+                &args,
+                point,
+                Some(window_id),
+            ).await;
+        }
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // AXValue writes on popups / sliders can cause reflex activations
         // in Chromium-based apps; the AXPopUpButton path also AXPresses a
         // child option which can trigger app activation in some setups.
         let prior_front = apps::frontmost_pid();
         let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let blocking_gate = dispatch_gate.clone();
+        let js_gate = dispatch_gate.clone();
 
-        let result = focus_guard::with_focus_suppressed(
+        let result: anyhow::Result<String> = focus_guard::with_focus_suppressed(
             Some(pid),
             prior_front,
             "set_value.AXValue",
             || async move {
-                tokio::task::spawn_blocking(move || {
-                    set_value_blocking(element_ptr, element_index, pid, &value)
+                let dispatch = tokio::task::spawn_blocking(move || {
+                    let element_ptr = element_guard.as_ptr();
+                    set_value_blocking(
+                        element_ptr,
+                        element_index,
+                        pid,
+                        window_id,
+                        &value,
+                        &blocking_gate,
+                    )
                 })
                 .await
+                .context("set_value blocking task failed")??;
+
+                match dispatch {
+                    SetValueDispatch::Complete(message) => Ok(message),
+                    SetValueDispatch::SafariSelect(request) => {
+                        set_select_via_js(request, js_gate).await
+                    }
+                }
             },
         )
         .await;
@@ -157,33 +231,52 @@ impl Tool for SetValueTool {
         let changes = snapshot.detect_async().await;
 
         match result {
-            Ok(Ok(mut msg)) => {
+            Ok(mut msg) => {
                 msg.push_str(&changes.result_suffix());
                 ToolResult::text(msg)
             }
-            Ok(Err(e))   => ToolResult::error(format!("set_value failed: {e}")),
-            Err(e)       => ToolResult::error(format!("Task error: {e}")),
+            Err(e) => ToolResult::error(format!("set_value failed: {e}")),
         }
     }
 }
 
 // ── Blocking implementation (runs on spawn_blocking thread) ─────────────────
 
+enum SetValueDispatch {
+    Complete(String),
+    SafariSelect(SafariSelectRequest),
+}
+
+struct SafariSelectRequest {
+    window_id: u32,
+    element_index: usize,
+    element_title: String,
+    value: String,
+}
+
 fn set_value_blocking(
     element_ptr: usize,
     element_index: usize,
     pid: i32,
+    window_id: u32,
     value: &str,
-) -> anyhow::Result<String> {
+    gate: &crate::dispatch_gate::NativeDispatchGate,
+) -> anyhow::Result<SetValueDispatch> {
     let element = element_ptr as AXUIElementRef;
 
-    let role = unsafe { copy_string_attr(element, "AXRole") }
-        .unwrap_or_default();
+    let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
 
     if role == "AXPopUpButton" {
-        let element_title = unsafe { copy_string_attr(element, "AXTitle") }
-            .unwrap_or_default();
-        select_popup_option(element, element_index, pid, value, &element_title)
+        let element_title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
+        select_popup_option(
+            element,
+            element_index,
+            pid,
+            window_id,
+            value,
+            &element_title,
+            gate,
+        )
     } else {
         // Default path: write AXValue directly. Numeric controls (AXSlider /
         // AXStepper) reject a CFString with -25201 and need a CFNumber; text
@@ -196,24 +289,31 @@ fn set_value_blocking(
         let numeric_target = value.trim().parse::<f64>().ok();
         let err = match numeric_target {
             Some(n) => {
+                gate.check()?;
                 let e = unsafe { set_number_attr(element, "AXValue", n) };
                 if e == kAXErrorSuccess {
                     e
                 } else {
+                    gate.check()?;
                     unsafe { set_string_attr(element, "AXValue", value) }
                 }
             }
-            None => unsafe { set_string_attr(element, "AXValue", value) },
+            None => {
+                gate.check()?;
+                unsafe { set_string_attr(element, "AXValue", value) }
+            }
         };
         if err == kAXErrorSuccess {
-            Ok(format!("✅ Set AXValue on [{element_index}] {role}."))
+            Ok(SetValueDispatch::Complete(format!(
+                "✅ Set AXValue on [{element_index}] {role}."
+            )))
         } else if let Some(target) = numeric_target {
             // Both direct writes failed for a numeric target — fall back to
             // stepping the control via AXIncrement / AXDecrement actions.
-            if step_to_value(element, target) {
-                Ok(format!(
+            if step_to_value(element, target, gate)? {
+                Ok(SetValueDispatch::Complete(format!(
                     "✅ Set AXValue on [{element_index}] {role} via AXIncrement/AXDecrement stepping."
-                ))
+                )))
             } else {
                 anyhow::bail!("AXUIElementSetAttributeValue(AXValue) failed with error {err}")
             }
@@ -232,11 +332,15 @@ fn set_value_blocking(
 ///
 /// Returns `true` once the control's value lands within half of the last
 /// observed step of `target`, `false` if it can't be read or can't be moved.
-fn step_to_value(element: AXUIElementRef, target: f64) -> bool {
+fn step_to_value(
+    element: AXUIElementRef,
+    target: f64,
+    gate: &crate::dispatch_gate::NativeDispatchGate,
+) -> anyhow::Result<bool> {
     // Can't target precisely without feedback — bail if AXValue is unreadable.
     let mut current = match unsafe { copy_number_attr(element, "AXValue") } {
         Some(v) => v,
-        None => return false,
+        None => return Ok(false),
     };
 
     // Half of the last observed step. Start near-zero so we never declare the
@@ -249,21 +353,26 @@ fn step_to_value(element: AXUIElementRef, target: f64) -> bool {
     // Hard cap to prevent runaway on a control that never quite converges.
     for _ in 0..500 {
         if (current - target).abs() <= step_radius {
-            return true;
+            return Ok(true);
         }
 
-        let action = if current < target { "AXIncrement" } else { "AXDecrement" };
+        let action = if current < target {
+            "AXIncrement"
+        } else {
+            "AXDecrement"
+        };
+        gate.check()?;
         let _ = unsafe { perform_action(element, action) };
 
         let next = match unsafe { copy_number_attr(element, "AXValue") } {
             Some(v) => v,
-            None => return false,
+            None => return Ok(false),
         };
 
         // The action didn't move the value — the control can't be stepped (or
         // has hit a min/max bound short of target). Stop to avoid looping.
         if next == current {
-            return false;
+            return Ok(false);
         }
 
         // Refine the stop threshold to half of the actual step the control took.
@@ -275,7 +384,7 @@ fn step_to_value(element: AXUIElementRef, target: f64) -> bool {
     }
 
     // Exhausted the iteration cap without converging.
-    (current - target).abs() <= step_radius
+    Ok((current - target).abs() <= step_radius)
 }
 
 // ── AXPopUpButton path ───────────────────────────────────────────────────────
@@ -284,9 +393,11 @@ fn select_popup_option(
     element: AXUIElementRef,
     element_index: usize,
     pid: i32,
+    window_id: u32,
     value: &str,
     element_title: &str,
-) -> anyhow::Result<String> {
+    gate: &crate::dispatch_gate::NativeDispatchGate,
+) -> anyhow::Result<SetValueDispatch> {
     let children = unsafe { copy_children(element) };
 
     if !children.is_empty() {
@@ -296,10 +407,8 @@ fn select_popup_option(
         let mut available: Vec<String> = Vec::with_capacity(children.len());
 
         for (i, &child) in children.iter().enumerate() {
-            let child_title = unsafe { copy_string_attr(child, "AXTitle") }
-                .unwrap_or_default();
-            let child_value = unsafe { copy_string_attr(child, "AXValue") }
-                .unwrap_or_default();
+            let child_title = unsafe { copy_string_attr(child, "AXTitle") }.unwrap_or_default();
+            let child_value = unsafe { copy_string_attr(child, "AXValue") }.unwrap_or_default();
             available.push(child_title.clone());
             if child_title.to_lowercase() == value_lower
                 || child_value.to_lowercase() == value_lower
@@ -311,21 +420,25 @@ fn select_popup_option(
 
         let result = if let Some(i) = matched_idx {
             let child = children[i];
-            let opt_title = unsafe { copy_string_attr(child, "AXTitle") }
-                .unwrap_or_else(|| value.to_string());
-            let err = unsafe { perform_action(child, "AXPress") };
-            if err == kAXErrorSuccess {
-                Ok(format!(
-                    "✅ Selected '{opt_title}' in AXPopUpButton [{element_index}] \
-                     \"{element_title}\" via AX child AXPress."
-                ))
-            } else {
-                anyhow::bail!(
-                    "AXPress on child option failed with error {err}"
-                )
+            let opt_title =
+                unsafe { copy_string_attr(child, "AXTitle") }.unwrap_or_else(|| value.to_string());
+            match gate.check() {
+                Ok(()) => {
+                    let err = unsafe { perform_action(child, "AXPress") };
+                    if err == kAXErrorSuccess {
+                        Ok(format!(
+                            "✅ Selected '{opt_title}' in AXPopUpButton [{element_index}] \
+                             \"{element_title}\" via AX child AXPress."
+                        ))
+                    } else {
+                        anyhow::bail!("AXPress on child option failed with error {err}")
+                    }
+                }
+                Err(error) => Err(error.into()),
             }
         } else {
-            let avail = available.iter()
+            let avail = available
+                .iter()
                 .map(|t| format!("\"{t}\""))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -337,37 +450,48 @@ fn select_popup_option(
 
         // Release children (copy_children retains each one).
         for &child in &children {
-            unsafe { CFRelease(child as _); }
+            unsafe {
+                CFRelease(child as _);
+            }
         }
 
-        return result;
+        return result.map(SetValueDispatch::Complete);
     }
 
-    // Strategy 2: Safari/WebKit — no AX children when popup is closed.
-    // Use osascript do JavaScript to set the <select> element's DOM value.
-    let app_name = crate::apps::get_app_name_for_pid(pid)
-        .unwrap_or_default();
+    // Strategy 2: Safari/WebKit has no AX children when the popup is closed.
+    // Use the same window-scoped, in-process Apple Event path as the page tool.
+    let bundle_id = crate::apps::bundle_id_for_pid(pid).unwrap_or_default();
 
-    if app_name != "Safari" {
+    if bundle_id != "com.apple.Safari" {
         anyhow::bail!(
             "AXPopUpButton [{element_index}] '{element_title}' has no AX children and \
-             target is '{app_name}' (not Safari) — no fallback available."
+             target bundle is '{bundle_id}' (not Safari), so no fallback is available."
         )
     }
 
-    set_select_via_js(element_index, element_title, value)
+    Ok(SetValueDispatch::SafariSelect(SafariSelectRequest {
+        window_id,
+        element_index,
+        element_title: element_title.to_owned(),
+        value: value.to_owned(),
+    }))
 }
 
 // ── Safari JavaScript fallback ───────────────────────────────────────────────
 
-/// Set an HTML `<select>` value in Safari via `osascript do JavaScript`.
+/// Set an HTML `<select>` value in Safari via its in-process Apple Event suite.
 /// Searches all `<select>` elements for an `<option>` whose text or value matches
 /// `value` (case-insensitive), then sets it and dispatches a `change` event.
-fn set_select_via_js(
-    element_index: usize,
-    element_title: &str,
-    value: &str,
+async fn set_select_via_js(
+    request: SafariSelectRequest,
+    gate: crate::dispatch_gate::NativeDispatchGate,
 ) -> anyhow::Result<String> {
+    let SafariSelectRequest {
+        window_id,
+        element_index,
+        element_title,
+        value,
+    } = request;
     // Percent-encode the lowercased value using only unreserved URL characters
     // as the allowed set, matching the Swift reference's percent-encoding approach.
     // This makes the string safe to embed in both a JS single-quoted string
@@ -393,61 +517,32 @@ fn set_select_via_js(
          }})()"
     );
 
-    let apple_script = format!(
-        "tell application \"Safari\" to do JavaScript \"{js}\" in front document"
-    );
+    let raw = BrowserJs::execute_guarded(&js, "com.apple.Safari", window_id, gate).await?;
+    interpret_select_js_result(&raw, element_index, &element_title, &value)
+}
 
-    // Spawn osascript with a 10-second deadline. A stuck Safari permission
-    // prompt or unresponsive renderer can cause wait() to block indefinitely,
-    // which would stall the MCP tool handler permanently.
-    let mut child = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&apple_script)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("osascript launch failed: {e}"))?;
+fn interpret_select_js_result(
+    raw: &str,
+    element_index: usize,
+    element_title: &str,
+    value: &str,
+) -> anyhow::Result<String> {
+    let raw = raw.trim();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    anyhow::bail!("osascript timed out after 10 seconds");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => anyhow::bail!("osascript wait error: {e}"),
-        }
-    }
-    let out = child.wait_with_output()
-        .map_err(|e| anyhow::anyhow!("osascript output error: {e}"))?;
-
-    let raw = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .to_string();
-
-    if raw.starts_with("SET:") {
-        let dom_val = &raw[4..];
+    if let Some(dom_val) = raw.strip_prefix("SET:") {
         Ok(format!(
             "✅ Set select [{element_index}] '{element_title}' to '{value}' via \
              Safari JavaScript (DOM value: \"{dom_val}\")."
         ))
-    } else if raw.starts_with("NOTFOUND:") {
-        let available = &raw[9..];
+    } else if let Some(available) = raw.strip_prefix("NOTFOUND:") {
         anyhow::bail!(
             "No <option> matching '{value}' found in any <select>. \
              Available (text|value): {available}"
         )
-    } else if raw.is_empty() && !out.status.success() {
-        let err_text = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("osascript failed: {}", err_text.trim())
     } else {
+        let preview = raw.chars().take(200).collect::<String>();
         anyhow::bail!(
-            "JavaScript returned unexpected output: {}",
-            &raw[..raw.len().min(200)]
+            "JavaScript returned unexpected output: {preview}"
         )
     }
 }
@@ -472,8 +567,48 @@ fn percent_encode_unreserved(s: &str) -> String {
 
 fn hex_digit(n: u8) -> char {
     match n {
-        0..=9  => (b'0' + n) as char,
+        0..=9 => (b'0' + n) as char,
         10..=15 => (b'A' + n - 10) as char,
-        _      => '0',
+        _ => '0',
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_value_encoding_is_safe_for_javascript_literal() {
+        assert_eq!(
+            percent_encode_unreserved("Tea & 'Coffee'"),
+            "Tea%20%26%20%27Coffee%27"
+        );
+        assert_eq!(
+            percent_encode_unreserved("日本語"),
+            "%E6%97%A5%E6%9C%AC%E8%AA%9E"
+        );
+    }
+
+    #[test]
+    fn select_result_parser_handles_success_and_available_options() {
+        let success = interpret_select_js_result("SET:tea", 7, "Drink", "Tea").unwrap();
+        assert!(success.contains("DOM value: \"tea\""));
+
+        let error = interpret_select_js_result(
+            "NOTFOUND:coffee|coffee,tea|tea",
+            7,
+            "Drink",
+            "Water",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("coffee|coffee,tea|tea"));
+    }
+
+    #[test]
+    fn unexpected_select_result_truncates_unicode_on_character_boundaries() {
+        let raw = "日".repeat(250);
+        let error = interpret_select_js_result(&raw, 7, "Drink", "Tea").unwrap_err();
+        let message = error.to_string();
+        assert_eq!(message.chars().filter(|&ch| ch == '日').count(), 200);
     }
 }

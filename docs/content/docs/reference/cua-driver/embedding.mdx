@@ -14,6 +14,7 @@ Set embedded mode on the driver process your host spawns:
 ```sh
 CUA_DRIVER_EMBEDDED=1 \
 CUA_DRIVER_HOST_BUNDLE_ID=com.yourco.yourapp \
+CUA_DRIVER_DEFAULT_SESSION=my-agent-run \
 cua-driver mcp
 ```
 
@@ -23,7 +24,7 @@ Or use the equivalent flags:
 cua-driver mcp --embedded --host-bundle-id com.yourco.yourapp
 ```
 
-Only the exact value `CUA_DRIVER_EMBEDDED=1` enables embedded mode. The host bundle id is an advisory label echoed in `check_permissions`; trust still comes from macOS's responsibility chain.
+Only the exact value `CUA_DRIVER_EMBEDDED=1` enables embedded mode. The host bundle id is an advisory label echoed in `check_permissions`; trust still comes from macOS's responsibility chain. `CUA_DRIVER_DEFAULT_SESSION` gives argument-less MCP actions a stable process-owned agent cursor. If it is omitted or empty, the driver uses `embedded-<pid>` instead. An explicit tool `session` or `cursor_id` still takes precedence.
 
 ## Host requirements
 
@@ -55,6 +56,7 @@ gateway / node daemon                           YourApp.app
 | macOS permission prompts | Driver may prompt | Driver never prompts |
 | macOS Settings entries | CuaDriver | Host app only |
 | `check_permissions` attribution | `driver-daemon` or `caller` | `host` on macOS embedded runs |
+| Anonymous action cursor | None | `CUA_DRIVER_DEFAULT_SESSION`, else `embedded-<pid>` |
 
 Driver tools, screenshots, AX tree reads, background input, and the agent cursor overlay otherwise behave the same.
 

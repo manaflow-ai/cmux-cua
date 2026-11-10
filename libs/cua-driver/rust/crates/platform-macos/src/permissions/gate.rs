@@ -1,13 +1,14 @@
-//! First-launch permissions gate — CLI flow.
+//! First-launch permissions gate.
 //!
-//! Rust port of Swift's `PermissionsGate` (SwiftUI panel + polling).  The
-//! Rust port intentionally drops the SwiftUI window and reimplements the
-//! flow as a terminal-only experience:
+//! Bundled app launches use the native panel in [`super::panel`]. It explains
+//! both grants before any system prompt, requests one grant per user action,
+//! and refreshes live until setup completes. Bare binaries and headless
+//! launches use this module's terminal fallback:
 //!
 //!   1. Inspect TCC state on `serve` startup.
 //!   2. If any required grant is missing, print a clear explanation
 //!      (which grant, why cua-driver needs it, what to do next).
-//!   3. Open the relevant `System Settings` pane(s) via the
+//!   3. Request the missing grants and open the relevant System Settings panes via the
 //!      `x-apple.systempreferences:` URL scheme.
 //!   4. Poll TCC state every second.  Emit a "still waiting" line every
 //!      5 seconds so the user knows the daemon is still alive and what
@@ -20,18 +21,14 @@
 //! (case-insensitive) skips the entire flow.  Intended for CI / headless
 //! automation where blocking on user input would deadlock the runner.
 //!
-//! Why no GUI window: the Swift gate uses AppKit + SwiftUI which would
-//! require a full overlay + NSApplication run loop just to display a
-//! dialog.  cua-driver-rs already has a separate AppKit thread for the
-//! cursor overlay, and grafting another window onto it is a recipe for
-//! main-thread deadlocks.  A terminal-driven flow is uglier but reliable
-//! and works headless (with the opt-out flag), which is exactly the
-//! audience for the Rust port.
-//!
-//! A future enhancement could open a native `NSAlert` via objc2 for a
-//! more polished look — left as a follow-up; CLI is the MVP.
+//! Embedded mode bypasses both surfaces because the host application owns
+//! permission attribution and onboarding.
 
+#[cfg(target_os = "macos")]
+use std::ffi::c_void;
 use std::io::Write;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -39,6 +36,253 @@ use anyhow::Result;
 use crate::permissions::status::{
     current_status, request_accessibility, request_screen_recording, PermissionsStatus,
 };
+
+#[cfg(target_os = "macos")]
+const RECOVERY_IDLE: u8 = 0;
+#[cfg(target_os = "macos")]
+const RECOVERY_QUEUED: u8 = 1;
+#[cfg(target_os = "macos")]
+const RECOVERY_PRESENTING: u8 = 2;
+#[cfg(target_os = "macos")]
+const RECOVERY_DISMISSED: u8 = 3;
+#[cfg(target_os = "macos")]
+const RECOVERY_REFRESHING: u8 = 4;
+#[cfg(target_os = "macos")]
+const RECOVERY_FAILED: u8 = 5;
+#[cfg(target_os = "macos")]
+const RECOVERY_RESERVING: u8 = 6;
+
+#[cfg(target_os = "macos")]
+static RECOVERY_STATE: AtomicU8 = AtomicU8::new(RECOVERY_IDLE);
+#[cfg(target_os = "macos")]
+static RECOVERY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Private daemon-control lifecycle for an explicit `permissions grant`
+/// recovery request. It is process-local and never appears in the MCP tool
+/// catalog.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryLifecycle {
+    pub generation: u64,
+    pub state: &'static str,
+}
+
+#[cfg(target_os = "macos")]
+pub fn recovery_lifecycle() -> RecoveryLifecycle {
+    let state = match RECOVERY_STATE.load(Ordering::Acquire) {
+        RECOVERY_QUEUED => "queued",
+        RECOVERY_PRESENTING => "presenting",
+        RECOVERY_DISMISSED => "dismissed",
+        RECOVERY_REFRESHING => "refreshing",
+        RECOVERY_FAILED => "failed",
+        RECOVERY_RESERVING => "reserving",
+        _ => "idle",
+    };
+    RecoveryLifecycle {
+        generation: RECOVERY_GENERATION.load(Ordering::Acquire),
+        state,
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryRequest {
+    Scheduled(u64),
+    AlreadyPending(u64),
+    ExistingPanel,
+}
+
+#[cfg(target_os = "macos")]
+impl RecoveryRequest {
+    pub fn state(self) -> &'static str {
+        match self {
+            Self::Scheduled(_) => "scheduled",
+            Self::AlreadyPending(_) => "already-pending",
+            Self::ExistingPanel => "already-visible",
+        }
+    }
+
+    pub fn generation(self) -> u64 {
+        match self {
+            Self::Scheduled(generation) | Self::AlreadyPending(generation) => generation,
+            Self::ExistingPanel => RECOVERY_GENERATION.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn needs_dispatch(self) -> bool {
+        matches!(self, Self::Scheduled(_))
+    }
+}
+
+#[cfg(target_os = "macos")]
+enum PermissionMainCommand {
+    PresentRecovery,
+    RefreshProcess,
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "dispatch", kind = "dylib")]
+extern "C" {
+    static _dispatch_main_q: u8;
+    fn dispatch_async_f(
+        queue: *const c_void,
+        context: *mut c_void,
+        work: unsafe extern "C" fn(*mut c_void),
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_permission_command(command: PermissionMainCommand) {
+    let command = Box::new(command);
+    unsafe {
+        let main_queue = &raw const _dispatch_main_q as *const c_void;
+        dispatch_async_f(
+            main_queue,
+            Box::into_raw(command) as *mut c_void,
+            permission_main_callback,
+        );
+    }
+}
+
+/// Ask the already-running daemon to show its branded permission panel again.
+/// The request only queues main-thread AppKit work and returns immediately, so
+/// the daemon socket and active MCP control connections stay alive while the
+/// user makes a decision.
+#[cfg(target_os = "macos")]
+pub fn prepare_interactive_recovery() -> Result<RecoveryRequest> {
+    let panel = crate::permissions::panel::lifecycle();
+    if panel.visible {
+        return Ok(RecoveryRequest::ExistingPanel);
+    }
+    if !crate::session::has_graphic_access() {
+        anyhow::bail!("permission onboarding requires an active macOS graphic session");
+    }
+    if !crate::pip::appkit_main_loop_available() {
+        anyhow::bail!(
+            "permission onboarding is not ready because the daemon's AppKit main loop is not available"
+        );
+    }
+
+    Ok(reserve_recovery_request())
+}
+
+#[cfg(target_os = "macos")]
+fn reserve_recovery_request() -> RecoveryRequest {
+    loop {
+        let current = RECOVERY_STATE.load(Ordering::Acquire);
+        if current == RECOVERY_RESERVING {
+            std::hint::spin_loop();
+            continue;
+        }
+        if matches!(
+            current,
+            RECOVERY_QUEUED | RECOVERY_PRESENTING | RECOVERY_REFRESHING
+        ) {
+            return RecoveryRequest::AlreadyPending(
+                RECOVERY_GENERATION.load(Ordering::Acquire),
+            );
+        }
+        if RECOVERY_STATE
+            .compare_exchange(
+                current,
+                RECOVERY_RESERVING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            break;
+        }
+    }
+
+    let generation = RECOVERY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    RECOVERY_STATE.store(RECOVERY_QUEUED, Ordering::Release);
+    RecoveryRequest::Scheduled(generation)
+}
+
+#[cfg(target_os = "macos")]
+pub fn dispatch_prepared_interactive_recovery(request: RecoveryRequest) {
+    if request.needs_dispatch() {
+        dispatch_permission_command(PermissionMainCommand::PresentRecovery);
+    }
+}
+
+/// Queue a fresh process image after the caller has flushed its daemon-control
+/// acknowledgement. The replacement retains the original argv and bundle
+/// identity, while proxy control connections reconnect to the same profile.
+#[cfg(target_os = "macos")]
+pub fn ensure_process_refresh_available() -> Result<()> {
+    if !crate::session::has_graphic_access() {
+        anyhow::bail!("permission refresh requires an active macOS graphic session");
+    }
+    if !crate::pip::appkit_main_loop_available() && !crate::permissions::panel::lifecycle().visible
+    {
+        anyhow::bail!(
+            "permission refresh is not ready because the daemon's AppKit main loop is not available"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn dispatch_process_refresh() {
+    dispatch_permission_command(PermissionMainCommand::RefreshProcess);
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn permission_main_callback(context: *mut c_void) {
+    let command = unsafe { *Box::from_raw(context as *mut PermissionMainCommand) };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match command {
+        PermissionMainCommand::PresentRecovery => run_interactive_recovery_on_main(),
+        PermissionMainCommand::RefreshProcess => {
+            reexec_self(ReexecMode::SilentWait);
+        }
+    }));
+    if result.is_err() {
+        RECOVERY_STATE.store(RECOVERY_FAILED, Ordering::Release);
+        eprintln!("[cua-driver] permission control panicked on the AppKit main thread");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_interactive_recovery_on_main() {
+    RECOVERY_STATE.store(RECOVERY_PRESENTING, Ordering::Release);
+    let lifecycle = crate::permissions::panel::lifecycle();
+    if lifecycle.visible {
+        RECOVERY_STATE.store(RECOVERY_IDLE, Ordering::Release);
+        return;
+    }
+
+    let initial = current_status();
+    if initial.all_granted() {
+        RECOVERY_STATE.store(RECOVERY_REFRESHING, Ordering::Release);
+        reexec_self(ReexecMode::InteractivePanel);
+        RECOVERY_STATE.store(RECOVERY_FAILED, Ordering::Release);
+        return;
+    }
+
+    let outcome = if crate::permissions::panel::panel_enabled() {
+        crate::permissions::panel::show_modal(crate::permissions::panel::PanelOpts {
+            initial_status: initial,
+        })
+    } else {
+        crate::permissions::panel::PanelOutcome::Unavailable
+    };
+    match outcome {
+        crate::permissions::panel::PanelOutcome::AllGranted
+        | crate::permissions::panel::PanelOutcome::RefreshRequired => {
+            RECOVERY_STATE.store(RECOVERY_REFRESHING, Ordering::Release);
+            reexec_self(ReexecMode::InteractivePanel);
+            RECOVERY_STATE.store(RECOVERY_FAILED, Ordering::Release);
+        }
+        crate::permissions::panel::PanelOutcome::Dismissed => {
+            RECOVERY_STATE.store(RECOVERY_DISMISSED, Ordering::Release);
+        }
+        crate::permissions::panel::PanelOutcome::Unavailable => {
+            RECOVERY_STATE.store(RECOVERY_FAILED, Ordering::Release);
+        }
+    }
+}
 
 /// Which TCC grant is missing.  Each variant maps 1:1 to a System Settings
 /// pane URL via [`MissingPermission::settings_url`].
@@ -61,12 +305,14 @@ impl MissingPermission {
     /// adapted from the Swift gate's SwiftUI subtitle copy.
     pub fn rationale(self) -> &'static str {
         match self {
-            Self::Accessibility =>
-                "lets cua-driver read the accessibility tree of running apps and \
-                 send clicks / keystrokes via AX RPC.",
-            Self::ScreenRecording =>
-                "lets cua-driver capture per-window screenshots so agents can see \
-                 the current UI state alongside the tree.",
+            Self::Accessibility => {
+                "lets the driver read interface text and operate buttons, fields, menus, \
+                 and other app controls."
+            }
+            Self::ScreenRecording => {
+                "lets the driver see app windows so actions can be placed accurately \
+                 and their results verified."
+            }
         }
     }
 
@@ -74,10 +320,12 @@ impl MissingPermission {
     /// Privacy pane.  Same strings the Swift gate uses.
     pub fn settings_url(self) -> &'static str {
         match self {
-            Self::Accessibility =>
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-            Self::ScreenRecording =>
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+            Self::Accessibility => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+            }
+            Self::ScreenRecording => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+            }
         }
     }
 }
@@ -200,16 +448,27 @@ const GATE_REEXEC_ENV: &str = "CUA_DRIVER_RS_GATE_REEXEC";
 /// (~10min) the deadline never triggers and the daemon re-execs forever.
 const GATE_START_ENV: &str = "CUA_DRIVER_RS_GATE_START_UNIX";
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReexecMode {
+    /// Return to the native panel after a fresh TCC preflight. This mode must
+    /// not set the silent-wait marker: a denied decision needs recoverable
+    /// per-row actions, not an invisible polling loop.
+    InteractivePanel,
+    /// Terminal fallback cache refresh. The restarted process resumes the
+    /// existing wait without raising prompts or reopening presentation UI.
+    SilentWait,
+}
+
 /// Run the gate if needed.  When called and the process already has both
 /// grants, this returns immediately without printing anything — the
 /// `serve` happy path is unaffected.
 ///
-/// When grants are missing and `opt_out` is false:
-///   - Prints the missing-permissions banner.
-///   - Optionally raises the system TCC prompts (`also_raise_prompts`).
-///   - Opens the System Settings pane(s) for the user.
-///   - Polls TCC every `poll_interval` and re-emits a status line every
-///     `status_interval` until everything is green or `deadline` elapses.
+/// When grants are missing and `opt_out` is false, bundled launches present
+/// the native per-row flow. If the native panel is unavailable, the terminal
+/// fallback prints its explanation, optionally raises TCC prompts, opens the
+/// matching Settings panes, and polls until everything is green or the
+/// deadline elapses.
 ///
 /// Returns `Ok(())` on success (all green or opt-out).  Returns
 /// `Err` only if the deadline elapsed without all permissions granted —
@@ -226,6 +485,12 @@ pub fn run_if_needed(opts: GateOpts) -> Result<()> {
     if initial.all_granted() {
         // Fast path: everything already green.  No banner, no polling —
         // the user sees nothing different from before this gate existed.
+        // Clear one-shot re-exec bookkeeping so later child processes do not
+        // inherit a stale "silent refresh" state.
+        std::env::remove_var(GATE_REEXEC_ENV);
+        std::env::remove_var(GATE_START_ENV);
+        #[cfg(target_os = "macos")]
+        crate::permissions::panel::clear_request_history();
         return Ok(());
     }
 
@@ -242,25 +507,43 @@ pub fn run_if_needed(opts: GateOpts) -> Result<()> {
 
     let missing = missing_from_status(initial);
 
-    // Raise the TCC system prompts BEFORE showing our panel. The
-    // `AXIsProcessTrustedWithOptions` / `CGRequestScreenCaptureAccess`
-    // calls have a side effect critical to the user flow: they
-    // register the calling process with the TCC daemon, which is what
-    // makes the app appear in
-    //   System Settings → Privacy & Security → {Accessibility,Screen Recording}
-    // with its toggle ready to flip. Without that registration, our
-    // "Open System Settings" button takes the user to a pane where
-    // CuaDriver simply isn't listed — they see nothing to grant.
-    //
-    // The Swift gate did the same registration via the matching
-    // `Permissions.requestAccessibility()` / `requestScreenRecording()`
-    // calls before its panel appeared. Moving them earlier here closes
-    // a UX regression the original Phase 1 wiring introduced: prompts
-    // used to happen after the panel, racing with the user clicking
-    // "Open Settings".
-    //
-    // These calls are no-ops when the grant is already active so the
-    // happy-path (both green) sees no UI from this block.
+    // Bundled launches show the explanation before requesting either TCC
+    // grant. The panel owns its per-row prompts and Settings deep links, so
+    // system UI never appears without an explicit Allow click.
+    match present_panel_if_available(initial) {
+        PanelPresentation::ShownAllGranted => {
+            // Start one fresh process image after first-time setup. macOS can
+            // cache both AX trust and Screen Recording capability inside the
+            // requesting process, and some OS versions do not make capture
+            // usable until relaunch. `execvp` preserves argv and attribution;
+            // the new image sees both grants on its fast path and does not
+            // show the panel again. It also avoids asking the user to quit and
+            // manually reconstruct the daemon launch arguments.
+            #[cfg(target_os = "macos")]
+            reexec_self(ReexecMode::InteractivePanel);
+            return wait_for_grants(&opts);
+        }
+        PanelPresentation::ShownRefreshRequired => {
+            // Returning from a TCC decision or System Settings is a progress
+            // signal, not proof of a grant. Re-exec immediately so cached
+            // false probes cannot strand the panel. A denied grant reopens
+            // the panel in its recoverable “Complete in System Settings”
+            // state; a granted one advances from fresh status.
+            #[cfg(target_os = "macos")]
+            reexec_self(ReexecMode::InteractivePanel);
+            return wait_for_grants(&opts);
+        }
+        PanelPresentation::ShownDismissed => {
+            return Ok(());
+        }
+        PanelPresentation::NotShown => {}
+    }
+
+    // Bare-binary and headless launches retain the terminal fallback. Print
+    // its explanation before raising prompts so the user knows why macOS is
+    // asking. Embedded mode returned at the top of this function and can
+    // never reach these calls.
+    print_banner(&missing, opts.open_settings);
     if opts.also_raise_prompts {
         if missing.contains(&MissingPermission::Accessibility) {
             let _ = request_accessibility();
@@ -269,54 +552,15 @@ pub fn run_if_needed(opts: GateOpts) -> Result<()> {
             let _ = request_screen_recording();
         }
     }
-
-    // Try to present a native NSPanel before falling back to the
-    // terminal banner. The panel's 1 Hz poll can also auto-resolve
-    // before the user touches a button — the trailing
-    // `wait_for_grants` loop becomes optional in that case. Outcomes:
-    //
-    //   * `NotShown` — historical CLI path: print the banner, auto-
-    //     open Settings (when `open_settings` is true), wait.
-    //   * `ShownOpenSettings` — user clicked the primary button; open
-    //     Settings on their behalf, then wait.
-    //   * `ShownDismissed` — user clicked "Continue anyway" or the red
-    //     dot; skip the auto-open since the user declined the guided
-    //     flow, but still wait so a later manual grant unblocks.
-    //   * `ShownAllGranted` — the panel's poll loop saw both grants
-    //     flip green; skip the wait loop entirely.
-    let presentation = present_panel_if_available(initial);
-    let should_auto_open_settings;
-    let skip_wait_loop;
-    match presentation {
-        PanelPresentation::NotShown => {
-            print_banner(&missing, opts.open_settings);
-            should_auto_open_settings = opts.open_settings;
-            skip_wait_loop = false;
-        }
-        PanelPresentation::ShownOpenSettings => {
-            should_auto_open_settings = opts.open_settings;
-            skip_wait_loop = false;
-        }
-        PanelPresentation::ShownDismissed => {
-            should_auto_open_settings = false;
-            skip_wait_loop = false;
-        }
-        PanelPresentation::ShownAllGranted => {
-            should_auto_open_settings = false;
-            skip_wait_loop = true;
-        }
-    }
-
-    if should_auto_open_settings {
-        for m in &missing {
-            if let Err(e) = open_system_settings_for(*m) {
-                eprintln!("  (could not auto-open Settings for {}: {e})", m.label());
+    if opts.open_settings {
+        for permission in &missing {
+            if let Err(error) = open_system_settings_for(*permission) {
+                eprintln!(
+                    "  (could not auto-open Settings for {}: {error})",
+                    permission.label()
+                );
             }
         }
-    }
-
-    if skip_wait_loop {
-        return Ok(());
     }
     wait_for_grants(&opts)
 }
@@ -328,13 +572,14 @@ enum PanelPresentation {
     /// Panel could not be shown (opt-out env var, bare-binary launch,
     /// headless, etc.). Caller should fall back to the terminal banner.
     NotShown,
-    /// Panel shown; user clicked "Open System Settings".
-    ShownOpenSettings,
-    /// Panel shown; user clicked "Continue anyway" or closed the window.
+    /// Panel shown; user closed the window.
     ShownDismissed,
     /// Panel shown; its 1 Hz poll loop saw both grants flip green and
     /// dismissed automatically. Caller can skip the trailing wait loop.
     ShownAllGranted,
+    /// Panel shown; the user returned from system permission UI. The result
+    /// is deliberately unknown until a fresh process verifies it.
+    ShownRefreshRequired,
 }
 
 fn present_panel_if_available(initial: PermissionsStatus) -> PanelPresentation {
@@ -347,9 +592,10 @@ fn present_panel_if_available(initial: PermissionsStatus) -> PanelPresentation {
         match panel::show_modal(panel::PanelOpts {
             initial_status: initial,
         }) {
-            panel::PanelOutcome::OpenSettings => PanelPresentation::ShownOpenSettings,
+            panel::PanelOutcome::Unavailable => PanelPresentation::NotShown,
             panel::PanelOutcome::Dismissed => PanelPresentation::ShownDismissed,
             panel::PanelOutcome::AllGranted => PanelPresentation::ShownAllGranted,
+            panel::PanelOutcome::RefreshRequired => PanelPresentation::ShownRefreshRequired,
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -394,7 +640,10 @@ pub fn wait_for_grants(opts: &GateOpts) -> Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        match std::env::var(GATE_START_ENV).ok().and_then(|s| s.parse::<u64>().ok()) {
+        match std::env::var(GATE_START_ENV)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
             Some(orig) => Instant::now()
                 .checked_sub(Duration::from_secs(now_unix.saturating_sub(orig)))
                 .unwrap_or_else(Instant::now),
@@ -447,7 +696,7 @@ pub fn wait_for_grants(opts: &GateOpts) -> Result<()> {
                     fmt_missing(&last_missing)
                 );
                 let _ = std::io::stdout().flush();
-                reexec_self();
+                reexec_self(ReexecMode::SilentWait);
                 // `reexec_self` only returns on failure; if it does,
                 // continue the loop with a reset counter so we don't
                 // spin-exec.
@@ -498,7 +747,7 @@ pub fn wait_for_grants(opts: &GateOpts) -> Result<()> {
 /// function is never executed. Caller continues if the call fails so
 /// the gate keeps polling rather than aborting hard.
 #[cfg(target_os = "macos")]
-fn reexec_self() {
+fn reexec_self(mode: ReexecMode) {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStringExt;
 
@@ -520,8 +769,7 @@ fn reexec_self() {
     }
 
     // execvp takes a NULL-terminated argv. Build pointers + sentinel.
-    let mut argv_ptrs: Vec<*const libc::c_char> =
-        argv.iter().map(|s| s.as_ptr()).collect();
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|s| s.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
 
     let exe_c = match CString::new(exe.into_os_string().into_vec()) {
@@ -536,12 +784,7 @@ fn reexec_self() {
     // polls silently (no re-prompt), and anchor the original gate start so
     // the deadline is cumulative across re-execs. execvp inherits the
     // environment, so the new image sees these.
-    std::env::set_var(GATE_REEXEC_ENV, "1");
-    if std::env::var(GATE_START_ENV).is_err() {
-        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            std::env::set_var(GATE_START_ENV, d.as_secs().to_string());
-        }
-    }
+    prepare_reexec_environment(mode);
 
     // execvp returns -1 on failure; on success it does not return.
     // SAFETY: argv_ptrs is NULL-terminated; exe_c outlives the call.
@@ -551,6 +794,19 @@ fn reexec_self() {
     // If we get here the exec failed.
     let err = std::io::Error::last_os_error();
     eprintln!("[cua-driver] re-exec failed: {err}");
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_reexec_environment(mode: ReexecMode) {
+    match mode {
+        ReexecMode::InteractivePanel => std::env::remove_var(GATE_REEXEC_ENV),
+        ReexecMode::SilentWait => std::env::set_var(GATE_REEXEC_ENV, "1"),
+    }
+    if std::env::var(GATE_START_ENV).is_err() {
+        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            std::env::set_var(GATE_START_ENV, d.as_secs().to_string());
+        }
+    }
 }
 
 fn print_banner(missing: &[MissingPermission], open_settings: bool) {
@@ -689,8 +945,10 @@ mod tests {
             let opts = GateOpts::from_env_and_flag(false);
             // "TrUe" is in the list intentionally — it must NOT opt out
             // (it's not in the off-sentinel set), so split the assertion.
-            let expected_opt_out =
-                matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off");
+            let expected_opt_out = matches!(
+                v.to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            );
             assert_eq!(
                 opts.opt_out, expected_opt_out,
                 "env={v:?} opt_out mismatch (expected {expected_opt_out})"
@@ -751,5 +1009,67 @@ mod tests {
             MissingPermission::ScreenRecording.settings_url(),
             "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interactive_refresh_reopens_panel_after_reexec() {
+        let _guard = env_lock();
+        std::env::set_var(GATE_REEXEC_ENV, "1");
+        std::env::remove_var(GATE_START_ENV);
+        prepare_reexec_environment(ReexecMode::InteractivePanel);
+        assert!(
+            std::env::var(GATE_REEXEC_ENV).is_err(),
+            "permission-decision refresh must not fall into silent polling"
+        );
+        assert!(std::env::var(GATE_START_ENV).is_ok());
+        std::env::remove_var(GATE_START_ENV);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn terminal_cache_refresh_remains_silent_after_reexec() {
+        let _guard = env_lock();
+        std::env::remove_var(GATE_REEXEC_ENV);
+        std::env::remove_var(GATE_START_ENV);
+        prepare_reexec_environment(ReexecMode::SilentWait);
+        assert_eq!(std::env::var(GATE_REEXEC_ENV).as_deref(), Ok("1"));
+        std::env::remove_var(GATE_REEXEC_ENV);
+        std::env::remove_var(GATE_START_ENV);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn concurrent_recovery_requests_share_the_published_generation() {
+        let _guard = env_lock();
+        RECOVERY_STATE.store(RECOVERY_IDLE, Ordering::Release);
+        RECOVERY_GENERATION.store(0, Ordering::Release);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    reserve_recovery_request()
+                })
+            })
+            .collect();
+        let requests: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("recovery reservation thread"))
+            .collect();
+
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, RecoveryRequest::Scheduled(1)))
+                .count(),
+            1
+        );
+        assert!(requests.iter().all(|request| request.generation() == 1));
+
+        RECOVERY_STATE.store(RECOVERY_IDLE, Ordering::Release);
+        RECOVERY_GENERATION.store(0, Ordering::Release);
     }
 }

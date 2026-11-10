@@ -26,6 +26,7 @@ mod get_cursor_position;
 mod move_cursor;
 mod cursor_tools;
 mod check_permissions;
+mod codex_compat;
 mod get_config;
 mod set_config;
 mod get_accessibility_tree;
@@ -96,6 +97,185 @@ impl DeliveryMode {
     pub fn is_foreground(self) -> bool { matches!(self, Self::Foreground) }
 }
 
+/// Side-effect-free addressing result used by targeted-action preflights.
+/// Resolving an element token reads only the snapshot registry; it does not
+/// touch Accessibility, cursor, focus, or input state.
+pub(crate) struct ActionAddress {
+    pub element: bool,
+    pub window_id: Option<u32>,
+    pub has_xy: bool,
+    pub partial_xy: bool,
+}
+
+pub(crate) fn preflight_action_address(
+    args: &serde_json::Value,
+    tool_name: &str,
+) -> Result<ActionAddress, cua_driver_core::protocol::ToolResult> {
+    use cua_driver_core::tool_args::ArgsExt;
+
+    let pid = args.require_i32("pid")?;
+    let window_id_arg = args.opt_u64("window_id").and_then(|value| u32::try_from(value).ok());
+    let resolved = cua_driver_core::element_token::resolve_element_args(
+        pid,
+        args.opt_u64("element_index").map(|value| value as usize),
+        args.opt_str("element_token").as_deref(),
+        window_id_arg,
+        tool_name,
+    )?;
+    let (element, window_id) = match resolved {
+        cua_driver_core::element_token::ResolvedElement::None => (false, window_id_arg),
+        cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => {
+            (true, window_id)
+        }
+    };
+    let has_x = args.get("x").is_some_and(serde_json::Value::is_number);
+    let has_y = args.get("y").is_some_and(serde_json::Value::is_number);
+    Ok(ActionAddress {
+        element,
+        window_id,
+        has_xy: has_x && has_y,
+        partial_xy: has_x != has_y,
+    })
+}
+
+// ── Explicit "watchable" target fronting ─────────────────────────────────────
+//
+// A host may explicitly request visible computer use, where the app being
+// driven stays frontmost. Embedding alone preserves the normal background
+// delivery contract. The shared action choke point (`ToolRegistry::invoke` in
+// cua-driver-core) calls [`front_target_if_watchable`] before each targeted
+// drive action; this module owns the activation + front-once/dedupe state so we
+// never flicker focus by re-activating an already-frontmost target on every
+// single action.
+
+/// The (session, target_pid) most recently fronted by [`front_target_if_watchable`].
+/// One driver process ⇒ one dedupe cell. `None` until the first front.
+static LAST_FRONTED: std::sync::Mutex<Option<(Option<String>, i32)>> =
+    std::sync::Mutex::new(None);
+
+/// Outcome of the front-once/dedupe decision. Pure and unit-testable: given the
+/// target, the current frontmost pid, and what we fronted last, decide whether
+/// to issue an activation now and what to remember as last-fronted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrontDecision {
+    /// Issue an `activate` for the target now.
+    pub front: bool,
+    /// Value to store as the new last-fronted `(session, pid)`.
+    pub new_last: Option<(Option<String>, i32)>,
+}
+
+/// Decide whether to bring `target_pid` to the front.
+///
+/// Rules (pure — no OS calls):
+/// - If the target is ALREADY frontmost → skip (never flicker a frontmost app),
+///   but still record it as last-fronted so later unchanged actions dedupe.
+/// - Else if we already fronted this exact `(session, target_pid)` on the
+///   previous action AND no *different* app has since grabbed the foreground
+///   (frontmost is the target or simply unknown) → skip: the earlier activation
+///   is still settling, re-issuing it just churns focus.
+/// - Else → front it so the watching user sees the driven window.
+pub(crate) fn decide_front(
+    target_pid: i32,
+    session: Option<&str>,
+    frontmost_pid: Option<i32>,
+    last_fronted: Option<&(Option<String>, i32)>,
+) -> FrontDecision {
+    let key = (session.map(str::to_owned), target_pid);
+    let already_frontmost = frontmost_pid == Some(target_pid);
+    let unchanged = last_fronted == Some(&key);
+    // A *different* app currently holds the foreground (real focus steal), as
+    // opposed to `None`/target (activation still settling).
+    let stolen_by_other = matches!(frontmost_pid, Some(p) if p != target_pid);
+
+    let front = if already_frontmost {
+        false
+    } else if unchanged && !stolen_by_other {
+        false
+    } else {
+        true
+    };
+    FrontDecision { front, new_last: Some(key) }
+}
+
+/// Bring a driven target app to the foreground in explicit watchable mode so
+/// the watching user sees the window being driven. Best-effort and deduped via
+/// [`decide_front`]: a rejected/failed activation is only warned about, never an
+/// error — this is called from the shared action choke point and must never
+/// fail a tool call. No-op without host opt-in (the core caller already gates
+/// on `watchable_front_mode()`, and this rechecks so a stray direct call stays
+/// safe).
+pub fn front_target_if_watchable(target_pid: i64, session: Option<&str>) {
+    if !cua_driver_core::watchable_front_mode() {
+        return;
+    }
+    let Ok(pid) = i32::try_from(target_pid) else {
+        return;
+    };
+    let frontmost = crate::apps::frontmost_pid();
+    let mut last = LAST_FRONTED.lock().unwrap();
+    let decision = decide_front(pid, session, frontmost, last.as_ref());
+    if decision.front {
+        let activated = crate::apps::activate_pid_all_windows(pid);
+        if !activated {
+            tracing::warn!(
+                target: "platform_macos::tools::watchable_front",
+                target_pid = pid,
+                "watchable front: activation returned NO (app hidden, \
+                 terminating, or denied) — proceeding with background drive"
+            );
+        }
+    }
+    *last = decision.new_last;
+}
+
+/// Fail closed when a background pixel event would be hit-tested onto a
+/// different visible window. Cursor-overlay windows are filtered inside the
+/// WindowServer hit-test because they share this process's pid.
+pub(crate) fn pixel_obstruction_error(
+    target_pid: i32,
+    target_window_id: u32,
+    screen_x: f64,
+    screen_y: f64,
+    point_name: Option<&str>,
+) -> Option<cua_driver_core::protocol::ToolResult> {
+    let occluder = crate::windows::pixel_obstruction(
+        target_pid,
+        target_window_id,
+        screen_x,
+        screen_y,
+    )?;
+    let app = if occluder.app_name.trim().is_empty() {
+        format!("pid {}", occluder.pid)
+    } else {
+        occluder.app_name.clone()
+    };
+    let title_suffix = if occluder.title.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" (\"{}\")", occluder.title)
+    };
+    let point_suffix = point_name.map(|name| format!(" at the drag {name}")).unwrap_or_default();
+    Some(
+        cua_driver_core::protocol::ToolResult::error(format!(
+            "Pixel dispatch blocked{point_suffix}: {app}{title_suffix} window {} is in front at \
+             screen point ({screen_x:.0}, {screen_y:.0}). Retry with \
+             delivery_mode:\"foreground\" or clear the obstruction.",
+            occluder.window_id,
+        ))
+        .with_structured(serde_json::json!({
+            "error": "obstructed",
+            "code": "background_occluded",
+            "occluding_app": app,
+            "occluding_pid": occluder.pid,
+            "occluding_window_id": occluder.window_id,
+            "occluding_window_title": occluder.title,
+            "screen_point": { "x": screen_x, "y": screen_y },
+            "point": point_name,
+            "hint": "retry with delivery_mode:\"foreground\" or clear the obstruction"
+        })),
+    )
+}
+
 /// px-focus for the keyboard family (type_text / press_key / hotkey): pixel-click
 /// at (x,y) to establish real renderer focus before a keystroke — the *element px
 /// action* form of a keyboard tool. Reuses ClickTool's exact coordinate
@@ -125,9 +305,9 @@ pub(crate) async fn focus_by_pixel(
     if from_zoom { click_args["from_zoom"] = serde_json::json!(true); }
     let focus = click::ClickTool::new(state.clone()).invoke(click_args).await;
     if focus.is_error == Some(true) {
-        return Err(cua_driver_core::protocol::ToolResult::error(format!(
-            "focus pixel-click at ({x:.0},{y:.0}) failed."
-        )));
+        // Preserve structured obstruction/background-unavailable details from
+        // ClickTool so pixel-focused keyboard calls remain actionable.
+        return Err(focus);
     }
     // Brief settle so the renderer registers focus before the keystrokes.
     tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -368,6 +548,13 @@ impl Default for ToolState {
 /// variant — same name, stricter args, window-scoped JPEG @ 85% + a text
 /// note telling the caller to use pixel-addressed tools.
 pub fn register_all(registry: &mut ToolRegistry, compat: bool) {
+    registry.set_target_app_resolver(|pid| {
+        i32::try_from(pid).ok().and_then(crate::apps::get_app_name_for_pid)
+    });
+    // Explicit "watchable" fronting: the core action choke point calls this
+    // before each targeted drive action only after host opt-in, so ordinary
+    // embedded and daemon sessions preserve background delivery semantics.
+    registry.set_target_front_hook(front_target_if_watchable);
     let state = Arc::new(ToolState::default());
     // Share the element cache with the recording-hook layer so it can
     // resolve element_index → window-local screenshot coords for click.png.
@@ -389,6 +576,10 @@ pub fn register_all(registry: &mut ToolRegistry, compat: bool) {
             // cursor are a harmless no-op.
             cursor_registry.remove(session_id);
             crate::cursor::overlay::remove_cursor(session_id.to_owned());
+            // Process-global cursor feed: hide only if the ending session still
+            // owns the host-rendered cursor, so another active session remains
+            // visible. No-op unless CUA_DRIVER_STATE_DIR is set.
+            cua_driver_core::cursor_feed::emit_hidden_if_owned(session_id);
         });
     }
 
@@ -452,6 +643,93 @@ pub fn register_all(registry: &mut ToolRegistry, compat: bool) {
     // Recording / replay + session-lifecycle tools are platform-independent.
     registry.register_recording_tools();
     registry.register_session_tools();
+}
+
+/// Register the deliberately narrow Codex Computer Use compatibility surface.
+///
+/// This is opt-in and replaces, rather than extends, the native registry so an
+/// agent sees the same ten app-oriented tools as Codex's Computer Use provider.
+/// The wrappers translate app names/paths/bundle identifiers into the native
+/// pid/window primitives and retain a fail-closed snapshot per MCP session.
+pub fn register_codex_compat(registry: &mut ToolRegistry) {
+    codex_compat::register_all(registry);
+}
+
+#[cfg(test)]
+mod watchable_front_tests {
+    //! Pure front-once/dedupe decision for explicit watchable fronting.
+    //! Injects the frontmost pid + last-fronted state so no live WindowServer
+    //! is needed.
+    use super::{decide_front, FrontDecision};
+
+    fn last(session: Option<&str>, pid: i32) -> (Option<String>, i32) {
+        (session.map(str::to_owned), pid)
+    }
+
+    #[test]
+    fn fronts_when_target_not_frontmost_and_no_history() {
+        // First action on a target that is behind the host: bring it forward.
+        let d = decide_front(42, Some("s"), Some(99), None);
+        assert_eq!(
+            d,
+            FrontDecision { front: true, new_last: Some(last(Some("s"), 42)) }
+        );
+    }
+
+    #[test]
+    fn skips_when_target_already_frontmost() {
+        // Never flicker a frontmost app — but still record it as last-fronted.
+        let d = decide_front(42, Some("s"), Some(42), None);
+        assert_eq!(
+            d,
+            FrontDecision { front: false, new_last: Some(last(Some("s"), 42)) }
+        );
+    }
+
+    #[test]
+    fn dedupes_unchanged_target_while_activation_settles() {
+        // We fronted (s,42) last action; frontmost hasn't updated yet (unknown).
+        // No *other* app stole focus, so don't re-issue the activation.
+        let prev = last(Some("s"), 42);
+        let d = decide_front(42, Some("s"), None, Some(&prev));
+        assert_eq!(d, FrontDecision { front: false, new_last: Some(prev) });
+    }
+
+    #[test]
+    fn refronts_unchanged_target_when_another_app_stole_focus() {
+        // Same target as last action, but a DIFFERENT app is now frontmost —
+        // a real focus steal — so bring the target back for the watcher.
+        let prev = last(Some("s"), 42);
+        let d = decide_front(42, Some("s"), Some(77), Some(&prev));
+        assert_eq!(
+            d,
+            FrontDecision { front: true, new_last: Some(last(Some("s"), 42)) }
+        );
+    }
+
+    #[test]
+    fn fronts_when_target_changed_even_if_not_frontmost() {
+        // Last action fronted a different target; the new target is not
+        // frontmost → front it.
+        let prev = last(Some("s"), 7);
+        let d = decide_front(42, Some("s"), Some(7), Some(&prev));
+        assert_eq!(
+            d,
+            FrontDecision { front: true, new_last: Some(last(Some("s"), 42)) }
+        );
+    }
+
+    #[test]
+    fn distinct_sessions_do_not_dedupe_each_other() {
+        // Same pid, different session key ⇒ treated as changed; front when the
+        // target is not already frontmost.
+        let prev = last(Some("a"), 42);
+        let d = decide_front(42, Some("b"), None, Some(&prev));
+        assert_eq!(
+            d,
+            FrontDecision { front: true, new_last: Some(last(Some("b"), 42)) }
+        );
+    }
 }
 
 #[cfg(test)]
