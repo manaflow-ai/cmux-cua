@@ -355,6 +355,7 @@ mod tests {
                 height: 100.,
             },
             layer: 0,
+            alpha: 1.0,
             z_index: 0,
             is_on_screen: true,
             on_current_space: None,

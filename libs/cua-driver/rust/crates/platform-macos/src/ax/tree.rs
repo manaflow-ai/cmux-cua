@@ -34,6 +34,51 @@ pub const DEFAULT_MAX_DEPTH: usize = 25;
 /// (issue #22865).
 pub const DEFAULT_MAX_ELEMENTS: usize = 2_000;
 
+/// Maximum number of Unicode scalar values emitted for one AXValue. Large
+/// document/text-area values otherwise duplicate entire documents into both
+/// the structured array and Markdown tree.
+pub const MAX_AX_VALUE_CHARS: usize = 512;
+
+#[derive(Default)]
+struct TopLevelWindowTracker {
+    window_ids: HashSet<u32>,
+    element_ptrs: HashSet<usize>,
+}
+
+impl TopLevelWindowTracker {
+    /// Returns `true` only for a top-level window not already represented by
+    /// the same retained AX reference or stable CGWindowID.
+    fn insert(&mut self, element_ptr: usize, window_id: Option<u32>) -> bool {
+        if !self.element_ptrs.insert(element_ptr) {
+            return false;
+        }
+        match window_id {
+            Some(window_id) => self.window_ids.insert(window_id),
+            None => true,
+        }
+    }
+}
+
+pub(crate) fn truncate_ax_value(value: String) -> String {
+    if value.chars().count() <= MAX_AX_VALUE_CHARS {
+        return value;
+    }
+    let mut truncated: String = value.chars().take(MAX_AX_VALUE_CHARS).collect();
+    truncated.push('…');
+    truncated
+}
+
+/// Human-facing label shared by the Markdown and structured output. Preserve
+/// the established title-first order used by structured consumers.
+pub(crate) fn preferred_label<'a>(
+    title: Option<&'a str>,
+    description: Option<&'a str>,
+    value: Option<&'a str>,
+    identifier: Option<&'a str>,
+) -> Option<&'a str> {
+    title.or(description).or(value).or(identifier)
+}
+
 /// How long to let a freshly-enabled Chromium/Electron app build its
 /// web-content AX tree before we read it. The tree is materialized
 /// asynchronously over IPC once the app detects an assistive client, so a
@@ -160,9 +205,16 @@ pub fn walk_tree_bounded(
         let from_windows = copy_ax_windows(app_elem);
 
         let mut top_level = from_children;
+        let mut top_level_windows = TopLevelWindowTracker::default();
+        for element in &top_level {
+            top_level_windows.insert(*element as usize, ax_get_window_id(*element));
+        }
         for w in from_windows {
-            // Deduplicate by raw pointer identity.
-            if !top_level.iter().any(|&e| e == w) {
+            // `AXChildren` and `AXWindows` can return distinct AX wrapper
+            // objects for the same window. Deduplicate only by retained
+            // reference or stable CGWindowID; visual attributes are not
+            // identity and may legitimately match across separate controls.
+            if top_level_windows.insert(w as usize, ax_get_window_id(w)) {
                 top_level.push(w);
             } else {
                 // Already present — release the extra retain from copy_ax_windows.
@@ -283,7 +335,7 @@ unsafe fn walk_element(
     // (digit buttons). Merging them would produce "2" (quoted) instead of (2)
     // (parens), breaking _find_calc_button which searches for "(2)".
     let title = copy_string_attr(element, "AXTitle");
-    let value = copy_string_attr(element, "AXValue");
+    let value = copy_stringified_attr(element, "AXValue");
     // AXPlaceholderValue as fallback for empty text fields.
     let value = value.filter(|v| !v.trim().is_empty())
         .or_else(|| copy_string_attr(element, "AXPlaceholderValue"));
@@ -295,6 +347,7 @@ unsafe fn walk_element(
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
     let visible_value = value.as_deref().unwrap_or("").trim().to_owned();
+    let visible_value = truncate_ax_value(visible_value);
 
     let has_content = !visible_title.is_empty()
         || !visible_description.is_empty()
@@ -323,48 +376,29 @@ unsafe fn walk_element(
 
     let element_ptr = element as usize;
     let frame = element_screen_rect(element);
-    let node = if is_actionable {
-        let idx = *counter;
+    let element_index = is_actionable.then(|| {
+        let index = *counter;
         *counter += 1;
         // Retain so the element stays alive in the cache after `copy_children`
         // releases the per-child ref at the end of the caller's loop.
         CFRetain(element as CFTypeRef);
-        AXNode {
-            element_index: Some(idx),
-            role: role.clone(),
-            title: if visible_title.is_empty() { None } else { Some(visible_title.clone()) },
-            value: if visible_value.is_empty() { None } else { Some(visible_value.clone()) },
-            description: if visible_description.is_empty() { None } else { Some(visible_description.clone()) },
-            identifier: identifier.clone(),
-            help: help.clone(),
-            actions: actions.clone(),
-            element_ptr,
-            depth,
-            parent_element_index: parent_index,
-            frame,
-        }
-    } else {
-        AXNode {
-            element_index: None,
-            role: role.clone(),
-            title: if visible_title.is_empty() { None } else { Some(visible_title.clone()) },
-            value: if visible_value.is_empty() { None } else { Some(visible_value.clone()) },
-            description: if visible_description.is_empty() { None } else { Some(visible_description.clone()) },
-            identifier: identifier.clone(),
-            help: help.clone(),
-            actions: vec![],
-            element_ptr,
-            depth,
-            parent_element_index: parent_index,
-            frame,
-        }
+        index
+    });
+    let node = AXNode {
+        element_index,
+        role: role.clone(),
+        title: if visible_title.is_empty() { None } else { Some(visible_title.clone()) },
+        value: if visible_value.is_empty() { None } else { Some(visible_value.clone()) },
+        description: if visible_description.is_empty() { None } else { Some(visible_description.clone()) },
+        identifier: identifier.clone(),
+        help: help.clone(),
+        actions: actions.clone(),
+        element_ptr,
+        depth,
+        parent_element_index: parent_index,
+        frame,
     };
-
-    // Track this node as the parent for its descendants only when it was
-    // assigned an element_index (mirrors what the markdown shows: only
-    // indexed rows are addressable in click(element_index=N)).
-    let next_parent = node.element_index.or(parent_index);
-
+    let descendants_parent_index = node.element_index.or(parent_index);
     let line = format_node_line(&node);
     lines.push((depth, line));
     nodes.push(node);
@@ -374,7 +408,7 @@ unsafe fn walk_element(
         walk_element(
             child,
             depth + 1,
-            next_parent,
+            descendants_parent_index,
             nodes,
             lines,
             counter,
@@ -497,4 +531,42 @@ fn leading_indent_depth(line: &str) -> usize {
         if ch == ' ' { count += 1; } else { break; }
     }
     count / 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_level_window_tracker_deduplicates_distinct_wrappers_for_one_window() {
+        let mut tracker = TopLevelWindowTracker::default();
+        assert!(tracker.insert(0x1111, Some(7)));
+        assert!(
+            !tracker.insert(0x2222, Some(7)),
+            "one CGWindowID returned through two AX wrappers must be walked once"
+        );
+        assert!(tracker.insert(0x3333, None));
+        assert!(
+            !tracker.insert(0x3333, None),
+            "the same retained AX reference must be walked once"
+        );
+    }
+
+    #[test]
+    fn top_level_window_tracker_preserves_distinct_window_identity() {
+        let mut tracker = TopLevelWindowTracker::default();
+        assert!(tracker.insert(0x1111, Some(7)));
+        assert!(tracker.insert(0x2222, Some(8)));
+        // Role, label, and frame are deliberately absent from this identity
+        // seam: distinct overlapping controls with identical display
+        // attributes must remain separately addressable inside each window.
+    }
+
+    #[test]
+    fn truncate_ax_value_keeps_unicode_boundaries() {
+        let value = "é".repeat(MAX_AX_VALUE_CHARS + 1);
+        let truncated = truncate_ax_value(value);
+        assert_eq!(truncated.chars().count(), MAX_AX_VALUE_CHARS + 1);
+        assert!(truncated.ends_with('…'));
+    }
 }

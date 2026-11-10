@@ -25,6 +25,27 @@ pub mod panel;
 pub use status::{PermissionsStatus, current_status};
 pub use gate::{GateOpts, MissingPermission, run_if_needed};
 
+/// Whether an embedding host owns permission onboarding and prompt timing.
+/// The branded executable fallback keeps cmux's helper silent even if an
+/// incomplete inherited environment omits the explicit flag.
+pub(crate) fn external_permission_flow_enabled() -> bool {
+    let from_environment = std::env::var("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    let cmux_branded_executable = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_owned()))
+        .and_then(|name| name.to_str().map(str::to_owned))
+        .as_deref()
+        == Some("cmux-cua-driver");
+    from_environment || cmux_branded_executable
+}
+
 /// Crate-wide lock serializing tests that mutate process-global env vars.
 /// Per-module locks are not enough: `gate` and `check_permissions` tests
 /// share `CUA_DRIVER_EMBEDDED`.

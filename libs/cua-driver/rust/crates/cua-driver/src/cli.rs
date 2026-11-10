@@ -217,9 +217,11 @@ pub fn parse_command() -> Command {
         println!("                          for any future compat-gated tool.");
         println!();
         println!("agent cursor overlay (serve / mcp only — needs the daemon UI runloop):");
-        println!("  The overlay is ON by default: every MCP session automatically gets its own");
-        println!("  cursor (keyed by session id) that shows where the agent acts without moving the");
-        println!("  real pointer. It is removed when the session ends. A pure accessibility (AX)");
+        println!("  Embedded stdio processes (CUA_DRIVER_EMBEDDED=1) get an automatic default");
+        println!("  cursor keyed by CUA_DRIVER_DEFAULT_SESSION (else embedded-<pid>), so anonymous");
+        println!("  calls show a cursor with no session arg. Non-embedded callers must pass an");
+        println!("  explicit `session` to get a cursor. The cursor shows where the agent acts");
+        println!("  without moving the real pointer and is removed when the session ends. A pure accessibility (AX)");
         println!("  action snaps the cursor with a brief pulse on its first action instead of a long");
         println!("  glide, so it can be easy to miss — do a pixel click or move_cursor first");
         println!("  for a visibly gliding demo. These flags tune the overlay on `serve`/`mcp`:");
@@ -229,7 +231,8 @@ pub fn parse_command() -> Command {
         println!("  --cursor-shape <name>   Built-in silhouette: {} ('teardrop' is the default —",
             cursor_overlay::BuiltinShape::names_help());
         println!("                          embedded cursor-up SVG; 'arrow' is the procedural gradient");
-        println!("                          diamond). Same vocabulary as MCP `cursor_icon`.");
+        println!("                          diamond; 'cmux' is Lawrence's fixed upright Sky kite).");
+        println!("                          Same vocabulary as MCP `cursor_icon`.");
         println!("  --cursor-palette <name> Pick a built-in colour palette for the cursor.");
         println!("  (These are no-ops for one-shot CLI calls like `cua-driver call` — the overlay");
         println!("   needs the long-lived AppKit runloop that only `serve` / `mcp` keep alive.)");
@@ -554,7 +557,16 @@ pub fn run_describe(registry: &ToolRegistry, name: &str) {
 /// there's no `open -a` equivalent on Linux / Windows.
 #[cfg(target_os = "macos")]
 pub fn should_use_daemon_proxy(no_daemon_relaunch: bool) -> bool {
-    use crate::bundle::{is_env_truthy, is_executable_inside_cuadriver_app, parent_is_not_launchd};
+    use crate::bundle::{
+        is_env_truthy, is_executable_inside_cuadriver_app, parent_is_not_launchd,
+        requires_external_daemon,
+    };
+    // A host-owned runtime is proxy-only. Evaluate this before every opt-out
+    // so ambient EMBEDDED / NO_RELAUNCH values cannot move a cmux session back
+    // into the main app's TCC responsibility chain.
+    if requires_external_daemon() {
+        return true;
+    }
     // Embedded mode stays in-process: relaunching via `open -a CuaDriver`
     // would leave the host's TCC responsibility chain and could prompt
     // for com.trycua.driver.
@@ -573,7 +585,11 @@ pub fn should_use_daemon_proxy(no_daemon_relaunch: bool) -> bool {
     // who've wrapped the binary in a custom bundle. Skips the
     // launch_daemon_and_wait `open -a` step too — caller is expected
     // to have a daemon already running on the chosen socket.
-    if is_env_truthy("CUA_DRIVER_RS_MCP_FORCE_PROXY") {
+    // cmux names a specific helper app to launch as the daemon (see
+    // launch_daemon_and_wait). Take the proxy path so that app — launched via
+    // LaunchServices under its own TCC identity — performs the TCC-gated work,
+    // instead of this in-process server running under the host app's identity.
+    if std::env::var_os("CUA_DRIVER_DAEMON_APP").is_some() {
         return true;
     }
     if !is_executable_inside_cuadriver_app() {
@@ -664,7 +680,15 @@ pub fn launch_daemon_and_wait(
     // actually differs from the default, so the common case keeps the
     // shorter `open` argv (and matches Swift's invocation byte-for-byte).
     let pass_socket = socket_path != crate::serve::default_socket_path();
-    let mut open_args: Vec<&str> = vec!["-n", "-g", "-a", "CuaDriver", "--args", "serve"];
+    // cmux sets CUA_DRIVER_DAEMON_APP to its bundled "cmux Computer Use.app" so
+    // LaunchServices launches THAT app as the serve daemon. A LaunchServices-
+    // launched app is its own responsible process (launchd-parented), so macOS
+    // attributes Accessibility / Screen Recording to the helper bundle's identity
+    // — the permission prompt names "cmux Computer Use", not the host app.
+    let daemon_app =
+        std::env::var("CUA_DRIVER_DAEMON_APP").unwrap_or_else(|_| "CuaDriver".to_string());
+    let mut open_args: Vec<&str> =
+        vec!["-n", "-g", "-a", daemon_app.as_str(), "--args", "serve"];
     if pass_socket {
         open_args.push("--socket");
         open_args.push(socket_path);
@@ -730,10 +754,36 @@ pub fn launch_daemon_and_wait(
     );
 }
 
-/// Run the MCP proxy path: ensure a daemon is up (spawning via
-/// `open` if needed), then `crate::proxy::run_proxy` against its
-/// socket. Builds its own tokio runtime — same shape as the other
-/// `run_*` helpers in this file that own their event loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingDaemonAction {
+    EnterLazyProxy,
+    FailExternalDaemon,
+    FailPlatformDaemon,
+}
+
+/// Decide what startup should do when the proxy socket is initially absent.
+///
+/// macOS intentionally enters `run_proxy` while dormant: that loop serves the
+/// permission-free handshake locally and performs the bounded daemon wait on
+/// the first tool call. Other platforms have no lazy LaunchServices path, so
+/// they retain their existing fail-fast behavior.
+fn missing_daemon_action(
+    is_macos: bool,
+    requires_external_daemon: bool,
+) -> MissingDaemonAction {
+    if is_macos {
+        MissingDaemonAction::EnterLazyProxy
+    } else if requires_external_daemon {
+        MissingDaemonAction::FailExternalDaemon
+    } else {
+        MissingDaemonAction::FailPlatformDaemon
+    }
+}
+
+/// Run the MCP proxy path: enter `crate::proxy::run_proxy` against the daemon
+/// socket, allowing its macOS implementation to start or wait for the daemon
+/// lazily. Builds its own tokio runtime — same shape as the other `run_*`
+/// helpers in this file that own their event loop.
 pub fn run_mcp_via_daemon_proxy(
     socket: Option<String>,
     claude_code_compat: bool,
@@ -761,53 +811,43 @@ pub fn run_mcp_via_daemon_proxy(
     };
 
     if !crate::serve::is_daemon_listening(&socket_path) {
-        // CUA_DRIVER_RS_MCP_FORCE_PROXY callers (test harness, custom
-        // bundle setups) supply their own daemon — skip the auto-
-        // launch step, since they don't have an installed
-        // CuaDriver.app to relaunch into. Fail fast if no daemon is
-        // up at this point.
-        if crate::bundle::is_env_truthy("CUA_DRIVER_RS_MCP_FORCE_PROXY") {
-            anyhow::bail!(
-                "CUA_DRIVER_RS_MCP_FORCE_PROXY=1 but no daemon listening on \
-                 {socket_path}. Start one with `cua-driver serve --socket {socket_path}` \
-                 and retry."
-            );
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let socket_suffix = if socket_path != crate::serve::default_socket_path() {
-                format!(" --socket {socket_path}")
-            } else {
-                String::new()
-            };
-            eprintln!(
-                "cua-driver-rs: mcp launched without CuaDriver.app's TCC grants; \
-                 auto-launching the daemon via `open -n -g -a CuaDriver --args serve{socket_suffix}` \
-                 and proxying MCP requests through it. Pass --no-daemon-relaunch to stay in-process."
-            );
-            launch_daemon_and_wait(&socket_path, 10, claude_code_compat)?;
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = claude_code_compat;
-        // On Linux / Windows there's no equivalent `open -a CuaDriver`
-        // mechanism to spawn a daemon attributed to the user's
-        // interactive session. The caller is expected to have one
-        // running already (e.g. via `cua-driver autostart enable && kick`
-        // on Windows). Bail with an actionable error rather than
-        // silently falling back to an in-process server that would
-        // be attributed to whatever session spawned us (typically
-        // Session 0 over SSH).
-        #[cfg(not(target_os = "macos"))]
-        {
-            anyhow::bail!(
-                "no Cua Driver daemon listening on {socket_path}. Start one in \
-                 your interactive session — on Windows run \
-                 `cua-driver autostart enable && cua-driver autostart kick`; \
-                 on Linux run `cua-driver serve &` in the user's session. \
-                 Then re-run `cua-driver mcp`. To skip the proxy and run \
-                 in-process anyway (Session 0 attribution, GUI tools will \
-                 return empty), pass --no-daemon-relaunch."
-            );
+        match missing_daemon_action(
+            cfg!(target_os = "macos"),
+            crate::bundle::requires_external_daemon(),
+        ) {
+            // Do not launch here. On macOS `run_proxy` serves `initialize` and
+            // `tools/list` locally, then waits for an externally-owned daemon
+            // (or lazily launches an ordinary CuaDriver daemon) on the first
+            // `tools/call`. In particular, the external branch never launches
+            // a standalone daemon.
+            MissingDaemonAction::EnterLazyProxy => {}
+            MissingDaemonAction::FailExternalDaemon => {
+                if crate::bundle::is_env_truthy("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW") {
+                    anyhow::bail!(
+                        "the cmux Computer Use runtime is not listening on {socket_path}. \
+                         Open cmux Settings → Computer Use and keep permission setup inside \
+                         cmux; do not launch cua-driver directly"
+                    );
+                }
+                anyhow::bail!(
+                    "CUA_DRIVER_RS_MCP_FORCE_PROXY=1 but no daemon listening on \
+                     {socket_path}. Start one with `cua-driver serve --socket {socket_path}` \
+                     and retry."
+                );
+            }
+            MissingDaemonAction::FailPlatformDaemon => {
+                // Linux / Windows have no equivalent lazy LaunchServices path.
+                // The caller must provide a daemon in the interactive session.
+                anyhow::bail!(
+                    "no Cua Driver daemon listening on {socket_path}. Start one in \
+                     your interactive session — on Windows run \
+                     `cua-driver autostart enable && cua-driver autostart kick`; \
+                     on Linux run `cua-driver serve &` in the user's session. \
+                     Then re-run `cua-driver mcp`. To skip the proxy and run \
+                     in-process anyway (Session 0 attribution, GUI tools will \
+                     return empty), pass --no-daemon-relaunch."
+                );
+            }
         }
     }
 
@@ -815,7 +855,28 @@ pub fn run_mcp_via_daemon_proxy(
         .enable_all()
         .build()
         .expect("tokio runtime");
-    rt.block_on(crate::proxy::run_proxy(socket_path))
+    rt.block_on(crate::proxy::run_proxy(socket_path, claude_code_compat))
+}
+
+#[cfg(test)]
+mod daemon_proxy_startup_policy_tests {
+    use super::{missing_daemon_action, MissingDaemonAction};
+
+    #[test]
+    fn external_macos_proxy_enters_lazy_proxy_when_socket_is_absent() {
+        assert_eq!(
+            missing_daemon_action(true, true),
+            MissingDaemonAction::EnterLazyProxy
+        );
+    }
+
+    #[test]
+    fn external_non_macos_proxy_remains_fail_fast_when_socket_is_absent() {
+        assert_eq!(
+            missing_daemon_action(false, true),
+            MissingDaemonAction::FailExternalDaemon
+        );
+    }
 }
 
 /// Emit a stable, machine-readable JSON description of the cua-driver CLI
@@ -1767,6 +1828,12 @@ pub fn run_permissions_cmd(
     subcommand: &str,
     json: bool,
 ) {
+    if crate::bundle::requires_external_daemon() {
+        eprintln!(
+            "cmux Computer Use owns this binary's permission flow. Use the tag-scoped cmux Computer Use helper and cmux Settings; standalone `cua-driver permissions` is disabled."
+        );
+        process::exit(1);
+    }
     match subcommand {
         "status" => run_permissions_status(json),
         "grant" => run_permissions_grant(),
@@ -1863,28 +1930,43 @@ fn run_permissions_status(json: bool) {
         return;
     }
 
+    for line in permission_status_lines(&structured) {
+        println!("{line}");
+    }
+}
+
+fn permission_status_lines(structured: &serde_json::Value) -> Vec<String> {
     let b = |k: &str| structured.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
     let ax = b("accessibility");
     let sr = b("screen_recording");
-    let cap = b("screen_recording_capturable");
+    let cap = structured
+        .get("screen_recording_capturable")
+        .and_then(|value| value.as_bool());
     let attribution = structured
         .get("source")
         .and_then(|s| s.get("attribution"))
         .and_then(|v| v.as_str())
         .unwrap_or("driver-daemon");
 
-    println!("Accessibility:    {}", if ax { "✅ granted" } else { "❌ not granted" });
-    println!("Screen Recording: {}", if sr { "✅ granted" } else { "❌ not granted" });
-    if sr && !cap {
-        println!(
-            "  ⚠️  preflight reports granted, but a live capture probe failed — the grant \
-             likely belongs to another process, not this one."
-        );
+    let mut lines = vec![
+        format!("Accessibility:    {}", if ax { "✅ granted" } else { "❌ not granted" }),
+        format!("Screen Recording: {}", if sr { "✅ granted" } else { "❌ not granted" }),
+    ];
+    match cap {
+        Some(false) if sr => lines.push(
+            "  ⚠️  preflight reports granted, but a live capture probe failed — the grant likely belongs to another process, not this one."
+                .to_owned(),
+        ),
+        None => lines.push(
+            "Live capture probe: ❓ not performed (silent status check)".to_owned(),
+        ),
+        _ => {}
     }
-    println!("Source: {attribution}");
+    lines.push(format!("Source: {attribution}"));
     if !(ax && sr) {
-        println!("  → To grant for the driver, run: cua-driver permissions grant");
+        lines.push("  → To grant for the driver, run: cua-driver permissions grant".to_owned());
     }
+    lines
 }
 
 /// Launch CuaDriver via LaunchServices so the permission prompt attributes to
@@ -2994,6 +3076,37 @@ mod tests {
         let sanitized = sanitize_tool_name(&long_name);
         assert_eq!(sanitized.len(), 64);
         assert!(sanitized.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn silent_permission_status_does_not_treat_unknown_probe_as_failure() {
+        let lines = permission_status_lines(&serde_json::json!({
+            "accessibility": true,
+            "screen_recording": true,
+            "screen_recording_capturable": null,
+            "screen_recording_probe_performed": false,
+            "source": { "attribution": "driver-daemon" }
+        }));
+        let output = lines.join("\n");
+        assert!(output.contains("not performed"));
+        assert!(!output.contains("live capture probe failed"));
+    }
+
+    #[test]
+    fn live_permission_probe_false_warns_but_true_does_not() {
+        for (capturable, should_warn) in [(false, true), (true, false)] {
+            let lines = permission_status_lines(&serde_json::json!({
+                "accessibility": true,
+                "screen_recording": true,
+                "screen_recording_capturable": capturable,
+                "screen_recording_probe_performed": true,
+                "source": { "attribution": "driver-daemon" }
+            }));
+            assert_eq!(
+                lines.join("\n").contains("live capture probe failed"),
+                should_warn,
+            );
+        }
     }
 
     // ── Surface 8: manifest shape ───────────────────────────────────────────

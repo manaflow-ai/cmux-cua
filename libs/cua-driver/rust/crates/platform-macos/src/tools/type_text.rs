@@ -80,7 +80,7 @@ fn def() -> &'static ToolDef {
             "type": "object",
             "required": ["pid", "text"],
             "properties": {
-                "session": { "type": "string", "description": "Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less." },
+                "session": { "type": "string", "description": "Optional explicit session id for the agent cursor and per-session state. Embedded MCP calls may omit it to use CUA_DRIVER_DEFAULT_SESSION (or embedded-<pid>); anonymous non-embedded calls remain cursor-less." },
                 "pid":  { "type": "integer", "description": "Target process ID." },
                 "text": { "type": "string",  "description": "Text to insert at the target's cursor." },
                 "window_id": {
@@ -121,6 +121,20 @@ fn def() -> &'static ToolDef {
 #[async_trait]
 impl Tool for TypeTextTool {
     fn def(&self) -> &ToolDef { def() }
+
+    fn dispatch_preflight(&self, args: &Value) -> Result<(), ToolResult> {
+        cua_driver_core::tool::validate_dispatch_args(self.def(), args)?;
+        let address = super::preflight_action_address(args, "type_text")?;
+        if address.element && address.has_xy {
+            return Err(ToolResult::error(
+                "Pass either element_index (ax) or x,y (px) to type_text, not both.",
+            ));
+        }
+        if address.element && address.window_id.is_none() {
+            return Err(ToolResult::error("window_id is required when element_index is used."));
+        }
+        Ok(())
+    }
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
@@ -202,6 +216,19 @@ impl Tool for TypeTextTool {
             None
         };
         let element_ptr = element_guard.as_ref().map(|(g, idx)| (g.as_ptr(), Some(*idx)));
+
+        // A keyboard action still has a visible action point: the explicit AX
+        // target, or the app's currently focused element. Glide before typing
+        // so an embedded default cursor is present where the text lands (the px
+        // form has already focused/clicked the same point above).
+        let cursor_point = if let Some((ptr, _)) = element_ptr {
+            super::cursor_tools::retained_element_center(ptr).await
+        } else {
+            super::cursor_tools::focused_element_center(pid).await
+        };
+        if let Some(point) = cursor_point {
+            super::cursor_tools::animate_to_action_point(&self.state, &args, point, window_id).await;
+        }
 
         let text_clone  = text.clone();
         let char_count  = text.chars().count();

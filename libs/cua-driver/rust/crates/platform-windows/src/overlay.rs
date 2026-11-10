@@ -326,7 +326,7 @@ fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target
         .cursors
         .entry(key.clone())
         .or_insert_with(|| render_state_for_key(&template, &k));
-    if !(rs.core.cfg.enabled && rs.core.pos.0 < -50.0) {
+    if !(rs.core.cfg.enabled && rs.core.is_unplaced()) {
         return false;
     }
     let mut sx = target_x - SEED_OFFSET;
@@ -342,7 +342,7 @@ fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target
             sy = (target_y + SEED_OFFSET).min(virt_y + virt_h - 2.0);
         }
     }
-    rs.core.pos = (sx, sy);
+    rs.core.place_at(sx, sy);
     true
 }
 
@@ -368,7 +368,7 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
     let should_animate = {
         let guard = RENDER.lock().unwrap();
         match guard.as_ref().and_then(|m| m.cursors.get(&key)) {
-            Some(rs) if rs.core.cfg.enabled && rs.core.pos.0 > -50.0 => true,
+            Some(rs) if rs.core.cfg.enabled && !rs.core.is_unplaced() => true,
             _ => false,
         }
     };
@@ -472,7 +472,7 @@ impl RenderState {
             || self.core.click_t.is_some()
             || (self.core.motion.idle_hide_ms > 0.0
                 && self.core.visible
-                && self.core.pos.0 >= -100.0
+                && !self.core.is_unplaced()
                 && self.core.idle_alpha >= 0.004)
     }
 }
@@ -1197,7 +1197,7 @@ mod tests {
     fn seed_is_noop_when_cursor_already_on_screen() {
         let mut map = empty_map();
         seed_start_in_map(&mut map, &"sessA".to_owned(), 60.0, 60.0);
-        map.cursors.get_mut("sessA").unwrap().core.pos = (30.0, 30.0);
+        map.cursors.get_mut("sessA").unwrap().core.place_at(30.0, 30.0);
         let seeded_again = seed_start_in_map(&mut map, &"sessA".to_owned(), 80.0, 80.0);
         assert!(!seeded_again, "on-screen cursor must not be re-seeded");
         assert_eq!(map.cursors["sessA"].core.pos, (30.0, 30.0), "pos must be untouched");

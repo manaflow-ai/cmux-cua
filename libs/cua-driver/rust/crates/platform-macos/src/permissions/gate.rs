@@ -166,8 +166,9 @@ impl GateOpts {
     /// Construct from the standard env-var
     /// (`CUA_DRIVER_RS_PERMISSIONS_GATE` set to `0` / `false` / `no` /
     /// `off`, case-insensitive, disables the gate), an explicit
-    /// `--no-permissions-gate` flag, and embedded mode
-    /// (`CUA_DRIVER_EMBEDDED=1`).  Any signal is sufficient to opt out.
+    /// `--no-permissions-gate` flag, embedded mode
+    /// (`CUA_DRIVER_EMBEDDED=1`), and host-owned permission flow. Any signal is
+    /// sufficient to opt out.
     /// Embedded mode opts out because the host app owns the grant flow;
     /// the driver must never raise its own prompts.
     pub fn from_env_and_flag(no_gate_flag: bool) -> Self {
@@ -183,7 +184,10 @@ impl GateOpts {
             })
             .unwrap_or(false);
         Self {
-            opt_out: no_gate_flag || env_disabled || cua_driver_core::embedded_mode(),
+            opt_out: no_gate_flag
+                || env_disabled
+                || cua_driver_core::embedded_mode()
+                || super::external_permission_flow_enabled(),
             ..Self::default()
         }
     }
@@ -658,6 +662,21 @@ mod tests {
         std::env::set_var(cua_driver_core::EMBEDDED_ENV, "true");
         assert!(!GateOpts::from_env_and_flag(false).opt_out);
         std::env::remove_var(cua_driver_core::EMBEDDED_ENV);
+    }
+
+    #[test]
+    fn external_permission_flow_opts_out_of_gate() {
+        let _guard = env_lock();
+        std::env::remove_var("CUA_DRIVER_RS_PERMISSIONS_GATE");
+        std::env::remove_var(cua_driver_core::EMBEDDED_ENV);
+        std::env::set_var("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW", "1");
+
+        assert!(
+            GateOpts::from_env_and_flag(false).opt_out,
+            "an embedding host that owns permission UX must never run the standalone gate"
+        );
+
+        std::env::remove_var("CUA_DRIVER_RS_EXTERNAL_PERMISSION_FLOW");
     }
 
     #[test]
