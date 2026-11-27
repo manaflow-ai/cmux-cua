@@ -65,6 +65,13 @@ impl Tool for BringToFrontTool {
     fn def(&self) -> &ToolDef { def() }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        if !crate::input::real_input::allowed() {
+            return ToolResult::error(crate::input::real_input::refusal("bring_to_front"))
+                .with_structured(serde_json::json!({
+                    "code": "foreground_not_permitted",
+                    "env": crate::input::real_input::ENV,
+                }));
+        }
         let pid = match args.get("pid").and_then(Value::as_i64) {
             Some(p) => match libc::pid_t::try_from(p) {
                 Ok(pid) => pid,

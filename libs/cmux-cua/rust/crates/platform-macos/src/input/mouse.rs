@@ -73,6 +73,8 @@ pub(crate) fn click_at_xy_desktop_guarded(
     button: &str,
     gate: &NativeDispatchGate,
 ) -> anyhow::Result<()> {
+    // Warps the person's real cursor and posts to the global HID tap.
+    crate::input::real_input::require("a desktop-scope (screen-absolute) click")?;
     use core_graphics::display::CGDisplay;
     use core_graphics::event::CGEventTapLocation;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -671,7 +673,7 @@ pub(crate) fn drag_at_xy_guarded(
     }
     let release_without_gate = || {
         post_mouse_event(pid, &up, to_local, wid, click_group_id, 1, button_number, 0);
-        if foreground_release {
+        if foreground_release && crate::input::real_input::allowed() {
             up.post(CGEventTapLocation::HID);
         }
     };
@@ -816,6 +818,7 @@ pub(crate) fn drag_at_xy_foreground_guarded(
     gate: &NativeDispatchGate,
     observe_posted_event: impl Fn(&CGEvent),
 ) -> anyhow::Result<()> {
+    crate::input::real_input::require("a foreground drag through the global HID tap")?;
     use core_graphics::display::CGDisplay;
     use core_graphics::event::CGEventTapLocation;
 

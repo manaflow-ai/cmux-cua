@@ -304,6 +304,7 @@ impl Tool for DragTool {
                     let do_it = move || -> anyhow::Result<()> {
                         let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                         if fg {
+                            crate::input::real_input::require("a foreground drag")?;
                             // HID delivery is global, so foreground mode must
                             // establish a real active application before the
                             // gesture begins. The SkyLight flash can be
