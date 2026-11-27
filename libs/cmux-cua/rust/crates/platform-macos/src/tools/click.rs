@@ -162,6 +162,18 @@ impl Tool for ClickTool {
             // `scope` is a per-call param now (default "window"); pass
             // scope="desktop" to enable screen-absolute clicks.
             let scope = args.str_or("scope", "window");
+            // A screen-absolute click warps the person's real cursor and posts
+            // to the global HID tap. Refuse before the agent cursor even glides.
+            if !crate::input::real_input::allowed() {
+                return ToolResult::error(crate::input::real_input::refusal(
+                    "a desktop-scope (screen-absolute) click",
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "foreground_not_permitted",
+                    "env": crate::input::real_input::ENV,
+                    "suggestion": "click by element_index/element_token, or pass pid + window_id with delivery_mode \"background\"",
+                }));
+            }
             if scope != "desktop" {
                 return ToolResult::error(
                     "click: x,y given with no pid/window_id, but scope is \"window\". \

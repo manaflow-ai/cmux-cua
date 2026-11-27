@@ -489,6 +489,12 @@ pub(crate) fn with_menu_shortcut_activation_guarded(
     gate: &NativeDispatchGate,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
+    // Fronting the target steals the person's keyboard focus. Without their
+    // opt-in, deliver in the background (the per-pid event is still posted).
+    if !crate::input::real_input::allowed() {
+        action()?;
+        return Ok(false);
+    }
     let set_front = match set_front_process_fn() {
         Some(f) => f,
         None => {

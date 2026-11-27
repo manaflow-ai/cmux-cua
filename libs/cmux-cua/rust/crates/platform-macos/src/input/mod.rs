@@ -12,6 +12,7 @@ pub mod mouse;
 pub mod keyboard;
 pub mod ax_actions;
 pub mod skylight;
+pub mod real_input;
 
 pub use ax_actions::perform_ax_action;
 pub use mouse::click_at_xy;

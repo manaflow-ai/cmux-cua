@@ -528,6 +528,11 @@ pub fn activate_pid(pid: i32) -> bool {
 /// user watching the agent cursor sees the driven app. Best-effort: callers
 /// treat a `false`/missing app as a warning, never a hard failure.
 pub fn activate_pid_all_windows(pid: i32) -> bool {
+    // Host-chosen "watchable" fronting is the only other opt-in besides the
+    // person's real-input switch; otherwise never take the foreground.
+    if !(crate::input::real_input::allowed() || cmux_cua_core::watchable_front_mode()) {
+        return false;
+    }
     use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
     unsafe {
         match NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
